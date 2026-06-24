@@ -669,11 +669,7 @@ def build_intent_packet(request: ReviewRequest, change_summary: ChangeSummary) -
         unknowns.append("no changed files were detected")
 
     acceptance_criteria: list[str] = []
-    if request.review_focus:
-        acceptance_criteria.append(f"Review focus: {request.review_focus}")
-        sources["acceptance_criteria"] = IntentSource.DECLARED
-    else:
-        unknowns.append("acceptance criteria are not explicitly declared")
+    unknowns.append("acceptance criteria are not explicitly declared")
 
     scope = list(change_summary.changed_files)
     if scope:
