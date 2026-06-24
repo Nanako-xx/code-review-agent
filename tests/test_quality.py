@@ -20,6 +20,14 @@ def test_python_compile_gate_passes_for_valid_python(tmp_path: Path):
     assert result.status == "passed"
 
 
+def test_python_compile_gate_passes_for_utf8_bom_python(tmp_path: Path):
+    (tmp_path / "app.py").write_text("\ufeffdef ok():\n    return 1\n", encoding="utf-8")
+
+    result = run_python_compile_gate(tmp_path)
+
+    assert result.status == "passed"
+
+
 def test_python_compile_gate_fails_for_invalid_python(tmp_path: Path):
     (tmp_path / "bad.py").write_text("def broken(:\n    return 1\n", encoding="utf-8")
 

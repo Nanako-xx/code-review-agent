@@ -14,7 +14,7 @@ def run_python_compile_gate(repo_path: Path) -> QualityGateResult:
     python_files = [path for path in repo_path.rglob("*.py") if ".git" not in path.parts]
     for path in python_files:
         try:
-            source = path.read_text(encoding="utf-8")
+            source = path.read_text(encoding="utf-8-sig")
             compile(source, str(path), "exec")
         except SyntaxError as exc:
             return QualityGateResult(

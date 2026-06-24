@@ -758,6 +758,14 @@ def test_python_compile_gate_passes_for_valid_python(tmp_path: Path):
     assert result.status == "passed"
 
 
+def test_python_compile_gate_passes_for_utf8_bom_python(tmp_path: Path):
+    (tmp_path / "app.py").write_text("\ufeffdef ok():\n    return 1\n", encoding="utf-8")
+
+    result = run_python_compile_gate(tmp_path)
+
+    assert result.status == "passed"
+
+
 def test_python_compile_gate_fails_for_invalid_python(tmp_path: Path):
     (tmp_path / "bad.py").write_text("def broken(:\n    return 1\n", encoding="utf-8")
 
@@ -798,7 +806,7 @@ def run_python_compile_gate(repo_path: Path) -> QualityGateResult:
     python_files = [path for path in repo_path.rglob("*.py") if ".git" not in path.parts]
     for path in python_files:
         try:
-            source = path.read_text(encoding="utf-8")
+            source = path.read_text(encoding="utf-8-sig")
             compile(source, str(path), "exec")
         except SyntaxError as exc:
             return QualityGateResult(
@@ -824,7 +832,7 @@ Run:
 python -m pytest tests/test_quality.py -q
 ```
 
-Expected: `3 passed`.
+Expected: `4 passed`.
 
 - [ ] **Step 5: Commit quality gates if Git is valid**
 
@@ -1787,6 +1795,7 @@ Expected: two commits exist and `$base` differs from `$head`.
 Run from `D:\Agent\code review agent`:
 
 ```powershell
+$env:PYTHONPATH='D:\Agent\code review agent\src'
 python -m review_agent review --repo $env:TEMP\review-agent-sample --base $base --head $head --intent "Add auth token check" --non-interactive
 ```
 
@@ -1837,6 +1846,7 @@ Expected: all tests pass.
 Run:
 
 ```powershell
+$env:PYTHONPATH='D:\Agent\code review agent\src'
 python -m review_agent --help
 ```
 
