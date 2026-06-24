@@ -1,7 +1,8 @@
 from review_agent.git_repo import ChangeSummary
 from review_agent.intent import build_intent_packet
-from review_agent.models import ReviewRequest, RiskLevel
+from review_agent.models import ReviewRequest, RiskAssessment, RiskLevel
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
+from review_agent.runtime import build_assignments
 
 
 def test_build_risk_packet_is_lightweight():
@@ -46,3 +47,27 @@ def test_local_risk_assessor_marks_small_non_sensitive_changes_low():
 
     assert assessment.level is RiskLevel.LOW
     assert assessment.suggested_focus == ["intent alignment", "changed file sanity"]
+
+
+def test_runtime_expands_high_risk_into_specific_assignments():
+    assessment = RiskAssessment(
+        level=RiskLevel.HIGH,
+        dimensions={},
+        reasons=["sensitive path changed: auth/session.py"],
+        evidence_refs=[],
+        unknowns=["project constraints are not explicitly declared"],
+        suggested_focus=["caller compatibility", "regression safety", "test adequacy"],
+    )
+
+    assignments = build_assignments(assessment)
+
+    assert len(assignments) == 3
+    assert assignments[0].role == "Core Reviewer"
+    assert assignments[1].role == "Adversarial Reviewer"
+    assert assignments[2].role == "Dynamic Specialist Reviewer"
+    assert assignments[0].max_turns == 16
+    assert assignments[0].required_checks == [
+        "map changed behavior to intent",
+        "inspect direct evidence for assigned contract items",
+        "record unavailable evidence as uncertainty",
+    ]
