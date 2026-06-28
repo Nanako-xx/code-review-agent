@@ -18,15 +18,16 @@ def build_reviewer_envelope(
     assignment: Assignment,
     intent: IntentPacket,
     code_snippets: dict[str, str],
-    evidence: dict[str, str],
+    observations: dict[str, str],
     trace_id: str,
 ) -> ModelInvocationEnvelope:
     content = "\n\n".join(
         [
             _assignment_block(assignment),
             _intent_block(intent),
+            _initial_context_block(assignment),
             _code_block(code_snippets),
-            _evidence_block(evidence),
+            _observation_block(observations),
             _completion_block(assignment),
         ]
     )
@@ -36,11 +37,15 @@ def build_reviewer_envelope(
         tools=[
             {
                 "name": "search_code",
-                "description": "Search repository text using a read-only indexed search.",
+                "description": "Search repository text using a read-only index of the reviewed head revision.",
             },
             {
                 "name": "read_range",
-                "description": "Read a bounded range from a repository file at the reviewed revision.",
+                "description": "Read a bounded range from a repository file at the reviewed head revision.",
+            },
+            {
+                "name": "compare_base_head",
+                "description": "Read Runtime-authorized base and head file ranges or diff hunks for comparison.",
             },
         ],
         messages=[{"role": "user", "content": content}],
@@ -78,7 +83,21 @@ def _intent_block(intent: IntentPacket) -> str:
             f"Goal: {intent.goal}",
             f"Status: {intent.status.value}",
             f"Sources: {sources}",
-            f"Unknowns: {'; '.join(intent.unknowns)}",
+            f"Uncertainties: {'; '.join(intent.uncertainties)}",
+        ]
+    )
+
+
+def _initial_context_block(assignment: Assignment) -> str:
+    context = assignment.initial_context
+    return "\n".join(
+        [
+            "Initial Context",
+            f"Changed Files: {', '.join(context.changed_files)}",
+            f"Diff Ranges: {', '.join(context.diff_ranges)}",
+            f"Code Ranges: {', '.join(context.code_ranges)}",
+            f"Quality Gates: {context.quality_gate_summary}",
+            f"Observation Refs: {', '.join(context.observation_refs)}",
         ]
     )
 
@@ -90,10 +109,10 @@ def _code_block(code_snippets: dict[str, str]) -> str:
     return "\n".join(parts)
 
 
-def _evidence_block(evidence: dict[str, str]) -> str:
-    parts = ["Evidence"]
-    for evidence_id, summary in evidence.items():
-        parts.append(f"{evidence_id}: {summary}")
+def _observation_block(observations: dict[str, str]) -> str:
+    parts = ["Observation Summary"]
+    for observation_id, summary in observations.items():
+        parts.append(f"{observation_id}: {summary}")
     return "\n".join(parts)
 
 
@@ -103,6 +122,6 @@ def _completion_block(assignment: Assignment) -> str:
             "Completion Rules",
             "You may request completion only after addressing every assigned contract item.",
             "If a required check cannot be performed, record the reason as an uncertainty.",
-            f"Provided evidence refs: {', '.join(assignment.provided_evidence_refs)}",
+            "Findings must cite observation IDs as evidence_refs in the final structured output.",
         ]
     )

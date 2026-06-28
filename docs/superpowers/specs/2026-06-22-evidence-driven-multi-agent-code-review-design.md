@@ -65,7 +65,7 @@ Diff Review 容易产生以下问题：
 
 ### 3.5 完整信息保存在系统中，相关信息才进入模型窗口
 
-- 原始工具结果和完整轨迹进入 Evidence Store 与 Session Store。
+- 原始工具结果和完整轨迹进入 Observation Store 与 Session Store。
 - Context Assembler 只向当前 Reviewer 提供与使命、假设和当前步骤相关的内容。
 - 上下文压缩不能删除系统状态或证据，只能减少模型当前看到的历史。
 
@@ -82,7 +82,7 @@ Diff Review 容易产生以下问题：
 - Portfolio Planner。
 - 多个独立 Reviewer Agent。
 - Repository Intelligence Layer。
-- Evidence Store、Session Store 与分层记忆。
+- Observation Store、Session Store 与分层记忆。
 - Evidence Reconciler 与全局 Completion Checker。
 - Markdown、JSON 和 JSONL 运行产物。
 - 暂停、恢复、预算限制、失败降级。
@@ -122,7 +122,20 @@ review-agent review \
   --focus "重复执行、事务和失败重试"
 ```
 
-`--intent` 和 `--focus` 只是用户提供的自然语言线索，不要求用户提交结构化 Intent Packet。用户可以完全不传意图；系统仍应根据 Diff、提交信息、代码上下文、测试、文档和历史记录构建内部意图模型。
+`--intent` 是用户对本次修改意图的自然语言说明；`--focus` 是用户希望重点审查的方向或风险视角，不自动成为产品意图、验收条件或约束。两者都不要求用户提交结构化 Intent Packet。用户可以完全不传意图；系统仍应根据 Diff、提交信息、代码上下文、测试、文档和历史记录构建内部意图模型。
+
+`repository_path` 是一个 Git 仓库路径。`base_revision` 与 `head_revision` 不是文件，也不是两份仓库，
+而是同一个仓库中的两个版本点。每个版本点都代表该仓库在对应提交、分支或 tag 上的完整快照。
+一次改动无论涉及多少文件，用户仍只提供一个 Base 和一个 Head。
+
+用户不直接提交 Diff 文件。Runtime 根据 `repository_path + base_revision + head_revision` 自动调用 Git
+生成：
+
+```text
+changed_files：base..head 之间改动过的文件清单
+diff_stat：改动统计
+diff_excerpt：用于初始分诊的高信号 Diff 片段
+```
 
 内部统一为 `ReviewRequest`：
 
@@ -142,9 +155,11 @@ provider_configuration: {}
 
 真正的审查对象不是一段孤立 Diff，而是：
 
-> 一个仓库从 Base 状态变化到 Head 状态后，是否正确实现了声明或系统推断并明确标记的意图，并保持既有系统行为可接受。
+> 一个仓库从 Base 状态变化到 Head 状态后，是否正确实现了声明或系统推断并明确标记来源的意图，并保持既有系统行为可接受。未确认的 `inferred` 意图必须在结论中标明来源和不确定性，不能冒充已经确认的真实需求。
 
-Diff 提供调查起点，完整仓库提供影响与正确性的证据。
+Diff 和 `changed_files` 只提供调查起点，不是默认读取上限。Reviewer 在权限和预算内可以按需读取
+`head_revision` 下的仓库相关文件，并通过 Runtime 授权的 Git 工具对比 `base_revision` 与 `head_revision`，
+以理解调用方、测试、配置、约束、既有行为和本次改动是否符合意图。
 
 ## 6. Intent Packet
 
@@ -152,7 +167,17 @@ Diff 提供调查起点，完整仓库提供影响与正确性的证据。
 
 Intent Packet 是系统内部维护的意图模型，不是用户必须提交的输入格式，也不是必须填满的表单。
 
-系统应先根据用户可选输入、Diff、提交信息、代码上下文、测试、文档、Issue/ADR 和历史记录自动构建 Intent Packet，并持续维护其充分性状态。用户提供的 `--intent`、PR 描述或 Issue 只是意图来源之一。
+系统按阶段构建 Intent Packet：
+
+1. 先收集 `explicit` 意图：用户明确输入，例如 `--intent` 和交互式回答；以及仓库中的明确意图来源，例如 PR 描述、Issue、spec、ADR、README、需求文档、测试说明和提交信息。`--focus` 单独进入 Review Preference，用来影响审查重点和 Assignment，不自动写入 Intent Packet。
+2. 如果关键意图仍不完整，再让 LLM 通过受控工具读取 `base_revision`、`head_revision`、Diff、相关测试、文档和提交信息，推断项目目标、当前改动意图、验收条件和约束，并将这些内容写入 Intent Packet，来源标记为 `inferred`。
+3. 如果 `inferred` 意图会影响审查结论，系统必须向用户确认或让用户修正。
+4. 用户确认后，该项来源升级为 `explicit`，来源记录为用户确认。用户修正后，以用户修正内容作为 `explicit`。用户否定、跳过、无法确认，或系统无法形成稳定推断时，该项进入 `uncertainties`，或保持 `inferred` 并让 IntentStatus 降为 `partial` / `insufficient`。
+
+LLM 从明确文档中提取意图，不等同于 LLM 自己推断意图。来源仍然属于文档本身；LLM 只是提取器。
+LLM 可以从 `head_revision` 的实现形态推断“这次修改似乎想达成什么”，但这类输出的来源必须标记为 `inferred`。
+如果 `inferred` 意图与 `base_revision` 的既有行为、明确文档、测试或用户声明冲突，该冲突本身就是审查线索；
+系统应把它记录为 `uncertainty`、风险理由或候选 finding，而不是把错误实现直接当作真实需求。
 
 Intent Packet 的主要作用是让系统判断“当前意图理解是否足够支持可靠审查”。只有当缺失信息可能改变审查结论时，系统才向用户提出具体问题。
 
@@ -171,27 +196,34 @@ constraints: 哪些行为、接口或边界不能破坏
 design_decision: 采用的设计
 alternatives_rejected: 放弃的方案与原因
 linked_issue: 需求来源
-author_evidence: 作者提供的验证
+author_validation: 作者提供的测试、命令或验证说明
 rollback_expectation: 回滚要求
 ```
 
 ### 6.2 来源与可信度
 
-每条意图信息必须区分：
+`IntentSource` 只用于判断 Intent Packet 的充分性，不直接决定最终输出内容。进入 Intent Packet 的意图信息必须区分：
 
 ```text
-declared：用户或作者明确声明
-linked_source：来自 Issue、ADR 或验收文档
-inferred：Agent 根据代码和提交历史推测
+explicit：有确定性来源，例如用户输入、交互式回答、PR 描述、Issue、spec、ADR、README、验收文档、测试说明、提交信息，或已经被用户确认的系统推断
+inferred：LLM 根据代码、Diff、测试和提交历史推断出来，但尚未被用户或确定性来源确认
 ```
 
-`inferred` 不能冒充真实需求，只能帮助提出问题和规划调查。
+`inferred` 不能冒充真实需求，只能帮助提出问题和规划调查。对审查结论有关键影响的 `inferred`
+意图必须优先请求用户确认；如果用户确认，该项升级为 `explicit`。如果用户无法确认或拒绝确认，
+该项保持 `inferred` 或进入 `uncertainties`，并通过 Intent Packet 的充分性状态影响后续风险判断。
 
 ### 6.3 充分性状态
 
-- `sufficient`：足以验证主要行为，剩余未知项不会改变核心审查判断。
-- `partial`：可以继续审查，但部分结论受未知信息限制。
-- `insufficient`：缺失信息会阻止可靠的语义性审查。
+充分性表示“当前意图是否足够支持审查”，不表示意图绝对真实。Intent Packet 的充分性由 `explicit`、
+`inferred` 和缺失意图项的覆盖情况计算：
+
+- `sufficient`：审查所需的关键目标、验收条件、范围和约束已经由 `explicit` 覆盖；可以存在不影响结论的补充性 `inferred` 线索。
+- `partial`：可以继续审查，但关键意图中仍有部分内容依赖 `inferred`，或存在不阻塞审查的缺失项。
+- `insufficient`：关键目标、验收条件、范围或约束缺失，且缺失信息会阻止可靠的语义性审查。
+
+只要关键目标、验收条件或约束主要来自未确认的 `inferred`，Intent Packet 不能仅因为内容看起来完整就标为
+`sufficient`。如果用户确认了这些推断，且审查所需信息已经完整，则可以标记为 `sufficient`。
 
 补齐意图的完成标志不是字段全部填写，而是：
 
@@ -210,6 +242,8 @@ Agent 只提出可能改变审查结论的具体问题，例如：
 - 历史数据是否需要被新版本继续读取？
 
 用户可以回答，也可以选择 `continue with uncertainty`。未知答案本身是有效信息，必须进入报告。
+
+`Uncertainties` 只记录经过 `explicit` 收集、`inferred` 推断和必要用户确认之后，仍然没有可用结论的意图项或运行条件。已经形成可用推断的项标记为 `inferred`；被用户确认后升级为 `explicit`；被用户否定、跳过、无法确认，且系统也无法形成稳定推断的项，进入 `Uncertainties`。
 
 ## 7. Deterministic Quality Gates
 
@@ -237,7 +271,14 @@ pytest
 
 廉价检查在风险评估前运行。昂贵的完整测试、安全扫描或集成检查由风险等级与 Reviewer 调查按需触发。
 
-Quality Gates 的完整输出进入 Evidence Store；模型先看到结构化摘要，需要时再按范围读取原始日志。
+Quality Gates 在 M1 中默认作为 risk signal，而不是 hard gate。检查失败时，Runtime 记录失败结果、
+提高风险、要求 Reviewer 继续审查相关影响，并在最终报告中保留该失败。失败本身不阻断后续 Reviewer，
+除非用户或项目规则显式要求阻断。
+
+M1 默认只读，不自动修改被审查代码。后续可以增加显式 `fix-and-review` 模式：用户授权后，Runtime
+对确定性小错误生成修复补丁、记录修复 diff，再基于修复后的状态继续审查。该模式不属于默认 Review 流程。
+
+Quality Gates 的完整输出进入 Observation Store；模型先看到结构化摘要，需要时再按范围读取原始日志。
 
 ## 8. Review Contract
 
@@ -321,13 +362,17 @@ Initial Risk Assessment 是轻量分诊阶段，不是正式审查。它的目�
 
 Runtime 先采集确定性特征：
 
-- Diff 规模与文件分布。
+- Diff 语义与触达领域。
 - changed symbols。
 - 调用方与依赖关系概览。
 - 公共接口变化。
-- 测试是否同步修改。
+- 测试变化：新增、修改、删除、skip/xfail、断言变弱，以及是否覆盖 Intent Packet 的验收条件。
 - Quality Gates 和 CI 状态。
 - Intent Packet 充分性。
+
+改动文件数量不能单独决定风险等级。大量无关紧要的文档或机械重命名不应因为数量多而自动高风险；
+少量认证、支付、数据迁移、公共 API 或状态机改动也可能高风险。风险判断应关注 Diff 语义、触达领域、
+受影响关系、测试证据和意图未知项。
 
 Runtime 将这些特征整理成轻量 `Risk Assessment Packet` 传给 Risk Assessor。这个 Packet 可以包含高信号 Diff 片段、关键符号、调用方概览、测试/质量门状态和意图未知项，但不能包含完整仓库、完整 Session Store 或正式 Reviewer 调查历史。
 
@@ -344,13 +389,17 @@ dimensions:
   uncertainty: ...
   verification_strength: ...
 reasoning: [...]
-evidence_refs: [...]
-unknowns: [...]
+signal_refs: [...]
+uncertainties: [...]
 suggested_review_profile:
   reviewer_count: ...
   required_focus: [...]
   budget_hint: ...
 ```
+
+`signal_refs` 引用 Risk Assessment Packet 中的轻量信号，例如 diff range、changed symbol、quality gate、
+测试变化、intent uncertainty 或对应的 Observation ID。Risk Assessment 阶段不产生正式 Finding，
+因此不使用 `evidence_refs`。
 
 Risk Assessor 不能提交正式 Finding、Approve/Reject 或自动合并。
 
@@ -454,6 +503,10 @@ mission: 调查后台任务的取消、重试、资源释放和状态一致性
 
 角色不是固定风险枚举。M1 可使用同一模型，但从第一天支持每个 Agent 独立配置 Provider、模型和预算。
 
+Reviewer Agent 底层仍然是一次或多次 LLM 调用。多 Agent 的价值不在于“换成神秘的独立实体”，而在于
+每个 Reviewer 拥有独立 Assignment、上下文、工具预算、读取轨迹、输出 schema 和完成状态。Orchestrator
+负责调度、隔离、校验与汇总。
+
 ### 10.3 Reviewer Assignment
 
 ```yaml
@@ -469,9 +522,11 @@ assigned_contract:
 required_checks:
   - inspect direct callers or record why unavailable
   - inspect related regression tests
-provided_context:
-  evidence_refs: [...]
+initial_context:
+  changed_files: [...]
+  diff_ranges: [...]
   code_ranges: [...]
+  quality_gate_summary: [...]
 budget:
   max_turns: 12
   max_tool_calls: 30
@@ -480,7 +535,10 @@ permissions:
   commands: safe_checks_only
 ```
 
-Reviewer 不能自行改变使命、Contract、预算和权限。风险等级可以保留在 Runtime state 中；Reviewer 看到的是由风险等级展开后的任务原因、检查清单、证据材料和完成条件，而不是依靠 `risk_level` 自主决定调查深度。
+Reviewer 不能自行改变使命、Contract、预算和权限。风险等级可以保留在 Runtime state 中；Reviewer 看到的是由风险等级展开后的任务原因、检查清单、初始上下文和完成条件，而不是依靠 `risk_level` 自主决定调查深度。
+
+`assigned_contract` 是最低必须覆盖项，不是唯一允许检查项。Reviewer 必须覆盖每个 assigned Contract；
+同时，如果发现合同外的高置信 correctness、security、data loss、operational 或 compatibility 问题，也必须报告。
 
 ### 10.4 Reviewer Agent Loop
 
@@ -490,7 +548,7 @@ Reviewer 不能自行改变使命、Contract、预算和权限。风险等级可
 理解 Assignment
 -> 提出风险假设
 -> 选择工具调查
--> 收集结构化证据
+-> 读取仓库上下文并让 Runtime 记录 observation
 -> 确认、否定或更新假设
 -> 发现新线索后继续
 -> 申请结束
@@ -538,9 +596,12 @@ Runtime 检查：
 
 ```yaml
 contract_assessments: [...]
-confirmed_findings: [...]
+confirmed_findings:
+  - claim: ...
+    evidence_refs: [...]
 rejected_hypotheses: [...]
 uncertainties: [...]
+observation_refs: [...]
 investigation_summary: ...
 status: completed | partial | blocked | failed
 ```
@@ -559,6 +620,10 @@ status: completed | partial | blocked | failed
 -> 阅读测试与历史
 -> 根据线索继续外扩
 ```
+
+`changed_files` 和初始 Diff 是探索入口，不是默认读取上限。Reviewer 可以根据 Intent Packet、Diff、调用关系、
+测试和配置线索继续读取仓库内相关文件。只有用户显式开启 strict/diff-only 模式时，Runtime 才把读取范围限制在
+changed files。
 
 ### 11.2 工具层
 
@@ -593,6 +658,11 @@ Git：变更、历史、归属和 Base/Head 证据
 ```
 
 LSP 不可用时降级到 AST + ripgrep，并降低对应结论的 confidence。
+
+普通代码导航和读取工具默认读取 `head_revision`，因为 Review 需要判断合并后的代码状态。用于对比、
+历史和意图重建的 Git 工具可以在 Runtime 授权范围内读取 `base_revision` 与 `head_revision`，例如 diff、
+base/head 文件对比、提交信息和相关历史。Reviewer 不能自行切换到其他 revision、读取当前工作区未提交内容、
+仓库外路径、`.git`、`.env` 或密钥文件。Runtime 对路径、revision、行数、输出大小和工具预算做硬校验。
 
 ### 11.3 共享事实层
 
@@ -629,12 +699,16 @@ Changed Symbol
 
 Knowledge Graph 保存结构化事实和证据引用，不保存模型隐藏思维链。
 
-## 12. Evidence System
+## 12. Observation And Evidence System
 
-每条证据必须具有稳定 ID 和来源：
+Runtime 不能在审查开始前替 Reviewer 知道“什么是证据”。Runtime 能确定的是 Reviewer 调用了什么工具、
+读取了哪个版本、哪个文件、哪些行，以及工具返回了什么结果。因此系统先记录 Observation，再由 Reviewer
+在输出 Finding 时引用 Observation 作为 evidence refs。
+
+每条工具 Observation 必须具有稳定 ID 和来源：
 
 ```yaml
-evidence_id: E-42
+observation_id: O-42
 source: lsp.find_references
 revision: head@abc123
 path: src/auth/service.py
@@ -646,7 +720,7 @@ raw_artifact_ref: optional
 
 工具返回两种视图：
 
-- Raw Evidence：完整保存，供恢复、审计和重新读取。
+- Raw Observation：完整保存，供恢复、审计和重新读取。
 - Context View：结构化、截断或摘要后提供给模型。
 
 Finding 必须包含：
@@ -662,6 +736,10 @@ impact: ...
 suggested_action: ...
 verification_performed: [...]
 ```
+
+`evidence_refs` 引用的是 Observation ID 或已经验证过的派生证据 ID。Reviewer 决定哪些 Observation
+能够支撑自己的 claim；Runtime 校验这些引用真实存在、属于本次授权的 `base_revision` 或 `head_revision`、
+路径和行号有效。
 
 证据不足的内容只能进入 `uncertainties`，不能伪装成 Finding。
 
@@ -838,11 +916,12 @@ Reviewer 遗漏
 ```text
 system：系统提示词
 tools：工具定义
-messages：对话历史、任务材料、工具结果、附件和证据摘要
+messages：对话历史、任务材料、工具结果、附件和 observation 摘要
 parameters：模型、输出上限、reasoning effort、temperature、response schema 等参数
 ```
 
-Intent Packet、风险评估、证据、项目记忆和 Reviewer Mission 不是额外输入类别。它们只是 Runtime 按需选择后，放入 `messages` 的任务材料。
+Intent Packet、风险评估、项目记忆和 Reviewer Mission 不是额外输入类别。它们只是 Runtime 按需选择后，
+放入 `messages` 的任务材料。Reviewer 的最终 evidence_refs 是输出的一部分，不是初始输入参数。
 
 ### 16.1 Model Invocation Envelope
 
@@ -864,7 +943,7 @@ parameters:
 
 `system` 包含不可被仓库内容覆盖的规则：角色边界、权限、安全边界、工具使用规则、Review Contract、证据要求和输出格式。Review Contract 在 prompt 中可见，但硬约束由 Runtime 和 Completion Checker 执行。
 
-`tools` 是本次调用允许使用的工具定义。Runtime 按 Agent 类型和阶段裁剪工具列表，并在工具网关中校验参数、权限、超时、输出大小和证据记录。
+`tools` 是本次调用允许使用的工具定义。Runtime 按 Agent 类型和阶段裁剪工具列表，并在工具网关中校验参数、权限、超时、输出大小和 Observation 记录。
 
 `messages` 承载当前任务材料和必要历史。Context System 的主要工作发生在这里：从系统状态中挑选最小充分材料，压缩后传给模型。
 
@@ -880,7 +959,8 @@ Runtime 从这些后端状态中选择材料：
 - Intent Packet。
 - Risk Assessment Packet 或风险评估结果。
 - Assignment。
-- Evidence Store 中的相关证据片段。
+- 初始 Diff、changed_files、质量门摘要和必要代码片段。
+- 当前 Reviewer 自己产生的 Observation 摘要。
 - Repository Knowledge 中的相关文件、符号、调用关系和测试映射。
 - 当前 Agent 的调查摘要和最近工具结果。
 - 已批准的项目记忆。
@@ -889,10 +969,10 @@ Runtime 从这些后端状态中选择材料：
 默认原则：
 
 - 不把完整仓库放进模型窗口。
-- 不把完整 Session Store 或 Evidence Store 直接传给模型。
+- 不把完整 Session Store 或 Observation Store 直接传给模型。
 - 不把其他 Reviewer 第一轮自由文本推理传给模型。
 - 不传与当前阶段无关的风险、记忆、日志或代码。
-- 能用 evidence/ref 表示的内容优先传引用；只有需要语义判断时才传片段。
+- 能用 observation/ref 表示的内容优先传引用；只有需要语义判断时才传片段。
 
 ### 16.3 Stage-Specific Minimal Context
 
@@ -902,12 +982,12 @@ Runtime 从这些后端状态中选择材料：
 |---|---|---|
 | Initial Risk Assessor | 轻量 Risk Assessment Packet：变更摘要、关键 Diff 片段、changed symbols、确定性信号、Intent 未知项 | 完整仓库、完整审查上下文、正式 Reviewer 调查历史 |
 | Portfolio Planner | 风险等级、风险理由、变更地图、可用 Reviewer 类型、预算策略 | 大量代码细节、完整工具日志 |
-| Reviewer Agent | Runtime 生成的具体 Assignment、相关代码片段、证据引用、必要工具结果、完成条件 | 抽象 `risk_level` 作为自主加深审查的提示、其他 Reviewer 第一轮推理、完整 Session Store |
+| Reviewer Agent | Runtime 生成的具体 Assignment、Intent Packet、初始 Diff/changed_files、质量门摘要、相关代码片段、必要工具结果、完成条件 | 预置证据输入、抽象 `risk_level` 作为自主加深审查的提示、其他 Reviewer 第一轮推理、完整 Session Store |
 | Evidence Reconciler | Findings、证据引用、冲突摘要、必要代码片段 | Reviewer 隐藏推理过程、无关原始日志 |
 | Final Risk Reassessment | 已验证 Findings、Uncertainties、Quality Gates、Contract Coverage | 原始所有工具输出 |
 | Completion Checker | 结构化覆盖摘要、失败/阻塞项、未决问题；多数检查由本地确定性逻辑完成 | 完整调查轨迹 |
 
-风险等级首先留在 Runtime state 中，用来决定审查深度。Reviewer 接收的是风险等级展开后的 Assignment，例如任务原因、检查清单、证据材料、预算和完成条件；它不依赖 `risk_level: high` 这类抽象标签自行决定调查深度。
+风险等级首先留在 Runtime state 中，用来决定审查深度。Reviewer 接收的是风险等级展开后的 Assignment，例如任务原因、检查清单、初始上下文、预算和完成条件；它不依赖 `risk_level: high` 这类抽象标签自行决定调查深度。
 
 ### 16.4 Reviewer Context Payload
 
@@ -917,9 +997,9 @@ Reviewer 每轮 `messages` 中的任务材料通常包括：
 
 - 当前 Assignment：角色、Mission、任务原因、assigned Contract、required checks。
 - 当前可用工具说明和工具调用规则摘要。
-- Intent Packet 摘要，包括 declared / linked_source / inferred / unknown 的区分。
+- Intent Packet 摘要，包括 `explicit` / `inferred` / `uncertainties` 的区分。
 - 相关代码片段、Diff 片段、调用关系或测试映射。
-- Evidence refs 与必要证据摘录。
+- 质量门摘要和必要工具结果。
 - 当前预算、完成条件和不能完成的条件。
 - 结构化输出 schema。
 
@@ -954,7 +1034,7 @@ Assignment 与意图：15%
 输出格式与工具结果预留：10%
 ```
 
-Compactor 保留任务、未解决假设、结论、证据引用和下一步方向；压缩重复代码、过长日志、已完成搜索过程和已否定假设的细节。完整内容始终保存在 Session/Evidence Store，压缩只影响下一次模型调用可见的 `messages`。
+Compactor 保留任务、未解决假设、结论、证据引用和下一步方向；压缩重复代码、过长日志、已完成搜索过程和已否定假设的细节。完整内容始终保存在 Session/Observation Store，压缩只影响下一次模型调用可见的 `messages`。
 
 ## 17. 信任与安全
 
@@ -970,12 +1050,15 @@ PR 描述、Issue、代码、注释、文档、日志、测试输出
 
 仓库内容全部视为不可信数据，不能改变 Agent 使命、权限或完成条件。
 
+仓库中的代码、注释、README、测试数据和生成文件都可能包含 prompt injection 或误导性说明。它们可以作为
+被审查数据和意图线索，但不能覆盖 Runtime Policy、Review Contract、工具权限、预算、输出格式或完成条件。
+
 M1 默认只读：
 
 允许：
 
-- 搜索和读取仓库。
-- 查询符号与 Git 关系。
+- 搜索和读取 Runtime 授权的 `head_revision` 仓库内路径。
+- 在 Runtime 授权的 `base_revision` 与 `head_revision` 范围内查询 Diff、文件对比、符号变化与 Git 关系。
 - 运行批准的确定性检查。
 
 禁止：
@@ -986,8 +1069,10 @@ M1 默认只读：
 - Approve、Reject、Merge。
 - 任意联网。
 - 任意执行仓库脚本。
+- 读取仓库外路径、`.git`、`.env`、密钥文件或其他敏感文件。
+- 自行切换 revision 或读取当前工作区未提交状态来污染本次 Review。
 
-命令执行必须经过白名单/仓库配置、参数校验、隔离工作区、超时、输出限制、网络禁用和完整证据记录。
+命令执行必须经过白名单/仓库配置、参数校验、隔离工作区、超时、输出限制、网络禁用和完整 Observation 记录。
 
 Prompt Injection 检测只提供告警；真正安全依赖 Runtime 硬权限。
 
@@ -1035,7 +1120,7 @@ Async Reviewer       investigating retry lifecycle
 ├── request.json
 ├── intent.json
 ├── state.json
-├── evidence.jsonl
+├── observations.jsonl
 ├── reviewers/
 ├── findings.json
 ├── session.json
@@ -1185,7 +1270,7 @@ M1 不建设完整 Agent Eval Harness，但必须记录：
 - Review 输入、Intent Packet。
 - 模型、Provider、Prompt 和配置版本。
 - Reviewer Assignment 与独立调查轨迹。
-- 工具调用、原始证据和结构化 Context View。
+- 工具调用、原始 Observation 和结构化 Context View。
 - Findings、confidence、severity 与最终报告。
 - token、耗时、终止原因和降级事件。
 - 人工接受、拒绝、修改 Finding 的反馈接口。
@@ -1205,17 +1290,31 @@ M1 完成时，应能在一个本地 Python Git 仓库中：
 1. 固定 Base/Head 并构建 ReviewRequest。
 2. 获取或补齐足够的 Intent Packet。
 3. 执行适用的确定性 Quality Gates。
-4. 基于证据完成初始风险定级。
+4. 基于轻量信号完成初始风险定级。
 5. 选择并并行运行多个独立 Reviewer。
 6. 让 Reviewer 按需搜索、读取和理解仓库关系。
-7. 形成有 revision 和来源的证据链。
+7. 形成有 revision 和来源的 Observation 与 evidence 链。
 8. 合并重复 Finding、保留有证据的独立发现、暴露冲突。
 9. 使用 Completion Checker 防止不完整 Review 伪装成功。
 10. 支持中断恢复、失败降级和预算耗尽。
 11. 生成人类可审计的 Markdown/JSON Review Brief。
 12. 不修改代码、不自动发布评论、不自动合并。
 
-## 24. 设计结论
+## 24. 实现同步原则
+
+本文档是后续代码生成和实现迁移的最新设计来源。已有 M1 Foundation 代码中的旧 schema 命名需要在下一轮实现中按本文迁移，例如：
+
+```text
+declared / linked_source -> explicit
+unknowns -> uncertainties
+RiskAssessment.evidence_refs -> signal_refs 或 observation_refs
+Assignment.provided_evidence_refs -> initial_context 中的 observation_refs / code_ranges / quality_gate_summary
+Evidence Store -> Observation Store + Finding evidence_refs
+```
+
+兼容层可以在读写旧产物或迁移历史 checkpoint 时短期存在，但 Runtime 内部状态、模型调用上下文和新产物 schema 应以本文为准。
+
+## 25. 设计结论
 
 本项目的核心不是“多调用几次 LLM”，而是：
 

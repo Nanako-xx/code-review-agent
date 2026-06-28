@@ -10,13 +10,15 @@ def test_checkpoint_store_writes_json_and_jsonl(tmp_path: Path):
     store = CheckpointStore(tmp_path, review_id="review-1")
 
     store.write_json("request.json", {"base": "main", "head": "HEAD"})
-    store.append_jsonl("evidence.jsonl", {"evidence_id": "ev_1", "summary": "changed app.py"})
+    store.append_jsonl("observations.jsonl", {"observation_id": "O-1", "summary": "changed app.py"})
 
     assert json.loads((tmp_path / ".review-agent" / "runs" / "review-1" / "request.json").read_text(encoding="utf-8")) == {
         "base": "main",
         "head": "HEAD",
     }
-    assert "ev_1" in (tmp_path / ".review-agent" / "runs" / "review-1" / "evidence.jsonl").read_text(encoding="utf-8")
+    assert "O-1" in (tmp_path / ".review-agent" / "runs" / "review-1" / "observations.jsonl").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_checkpoint_store_serializes_enum_values(tmp_path: Path):
@@ -29,24 +31,27 @@ def test_checkpoint_store_serializes_enum_values(tmp_path: Path):
     }
 
 
-def test_markdown_report_contains_risk_and_uncertainties():
+def test_markdown_report_contains_risk_signals_and_uncertainties():
     assessment = RiskAssessment(
         level=RiskLevel.HIGH,
-        dimensions={},
-        reasons=["sensitive path changed: auth/session.py"],
-        evidence_refs=[],
-        unknowns=["user did not provide declared intent"],
-        suggested_focus=["caller compatibility"],
+        dimensions={"impact": "sensitive path"},
+        reasons=["sensitive path changed: auth.py"],
+        signal_refs=["changed_file:auth.py"],
+        uncertainties=["user did not provide explicit intent"],
+        suggested_focus=["regression safety"],
     )
 
     report = render_markdown_report(
         review_id="review-1",
-        base_revision="main",
-        head_revision="HEAD",
+        base_revision="base",
+        head_revision="head",
         risk_assessment=assessment,
-        changed_files=["auth/session.py"],
+        changed_files=["auth.py"],
     )
 
     assert "# Review Brief" in report
     assert "Risk level: high" in report
-    assert "user did not provide declared intent" in report
+    assert "## Risk Signals" in report
+    assert "- changed_file:auth.py" in report
+    assert "## Uncertainties" in report
+    assert "- user did not provide explicit intent" in report
