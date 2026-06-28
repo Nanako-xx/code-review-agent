@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from review_agent.models import Assignment, RiskAssessment, ReviewProfile
+from review_agent.models import Assignment, InitialContext, RiskAssessment, ReviewProfile
 
 
 def build_assignments(risk_assessment: RiskAssessment) -> list[Assignment]:
@@ -17,11 +17,12 @@ def build_assignments(risk_assessment: RiskAssessment) -> list[Assignment]:
                 assigned_contract=_contract_for_role(role),
                 required_checks=[
                     "map changed behavior to intent",
-                    "inspect direct evidence for assigned contract items",
-                    "record unavailable evidence as uncertainty",
+                    "inspect direct observations for assigned contract items",
+                    "record unavailable observations as uncertainty",
                 ],
-                provided_evidence_refs=list(risk_assessment.evidence_refs),
-                code_ranges=[],
+                initial_context=InitialContext(
+                    observation_refs=list(risk_assessment.signal_refs),
+                ),
                 max_turns=profile.max_turns_per_reviewer,
                 max_tool_calls=profile.max_tool_calls_per_reviewer,
             )
