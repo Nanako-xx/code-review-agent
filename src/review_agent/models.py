@@ -29,6 +29,13 @@ class ContractItemStatus(str, Enum):
     NOT_APPLICABLE = "not_applicable"
 
 
+class ReviewerResultStatus(str, Enum):
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class ReviewRequest:
     repository_path: str
@@ -129,3 +136,31 @@ class ModelInvocationEnvelope:
     tools: list[dict[str, object]]
     messages: list[dict[str, object]]
     parameters: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ContractAssessment:
+    contract: str
+    status: ContractItemStatus
+    summary: str
+    evidence_refs: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ReviewerFinding:
+    claim: str
+    severity: str
+    confidence: str
+    evidence_refs: list[str] = field(default_factory=list)
+    suggested_action: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewerResult:
+    contract_assessments: list[ContractAssessment] = field(default_factory=list)
+    confirmed_findings: list[ReviewerFinding] = field(default_factory=list)
+    rejected_hypotheses: list[str] = field(default_factory=list)
+    uncertainties: list[str] = field(default_factory=list)
+    observation_refs: list[str] = field(default_factory=list)
+    investigation_summary: str = ""
+    status: ReviewerResultStatus = ReviewerResultStatus.PARTIAL
