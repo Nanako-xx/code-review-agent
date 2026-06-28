@@ -5,8 +5,7 @@ from enum import Enum
 
 
 class IntentSource(str, Enum):
-    DECLARED = "declared"
-    LINKED_SOURCE = "linked_source"
+    EXPLICIT = "explicit"
     INFERRED = "inferred"
 
 
@@ -52,7 +51,7 @@ class IntentPacket:
     constraints: list[str] = field(default_factory=list)
     sources: dict[str, IntentSource] = field(default_factory=dict)
     status: IntentStatus = IntentStatus.INSUFFICIENT
-    unknowns: list[str] = field(default_factory=list)
+    uncertainties: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -61,7 +60,7 @@ class QualityGateResult:
     status: str
     command: list[str]
     summary: str
-    evidence_ref: str | None = None
+    observation_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,7 +68,7 @@ class RiskAssessmentPacket:
     change_summary: dict[str, object]
     deterministic_signals: dict[str, object]
     intent_status: IntentStatus
-    intent_unknowns: list[str]
+    intent_uncertainties: list[str]
     diff_excerpt: list[str]
 
 
@@ -78,9 +77,18 @@ class RiskAssessment:
     level: RiskLevel
     dimensions: dict[str, str]
     reasons: list[str]
-    evidence_refs: list[str]
-    unknowns: list[str]
+    signal_refs: list[str]
+    uncertainties: list[str]
     suggested_focus: list[str]
+
+
+@dataclass(frozen=True)
+class InitialContext:
+    changed_files: list[str] = field(default_factory=list)
+    diff_ranges: list[str] = field(default_factory=list)
+    code_ranges: list[str] = field(default_factory=list)
+    quality_gate_summary: dict[str, str] = field(default_factory=dict)
+    observation_refs: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -108,8 +116,7 @@ class Assignment:
     assignment_reason: list[str]
     assigned_contract: list[str]
     required_checks: list[str]
-    provided_evidence_refs: list[str]
-    code_ranges: list[str]
+    initial_context: InitialContext
     max_turns: int
     max_tool_calls: int
     repository_permission: str = "read_only"
