@@ -1,20 +1,32 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import json
 from typing import Any
 
+from review_agent.context import build_reviewer_envelope
 from review_agent.models import (
+    Assignment,
     ContractAssessment,
     ContractItemStatus,
+    IntentPacket,
+    ModelInvocationEnvelope,
     ReviewerFinding,
     ReviewerResult,
     ReviewerResultStatus,
 )
+from review_agent.provider import ModelProvider, ModelResponse
 
 
 class ReviewerResultParseError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class ReviewerRun:
+    envelope: ModelInvocationEnvelope
+    response: ModelResponse
+    result: ReviewerResult
 
 
 REQUIRED_RESULT_KEYS = (
@@ -52,6 +64,26 @@ def parse_reviewer_result(raw_text: str) -> ReviewerResult:
 
 def reviewer_result_to_dict(result: ReviewerResult) -> dict[str, Any]:
     return asdict(result)
+
+
+def run_single_reviewer(
+    provider: ModelProvider,
+    assignment: Assignment,
+    intent: IntentPacket,
+    diff_excerpt: list[str],
+    observations: dict[str, str],
+    trace_id: str,
+) -> ReviewerRun:
+    envelope = build_reviewer_envelope(
+        assignment=assignment,
+        intent=intent,
+        code_snippets={"Diff Excerpt": "\n".join(diff_excerpt)},
+        observations=observations,
+        trace_id=trace_id,
+    )
+    response = provider.complete(envelope)
+    result = parse_reviewer_result(response.content)
+    return ReviewerRun(envelope=envelope, response=response, result=result)
 
 
 def _strip_json_fence(raw_text: str) -> str:
