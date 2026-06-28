@@ -80,3 +80,21 @@ def test_runtime_assignments_use_initial_context():
 
     assert len(assignments) == 2
     assert assignments[0].initial_context.observation_refs == ["diff:src/app.py"]
+
+
+def test_assignments_receive_initial_context_not_raw_evidence():
+    assessment = RiskAssessment(
+        level=RiskLevel.LOW,
+        dimensions={"impact": "local"},
+        reasons=["small or documentation-only non-sensitive change set"],
+        signal_refs=["diff:README.md"],
+        uncertainties=["acceptance criteria are not explicitly declared"],
+        suggested_focus=["intent alignment"],
+    )
+
+    assignment = build_assignments(assessment)[0]
+
+    assert assignment.initial_context.observation_refs == ["diff:README.md"]
+    assert assignment.initial_context.quality_gate_summary == {}
+    assert not hasattr(assignment, "provided_evidence_refs")
+    assert not hasattr(assignment, "code_ranges")
