@@ -2,7 +2,7 @@ from pathlib import Path
 import json
 
 from review_agent.checkpoint import CheckpointStore
-from review_agent.models import IntentStatus, RiskAssessment, RiskLevel
+from review_agent.models import IntentStatus, ReviewerResult, ReviewerResultStatus, RiskAssessment, RiskLevel
 from review_agent.reporting import render_markdown_report
 
 
@@ -55,3 +55,33 @@ def test_markdown_report_contains_risk_signals_and_uncertainties():
     assert "- changed_file:auth.py" in report
     assert "## Uncertainties" in report
     assert "- user did not provide explicit intent" in report
+
+
+def test_markdown_report_includes_single_reviewer_result():
+    assessment = RiskAssessment(
+        level=RiskLevel.LOW,
+        dimensions={"impact": "local"},
+        reasons=["small change"],
+        signal_refs=[],
+        uncertainties=[],
+        suggested_focus=["intent alignment"],
+    )
+    reviewer_result = ReviewerResult(
+        investigation_summary="Fake reviewer executed.",
+        status=ReviewerResultStatus.PARTIAL,
+        uncertainties=["Fake provider does not perform semantic review."],
+    )
+
+    report = render_markdown_report(
+        review_id="review-1",
+        base_revision="base",
+        head_revision="head",
+        risk_assessment=assessment,
+        changed_files=["auth.py"],
+        reviewer_result=reviewer_result,
+    )
+
+    assert "## Single Reviewer Result" in report
+    assert "Status: partial" in report
+    assert "Fake reviewer executed." in report
+    assert "- Fake provider does not perform semantic review." in report

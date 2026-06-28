@@ -9,9 +9,11 @@ from review_agent.checkpoint import CheckpointStore
 from review_agent.git_repo import collect_change_summary
 from review_agent.intent import build_intent_packet
 from review_agent.models import ReviewRequest
+from review_agent.provider import ProviderConfigError, build_provider_from_config
 from review_agent.quality import detect_quality_gates, run_python_compile_gate
 from review_agent.reporting import render_markdown_report
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
+from review_agent.reviewer import reviewer_result_to_dict, run_single_reviewer
 from review_agent.runtime import build_assignments
 
 
@@ -35,6 +37,10 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument("--intent")
     review.add_argument("--focus")
     review.add_argument("--non-interactive", action="store_true")
+    review.add_argument("--reviewer-provider", choices=["none", "fake", "openai-compatible"], default="none")
+    review.add_argument("--reviewer-model")
+    review.add_argument("--reviewer-base-url")
+    review.add_argument("--reviewer-api-key-env", default="REVIEW_AGENT_API_KEY")
 
     return parser
 
@@ -62,6 +68,16 @@ def _run_review(args: argparse.Namespace) -> int:
     risk_packet = build_risk_packet(change_summary, intent, quality_status)
     risk_assessment = LocalRiskAssessor().assess(risk_packet)
     assignments = build_assignments(risk_assessment)
+    try:
+        provider = build_provider_from_config(
+            provider_name=args.reviewer_provider,
+            model=args.reviewer_model,
+            base_url=args.reviewer_base_url,
+            api_key_env=args.reviewer_api_key_env,
+        )
+    except ProviderConfigError as error:
+        print(f"Reviewer provider configuration error: {error}")
+        return 2
 
     store = CheckpointStore(repo, review_id)
     store.write_json("request.json", asdict(request))
@@ -71,12 +87,36 @@ def _run_review(args: argparse.Namespace) -> int:
     store.write_json("assignments.json", {"assignments": [asdict(item) for item in assignments]})
     store.write_json("quality_gates.json", {"results": [asdict(item) for item in quality_results]})
 
+    reviewer_result = None
+    if provider is not None and assignments:
+        reviewer_run = run_single_reviewer(
+            provider=provider,
+            assignment=assignments[0],
+            intent=intent,
+            diff_excerpt=change_summary.diff_excerpt,
+            observations={ref: ref for ref in assignments[0].initial_context.observation_refs},
+            trace_id=f"{review_id}-reviewer-0",
+        )
+        reviewer_result = reviewer_run.result
+        store.write_json("reviewer_envelope.json", asdict(reviewer_run.envelope))
+        store.write_json(
+            "reviewer_raw_response.json",
+            {
+                "provider_name": reviewer_run.response.provider_name,
+                "model": reviewer_run.response.model,
+                "content": reviewer_run.response.content,
+                "raw": reviewer_run.response.raw,
+            },
+        )
+        store.write_json("reviewer_result.json", reviewer_result_to_dict(reviewer_run.result))
+
     report = render_markdown_report(
         review_id=review_id,
         base_revision=args.base,
         head_revision=args.head,
         risk_assessment=risk_assessment,
         changed_files=change_summary.changed_files,
+        reviewer_result=reviewer_result,
     )
     (store.run_dir / "report.md").write_text(report, encoding="utf-8")
 
