@@ -77,6 +77,17 @@ def test_search_repository_text_is_revision_bound(git_repo: Path):
     assert "def check_role" in matches[0].line
 
 
+def test_collect_python_symbols_tolerates_utf8_bom(git_repo: Path):
+    (git_repo / "bom.py").write_text("\ufeffdef with_bom():\n    return True\n", encoding="utf-8")
+    run_git(git_repo, "add", "bom.py")
+    run_git(git_repo, "commit", "-m", "add bom file")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    symbols = collect_python_symbols(git_repo, head, paths=["bom.py"])
+
+    assert [symbol.qualified_name for symbol in symbols] == ["with_bom"]
+
+
 def test_repository_intelligence_summary_and_dict(git_repo: Path):
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "app.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")

@@ -237,11 +237,13 @@ def _git_show(repo: Path, revision: str, path: str, allow_missing: bool) -> str 
         ["git", "show", f"{revision}:{path}"],
         cwd=repo,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     if result.returncode == 0:
-        return result.stdout
+        return result.stdout.lstrip("\ufeff")
     if allow_missing:
         return None
     raise RuntimeError(result.stderr.strip() or f"git show failed for {path}")
@@ -252,6 +254,8 @@ def _run_git(repo: Path, args: list[str], allow_exit_codes: set[int]) -> str:
         ["git", *args],
         cwd=repo,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
