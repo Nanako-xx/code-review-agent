@@ -200,3 +200,47 @@ def test_cli_writes_repository_intelligence_artifacts(git_repo: Path):
     assert "## Repository Intelligence" in report
     assert "modified function add app.py:1-2" in report
     assert "Repository Intelligence" in envelope["messages"][0]["content"]
+
+
+def test_cli_multi_reviewer_mode_writes_per_reviewer_artifacts(git_repo: Path):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "auth.py").write_text(
+        "def is_admin(user):\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    run_git(git_repo, "add", "auth.py")
+    run_git(git_repo, "commit", "-m", "change auth")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--intent",
+            "Change authorization behavior",
+            "--reviewer-provider",
+            "fake",
+            "--reviewer-mode",
+            "multi",
+            "--non-interactive",
+        ]
+    )
+
+    assert exit_code == 0
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    multi = json.loads((run_dir / "multi_reviewer_result.json").read_text(encoding="utf-8"))
+    report = (run_dir / "report.md").read_text(encoding="utf-8")
+
+    assert multi["reviewer_count"] >= 2
+    assert {item["role"] for item in multi["executions"]} >= {"Core Reviewer", "Adversarial Reviewer"}
+    assert (run_dir / "reviewer_0_envelope.json").exists()
+    assert (run_dir / "reviewer_1_envelope.json").exists()
+    assert (run_dir / "reviewer_0_result.json").exists()
+    assert (run_dir / "reviewer_1_result.json").exists()
+    assert "## Multi-Reviewer Summary" in report

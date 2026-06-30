@@ -12,6 +12,7 @@ def render_markdown_report(
     reviewer_result: ReviewerResult | None = None,
     observation_summaries: dict[str, str] | None = None,
     repository_intelligence_summary: str | None = None,
+    multi_reviewer_summary: dict[str, object] | None = None,
 ) -> str:
     changed = "\n".join(f"- {path}" for path in changed_files) or "- No changed files detected"
     reasons = "\n".join(f"- {reason}" for reason in risk_assessment.reasons) or "- No risk reasons recorded"
@@ -53,6 +54,7 @@ def render_markdown_report(
             "",
             *_observation_section(observation_summaries or {}),
             *_repository_intelligence_section(repository_intelligence_summary),
+            *_multi_reviewer_section(multi_reviewer_summary),
             *_reviewer_result_section(reviewer_result),
             "## Non-Binding Recommendation",
             "",
@@ -60,6 +62,32 @@ def render_markdown_report(
             "",
         ]
     )
+
+
+def _multi_reviewer_section(multi_reviewer_summary: dict[str, object] | None) -> list[str]:
+    if not multi_reviewer_summary:
+        return []
+    roles = multi_reviewer_summary.get("roles", [])
+    status_counts = multi_reviewer_summary.get("status_counts", {})
+    role_lines = "\n".join(f"- {role}" for role in roles) or "- No reviewer roles recorded"
+    status_lines = (
+        "\n".join(f"- {status}: {count}" for status, count in dict(status_counts).items())
+        or "- No reviewer statuses recorded"
+    )
+    return [
+        "## Multi-Reviewer Summary",
+        "",
+        f"Reviewers: {multi_reviewer_summary.get('reviewer_count', 0)}",
+        "",
+        "### Reviewer Roles",
+        "",
+        role_lines,
+        "",
+        "### Reviewer Status Counts",
+        "",
+        status_lines,
+        "",
+    ]
 
 
 def _repository_intelligence_section(repository_intelligence_summary: str | None) -> list[str]:

@@ -10,6 +10,7 @@ from review_agent.git_repo import collect_change_summary
 from review_agent.intent import build_intent_packet
 from review_agent.models import ReviewRequest
 from review_agent.observations import ObservationStore
+from review_agent.orchestrator import multi_reviewer_run_to_dict, run_multi_reviewer
 from review_agent.provider import ProviderConfigError, build_provider_from_config
 from review_agent.quality import detect_quality_gates, run_python_compile_gate
 from review_agent.repository_intelligence import (
@@ -46,6 +47,7 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument("--focus")
     review.add_argument("--non-interactive", action="store_true")
     review.add_argument("--reviewer-provider", choices=["none", "fake", "openai-compatible"], default="none")
+    review.add_argument("--reviewer-mode", choices=["single", "multi"], default="single")
     review.add_argument("--reviewer-model")
     review.add_argument("--reviewer-base-url")
     review.add_argument("--reviewer-api-key-env", default="REVIEW_AGENT_API_KEY")
@@ -114,6 +116,7 @@ def _run_review(args: argparse.Namespace) -> int:
     )
 
     reviewer_result = None
+    multi_reviewer_summary = None
     if provider is not None and assignments:
         gateway = ToolGateway(
             repository_path=repo,
@@ -123,26 +126,56 @@ def _run_review(args: argparse.Namespace) -> int:
         )
         for changed_file in change_summary.changed_files:
             gateway.execute("compare_base_head", {"path": changed_file})
-        reviewer_run = run_single_reviewer(
-            provider=provider,
-            assignment=assignments[0],
-            intent=intent,
-            diff_excerpt=change_summary.diff_excerpt,
-            observations=observation_store.summaries_by_id(),
-            trace_id=f"{review_id}-reviewer-0",
-        )
-        reviewer_result = reviewer_run.result
-        store.write_json("reviewer_envelope.json", asdict(reviewer_run.envelope))
-        store.write_json(
-            "reviewer_raw_response.json",
-            {
-                "provider_name": reviewer_run.response.provider_name,
-                "model": reviewer_run.response.model,
-                "content": reviewer_run.response.content,
-                "raw": reviewer_run.response.raw,
-            },
-        )
-        store.write_json("reviewer_result.json", reviewer_result_to_dict(reviewer_run.result))
+        if args.reviewer_mode == "multi":
+            multi_run = run_multi_reviewer(
+                provider=provider,
+                assignments=assignments,
+                intent=intent,
+                diff_excerpt=change_summary.diff_excerpt,
+                observations=observation_store.summaries_by_id(),
+                trace_id_prefix=review_id,
+            )
+            multi_payload = multi_reviewer_run_to_dict(multi_run)
+            store.write_json("multi_reviewer_result.json", multi_payload)
+            multi_reviewer_summary = {
+                "reviewer_count": multi_payload["reviewer_count"],
+                "status_counts": multi_payload["status_counts"],
+                "roles": [item["role"] for item in multi_payload["executions"]],
+            }
+            for execution in multi_run.executions:
+                index = execution.reviewer_index
+                store.write_json(f"reviewer_{index}_envelope.json", asdict(execution.envelope))
+                store.write_json(
+                    f"reviewer_{index}_raw_response.json",
+                    {
+                        "provider_name": execution.response.provider_name,
+                        "model": execution.response.model,
+                        "content": execution.response.content,
+                        "raw": execution.response.raw,
+                    },
+                )
+                store.write_json(f"reviewer_{index}_result.json", reviewer_result_to_dict(execution.result))
+        else:
+            reviewer_run = run_single_reviewer(
+                provider=provider,
+                assignment=assignments[0],
+                intent=intent,
+                diff_excerpt=change_summary.diff_excerpt,
+                observations=observation_store.summaries_by_id(),
+                trace_id=f"{review_id}-reviewer-0",
+            )
+            reviewer_result = reviewer_run.result
+            store.write_json("reviewer_envelope.json", asdict(reviewer_run.envelope))
+            store.write_json(
+                "reviewer_raw_response.json",
+                {
+                    "provider_name": reviewer_run.response.provider_name,
+                    "model": reviewer_run.response.model,
+                    "content": reviewer_run.response.content,
+                    "raw": reviewer_run.response.raw,
+                },
+            )
+            store.write_json("reviewer_result.json", reviewer_result_to_dict(reviewer_run.result))
 
     report = render_markdown_report(
         review_id=review_id,
@@ -153,6 +186,7 @@ def _run_review(args: argparse.Namespace) -> int:
         reviewer_result=reviewer_result,
         observation_summaries=observation_store.summaries_by_id(),
         repository_intelligence_summary=repository_intelligence_summary,
+        multi_reviewer_summary=multi_reviewer_summary,
     )
     (store.run_dir / "report.md").write_text(report, encoding="utf-8")
 

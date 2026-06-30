@@ -131,3 +131,32 @@ def test_markdown_report_includes_repository_intelligence_summary():
 
     assert "## Repository Intelligence" in report
     assert "modified function add app.py:1-2" in report
+
+
+def test_markdown_report_includes_multi_reviewer_summary():
+    assessment = RiskAssessment(
+        level=RiskLevel.MEDIUM,
+        dimensions={},
+        reasons=[],
+        signal_refs=[],
+        uncertainties=[],
+        suggested_focus=[],
+    )
+
+    report = render_markdown_report(
+        review_id="review-1",
+        base_revision="base",
+        head_revision="head",
+        risk_assessment=assessment,
+        changed_files=["auth.py"],
+        multi_reviewer_summary={
+            "reviewer_count": 2,
+            "status_counts": {"partial": 2},
+            "roles": ["Core Reviewer", "Adversarial Reviewer"],
+        },
+    )
+
+    assert "## Multi-Reviewer Summary" in report
+    assert "Reviewers: 2" in report
+    assert "- Core Reviewer" in report
+    assert "- Adversarial Reviewer" in report
