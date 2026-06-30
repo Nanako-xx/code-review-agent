@@ -108,3 +108,26 @@ def test_markdown_report_includes_observation_summaries():
 
     assert "## Observations" in report
     assert "- O-abc: auth.py changed between base and head" in report
+
+
+def test_markdown_report_includes_repository_intelligence_summary():
+    assessment = RiskAssessment(
+        level=RiskLevel.LOW,
+        dimensions={},
+        reasons=[],
+        signal_refs=[],
+        uncertainties=[],
+        suggested_focus=[],
+    )
+
+    report = render_markdown_report(
+        review_id="review-1",
+        base_revision="base",
+        head_revision="head",
+        risk_assessment=assessment,
+        changed_files=["app.py"],
+        repository_intelligence_summary="Repository Intelligence\n- modified function add app.py:1-2",
+    )
+
+    assert "## Repository Intelligence" in report
+    assert "modified function add app.py:1-2" in report

@@ -12,6 +12,12 @@ from review_agent.models import ReviewRequest
 from review_agent.observations import ObservationStore
 from review_agent.provider import ProviderConfigError, build_provider_from_config
 from review_agent.quality import detect_quality_gates, run_python_compile_gate
+from review_agent.repository_intelligence import (
+    build_repository_intelligence,
+    repository_intelligence_raw_json,
+    repository_intelligence_to_dict,
+    summarize_repository_intelligence,
+)
 from review_agent.reporting import render_markdown_report
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
 from review_agent.reviewer import reviewer_result_to_dict, run_single_reviewer
@@ -83,12 +89,29 @@ def _run_review(args: argparse.Namespace) -> int:
 
     store = CheckpointStore(repo, review_id)
     observation_store = ObservationStore(store.run_dir)
+    repository_intelligence = build_repository_intelligence(
+        repo=repo,
+        base_revision=args.base,
+        head_revision=args.head,
+        changed_files=change_summary.changed_files,
+    )
+    repository_intelligence_summary = summarize_repository_intelligence(repository_intelligence)
     store.write_json("request.json", asdict(request))
     store.write_json("intent.json", asdict(intent))
     store.write_json("risk_packet.json", asdict(risk_packet))
     store.write_json("risk.json", asdict(risk_assessment))
     store.write_json("assignments.json", {"assignments": [asdict(item) for item in assignments]})
     store.write_json("quality_gates.json", {"results": [asdict(item) for item in quality_results]})
+    store.write_json("repository_intelligence.json", repository_intelligence_to_dict(repository_intelligence))
+    observation_store.record(
+        source="repo_intelligence.snapshot",
+        revision=f"{args.base}..{args.head}",
+        path=None,
+        line_start=None,
+        line_end=None,
+        raw_content=repository_intelligence_raw_json(repository_intelligence),
+        context_view=repository_intelligence_summary,
+    )
 
     reviewer_result = None
     if provider is not None and assignments:
@@ -129,6 +152,7 @@ def _run_review(args: argparse.Namespace) -> int:
         changed_files=change_summary.changed_files,
         reviewer_result=reviewer_result,
         observation_summaries=observation_store.summaries_by_id(),
+        repository_intelligence_summary=repository_intelligence_summary,
     )
     (store.run_dir / "report.md").write_text(report, encoding="utf-8")
 
