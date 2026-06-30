@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import json
 from pathlib import Path, PurePosixPath
 import subprocess
 from typing import Any
 
 from review_agent.observations import ObservationStore
+from review_agent.repository_intelligence import collect_python_symbols, search_repository_text
 
 
 class ToolGatewayError(ValueError):
@@ -44,6 +46,12 @@ class ToolGateway:
             return self._compare_base_head(arguments)
         if tool_name == "search_code":
             return self._search_code(arguments)
+        if tool_name == "list_symbols":
+            return self._list_symbols(arguments)
+        if tool_name == "inspect_symbol":
+            return self._inspect_symbol(arguments)
+        if tool_name == "find_references":
+            return self._find_references(arguments)
         raise ToolGatewayError(f"unsupported tool: {tool_name}")
 
     def _read_range(self, arguments: dict[str, Any]) -> ToolExecutionResult:
@@ -119,6 +127,73 @@ class ToolGateway:
             context_view=context_view,
         )
         return ToolExecutionResult("search_code", [observation.observation_id], context_view, truncated)
+
+    def _list_symbols(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        path = _safe_repo_path(str(arguments["path"]))
+        revision_label, revision = self._resolve_revision(str(arguments.get("revision", "head")))
+        symbols = collect_python_symbols(self.repository_path, revision, paths=[path])
+        raw_content = json.dumps([asdict(symbol) for symbol in symbols], ensure_ascii=False, indent=2)
+        lines = [
+            f"{symbol.kind} {symbol.qualified_name} {symbol.path}:{symbol.line_start}-{symbol.line_end}"
+            for symbol in symbols
+        ]
+        context_view, truncated = _context_view("\n".join(lines) or "- No Python symbols found", self.max_context_chars)
+        observation = self.observation_store.record(
+            source="repo_intelligence.list_symbols",
+            revision=f"{revision_label}@{revision}",
+            path=path,
+            line_start=None,
+            line_end=None,
+            raw_content=raw_content,
+            context_view=context_view,
+        )
+        return ToolExecutionResult("list_symbols", [observation.observation_id], context_view, truncated)
+
+    def _inspect_symbol(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        name = str(arguments["name"])
+        revision_label, revision = self._resolve_revision(str(arguments.get("revision", "head")))
+        symbols = collect_python_symbols(self.repository_path, revision)
+        matches = [symbol for symbol in symbols if symbol.name == name or symbol.qualified_name == name]
+        raw_content = json.dumps([asdict(symbol) for symbol in matches], ensure_ascii=False, indent=2)
+        lines = []
+        for symbol in matches:
+            calls = ", ".join(symbol.calls) if symbol.calls else "none"
+            lines.append(
+                f"{symbol.kind} {symbol.qualified_name} {symbol.path}:{symbol.line_start}-{symbol.line_end}; "
+                f"calls: {calls}"
+            )
+        context_view, truncated = _context_view("\n".join(lines) or f"- No symbol found: {name}", self.max_context_chars)
+        observation = self.observation_store.record(
+            source="repo_intelligence.inspect_symbol",
+            revision=f"{revision_label}@{revision}",
+            path=matches[0].path if matches else None,
+            line_start=matches[0].line_start if matches else None,
+            line_end=matches[0].line_end if matches else None,
+            raw_content=raw_content,
+            context_view=context_view,
+        )
+        return ToolExecutionResult("inspect_symbol", [observation.observation_id], context_view, truncated)
+
+    def _find_references(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        name = str(arguments["name"])
+        revision_label, revision = self._resolve_revision(str(arguments.get("revision", "head")))
+        max_results = int(arguments.get("max_results", 20))
+        if max_results < 1:
+            raise ToolGatewayError("max_results must be positive")
+        matches = search_repository_text(self.repository_path, revision, name, max_results=max_results)
+        raw_content = json.dumps([asdict(match) for match in matches], ensure_ascii=False, indent=2)
+        lines = [f"{match.path}:{match.line_number}:{match.line}" for match in matches]
+        context_view, truncated = _context_view("\n".join(lines) or f"- No references found: {name}", self.max_context_chars)
+        observation = self.observation_store.record(
+            source="repo_intelligence.find_references",
+            revision=f"{revision_label}@{revision}",
+            path=None,
+            line_start=None,
+            line_end=None,
+            raw_content=raw_content,
+            context_view=context_view,
+        )
+        return ToolExecutionResult("find_references", [observation.observation_id], context_view, truncated)
 
     def _resolve_revision(self, revision_label: str) -> tuple[str, str]:
         if revision_label == "base":
