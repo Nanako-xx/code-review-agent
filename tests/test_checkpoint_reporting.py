@@ -85,3 +85,26 @@ def test_markdown_report_includes_single_reviewer_result():
     assert "Status: partial" in report
     assert "Fake reviewer executed." in report
     assert "- Fake provider does not perform semantic review." in report
+
+
+def test_markdown_report_includes_observation_summaries():
+    assessment = RiskAssessment(
+        level=RiskLevel.LOW,
+        dimensions={"impact": "local"},
+        reasons=[],
+        signal_refs=[],
+        uncertainties=[],
+        suggested_focus=[],
+    )
+
+    report = render_markdown_report(
+        review_id="review-1",
+        base_revision="base",
+        head_revision="head",
+        risk_assessment=assessment,
+        changed_files=["auth.py"],
+        observation_summaries={"O-abc": "auth.py changed between base and head"},
+    )
+
+    assert "## Observations" in report
+    assert "- O-abc: auth.py changed between base and head" in report

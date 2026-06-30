@@ -9,12 +9,14 @@ from review_agent.checkpoint import CheckpointStore
 from review_agent.git_repo import collect_change_summary
 from review_agent.intent import build_intent_packet
 from review_agent.models import ReviewRequest
+from review_agent.observations import ObservationStore
 from review_agent.provider import ProviderConfigError, build_provider_from_config
 from review_agent.quality import detect_quality_gates, run_python_compile_gate
 from review_agent.reporting import render_markdown_report
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
 from review_agent.reviewer import reviewer_result_to_dict, run_single_reviewer
 from review_agent.runtime import build_assignments
+from review_agent.tool_gateway import ToolGateway
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,6 +82,7 @@ def _run_review(args: argparse.Namespace) -> int:
         return 2
 
     store = CheckpointStore(repo, review_id)
+    observation_store = ObservationStore(store.run_dir)
     store.write_json("request.json", asdict(request))
     store.write_json("intent.json", asdict(intent))
     store.write_json("risk_packet.json", asdict(risk_packet))
@@ -89,12 +92,20 @@ def _run_review(args: argparse.Namespace) -> int:
 
     reviewer_result = None
     if provider is not None and assignments:
+        gateway = ToolGateway(
+            repository_path=repo,
+            base_revision=args.base,
+            head_revision=args.head,
+            observation_store=observation_store,
+        )
+        for changed_file in change_summary.changed_files:
+            gateway.execute("compare_base_head", {"path": changed_file})
         reviewer_run = run_single_reviewer(
             provider=provider,
             assignment=assignments[0],
             intent=intent,
             diff_excerpt=change_summary.diff_excerpt,
-            observations={ref: ref for ref in assignments[0].initial_context.observation_refs},
+            observations=observation_store.summaries_by_id(),
             trace_id=f"{review_id}-reviewer-0",
         )
         reviewer_result = reviewer_run.result
@@ -117,6 +128,7 @@ def _run_review(args: argparse.Namespace) -> int:
         risk_assessment=risk_assessment,
         changed_files=change_summary.changed_files,
         reviewer_result=reviewer_result,
+        observation_summaries=observation_store.summaries_by_id(),
     )
     (store.run_dir / "report.md").write_text(report, encoding="utf-8")
 
