@@ -10,6 +10,7 @@ def render_markdown_report(
     risk_assessment: RiskAssessment,
     changed_files: list[str],
     reviewer_result: ReviewerResult | None = None,
+    observation_summaries: dict[str, str] | None = None,
 ) -> str:
     changed = "\n".join(f"- {path}" for path in changed_files) or "- No changed files detected"
     reasons = "\n".join(f"- {reason}" for reason in risk_assessment.reasons) or "- No risk reasons recorded"
@@ -49,6 +50,7 @@ def render_markdown_report(
             "",
             uncertainties,
             "",
+            *_observation_section(observation_summaries or {}),
             *_reviewer_result_section(reviewer_result),
             "## Non-Binding Recommendation",
             "",
@@ -56,6 +58,20 @@ def render_markdown_report(
             "",
         ]
     )
+
+
+def _observation_section(observation_summaries: dict[str, str]) -> list[str]:
+    if not observation_summaries:
+        return []
+    items = "\n".join(
+        f"- {observation_id}: {summary}" for observation_id, summary in observation_summaries.items()
+    )
+    return [
+        "## Observations",
+        "",
+        items,
+        "",
+    ]
 
 
 def _reviewer_result_section(reviewer_result: ReviewerResult | None) -> list[str]:

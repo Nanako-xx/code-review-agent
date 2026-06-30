@@ -123,3 +123,42 @@ def test_cli_openai_compatible_provider_requires_api_key(git_repo: Path, monkeyp
 
     assert exit_code == 2
     assert "Reviewer provider configuration error" in capsys.readouterr().out
+
+
+def test_cli_fake_reviewer_writes_observation_store_artifacts(git_repo: Path):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "auth.py").write_text("def check(token):\n    return token == 'ok'\n", encoding="utf-8")
+    run_git(git_repo, "add", "auth.py")
+    run_git(git_repo, "commit", "-m", "add auth check")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--intent",
+            "Add auth token check",
+            "--reviewer-provider",
+            "fake",
+            "--non-interactive",
+        ]
+    )
+
+    assert exit_code == 0
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    observation_records = [
+        json.loads(line) for line in (run_dir / "observations.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert observation_records
+    assert observation_records[0]["source"] == "git.compare_base_head"
+    assert observation_records[0]["path"] == "auth.py"
+    assert (run_dir / observation_records[0]["raw_artifact_ref"]).exists()
+
+    envelope = json.loads((run_dir / "reviewer_envelope.json").read_text(encoding="utf-8"))
+    assert observation_records[0]["observation_id"] in envelope["messages"][0]["content"]
+    assert "## Observations" in (run_dir / "report.md").read_text(encoding="utf-8")
