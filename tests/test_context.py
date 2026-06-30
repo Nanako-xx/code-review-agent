@@ -71,3 +71,28 @@ def test_reviewer_tools_describe_head_default_and_base_head_comparison():
     tool_text = " ".join(str(tool) for tool in envelope.tools)
     assert "head revision" in tool_text
     assert "base and head" in tool_text
+
+
+def test_reviewer_envelope_includes_repository_intelligence_tools():
+    assignment = Assignment(
+        role="Core Reviewer",
+        mission="Check intent alignment",
+        assignment_reason=[],
+        assigned_contract=[],
+        required_checks=[],
+        initial_context=InitialContext(),
+        max_turns=6,
+        max_tool_calls=12,
+    )
+    intent = IntentPacket(goal="Review changes", status=IntentStatus.PARTIAL)
+
+    envelope = build_reviewer_envelope(
+        assignment=assignment,
+        intent=intent,
+        code_snippets={},
+        observations={},
+        trace_id="trace-ri-tools",
+    )
+
+    tool_names = {tool["name"] for tool in envelope.tools}
+    assert {"list_symbols", "inspect_symbol", "find_references"}.issubset(tool_names)

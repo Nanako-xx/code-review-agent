@@ -47,6 +47,18 @@ def build_reviewer_envelope(
                 "name": "compare_base_head",
                 "description": "Read Runtime-authorized base and head file ranges or diff hunks for comparison.",
             },
+            {
+                "name": "list_symbols",
+                "description": "List Python AST symbols for a repository file at an authorized revision.",
+            },
+            {
+                "name": "inspect_symbol",
+                "description": "Inspect a Python AST symbol, including path, line range, and simple call names.",
+            },
+            {
+                "name": "find_references",
+                "description": "Find textual references to a symbol name within the authorized repository revision.",
+            },
         ],
         messages=[{"role": "user", "content": content}],
         parameters={
