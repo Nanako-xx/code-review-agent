@@ -88,6 +88,9 @@ def _run_review(args: argparse.Namespace) -> int:
     except ProviderConfigError as error:
         print(f"Reviewer provider configuration error: {error}")
         return 2
+    if args.reviewer_mode == "multi" and provider is None:
+        print("--reviewer-mode multi requires --reviewer-provider fake or openai-compatible")
+        return 2
 
     store = CheckpointStore(repo, review_id)
     observation_store = ObservationStore(store.run_dir)

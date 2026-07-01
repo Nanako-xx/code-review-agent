@@ -125,6 +125,33 @@ def test_cli_openai_compatible_provider_requires_api_key(git_repo: Path, monkeyp
     assert "Reviewer provider configuration error" in capsys.readouterr().out
 
 
+def test_cli_multi_reviewer_mode_requires_reviewer_provider(git_repo: Path, capsys):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "app.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    run_git(git_repo, "add", "app.py")
+    run_git(git_repo, "commit", "-m", "change app")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--reviewer-mode",
+            "multi",
+            "--non-interactive",
+        ]
+    )
+
+    assert exit_code == 2
+    assert "--reviewer-mode multi requires --reviewer-provider" in capsys.readouterr().out
+    assert not (git_repo / ".review-agent").exists()
+
+
 def test_cli_fake_reviewer_writes_observation_store_artifacts(git_repo: Path):
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "auth.py").write_text("def check(token):\n    return token == 'ok'\n", encoding="utf-8")
@@ -241,6 +268,8 @@ def test_cli_multi_reviewer_mode_writes_per_reviewer_artifacts(git_repo: Path):
     assert {item["role"] for item in multi["executions"]} >= {"Core Reviewer", "Adversarial Reviewer"}
     assert (run_dir / "reviewer_0_envelope.json").exists()
     assert (run_dir / "reviewer_1_envelope.json").exists()
+    assert (run_dir / "reviewer_0_raw_response.json").exists()
+    assert (run_dir / "reviewer_1_raw_response.json").exists()
     assert (run_dir / "reviewer_0_result.json").exists()
     assert (run_dir / "reviewer_1_result.json").exists()
     assert "## Multi-Reviewer Summary" in report

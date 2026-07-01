@@ -2,7 +2,7 @@ import json
 
 from review_agent.models import Assignment, InitialContext, IntentPacket, IntentSource, IntentStatus
 from review_agent.orchestrator import multi_reviewer_run_to_dict, run_multi_reviewer
-from review_agent.provider import ModelResponse
+from review_agent.provider import ModelProviderError, ModelResponse
 
 
 class RecordingProvider:
@@ -32,6 +32,13 @@ class RecordingProvider:
             model="recording-model",
             raw={"role": role},
         )
+
+
+class FailingSecondProvider(RecordingProvider):
+    def complete(self, envelope):
+        if len(self.trace_ids) == 1:
+            raise ModelProviderError("provider unavailable")
+        return super().complete(envelope)
 
 
 def make_assignment(role: str) -> Assignment:
@@ -92,3 +99,23 @@ def test_multi_reviewer_run_to_dict_contains_artifact_summary():
     assert payload["executions"][0]["role"] == "Core Reviewer"
     assert payload["executions"][0]["trace_id"] == "review-456-reviewer-0"
     assert payload["executions"][0]["result"]["investigation_summary"] == "Core Reviewer finished."
+
+
+def test_run_multi_reviewer_records_failed_execution_without_aborting_remaining_artifacts():
+    run = run_multi_reviewer(
+        provider=FailingSecondProvider(),
+        assignments=[make_assignment("Core Reviewer"), make_assignment("Adversarial Reviewer")],
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={"O-shared": "shared observation"},
+        trace_id_prefix="review-789",
+    )
+
+    payload = multi_reviewer_run_to_dict(run)
+
+    assert payload["reviewer_count"] == 2
+    assert payload["status_counts"] == {"partial": 1, "failed": 1}
+    assert payload["executions"][0]["result"]["status"] == "partial"
+    assert payload["executions"][1]["trace_id"] == "review-789-reviewer-1"
+    assert payload["executions"][1]["result"]["status"] == "failed"
+    assert "provider unavailable" in payload["executions"][1]["result"]["investigation_summary"]
