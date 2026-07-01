@@ -37,7 +37,7 @@ def check_completion(
         if result.status == "failed":
             uncertainties.append(f"Quality gate failed: {result.name}")
 
-    covered_contracts = _covered_contracts(reconciliation)
+    contract_coverage = _contract_coverage(reconciliation)
     for execution in executions:
         role = execution.assignment.role
         if execution.result.status is ReviewerResultStatus.FAILED:
@@ -56,9 +56,11 @@ def check_completion(
 
         if execution.result.status is ReviewerResultStatus.COMPLETED:
             for contract in execution.assignment.assigned_contract:
-                if (execution.reviewer_index, contract) in covered_contracts:
+                coverage_status = contract_coverage.get((execution.reviewer_index, contract))
+                if coverage_status == "complete":
                     continue
-                message = f"{role} missing contract coverage: {contract}"
+                coverage_problem = "missing" if coverage_status is None else "incomplete"
+                message = f"{role} {coverage_problem} contract coverage: {contract}"
                 if _is_core_reviewer(role):
                     blockers.append(message)
                 else:
@@ -98,17 +100,20 @@ def _is_core_reviewer(role: str) -> bool:
     return "core" in role.casefold()
 
 
-def _covered_contracts(reconciliation: EvidenceReconciliation) -> set[tuple[int, str]]:
-    covered: set[tuple[int, str]] = set()
+def _contract_coverage(reconciliation: EvidenceReconciliation) -> dict[tuple[int, str], str]:
+    coverage: dict[tuple[int, str], str] = {}
     for row in reconciliation.contract_coverage:
         unsupported_refs = getattr(row, "unsupported_evidence_refs", [])
         status = str(getattr(row, "status", ""))
+        key = (int(getattr(row, "reviewer_index")), str(getattr(row, "contract")))
         if unsupported_refs:
+            coverage[key] = "incomplete"
             continue
-        if status not in {"covered", "partial", "unknown", "not_applicable"}:
+        if status in {"covered", "not_applicable"}:
+            coverage[key] = "complete"
             continue
-        covered.add((int(getattr(row, "reviewer_index")), str(getattr(row, "contract"))))
-    return covered
+        coverage[key] = "incomplete"
+    return coverage
 
 
 def _recommendation(

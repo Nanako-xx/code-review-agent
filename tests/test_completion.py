@@ -41,12 +41,12 @@ def reconciliation_with_coverage(*coverage_rows):
     )
 
 
-def coverage(index, role, contract="regression_safety"):
+def coverage(index, role, contract="regression_safety", status="covered"):
     return ContractCoverage(
         reviewer_index=index,
         role=role,
         contract=contract,
-        status="covered",
+        status=status,
         summary=f"{role} covered {contract}",
         evidence_refs=[],
         unsupported_evidence_refs=[],
@@ -181,3 +181,35 @@ def test_completion_records_blocked_non_core_reviewer_as_missing_perspective():
     assert result.status == "completed_with_uncertainties"
     assert result.recommendation == "manual_review"
     assert result.missing_perspectives == ["Adversarial Reviewer"]
+
+
+def test_completion_blocks_when_core_contract_coverage_is_unknown():
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED)],
+        reconciliation=reconciliation_with_coverage(coverage(0, "Core Reviewer", status="unknown")),
+    )
+
+    assert result.status == "blocked"
+    assert result.recommendation == "manual_review"
+    assert "Core Reviewer incomplete contract coverage: regression_safety" in result.blockers
+
+
+def test_completion_with_uncertainties_when_non_core_contract_coverage_is_partial():
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[
+            execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED),
+            execution(1, "Adversarial Reviewer", ReviewerResultStatus.COMPLETED),
+        ],
+        reconciliation=reconciliation_with_coverage(
+            coverage(0, "Core Reviewer"),
+            coverage(1, "Adversarial Reviewer", status="partial"),
+        ),
+    )
+
+    assert result.status == "completed_with_uncertainties"
+    assert result.recommendation == "manual_review"
+    assert "Adversarial Reviewer incomplete contract coverage: regression_safety" in result.uncertainties
