@@ -1,5 +1,5 @@
 from review_agent.completion import check_completion, completion_to_dict
-from review_agent.evidence import EvidenceReconciliation
+from review_agent.evidence import ContractCoverage, EvidenceReconciliation
 from review_agent.models import IntentPacket, IntentSource, IntentStatus, ReviewerResult, ReviewerResultStatus
 from review_agent.orchestrator import ReviewerExecution
 from review_agent.provider import ModelResponse
@@ -31,6 +31,28 @@ def reconciliation(canonical=0, rejected=0):
     )
 
 
+def reconciliation_with_coverage(*coverage_rows):
+    return EvidenceReconciliation(
+        canonical_findings=[],
+        rejected_findings=[],
+        remaining_disagreements=[],
+        contract_coverage=list(coverage_rows),
+        evidence_quality="verified",
+    )
+
+
+def coverage(index, role, contract="regression_safety"):
+    return ContractCoverage(
+        reviewer_index=index,
+        role=role,
+        contract=contract,
+        status="covered",
+        summary=f"{role} covered {contract}",
+        evidence_refs=[],
+        unsupported_evidence_refs=[],
+    )
+
+
 def test_completion_blocks_when_core_reviewer_failed():
     result = check_completion(
         intent=intent(),
@@ -55,7 +77,7 @@ def test_completion_with_uncertainties_when_specialist_failed():
             execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED),
             execution(1, "Adversarial Reviewer", ReviewerResultStatus.FAILED),
         ],
-        reconciliation=reconciliation(),
+        reconciliation=reconciliation_with_coverage(coverage(0, "Core Reviewer")),
     )
 
     assert result.status == "completed_with_uncertainties"
@@ -68,7 +90,13 @@ def test_completion_requires_manual_review_for_unsupported_findings():
         intent=intent(),
         quality_results=[],
         executions=[execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED)],
-        reconciliation=reconciliation(rejected=1),
+        reconciliation=EvidenceReconciliation(
+            canonical_findings=[],
+            rejected_findings=[object()],
+            remaining_disagreements=[],
+            contract_coverage=[coverage(0, "Core Reviewer")],
+            evidence_quality="unsupported_claims",
+        ),
     )
 
     payload = completion_to_dict(result)
@@ -89,3 +117,67 @@ def test_completion_with_uncertainties_when_reviewer_is_partial():
     assert result.status == "completed_with_uncertainties"
     assert result.recommendation == "manual_review"
     assert "Core Reviewer returned partial review" in result.uncertainties
+
+
+def test_completion_blocks_when_core_contract_coverage_missing():
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED)],
+        reconciliation=reconciliation_with_coverage(),
+    )
+
+    assert result.status == "blocked"
+    assert result.recommendation == "manual_review"
+    assert "Core Reviewer missing contract coverage: regression_safety" in result.blockers
+
+
+def test_completion_with_uncertainties_when_specialist_contract_coverage_missing():
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[
+            execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED),
+            execution(1, "Adversarial Reviewer", ReviewerResultStatus.COMPLETED),
+        ],
+        reconciliation=reconciliation_with_coverage(coverage(0, "Core Reviewer")),
+    )
+
+    assert result.status == "completed_with_uncertainties"
+    assert result.recommendation == "manual_review"
+    assert "Adversarial Reviewer missing contract coverage: regression_safety" in result.uncertainties
+
+
+def test_completion_with_uncertainties_when_intent_is_partial():
+    result = check_completion(
+        intent=IntentPacket(
+            goal="Review change",
+            sources={"goal": IntentSource.INFERRED},
+            status=IntentStatus.PARTIAL,
+            uncertainties=["acceptance criteria unclear"],
+        ),
+        quality_results=[],
+        executions=[execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED)],
+        reconciliation=reconciliation_with_coverage(coverage(0, "Core Reviewer")),
+    )
+
+    assert result.status == "completed_with_uncertainties"
+    assert result.recommendation == "manual_review"
+    assert "Intent Packet partial" in result.uncertainties
+    assert "acceptance criteria unclear" in result.uncertainties
+
+
+def test_completion_records_blocked_non_core_reviewer_as_missing_perspective():
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[
+            execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED),
+            execution(1, "Adversarial Reviewer", ReviewerResultStatus.BLOCKED),
+        ],
+        reconciliation=reconciliation_with_coverage(coverage(0, "Core Reviewer")),
+    )
+
+    assert result.status == "completed_with_uncertainties"
+    assert result.recommendation == "manual_review"
+    assert result.missing_perspectives == ["Adversarial Reviewer"]

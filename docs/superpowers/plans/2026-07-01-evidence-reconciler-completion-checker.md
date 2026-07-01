@@ -274,8 +274,12 @@ Implement:
 Rules:
 
 - Intent `INSUFFICIENT` blocks completion.
+- Intent `PARTIAL` and intent uncertainties force `completed_with_uncertainties` plus `manual_review`.
 - Core Reviewer failed => `blocked`, `manual_review`.
 - Non-core failed reviewer => `completed_with_uncertainties`, `manual_review`, missing perspective recorded.
+- Missing Core Reviewer contract coverage => `blocked`, `manual_review`.
+- Missing non-core contract coverage => `completed_with_uncertainties`, `manual_review`.
+- Blocked non-core reviewer is recorded as a missing perspective.
 - Rejected findings => `completed_with_uncertainties`, `manual_review`.
 - Supported blocking/high finding => `completed`, `needs_work`.
 - Clean supported completion => `completed`, `approve`.

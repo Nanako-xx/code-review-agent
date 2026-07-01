@@ -29,11 +29,15 @@ def check_completion(
 
     if intent.status is IntentStatus.INSUFFICIENT:
         blockers.append("Intent Packet insufficient")
+    elif intent.status is IntentStatus.PARTIAL:
+        uncertainties.append("Intent Packet partial")
+    uncertainties.extend(intent.uncertainties)
 
     for result in quality_results:
         if result.status == "failed":
             uncertainties.append(f"Quality gate failed: {result.name}")
 
+    covered_contracts = _covered_contracts(reconciliation)
     for execution in executions:
         role = execution.assignment.role
         if execution.result.status is ReviewerResultStatus.FAILED:
@@ -44,7 +48,21 @@ def check_completion(
         elif execution.result.status is ReviewerResultStatus.PARTIAL:
             uncertainties.append(f"{role} returned partial review")
         elif execution.result.status is ReviewerResultStatus.BLOCKED:
-            uncertainties.append(f"{role} was blocked")
+            if _is_core_reviewer(role):
+                blockers.append(f"{role} was blocked")
+            else:
+                missing_perspectives.append(role)
+                uncertainties.append(f"{role} was blocked")
+
+        if execution.result.status is ReviewerResultStatus.COMPLETED:
+            for contract in execution.assignment.assigned_contract:
+                if (execution.reviewer_index, contract) in covered_contracts:
+                    continue
+                message = f"{role} missing contract coverage: {contract}"
+                if _is_core_reviewer(role):
+                    blockers.append(message)
+                else:
+                    uncertainties.append(message)
 
     if reconciliation.rejected_findings:
         uncertainties.append("unsupported findings rejected")
@@ -78,6 +96,19 @@ def completion_to_dict(result: CompletionResult) -> dict[str, Any]:
 
 def _is_core_reviewer(role: str) -> bool:
     return "core" in role.casefold()
+
+
+def _covered_contracts(reconciliation: EvidenceReconciliation) -> set[tuple[int, str]]:
+    covered: set[tuple[int, str]] = set()
+    for row in reconciliation.contract_coverage:
+        unsupported_refs = getattr(row, "unsupported_evidence_refs", [])
+        status = str(getattr(row, "status", ""))
+        if unsupported_refs:
+            continue
+        if status not in {"covered", "partial", "unknown", "not_applicable"}:
+            continue
+        covered.add((int(getattr(row, "reviewer_index")), str(getattr(row, "contract"))))
+    return covered
 
 
 def _recommendation(
