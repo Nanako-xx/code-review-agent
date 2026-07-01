@@ -35,13 +35,16 @@ def check_completion(
             uncertainties.append(f"Quality gate failed: {result.name}")
 
     for execution in executions:
-        if execution.result.status is not ReviewerResultStatus.FAILED:
-            continue
         role = execution.assignment.role
-        if _is_core_reviewer(role):
-            blockers.append(f"{role} failed")
-        else:
-            missing_perspectives.append(role)
+        if execution.result.status is ReviewerResultStatus.FAILED:
+            if _is_core_reviewer(role):
+                blockers.append(f"{role} failed")
+            else:
+                missing_perspectives.append(role)
+        elif execution.result.status is ReviewerResultStatus.PARTIAL:
+            uncertainties.append(f"{role} returned partial review")
+        elif execution.result.status is ReviewerResultStatus.BLOCKED:
+            uncertainties.append(f"{role} was blocked")
 
     if reconciliation.rejected_findings:
         uncertainties.append("unsupported findings rejected")

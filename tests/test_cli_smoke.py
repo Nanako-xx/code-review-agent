@@ -262,9 +262,13 @@ def test_cli_multi_reviewer_mode_writes_per_reviewer_artifacts(git_repo: Path):
     assert exit_code == 0
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
     multi = json.loads((run_dir / "multi_reviewer_result.json").read_text(encoding="utf-8"))
+    reconciliation = json.loads((run_dir / "reconciliation.json").read_text(encoding="utf-8"))
+    completion = json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))
     report = (run_dir / "report.md").read_text(encoding="utf-8")
 
     assert multi["reviewer_count"] >= 2
+    assert "canonical_findings" in reconciliation
+    assert completion["status"] in {"completed", "completed_with_uncertainties", "blocked"}
     assert {item["role"] for item in multi["executions"]} >= {"Core Reviewer", "Adversarial Reviewer"}
     assert (run_dir / "reviewer_0_envelope.json").exists()
     assert (run_dir / "reviewer_1_envelope.json").exists()
@@ -273,3 +277,5 @@ def test_cli_multi_reviewer_mode_writes_per_reviewer_artifacts(git_repo: Path):
     assert (run_dir / "reviewer_0_result.json").exists()
     assert (run_dir / "reviewer_1_result.json").exists()
     assert "## Multi-Reviewer Summary" in report
+    assert "## Evidence Reconciliation" in report
+    assert "## Completion Status" in report

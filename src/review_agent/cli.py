@@ -6,6 +6,8 @@ import argparse
 import uuid
 
 from review_agent.checkpoint import CheckpointStore
+from review_agent.completion import check_completion, completion_to_dict
+from review_agent.evidence import reconcile_evidence, reconciliation_to_dict
 from review_agent.git_repo import collect_change_summary
 from review_agent.intent import build_intent_packet
 from review_agent.models import ReviewRequest
@@ -120,6 +122,8 @@ def _run_review(args: argparse.Namespace) -> int:
 
     reviewer_result = None
     multi_reviewer_summary = None
+    reconciliation_summary = None
+    completion_summary = None
     if provider is not None and assignments:
         gateway = ToolGateway(
             repository_path=repo,
@@ -145,6 +149,26 @@ def _run_review(args: argparse.Namespace) -> int:
                 "status_counts": multi_payload["status_counts"],
                 "roles": [item["role"] for item in multi_payload["executions"]],
             }
+            reconciliation = reconcile_evidence(
+                executions=multi_run.executions,
+                authorized_observation_ids=set(observation_store.summaries_by_id()),
+            )
+            reconciliation_payload = reconciliation_to_dict(reconciliation)
+            store.write_json("reconciliation.json", reconciliation_payload)
+            reconciliation_summary = {
+                "canonical_count": len(reconciliation.canonical_findings),
+                "rejected_count": len(reconciliation.rejected_findings),
+                "evidence_quality": reconciliation.evidence_quality,
+            }
+            completion = check_completion(
+                intent=intent,
+                quality_results=quality_results,
+                executions=multi_run.executions,
+                reconciliation=reconciliation,
+            )
+            completion_payload = completion_to_dict(completion)
+            store.write_json("completion.json", completion_payload)
+            completion_summary = completion_payload
             for execution in multi_run.executions:
                 index = execution.reviewer_index
                 store.write_json(f"reviewer_{index}_envelope.json", asdict(execution.envelope))
@@ -190,6 +214,8 @@ def _run_review(args: argparse.Namespace) -> int:
         observation_summaries=observation_store.summaries_by_id(),
         repository_intelligence_summary=repository_intelligence_summary,
         multi_reviewer_summary=multi_reviewer_summary,
+        reconciliation_summary=reconciliation_summary,
+        completion_summary=completion_summary,
     )
     (store.run_dir / "report.md").write_text(report, encoding="utf-8")
 

@@ -76,3 +76,16 @@ def test_completion_requires_manual_review_for_unsupported_findings():
     assert payload["status"] == "completed_with_uncertainties"
     assert payload["recommendation"] == "manual_review"
     assert "unsupported findings rejected" in payload["uncertainties"]
+
+
+def test_completion_with_uncertainties_when_reviewer_is_partial():
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[execution(0, "Core Reviewer", ReviewerResultStatus.PARTIAL)],
+        reconciliation=reconciliation(),
+    )
+
+    assert result.status == "completed_with_uncertainties"
+    assert result.recommendation == "manual_review"
+    assert "Core Reviewer returned partial review" in result.uncertainties

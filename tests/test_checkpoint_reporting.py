@@ -160,3 +160,41 @@ def test_markdown_report_includes_multi_reviewer_summary():
     assert "Reviewers: 2" in report
     assert "- Core Reviewer" in report
     assert "- Adversarial Reviewer" in report
+
+
+def test_markdown_report_includes_reconciliation_and_completion_sections():
+    assessment = RiskAssessment(
+        level=RiskLevel.HIGH,
+        dimensions={},
+        reasons=[],
+        signal_refs=[],
+        uncertainties=[],
+        suggested_focus=[],
+    )
+
+    report = render_markdown_report(
+        review_id="review-1",
+        base_revision="base",
+        head_revision="head",
+        risk_assessment=assessment,
+        changed_files=["auth.py"],
+        reconciliation_summary={
+            "canonical_count": 1,
+            "rejected_count": 0,
+            "evidence_quality": "verified",
+        },
+        completion_summary={
+            "status": "completed",
+            "recommendation": "needs_work",
+            "blockers": [],
+            "uncertainties": [],
+            "missing_perspectives": [],
+        },
+    )
+
+    assert "## Evidence Reconciliation" in report
+    assert "Canonical findings: 1" in report
+    assert "Evidence quality: verified" in report
+    assert "## Completion Status" in report
+    assert "Status: completed" in report
+    assert "Recommendation: needs_work" in report

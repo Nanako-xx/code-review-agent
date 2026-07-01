@@ -13,6 +13,8 @@ def render_markdown_report(
     observation_summaries: dict[str, str] | None = None,
     repository_intelligence_summary: str | None = None,
     multi_reviewer_summary: dict[str, object] | None = None,
+    reconciliation_summary: dict[str, object] | None = None,
+    completion_summary: dict[str, object] | None = None,
 ) -> str:
     changed = "\n".join(f"- {path}" for path in changed_files) or "- No changed files detected"
     reasons = "\n".join(f"- {reason}" for reason in risk_assessment.reasons) or "- No risk reasons recorded"
@@ -55,6 +57,8 @@ def render_markdown_report(
             *_observation_section(observation_summaries or {}),
             *_repository_intelligence_section(repository_intelligence_summary),
             *_multi_reviewer_section(multi_reviewer_summary),
+            *_reconciliation_section(reconciliation_summary),
+            *_completion_section(completion_summary),
             *_reviewer_result_section(reviewer_result),
             "## Non-Binding Recommendation",
             "",
@@ -62,6 +66,49 @@ def render_markdown_report(
             "",
         ]
     )
+
+
+def _reconciliation_section(reconciliation_summary: dict[str, object] | None) -> list[str]:
+    if not reconciliation_summary:
+        return []
+    return [
+        "## Evidence Reconciliation",
+        "",
+        f"Canonical findings: {reconciliation_summary.get('canonical_count', 0)}",
+        f"Rejected findings: {reconciliation_summary.get('rejected_count', 0)}",
+        f"Evidence quality: {reconciliation_summary.get('evidence_quality', 'unknown')}",
+        "",
+    ]
+
+
+def _completion_section(completion_summary: dict[str, object] | None) -> list[str]:
+    if not completion_summary:
+        return []
+    blockers = _markdown_list(completion_summary.get("blockers", []), "No blockers recorded")
+    uncertainties = _markdown_list(completion_summary.get("uncertainties", []), "No completion uncertainties recorded")
+    missing = _markdown_list(
+        completion_summary.get("missing_perspectives", []),
+        "No missing reviewer perspectives recorded",
+    )
+    return [
+        "## Completion Status",
+        "",
+        f"Status: {completion_summary.get('status', 'unknown')}",
+        f"Recommendation: {completion_summary.get('recommendation', 'manual_review')}",
+        "",
+        "### Completion Blockers",
+        "",
+        blockers,
+        "",
+        "### Completion Uncertainties",
+        "",
+        uncertainties,
+        "",
+        "### Missing Perspectives",
+        "",
+        missing,
+        "",
+    ]
 
 
 def _multi_reviewer_section(multi_reviewer_summary: dict[str, object] | None) -> list[str]:
@@ -88,6 +135,12 @@ def _multi_reviewer_section(multi_reviewer_summary: dict[str, object] | None) ->
         status_lines,
         "",
     ]
+
+
+def _markdown_list(items: object, fallback: str) -> str:
+    if not items:
+        return f"- {fallback}"
+    return "\n".join(f"- {item}" for item in items)
 
 
 def _repository_intelligence_section(repository_intelligence_summary: str | None) -> list[str]:
