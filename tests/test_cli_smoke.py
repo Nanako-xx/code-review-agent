@@ -125,6 +125,40 @@ def test_cli_openai_compatible_provider_requires_api_key(git_repo: Path, monkeyp
     assert "Reviewer provider configuration error" in capsys.readouterr().out
 
 
+def test_cli_agent_loop_rejects_unsupported_provider_before_provider_config(
+    git_repo: Path, monkeypatch, capsys
+):
+    monkeypatch.delenv("REVIEW_AGENT_API_KEY", raising=False)
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "app.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    run_git(git_repo, "add", "app.py")
+    run_git(git_repo, "commit", "-m", "change app")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--reviewer-loop",
+            "agent-loop",
+            "--reviewer-provider",
+            "openai-compatible",
+            "--non-interactive",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 2
+    assert "--reviewer-loop agent-loop currently requires --reviewer-provider fake" in output
+    assert "Reviewer provider configuration error" not in output
+    assert not (git_repo / ".review-agent").exists()
+
+
 def test_cli_multi_reviewer_mode_requires_reviewer_provider(git_repo: Path, capsys):
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "app.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
@@ -381,6 +415,12 @@ def test_cli_multi_agent_loop_writes_per_reviewer_trace_artifacts(git_repo: Path
 
     assert (run_dir / "reviewer_0_agent_trace.json").exists()
     assert (run_dir / "reviewer_1_agent_trace.json").exists()
+    reviewer_0_trace = json.loads((run_dir / "reviewer_0_agent_trace.json").read_text(encoding="utf-8"))
+    reviewer_1_trace = json.loads((run_dir / "reviewer_1_agent_trace.json").read_text(encoding="utf-8"))
+    for trace in (reviewer_0_trace, reviewer_1_trace):
+        assert trace["tool_call_count"] == 1
+        assert trace["final_status"] == "completed"
+        assert trace["turns"][0]["tool_calls"][0]["tool_name"] == "compare_base_head"
     assert (run_dir / "multi_reviewer_result.json").exists()
     assert (run_dir / "reconciliation.json").exists()
     assert (run_dir / "completion.json").exists()

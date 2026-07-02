@@ -129,6 +129,9 @@ def _run_review(args: argparse.Namespace) -> int:
     risk_packet = build_risk_packet(change_summary, intent, quality_status)
     risk_assessment = LocalRiskAssessor().assess(risk_packet)
     assignments = build_assignments(risk_assessment)
+    if args.reviewer_loop == "agent-loop" and args.reviewer_provider != "fake":
+        print("--reviewer-loop agent-loop currently requires --reviewer-provider fake")
+        return 2
     try:
         provider = build_provider_from_config(
             provider_name=args.reviewer_provider,
@@ -141,9 +144,6 @@ def _run_review(args: argparse.Namespace) -> int:
         return 2
     if args.reviewer_mode == "multi" and provider is None:
         print("--reviewer-mode multi requires --reviewer-provider fake or openai-compatible")
-        return 2
-    if args.reviewer_loop == "agent-loop" and args.reviewer_provider != "fake":
-        print("--reviewer-loop agent-loop currently requires --reviewer-provider fake")
         return 2
 
     store = CheckpointStore(repo, review_id)
