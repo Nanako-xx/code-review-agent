@@ -279,3 +279,77 @@ def test_cli_multi_reviewer_mode_writes_per_reviewer_artifacts(git_repo: Path):
     assert "## Multi-Reviewer Summary" in report
     assert "## Evidence Reconciliation" in report
     assert "## Completion Status" in report
+
+
+def test_cli_agent_loop_fake_reviewer_writes_trace_artifact(git_repo: Path):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "app.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    run_git(git_repo, "add", "app.py")
+    run_git(git_repo, "commit", "-m", "change app")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--intent",
+            "Review arithmetic change",
+            "--reviewer-provider",
+            "fake",
+            "--reviewer-loop",
+            "agent-loop",
+            "--non-interactive",
+        ]
+    )
+
+    assert exit_code == 0
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    trace = json.loads((run_dir / "reviewer_agent_trace.json").read_text(encoding="utf-8"))
+    result = json.loads((run_dir / "reviewer_result.json").read_text(encoding="utf-8"))
+
+    assert trace["tool_call_count"] == 1
+    assert trace["turns"][0]["tool_calls"][0]["tool_name"] == "compare_base_head"
+    assert result["status"] == "completed"
+
+
+def test_cli_multi_agent_loop_writes_per_reviewer_trace_artifacts(git_repo: Path):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "auth.py").write_text("def is_admin(user):\n    return True\n", encoding="utf-8")
+    run_git(git_repo, "add", "auth.py")
+    run_git(git_repo, "commit", "-m", "change auth")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--intent",
+            "Change authorization behavior",
+            "--reviewer-provider",
+            "fake",
+            "--reviewer-mode",
+            "multi",
+            "--reviewer-loop",
+            "agent-loop",
+            "--non-interactive",
+        ]
+    )
+
+    assert exit_code == 0
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+
+    assert (run_dir / "reviewer_0_agent_trace.json").exists()
+    assert (run_dir / "reviewer_1_agent_trace.json").exists()
+    assert (run_dir / "multi_reviewer_result.json").exists()
+    assert (run_dir / "reconciliation.json").exists()
+    assert (run_dir / "completion.json").exists()
