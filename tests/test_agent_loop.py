@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 from review_agent.agent_loop import agent_loop_run_to_dict, run_reviewer_agent_loop
 from review_agent.model_adapter import FakeToolCallingAdapter
@@ -40,6 +41,26 @@ def final_response(request):
                 "status": "completed",
             }
         ),
+    )
+
+
+def final_response_after_tool_error(request):
+    assert request.tool_results[-1].is_error
+    return ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "contract_assessments": [],
+                "confirmed_findings": [],
+                "rejected_hypotheses": [],
+                "uncertainties": ["tool failed"],
+                "observation_refs": [],
+                "investigation_summary": "Handled tool error.",
+                "status": "partial",
+            }
+        ),
+        raw={"turn": "final-after-tool-error"},
+        model="final-model",
     )
 
 
@@ -86,17 +107,7 @@ def test_agent_loop_returns_partial_when_tool_budget_is_exhausted(git_repo):
     head = base
     observation_store = ObservationStore(git_repo / ".review-agent" / "runs" / "review-budget")
     gateway = ToolGateway(git_repo, base, head, observation_store)
-    assignment = make_assignment("Core Reviewer")
-    assignment = type(assignment)(
-        role=assignment.role,
-        mission=assignment.mission,
-        assignment_reason=assignment.assignment_reason,
-        assigned_contract=assignment.assigned_contract,
-        required_checks=assignment.required_checks,
-        initial_context=assignment.initial_context,
-        max_turns=assignment.max_turns,
-        max_tool_calls=0,
-    )
+    assignment = replace(make_assignment("Core Reviewer"), max_tool_calls=0)
     adapter = FakeToolCallingAdapter(
         script=[
             ModelTurnResponse(
@@ -119,3 +130,125 @@ def test_agent_loop_returns_partial_when_tool_budget_is_exhausted(git_repo):
     assert run.result.status.value == "partial"
     assert "tool budget exhausted" in run.result.uncertainties
     assert run.trace.final_status == "partial"
+
+
+def test_agent_loop_converts_gateway_argument_error_to_error_tool_result(git_repo):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(git_repo / ".review-agent" / "runs" / "review-tool-error")
+    gateway = ToolGateway(git_repo, base, base, observation_store)
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.TOOL_CALLS,
+                tool_calls=[ModelToolCall("call-1", "compare_base_head", {})],
+            ),
+            final_response_after_tool_error,
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=make_assignment("Core Reviewer"),
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-tool-error-reviewer-0",
+    )
+
+    error_result = run.trace.turns[0].tool_results[0]
+    assert run.result.status.value == "partial"
+    assert error_result.is_error is True
+    assert error_result.call_id == "call-1"
+    assert error_result.tool_name == "compare_base_head"
+    assert "KeyError" in error_result.content
+    assert "'path'" in error_result.content
+    assert adapter.requests[1].tool_results[0].is_error is True
+
+
+def test_agent_loop_returns_failed_result_when_final_response_cannot_be_parsed(git_repo):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(git_repo / ".review-agent" / "runs" / "review-parse-error")
+    gateway = ToolGateway(git_repo, base, base, observation_store)
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="not json",
+                raw={"turn": "bad-final"},
+                model="bad-final-model",
+            )
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=make_assignment("Core Reviewer"),
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-parse-error-reviewer-0",
+    )
+
+    assert run.result.status.value == "failed"
+    assert "final response parse failed" in run.result.uncertainties[0]
+    assert run.trace.final_status == "failed"
+    assert run.trace.turns[0].error == run.result.uncertainties[0]
+
+
+def test_agent_loop_run_to_dict_serializes_trace_response_and_result(git_repo):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "app.py").write_text("def add(a, b):\n    return a * b\n", encoding="utf-8")
+    run_git(git_repo, "add", "app.py")
+    run_git(git_repo, "commit", "-m", "change app for serialization")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(git_repo / ".review-agent" / "runs" / "review-serialize")
+    gateway = ToolGateway(git_repo, base, head, observation_store)
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.TOOL_CALLS,
+                tool_calls=[ModelToolCall("call-serialize", "compare_base_head", {"path": "app.py"})],
+            ),
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(
+                    {
+                        "contract_assessments": [],
+                        "confirmed_findings": [],
+                        "rejected_hypotheses": [],
+                        "uncertainties": [],
+                        "observation_refs": [],
+                        "investigation_summary": "Serialized run.",
+                        "status": "completed",
+                    }
+                ),
+                raw={"turn": "serialize-final"},
+                model="serialize-model",
+            ),
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=make_assignment("Core Reviewer"),
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-serialize-reviewer-0",
+    )
+
+    payload = agent_loop_run_to_dict(run)
+
+    assert payload["response"]["provider_name"] == "fake-tool-calling"
+    assert payload["response"]["model"] == "serialize-model"
+    assert payload["response"]["raw"] == {"turn": "serialize-final"}
+    assert payload["result"]["status"] == "completed"
+    assert payload["trace"]["trace_id"] == "review-serialize-reviewer-0"
+    assert payload["trace"]["final_status"] == "completed"
+    assert payload["trace"]["turns"][0]["tool_calls"][0]["tool_name"] == "compare_base_head"
+    assert payload["trace"]["turns"][0]["tool_calls"][0]["call_id"] == "call-serialize"
+    assert payload["trace"]["turns"][0]["tool_results"][0]["tool_name"] == "compare_base_head"
+    assert payload["trace"]["turns"][0]["tool_results"][0]["observation_ids"]

@@ -192,11 +192,11 @@ def _tool_spec_from_envelope_tool(tool: dict[str, object]) -> ModelToolSpec:
 def _execute_tool_call(gateway: ToolGateway, call: ModelToolCall) -> ModelToolResult:
     try:
         result = gateway.execute(call.tool_name, call.arguments)
-    except ToolGatewayError as error:
+    except (ToolGatewayError, KeyError, ValueError, TypeError) as error:
         return ModelToolResult(
             call_id=call.call_id,
             tool_name=call.tool_name,
-            content=f"ToolGatewayError: {error}",
+            content=f"{type(error).__name__}: {error}",
             observation_ids=[],
             is_error=True,
         )
