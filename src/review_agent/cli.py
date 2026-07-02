@@ -92,6 +92,9 @@ def _fake_agent_loop_adapter(path: str) -> FakeToolCallingAdapter:
             ),
         )
 
+    if path == ".":
+        return FakeToolCallingAdapter(script=[final_response])
+
     return FakeToolCallingAdapter(
         script=[
             ModelTurnResponse(

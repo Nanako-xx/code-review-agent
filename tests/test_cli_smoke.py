@@ -317,6 +317,37 @@ def test_cli_agent_loop_fake_reviewer_writes_trace_artifact(git_repo: Path):
     assert result["status"] == "completed"
 
 
+def test_cli_agent_loop_fake_reviewer_handles_no_changed_files(git_repo: Path):
+    base = head = run_git(git_repo, "rev-parse", "HEAD")
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--intent",
+            "Review unchanged repository",
+            "--reviewer-provider",
+            "fake",
+            "--reviewer-loop",
+            "agent-loop",
+            "--non-interactive",
+        ]
+    )
+
+    assert exit_code == 0
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    trace = json.loads((run_dir / "reviewer_agent_trace.json").read_text(encoding="utf-8"))
+    result = json.loads((run_dir / "reviewer_result.json").read_text(encoding="utf-8"))
+
+    assert trace["tool_call_count"] == 0
+    assert result["status"] == "completed"
+
+
 def test_cli_multi_agent_loop_writes_per_reviewer_trace_artifacts(git_repo: Path):
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "auth.py").write_text("def is_admin(user):\n    return True\n", encoding="utf-8")
