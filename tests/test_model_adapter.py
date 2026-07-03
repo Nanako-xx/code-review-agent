@@ -1,12 +1,14 @@
 import json
 
-from review_agent.model_adapter import FakeToolCallingAdapter
+from review_agent.model_adapter import FakeToolCallingAdapter, OpenAICompatibleToolAdapter
 from review_agent.model_protocol import (
     ModelResponseKind,
     ModelToolCall,
+    ModelToolSpec,
     ModelTurnRequest,
     ModelTurnResponse,
 )
+from review_agent.provider import OpenAICompatibleConfig
 
 
 def make_request(tool_results=None):
@@ -78,3 +80,84 @@ def test_fake_adapter_can_compute_final_response_from_request():
 
     assert response.kind is ModelResponseKind.FINAL
     assert "O-abc" in response.final_text
+
+
+def test_openai_compatible_adapter_converts_tool_call_response():
+    captured = {}
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured["payload"] = payload
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_range",
+                                    "arguments": (
+                                        '{"path": "app.py", "revision": "head", '
+                                        '"line_start": 1, "line_end": 10}'
+                                    ),
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    request = ModelTurnRequest(
+        system="system",
+        tools=[
+            ModelToolSpec(
+                name="read_range",
+                description="Read range",
+                parameters_schema={
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            )
+        ],
+        messages=[{"role": "user", "content": "Review"}],
+        tool_results=[],
+        parameters={"max_output_tokens": 1000, "temperature": 0},
+    )
+
+    response = adapter.complete_turn(request)
+
+    assert captured["payload"]["tools"][0]["function"]["name"] == "read_range"
+    assert response.kind is ModelResponseKind.TOOL_CALLS
+    assert response.tool_calls[0].tool_name == "read_range"
+    assert response.tool_calls[0].arguments["path"] == "app.py"
+
+
+def test_openai_compatible_adapter_converts_final_text_response():
+    def transport(url, headers, payload, timeout_seconds):
+        return {"choices": [{"message": {"content": '{"status": "partial"}'}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+
+    response = adapter.complete_turn(make_request())
+
+    assert response.kind is ModelResponseKind.FINAL
+    assert response.final_text == '{"status": "partial"}'
+    assert response.provider_name == "openai-compatible"
