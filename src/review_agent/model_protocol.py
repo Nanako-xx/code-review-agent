@@ -54,6 +54,14 @@ class ModelTurnResponse:
     model: str = "unknown"
 
 
+@dataclass(frozen=True)
+class ModelResponse:
+    content: str
+    provider_name: str
+    model: str
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
 def model_turn_response_to_dict(response: ModelTurnResponse) -> dict[str, Any]:
     payload = asdict(response)
     payload["kind"] = response.kind.value

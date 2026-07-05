@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import urllib.error
+import urllib.request
 from typing import Any, Callable, Protocol, Union
 
 from review_agent.model_protocol import (
@@ -12,7 +14,6 @@ from review_agent.model_protocol import (
     ModelTurnRequest,
     ModelTurnResponse,
 )
-from review_agent.provider import OpenAICompatibleConfig, Transport, _urllib_transport
 
 
 class ModelAdapter(Protocol):
@@ -52,6 +53,29 @@ class FakeToolCallingAdapter:
             provider_name=self.provider_name,
             model=response.model if response.model != "unknown" else "fake-tool-model",
         )
+
+
+@dataclass(frozen=True)
+class OpenAICompatibleConfig:
+    base_url: str
+    api_key: str
+    model: str
+    timeout_seconds: int = 60
+
+
+Transport = Callable[[str, dict[str, str], dict[str, Any], int], dict[str, Any]]
+
+
+def _urllib_transport(
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url=url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 class OpenAICompatibleToolAdapter:

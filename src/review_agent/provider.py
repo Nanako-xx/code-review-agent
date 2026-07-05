@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 import os
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 import urllib.error
-import urllib.request
 
+from review_agent.model_adapter import OpenAICompatibleConfig, Transport, _urllib_transport
+from review_agent.model_protocol import ModelResponse
 from review_agent.models import ModelInvocationEnvelope
 
 
@@ -16,14 +16,6 @@ class ModelProviderError(RuntimeError):
 
 class ProviderConfigError(ValueError):
     pass
-
-
-@dataclass(frozen=True)
-class ModelResponse:
-    content: str
-    provider_name: str
-    model: str
-    raw: dict[str, Any] = field(default_factory=dict)
 
 
 class ModelProvider(Protocol):
@@ -43,17 +35,6 @@ class FakeProvider:
             model=self._model,
             raw={"trace_id": envelope.parameters.get("trace_id")},
         )
-
-
-@dataclass(frozen=True)
-class OpenAICompatibleConfig:
-    base_url: str
-    api_key: str
-    model: str
-    timeout_seconds: int = 60
-
-
-Transport = Callable[[str, dict[str, str], dict[str, Any], int], dict[str, Any]]
 
 
 class OpenAICompatibleProvider:
@@ -126,18 +107,6 @@ def _extract_chat_content(raw: dict[str, Any]) -> str:
         return str(raw["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError) as error:
         raise ModelProviderError("provider response did not contain choices[0].message.content") from error
-
-
-def _urllib_transport(
-    url: str,
-    headers: dict[str, str],
-    payload: dict[str, Any],
-    timeout_seconds: int,
-) -> dict[str, Any]:
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url=url, data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-        return json.loads(response.read().decode("utf-8"))
 
 
 def _fake_reviewer_result_json() -> str:

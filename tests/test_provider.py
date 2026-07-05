@@ -3,10 +3,11 @@ import urllib.error
 import pytest
 
 from review_agent.models import ModelInvocationEnvelope
+from review_agent.model_adapter import OpenAICompatibleConfig
+from review_agent.model_protocol import ModelResponse
 from review_agent.provider import (
     FakeProvider,
     ModelProviderError,
-    OpenAICompatibleConfig,
     OpenAICompatibleProvider,
     ProviderConfigError,
     build_provider_from_config,

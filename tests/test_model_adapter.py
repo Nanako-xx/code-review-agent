@@ -1,14 +1,18 @@
 import json
 
-from review_agent.model_adapter import FakeToolCallingAdapter, OpenAICompatibleToolAdapter
+from review_agent.model_adapter import (
+    FakeToolCallingAdapter,
+    OpenAICompatibleConfig,
+    OpenAICompatibleToolAdapter,
+)
 from review_agent.model_protocol import (
+    ModelResponse,
     ModelResponseKind,
     ModelToolCall,
     ModelToolSpec,
     ModelTurnRequest,
     ModelTurnResponse,
 )
-from review_agent.provider import OpenAICompatibleConfig
 
 
 def make_request(tool_results=None):
@@ -19,6 +23,22 @@ def make_request(tool_results=None):
         tool_results=tool_results or [],
         parameters={"trace_id": "review-1-reviewer-0"},
     )
+
+
+def test_model_response_lives_in_model_protocol():
+    response = ModelResponse(
+        content='{"status": "completed"}',
+        provider_name="adapter",
+        model="review-model",
+        raw={"trace_id": "trace-1"},
+    )
+
+    assert response.provider_name == "adapter"
+    assert response.raw["trace_id"] == "trace-1"
+
+
+def test_openai_compatible_config_lives_in_model_adapter():
+    assert OpenAICompatibleConfig.__module__ == "review_agent.model_adapter"
 
 
 def test_fake_adapter_returns_scripted_tool_call():
