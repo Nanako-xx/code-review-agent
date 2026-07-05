@@ -45,6 +45,10 @@ class OpenAICompatibleModelAdapterFactory:
         return OpenAICompatibleToolAdapter(self.config)
 
 
+class _FactoryFakeToolCallingAdapter(FakeToolCallingAdapter):
+    provider_name = "fake"
+
+
 def build_model_adapter_factory_from_config(
     config: ModelAdapterConfig,
 ) -> ModelAdapterFactory | None:
@@ -72,7 +76,7 @@ def build_model_adapter_factory_from_config(
 
 
 def _fake_single_shot_adapter() -> FakeToolCallingAdapter:
-    return FakeToolCallingAdapter(
+    return _FactoryFakeToolCallingAdapter(
         script=[
             ModelTurnResponse(
                 kind=ModelResponseKind.FINAL,
