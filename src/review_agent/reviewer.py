@@ -5,6 +5,8 @@ import json
 from typing import Any
 
 from review_agent.context import build_reviewer_envelope
+from review_agent.model_adapter import ModelAdapter
+from review_agent.model_protocol import ModelResponse, ModelResponseKind, ModelTurnRequest
 from review_agent.models import (
     Assignment,
     ContractAssessment,
@@ -15,7 +17,6 @@ from review_agent.models import (
     ReviewerResult,
     ReviewerResultStatus,
 )
-from review_agent.provider import ModelProvider, ModelResponse
 
 
 class ReviewerResultParseError(ValueError):
@@ -67,7 +68,7 @@ def reviewer_result_to_dict(result: ReviewerResult) -> dict[str, Any]:
 
 
 def run_single_reviewer(
-    provider: ModelProvider,
+    adapter: ModelAdapter,
     assignment: Assignment,
     intent: IntentPacket,
     diff_excerpt: list[str],
@@ -81,8 +82,40 @@ def run_single_reviewer(
         observations=observations,
         trace_id=trace_id,
     )
-    response = provider.complete(envelope)
-    result = parse_reviewer_result(response.content)
+    request = ModelTurnRequest(
+        system=envelope.system,
+        tools=[],
+        messages=list(envelope.messages),
+        tool_results=[],
+        parameters={**dict(envelope.parameters), "tool_choice": "none"},
+    )
+    turn_response = adapter.complete_turn(request)
+    response = ModelResponse(
+        content=turn_response.final_text or turn_response.error or "",
+        provider_name=turn_response.provider_name,
+        model=turn_response.model,
+        raw=turn_response.raw,
+    )
+    if turn_response.kind is ModelResponseKind.FINAL:
+        try:
+            result = parse_reviewer_result(turn_response.final_text or "")
+        except ReviewerResultParseError as error:
+            message = f"single-shot final response parse failed: {error}"
+            result = ReviewerResult(
+                uncertainties=[message],
+                investigation_summary=message,
+                status=ReviewerResultStatus.FAILED,
+            )
+        return ReviewerRun(envelope=envelope, response=response, result=result)
+    if turn_response.kind is ModelResponseKind.TOOL_CALLS:
+        message = "single-shot reviewer received tool calls; use --reviewer-loop agent-loop to enable tools"
+    else:
+        message = turn_response.error or f"single-shot reviewer received invalid response kind: {turn_response.kind.value}"
+    result = ReviewerResult(
+        uncertainties=[message],
+        investigation_summary=message,
+        status=ReviewerResultStatus.FAILED,
+    )
     return ReviewerRun(envelope=envelope, response=response, result=result)
 
 
