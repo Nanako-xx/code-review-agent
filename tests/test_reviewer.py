@@ -94,6 +94,47 @@ def test_parse_reviewer_result_rejects_invalid_status():
         )
 
 
+def test_parse_reviewer_result_rejects_non_list_result_fields():
+    with pytest.raises(ReviewerResultParseError, match="contract_assessments must be a list"):
+        parse_reviewer_result(
+            """
+            {
+              "contract_assessments": null,
+              "confirmed_findings": [],
+              "rejected_hypotheses": [],
+              "uncertainties": [],
+              "observation_refs": [],
+              "investigation_summary": "Malformed list field.",
+              "status": "failed"
+            }
+            """
+        )
+
+
+def test_parse_reviewer_result_rejects_non_list_evidence_refs():
+    with pytest.raises(ReviewerResultParseError, match="contract assessment evidence_refs must be a list"):
+        parse_reviewer_result(
+            """
+            {
+              "contract_assessments": [
+                {
+                  "contract": "intent_alignment",
+                  "status": "covered",
+                  "summary": "The change matches the stated intent.",
+                  "evidence_refs": null
+                }
+              ],
+              "confirmed_findings": [],
+              "rejected_hypotheses": [],
+              "uncertainties": [],
+              "observation_refs": [],
+              "investigation_summary": "Malformed nested list field.",
+              "status": "failed"
+            }
+            """
+        )
+
+
 def make_assignment() -> Assignment:
     return Assignment(
         role="Core Reviewer",
@@ -210,6 +251,43 @@ def test_run_single_reviewer_handles_invalid_adapter_response():
     assert run.result.status is ReviewerResultStatus.FAILED
     assert run.result.uncertainties == ["bad response shape"]
     assert run.response.content == "bad response shape"
+
+
+def test_run_single_reviewer_handles_malformed_final_list_field():
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="""
+                {
+                  "contract_assessments": null,
+                  "confirmed_findings": [],
+                  "rejected_hypotheses": [],
+                  "uncertainties": [],
+                  "observation_refs": [],
+                  "investigation_summary": "Malformed list field.",
+                  "status": "failed"
+                }
+                """,
+                provider_name="fake",
+                model="fake-reviewer",
+            )
+        ]
+    )
+
+    run = run_single_reviewer(
+        adapter=adapter,
+        assignment=make_assignment(),
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="trace-reviewer-malformed-final",
+    )
+
+    assert run.result.status is ReviewerResultStatus.FAILED
+    assert "single-shot final response parse failed" in run.result.uncertainties[0]
+    assert "contract_assessments must be a list" in run.result.uncertainties[0]
+    assert "single-shot final response parse failed" in run.result.investigation_summary
 
 
 def test_run_single_reviewer_uses_diff_excerpt_as_code_snippet():

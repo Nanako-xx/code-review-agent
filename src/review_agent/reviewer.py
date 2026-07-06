@@ -40,12 +40,22 @@ REQUIRED_RESULT_KEYS = (
     "status",
 )
 
+LIST_RESULT_KEYS = (
+    "contract_assessments",
+    "confirmed_findings",
+    "rejected_hypotheses",
+    "uncertainties",
+    "observation_refs",
+)
+
 
 def parse_reviewer_result(raw_text: str) -> ReviewerResult:
     payload = _loads_json_object(_strip_json_fence(raw_text))
     for key in REQUIRED_RESULT_KEYS:
         if key not in payload:
             raise ReviewerResultParseError(f"missing required key: {key}")
+    for key in LIST_RESULT_KEYS:
+        _require_list(payload, key)
 
     try:
         status = ReviewerResultStatus(payload["status"])
@@ -85,7 +95,7 @@ def run_single_reviewer(
     request = ModelTurnRequest(
         system=envelope.system,
         tools=[],
-        messages=list(envelope.messages),
+        messages=[dict(message) for message in envelope.messages],
         tool_results=[],
         parameters={**dict(envelope.parameters), "tool_choice": "none"},
     )
@@ -140,6 +150,20 @@ def _loads_json_object(text: str) -> dict[str, Any]:
     return payload
 
 
+def _require_list(container: dict[str, Any], key: str, *, field_label: str | None = None) -> list[Any]:
+    value = container[key]
+    if not isinstance(value, list):
+        raise ReviewerResultParseError(f"{field_label or key} must be a list")
+    return value
+
+
+def _optional_list(container: dict[str, Any], key: str, *, field_label: str | None = None) -> list[Any]:
+    value = container.get(key, [])
+    if not isinstance(value, list):
+        raise ReviewerResultParseError(f"{field_label or key} must be a list")
+    return value
+
+
 def _parse_contract_assessment(item: Any) -> ContractAssessment:
     if not isinstance(item, dict):
         raise ReviewerResultParseError("contract assessment must be an object")
@@ -149,11 +173,12 @@ def _parse_contract_assessment(item: Any) -> ContractAssessment:
         raise ReviewerResultParseError("contract assessment missing required key: status") from error
     except ValueError as error:
         raise ReviewerResultParseError(f"invalid contract status: {item.get('status')}") from error
+    evidence_refs = _optional_list(item, "evidence_refs", field_label="contract assessment evidence_refs")
     return ContractAssessment(
         contract=str(item.get("contract", "")),
         status=status,
         summary=str(item.get("summary", "")),
-        evidence_refs=[str(ref) for ref in item.get("evidence_refs", [])],
+        evidence_refs=[str(ref) for ref in evidence_refs],
     )
 
 
@@ -161,10 +186,11 @@ def _parse_finding(item: Any) -> ReviewerFinding:
     if not isinstance(item, dict):
         raise ReviewerResultParseError("finding must be an object")
     suggested_action = item.get("suggested_action")
+    evidence_refs = _optional_list(item, "evidence_refs", field_label="finding evidence_refs")
     return ReviewerFinding(
         claim=str(item.get("claim", "")),
         severity=str(item.get("severity", "")),
         confidence=str(item.get("confidence", "")),
-        evidence_refs=[str(ref) for ref in item.get("evidence_refs", [])],
+        evidence_refs=[str(ref) for ref in evidence_refs],
         suggested_action=str(suggested_action) if suggested_action is not None else None,
     )
