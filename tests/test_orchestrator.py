@@ -1,23 +1,34 @@
 import json
 
+from review_agent.model_adapter import ModelAdapter
+from review_agent.model_adapter_factory import ModelAdapterFactory
+from review_agent.model_protocol import ModelResponseKind, ModelTurnRequest, ModelTurnResponse
 from review_agent.models import Assignment, InitialContext, IntentPacket, IntentSource, IntentStatus
 from review_agent.orchestrator import multi_reviewer_run_to_dict, run_multi_reviewer
-from review_agent.provider import ModelProviderError, ModelResponse
 
 
-class RecordingProvider:
-    def __init__(self):
-        self.trace_ids = []
-        self.roles = []
+class RecordingAdapter:
+    provider_name = "recording"
 
-    def complete(self, envelope):
-        self.trace_ids.append(envelope.parameters["trace_id"])
-        content = envelope.messages[0]["content"]
+    def __init__(self, factory):
+        self._factory = factory
+
+    def complete_turn(self, request: ModelTurnRequest) -> ModelTurnResponse:
+        self._factory.trace_ids.append(request.parameters["trace_id"])
+        content = request.messages[0]["content"]
         role_line = next(line for line in content.splitlines() if line.startswith("Role: "))
         role = role_line.removeprefix("Role: ")
-        self.roles.append(role)
-        return ModelResponse(
-            content=json.dumps(
+        self._factory.roles.append(role)
+        if self._factory.fail_on_call_number == len(self._factory.trace_ids):
+            return ModelTurnResponse(
+                kind=ModelResponseKind.INVALID,
+                error="provider unavailable",
+                provider_name="recording",
+                model="recording-model",
+            )
+        return ModelTurnResponse(
+            kind=ModelResponseKind.FINAL,
+            final_text=json.dumps(
                 {
                     "contract_assessments": [],
                     "confirmed_findings": [],
@@ -34,11 +45,16 @@ class RecordingProvider:
         )
 
 
-class FailingSecondProvider(RecordingProvider):
-    def complete(self, envelope):
-        if len(self.trace_ids) == 1:
-            raise ModelProviderError("provider unavailable")
-        return super().complete(envelope)
+class RecordingAdapterFactory:
+    def __init__(self, fail_on_call_number=None):
+        self.trace_ids = []
+        self.roles = []
+        self.fail_on_call_number = fail_on_call_number
+        self.created_count = 0
+
+    def create(self) -> ModelAdapter:
+        self.created_count += 1
+        return RecordingAdapter(self)
 
 
 def make_assignment(role: str) -> Assignment:
@@ -63,11 +79,11 @@ def make_intent() -> IntentPacket:
 
 
 def test_run_multi_reviewer_runs_every_assignment_with_isolated_traces():
-    provider = RecordingProvider()
+    factory = RecordingAdapterFactory()
     assignments = [make_assignment("Core Reviewer"), make_assignment("Adversarial Reviewer")]
 
     run = run_multi_reviewer(
-        provider=provider,
+        adapter_factory=factory,
         assignments=assignments,
         intent=make_intent(),
         diff_excerpt=["+changed"],
@@ -75,8 +91,9 @@ def test_run_multi_reviewer_runs_every_assignment_with_isolated_traces():
         trace_id_prefix="review-123",
     )
 
-    assert provider.trace_ids == ["review-123-reviewer-0", "review-123-reviewer-1"]
-    assert provider.roles == ["Core Reviewer", "Adversarial Reviewer"]
+    assert factory.created_count == 2
+    assert factory.trace_ids == ["review-123-reviewer-0", "review-123-reviewer-1"]
+    assert factory.roles == ["Core Reviewer", "Adversarial Reviewer"]
     assert [item.assignment.role for item in run.executions] == ["Core Reviewer", "Adversarial Reviewer"]
     assert [item.result.status.value for item in run.executions] == ["partial", "partial"]
     assert run.status_counts == {"partial": 2}
@@ -84,7 +101,7 @@ def test_run_multi_reviewer_runs_every_assignment_with_isolated_traces():
 
 def test_multi_reviewer_run_to_dict_contains_artifact_summary():
     run = run_multi_reviewer(
-        provider=RecordingProvider(),
+        adapter_factory=RecordingAdapterFactory(),
         assignments=[make_assignment("Core Reviewer")],
         intent=make_intent(),
         diff_excerpt=[],
@@ -103,7 +120,7 @@ def test_multi_reviewer_run_to_dict_contains_artifact_summary():
 
 def test_run_multi_reviewer_records_failed_execution_without_aborting_remaining_artifacts():
     run = run_multi_reviewer(
-        provider=FailingSecondProvider(),
+        adapter_factory=RecordingAdapterFactory(fail_on_call_number=2),
         assignments=[make_assignment("Core Reviewer"), make_assignment("Adversarial Reviewer")],
         intent=make_intent(),
         diff_excerpt=[],

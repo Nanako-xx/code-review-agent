@@ -11,7 +11,8 @@ from review_agent.models import (
     ReviewerResult,
     ReviewerResultStatus,
 )
-from review_agent.provider import ModelProvider, ModelResponse
+from review_agent.model_adapter_factory import ModelAdapterFactory
+from review_agent.model_protocol import ModelResponse
 from review_agent.reviewer import ReviewerRun, reviewer_result_to_dict, run_single_reviewer
 
 
@@ -39,7 +40,7 @@ class MultiReviewerRun:
 
 
 def run_multi_reviewer(
-    provider: ModelProvider,
+    adapter_factory: ModelAdapterFactory,
     assignments: list[Assignment],
     intent: IntentPacket,
     diff_excerpt: list[str],
@@ -50,8 +51,9 @@ def run_multi_reviewer(
     for index, assignment in enumerate(assignments):
         trace_id = f"{trace_id_prefix}-reviewer-{index}"
         try:
+            adapter = adapter_factory.create()
             run = run_single_reviewer(
-                provider=provider,
+                adapter=adapter,
                 assignment=assignment,
                 intent=intent,
                 diff_excerpt=diff_excerpt,
