@@ -51,6 +51,44 @@ def test_cli_review_writes_current_schema_artifacts(git_repo: Path):
     assert "provided_evidence_refs" not in assignments["assignments"][0]
 
 
+def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, capsys):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "auth.py").write_text("def check(token):\n    return token == 'ok'\n", encoding="utf-8")
+    run_git(git_repo, "add", "auth.py")
+    run_git(git_repo, "commit", "-m", "add auth check")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--intent",
+            "Add auth token check",
+            "--non-interactive",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    run_dirs = sorted((git_repo / ".review-agent" / "runs").iterdir())
+    state = json.loads((run_dirs[-1] / "state.json").read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert "Preflight" in output
+    assert "Changed files: 1" in output
+    assert "Intent status:" in output
+    assert "Run directory:" in output
+    assert state["status"] == "completed"
+    assert state["phase"] == "completed"
+    assert state["artifacts"]["request"] == "request.json"
+    assert state["artifacts"]["repository_intelligence"] == "repository_intelligence.json"
+    assert state["artifacts"]["report"] == "report.md"
+
+
 def test_cli_review_with_fake_reviewer_writes_reviewer_artifacts(git_repo: Path):
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "auth.py").write_text("def check(token):\n    return token == 'ok'\n", encoding="utf-8")

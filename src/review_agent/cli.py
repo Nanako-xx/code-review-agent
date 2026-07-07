@@ -9,7 +9,7 @@ from review_agent.agent_loop import agent_loop_run_to_dict, run_reviewer_agent_l
 from review_agent.checkpoint import CheckpointStore
 from review_agent.completion import check_completion, completion_to_dict
 from review_agent.evidence import reconcile_evidence, reconciliation_to_dict
-from review_agent.git_repo import collect_change_summary
+from review_agent.git_repo import ChangeSummary, collect_change_summary
 from review_agent.intent import build_intent_packet
 from review_agent.model_adapter_factory import (
     AdapterConfigError,
@@ -17,7 +17,7 @@ from review_agent.model_adapter_factory import (
     ModelAdapterFactory,
     build_model_adapter_factory_from_config,
 )
-from review_agent.models import ReviewRequest
+from review_agent.models import IntentPacket, QualityGateResult, ReviewRequest, RiskAssessment
 from review_agent.observations import ObservationStore
 from review_agent.orchestrator import (
     MultiReviewerRun,
@@ -35,6 +35,7 @@ from review_agent.repository_intelligence import (
 from review_agent.reporting import render_markdown_report
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
 from review_agent.reviewer import reviewer_result_to_dict, run_single_reviewer
+from review_agent.run_state import RunPhase, advance_run_state, initial_run_state
 from review_agent.runtime import build_assignments
 from review_agent.tool_gateway import ToolGateway
 
@@ -119,6 +120,13 @@ def _run_review(args: argparse.Namespace) -> int:
         return 2
 
     store = CheckpointStore(repo, review_id)
+    state = initial_run_state(
+        review_id=review_id,
+        repository_path=str(repo),
+        base_revision=args.base,
+        head_revision=args.head,
+    )
+    store.write_state(state)
     observation_store = ObservationStore(store.run_dir)
     repository_intelligence = build_repository_intelligence(
         repo=repo,
@@ -134,6 +142,38 @@ def _run_review(args: argparse.Namespace) -> int:
     store.write_json("assignments.json", {"assignments": [asdict(item) for item in assignments]})
     store.write_json("quality_gates.json", {"results": [asdict(item) for item in quality_results]})
     store.write_json("repository_intelligence.json", repository_intelligence_to_dict(repository_intelligence))
+    _print_preflight_summary(
+        review_id=review_id,
+        repo=repo,
+        base_revision=args.base,
+        head_revision=args.head,
+        change_summary=change_summary,
+        intent_packet=intent,
+        quality_results=quality_results,
+        risk_assessment=risk_assessment,
+        run_dir=store.run_dir,
+    )
+    state = advance_run_state(
+        state,
+        phase=RunPhase.PREFLIGHT,
+        message="Preflight completed",
+        artifacts={
+            "request": "request.json",
+            "intent": "intent.json",
+            "risk_packet": "risk_packet.json",
+            "risk": "risk.json",
+            "assignments": "assignments.json",
+            "quality_gates": "quality_gates.json",
+        },
+    )
+    store.write_state(state)
+    state = advance_run_state(
+        state,
+        phase=RunPhase.REPOSITORY_INTELLIGENCE,
+        message="Repository intelligence collected",
+        artifacts={"repository_intelligence": "repository_intelligence.json"},
+    )
+    store.write_state(state)
     observation_store.record(
         source="repo_intelligence.snapshot",
         revision=f"{args.base}..{args.head}",
@@ -196,6 +236,13 @@ def _run_review(args: argparse.Namespace) -> int:
                 multi_run = MultiReviewerRun(executions=executions)
             multi_payload = multi_reviewer_run_to_dict(multi_run)
             store.write_json("multi_reviewer_result.json", multi_payload)
+            state = advance_run_state(
+                state,
+                phase=RunPhase.REVIEWERS,
+                message="Reviewer execution completed",
+                artifacts={"multi_reviewer": "multi_reviewer_result.json"},
+            )
+            store.write_state(state)
             multi_reviewer_summary = {
                 "reviewer_count": multi_payload["reviewer_count"],
                 "status_counts": multi_payload["status_counts"],
@@ -207,6 +254,13 @@ def _run_review(args: argparse.Namespace) -> int:
             )
             reconciliation_payload = reconciliation_to_dict(reconciliation)
             store.write_json("reconciliation.json", reconciliation_payload)
+            state = advance_run_state(
+                state,
+                phase=RunPhase.RECONCILIATION,
+                message="Evidence reconciliation completed",
+                artifacts={"reconciliation": "reconciliation.json"},
+            )
+            store.write_state(state)
             reconciliation_summary = {
                 "canonical_count": len(reconciliation.canonical_findings),
                 "rejected_count": len(reconciliation.rejected_findings),
@@ -220,6 +274,13 @@ def _run_review(args: argparse.Namespace) -> int:
             )
             completion_payload = completion_to_dict(completion)
             store.write_json("completion.json", completion_payload)
+            state = advance_run_state(
+                state,
+                phase=RunPhase.COMPLETION,
+                message="Completion check completed",
+                artifacts={"completion": "completion.json"},
+            )
+            store.write_state(state)
             completion_summary = completion_payload
             for execution in multi_run.executions:
                 index = execution.reviewer_index
@@ -261,6 +322,17 @@ def _run_review(args: argparse.Namespace) -> int:
                     },
                 )
                 store.write_json("reviewer_result.json", reviewer_result_to_dict(reviewer_run.result))
+                state = advance_run_state(
+                    state,
+                    phase=RunPhase.REVIEWERS,
+                    message="Reviewer execution completed",
+                    artifacts={
+                        "reviewer_envelope": "reviewer_envelope.json",
+                        "reviewer_raw_response": "reviewer_raw_response.json",
+                        "reviewer": "reviewer_result.json",
+                    },
+                )
+                store.write_state(state)
             else:
                 loop_run = run_reviewer_agent_loop(
                     adapter=adapter_factory.create(),
@@ -284,6 +356,18 @@ def _run_review(args: argparse.Namespace) -> int:
                 )
                 store.write_json("reviewer_result.json", reviewer_result_to_dict(loop_run.result))
                 store.write_json("reviewer_agent_trace.json", agent_loop_run_to_dict(loop_run)["trace"])
+                state = advance_run_state(
+                    state,
+                    phase=RunPhase.REVIEWERS,
+                    message="Reviewer execution completed",
+                    artifacts={
+                        "reviewer_envelope": "reviewer_envelope.json",
+                        "reviewer_raw_response": "reviewer_raw_response.json",
+                        "reviewer": "reviewer_result.json",
+                        "reviewer_agent_trace": "reviewer_agent_trace.json",
+                    },
+                )
+                store.write_state(state)
 
     report = render_markdown_report(
         review_id=review_id,
@@ -299,6 +383,43 @@ def _run_review(args: argparse.Namespace) -> int:
         completion_summary=completion_summary,
     )
     (store.run_dir / "report.md").write_text(report, encoding="utf-8")
+    state = advance_run_state(
+        state,
+        phase=RunPhase.COMPLETED,
+        message="Review completed",
+        artifacts={"report": "report.md"},
+    )
+    store.write_state(state)
 
     print(f"Review foundation completed: {store.run_dir}")
     return 0
+
+
+def _print_preflight_summary(
+    *,
+    review_id: str,
+    repo: Path,
+    base_revision: str,
+    head_revision: str,
+    change_summary: ChangeSummary,
+    intent_packet: IntentPacket,
+    quality_results: list[QualityGateResult],
+    risk_assessment: RiskAssessment,
+    run_dir: Path,
+) -> None:
+    print("Preflight")
+    print(f"  Review ID: {review_id}")
+    print(f"  Repository: {repo}")
+    print(f"  Base: {base_revision}")
+    print(f"  Head: {head_revision}")
+    print(f"  Changed files: {len(change_summary.changed_files)}")
+    print(f"  Intent status: {intent_packet.status.value}")
+    print(f"  Risk level: {risk_assessment.level.value}")
+    print(f"  Quality gates: {_format_quality_gate_summary(quality_results)}")
+    print(f"  Run directory: {run_dir}")
+
+
+def _format_quality_gate_summary(quality_results: list[QualityGateResult]) -> str:
+    if not quality_results:
+        return "none"
+    return ", ".join(f"{result.name}={result.status}" for result in quality_results)
