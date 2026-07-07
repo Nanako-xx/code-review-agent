@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, replace
 from pathlib import Path
+import sys
 import uuid
 
 from review_agent.agent_loop import agent_loop_run_to_dict, run_reviewer_agent_loop
@@ -45,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "review":
         return _run_review(args)
+    if args.command == "resume":
+        return _run_resume(args)
     parser.print_help()
     return 2
 
@@ -66,6 +69,10 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument("--reviewer-model")
     review.add_argument("--reviewer-base-url")
     review.add_argument("--reviewer-api-key-env", default="REVIEW_AGENT_API_KEY")
+
+    resume = subparsers.add_parser("resume", help="Inspect and resume from a local review checkpoint")
+    resume.add_argument("review_id", help="Review id under .review-agent/runs")
+    resume.add_argument("--repo", default=".", help="Repository path")
 
     return parser
 
@@ -392,6 +399,51 @@ def _run_review(args: argparse.Namespace) -> int:
     store.write_state(state)
 
     print(f"Review foundation completed: {store.run_dir}")
+    return 0
+
+
+def _run_resume(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    store = CheckpointStore(repo, args.review_id, create=False)
+
+    if not store.run_dir.exists():
+        print(f"Review run not found: {store.run_dir}", file=sys.stderr)
+        return 2
+
+    state_path = store.run_dir / "state.json"
+    request_path = store.run_dir / "request.json"
+    if not state_path.exists():
+        print(f"Review run has no state.json: {store.run_dir}", file=sys.stderr)
+        return 2
+    if not request_path.exists():
+        print(f"Review run has no request.json: {store.run_dir}", file=sys.stderr)
+        return 2
+
+    state = store.read_state()
+    request = store.read_json("request.json")
+
+    print("Resume")
+    print(f"  Review ID: {state.review_id}")
+    print(f"  Status: {state.status.value}")
+    print(f"  Phase: {state.phase.value}")
+    print(f"  Repository: {state.repository_path}")
+    print(f"  Base: {state.base_revision}")
+    print(f"  Head: {state.head_revision}")
+    print(f"  Message: {state.message}")
+    print(f"  Run directory: {store.run_dir}")
+    request_repository = request.get("repository_path")
+    if request_repository and str(request_repository) != state.repository_path:
+        print(f"  Request repository: {request_repository}")
+    print("  Artifacts:")
+    for name, relative_path in sorted(state.artifacts.items()):
+        marker = "present" if (store.run_dir / relative_path).exists() else "missing"
+        print(f"    - {name}: {relative_path} ({marker})")
+
+    if state.errors:
+        print("  Errors:")
+        for error in state.errors:
+            print(f"    - {error}")
+
     return 0
 
 
