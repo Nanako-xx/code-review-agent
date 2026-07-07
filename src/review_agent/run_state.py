@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+
+class RunStatus(str, Enum):
+    CREATED = "created"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class RunPhase(str, Enum):
+    CREATED = "created"
+    PREFLIGHT = "preflight"
+    QUALITY_GATES = "quality_gates"
+    REPOSITORY_INTELLIGENCE = "repository_intelligence"
+    REVIEWERS = "reviewers"
+    RECONCILIATION = "reconciliation"
+    COMPLETION = "completion"
+    REPORTING = "reporting"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class RunState:
+    review_id: str
+    status: RunStatus
+    phase: RunPhase
+    repository_path: str
+    base_revision: str
+    head_revision: str
+    message: str
+    artifacts: dict[str, str] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+
+def initial_run_state(
+    *,
+    review_id: str,
+    repository_path: str,
+    base_revision: str,
+    head_revision: str,
+) -> RunState:
+    return RunState(
+        review_id=review_id,
+        status=RunStatus.CREATED,
+        phase=RunPhase.CREATED,
+        repository_path=repository_path,
+        base_revision=base_revision,
+        head_revision=head_revision,
+        message="Run created",
+    )
+
+
+def advance_run_state(
+    state: RunState,
+    *,
+    phase: RunPhase,
+    message: str,
+    artifacts: dict[str, str] | None = None,
+) -> RunState:
+    next_artifacts = dict(state.artifacts)
+    if artifacts:
+        next_artifacts.update(artifacts)
+    status = RunStatus.COMPLETED if phase is RunPhase.COMPLETED else RunStatus.RUNNING
+    return RunState(
+        review_id=state.review_id,
+        status=status,
+        phase=phase,
+        repository_path=state.repository_path,
+        base_revision=state.base_revision,
+        head_revision=state.head_revision,
+        message=message,
+        artifacts=next_artifacts,
+        errors=list(state.errors),
+    )
+
+
+def fail_run_state(state: RunState, *, message: str, error: str) -> RunState:
+    return RunState(
+        review_id=state.review_id,
+        status=RunStatus.FAILED,
+        phase=RunPhase.FAILED,
+        repository_path=state.repository_path,
+        base_revision=state.base_revision,
+        head_revision=state.head_revision,
+        message=message,
+        artifacts=dict(state.artifacts),
+        errors=[*state.errors, error],
+    )
+
+
+def run_state_to_dict(state: RunState) -> dict[str, Any]:
+    return {
+        "review_id": state.review_id,
+        "status": state.status.value,
+        "phase": state.phase.value,
+        "repository_path": state.repository_path,
+        "base_revision": state.base_revision,
+        "head_revision": state.head_revision,
+        "message": state.message,
+        "artifacts": dict(state.artifacts),
+        "errors": list(state.errors),
+    }
+
+
+def run_state_from_dict(payload: dict[str, Any]) -> RunState:
+    return RunState(
+        review_id=str(payload["review_id"]),
+        status=RunStatus(str(payload["status"])),
+        phase=RunPhase(str(payload["phase"])),
+        repository_path=str(payload["repository_path"]),
+        base_revision=str(payload["base_revision"]),
+        head_revision=str(payload["head_revision"]),
+        message=str(payload["message"]),
+        artifacts={str(key): str(value) for key, value in dict(payload.get("artifacts", {})).items()},
+        errors=[str(item) for item in list(payload.get("errors", []))],
+    )

@@ -4,6 +4,7 @@ import json
 from review_agent.checkpoint import CheckpointStore
 from review_agent.models import IntentStatus, ReviewerResult, ReviewerResultStatus, RiskAssessment, RiskLevel
 from review_agent.reporting import render_markdown_report
+from review_agent.run_state import initial_run_state
 
 
 def test_checkpoint_store_writes_json_and_jsonl(tmp_path: Path):
@@ -29,6 +30,20 @@ def test_checkpoint_store_serializes_enum_values(tmp_path: Path):
     assert json.loads((tmp_path / ".review-agent" / "runs" / "review-1" / "intent.json").read_text(encoding="utf-8")) == {
         "status": "partial",
     }
+
+
+def test_checkpoint_store_writes_and_reads_run_state(tmp_path: Path) -> None:
+    store = CheckpointStore(tmp_path, "review-1")
+    state = initial_run_state(
+        review_id="review-1",
+        repository_path=str(tmp_path),
+        base_revision="main",
+        head_revision="HEAD",
+    )
+
+    store.write_state(state)
+
+    assert store.read_state() == state
 
 
 def test_markdown_report_contains_risk_signals_and_uncertainties():

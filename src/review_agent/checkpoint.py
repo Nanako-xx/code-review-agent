@@ -5,16 +5,30 @@ from enum import Enum
 from pathlib import Path
 import json
 
+from review_agent.run_state import RunState, run_state_from_dict, run_state_to_dict
+
 
 class CheckpointStore:
-    def __init__(self, repository_path: Path, review_id: str) -> None:
-        self.run_dir = repository_path / ".review-agent" / "runs" / review_id
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, repository_path: Path, review_id: str, *, create: bool = True) -> None:
+        self.repository_path = Path(repository_path)
+        self.review_id = review_id
+        self.run_dir = self.repository_path / ".review-agent" / "runs" / review_id
+        if create:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
 
     def write_json(self, filename: str, payload: dict[str, object]) -> Path:
         path = self.run_dir / filename
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
         return path
+
+    def read_json(self, filename: str) -> dict[str, object]:
+        return json.loads((self.run_dir / filename).read_text(encoding="utf-8"))
+
+    def write_state(self, state: RunState) -> Path:
+        return self.write_json("state.json", run_state_to_dict(state))
+
+    def read_state(self) -> RunState:
+        return run_state_from_dict(self.read_json("state.json"))
 
     def append_jsonl(self, filename: str, payload: dict[str, object]) -> Path:
         path = self.run_dir / filename
