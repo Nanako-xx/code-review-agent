@@ -1,3 +1,5 @@
+# Legacy compatibility tests. Reviewer business paths use ModelAdapterFactory.
+
 import urllib.error
 
 import pytest
