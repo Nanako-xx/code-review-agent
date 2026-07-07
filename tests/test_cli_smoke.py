@@ -94,7 +94,7 @@ def test_cli_review_with_fake_reviewer_writes_reviewer_artifacts(git_repo: Path)
     assert "Fake reviewer executed." in report
 
 
-def test_cli_openai_compatible_provider_requires_api_key(git_repo: Path, monkeypatch, capsys):
+def test_cli_openai_compatible_adapter_requires_api_key(git_repo: Path, monkeypatch, capsys):
     monkeypatch.delenv("REVIEW_AGENT_API_KEY", raising=False)
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "app.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
@@ -122,13 +122,61 @@ def test_cli_openai_compatible_provider_requires_api_key(git_repo: Path, monkeyp
     )
 
     assert exit_code == 2
-    assert "Reviewer provider configuration error" in capsys.readouterr().out
+    assert "Reviewer adapter configuration error" in capsys.readouterr().out
 
 
-def test_cli_agent_loop_rejects_unsupported_provider_before_provider_config(
-    git_repo: Path, monkeypatch, capsys
-):
-    monkeypatch.delenv("REVIEW_AGENT_API_KEY", raising=False)
+def test_cli_agent_loop_openai_compatible_uses_adapter_factory(git_repo: Path, monkeypatch):
+    from review_agent.model_adapter import FakeToolCallingAdapter
+    from review_agent.model_protocol import ModelResponseKind, ModelToolCall, ModelTurnResponse
+
+    class ToolThenFinalFactory:
+        def create(self):
+            class OpenAICompatibleFakeToolCallingAdapter(FakeToolCallingAdapter):
+                provider_name = "openai-compatible"
+
+            def final_response(request):
+                observation_id = request.tool_results[-1].observation_ids[0]
+                return ModelTurnResponse(
+                    kind=ModelResponseKind.FINAL,
+                    final_text=json.dumps(
+                        {
+                            "contract_assessments": [
+                                {
+                                    "contract": "regression_safety",
+                                    "status": "covered",
+                                    "summary": "OpenAI-compatible adapter path used tools.",
+                                    "evidence_refs": [observation_id],
+                                }
+                            ],
+                            "confirmed_findings": [],
+                            "rejected_hypotheses": [],
+                            "uncertainties": [],
+                            "observation_refs": [observation_id],
+                            "investigation_summary": "OpenAI-compatible agent loop executed.",
+                            "status": "completed",
+                        }
+                    ),
+                    provider_name="openai-compatible",
+                    model="review-model",
+                )
+
+            return OpenAICompatibleFakeToolCallingAdapter(
+                script=[
+                    ModelTurnResponse(
+                        kind=ModelResponseKind.TOOL_CALLS,
+                        tool_calls=[ModelToolCall("call-1", "compare_base_head", {"path": "app.py"})],
+                    ),
+                    final_response,
+                ]
+            )
+
+    def fake_build_factory(config):
+        assert config.provider_name == "openai-compatible"
+        assert config.model == "review-model"
+        assert config.base_url == "https://example.test/v1"
+        return ToolThenFinalFactory()
+
+    monkeypatch.setattr("review_agent.cli.build_model_adapter_factory_from_config", fake_build_factory, raising=False)
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "app.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
     run_git(git_repo, "add", "app.py")
@@ -148,15 +196,23 @@ def test_cli_agent_loop_rejects_unsupported_provider_before_provider_config(
             "agent-loop",
             "--reviewer-provider",
             "openai-compatible",
+            "--reviewer-model",
+            "review-model",
+            "--reviewer-base-url",
+            "https://example.test/v1",
             "--non-interactive",
         ]
     )
 
-    output = capsys.readouterr().out
-    assert exit_code == 2
-    assert "--reviewer-loop agent-loop currently requires --reviewer-provider fake" in output
-    assert "Reviewer provider configuration error" not in output
-    assert not (git_repo / ".review-agent").exists()
+    assert exit_code == 0
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    trace = json.loads((run_dir / "reviewer_agent_trace.json").read_text(encoding="utf-8"))
+    result = json.loads((run_dir / "reviewer_result.json").read_text(encoding="utf-8"))
+    raw = json.loads((run_dir / "reviewer_raw_response.json").read_text(encoding="utf-8"))
+
+    assert trace["tool_call_count"] == 1
+    assert result["status"] == "completed"
+    assert raw["provider_name"] == "openai-compatible"
 
 
 def test_cli_multi_reviewer_mode_requires_reviewer_provider(git_repo: Path, capsys):

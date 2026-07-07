@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
-import json
+from dataclasses import asdict, replace
 from pathlib import Path
 import uuid
 
@@ -12,8 +11,12 @@ from review_agent.completion import check_completion, completion_to_dict
 from review_agent.evidence import reconcile_evidence, reconciliation_to_dict
 from review_agent.git_repo import collect_change_summary
 from review_agent.intent import build_intent_packet
-from review_agent.model_adapter import FakeToolCallingAdapter
-from review_agent.model_protocol import ModelResponseKind, ModelToolCall, ModelTurnResponse
+from review_agent.model_adapter_factory import (
+    AdapterConfigError,
+    ModelAdapterConfig,
+    ModelAdapterFactory,
+    build_model_adapter_factory_from_config,
+)
 from review_agent.models import ReviewRequest
 from review_agent.observations import ObservationStore
 from review_agent.orchestrator import (
@@ -22,7 +25,6 @@ from review_agent.orchestrator import (
     multi_reviewer_run_to_dict,
     run_multi_reviewer,
 )
-from review_agent.provider import ProviderConfigError, build_provider_from_config
 from review_agent.quality import detect_quality_gates, run_python_compile_gate
 from review_agent.repository_intelligence import (
     build_repository_intelligence,
@@ -67,45 +69,6 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _fake_agent_loop_adapter(path: str) -> FakeToolCallingAdapter:
-    def final_response(request):
-        observation_id = request.tool_results[-1].observation_ids[0] if request.tool_results else ""
-        return ModelTurnResponse(
-            kind=ModelResponseKind.FINAL,
-            final_text=json.dumps(
-                {
-                    "contract_assessments": [
-                        {
-                            "contract": "regression_safety",
-                            "status": "covered",
-                            "summary": "Fake agent loop used a tool observation.",
-                            "evidence_refs": [observation_id] if observation_id else [],
-                        }
-                    ],
-                    "confirmed_findings": [],
-                    "rejected_hypotheses": [],
-                    "uncertainties": [],
-                    "observation_refs": [observation_id] if observation_id else [],
-                    "investigation_summary": "Fake agent loop reviewer executed.",
-                    "status": "completed",
-                }
-            ),
-        )
-
-    if path == ".":
-        return FakeToolCallingAdapter(script=[final_response])
-
-    return FakeToolCallingAdapter(
-        script=[
-            ModelTurnResponse(
-                kind=ModelResponseKind.TOOL_CALLS,
-                tool_calls=[ModelToolCall("call-1", "compare_base_head", {"path": path})],
-            ),
-            final_response,
-        ]
-    )
-
-
 def _run_review(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     review_id = f"review-{uuid.uuid4().hex[:12]}"
@@ -129,20 +92,29 @@ def _run_review(args: argparse.Namespace) -> int:
     risk_packet = build_risk_packet(change_summary, intent, quality_status)
     risk_assessment = LocalRiskAssessor().assess(risk_packet)
     assignments = build_assignments(risk_assessment)
-    if args.reviewer_loop == "agent-loop" and args.reviewer_provider != "fake":
-        print("--reviewer-loop agent-loop currently requires --reviewer-provider fake")
-        return 2
-    try:
-        provider = build_provider_from_config(
-            provider_name=args.reviewer_provider,
-            model=args.reviewer_model,
-            base_url=args.reviewer_base_url,
-            api_key_env=args.reviewer_api_key_env,
+    assignments = [
+        replace(
+            assignment,
+            initial_context=replace(
+                assignment.initial_context,
+                changed_files=list(change_summary.changed_files),
+            ),
         )
-    except ProviderConfigError as error:
-        print(f"Reviewer provider configuration error: {error}")
+        for assignment in assignments
+    ]
+    try:
+        adapter_factory: ModelAdapterFactory | None = build_model_adapter_factory_from_config(
+            ModelAdapterConfig(
+                provider_name=args.reviewer_provider,
+                model=args.reviewer_model,
+                base_url=args.reviewer_base_url,
+                api_key_env=args.reviewer_api_key_env,
+            )
+        )
+    except AdapterConfigError as error:
+        print(f"Reviewer adapter configuration error: {error}")
         return 2
-    if args.reviewer_mode == "multi" and provider is None:
+    if args.reviewer_mode == "multi" and adapter_factory is None:
         print("--reviewer-mode multi requires --reviewer-provider fake or openai-compatible")
         return 2
 
@@ -176,7 +148,7 @@ def _run_review(args: argparse.Namespace) -> int:
     multi_reviewer_summary = None
     reconciliation_summary = None
     completion_summary = None
-    if provider is not None and assignments:
+    if adapter_factory is not None and assignments:
         gateway = ToolGateway(
             repository_path=repo,
             base_revision=args.base,
@@ -190,7 +162,7 @@ def _run_review(args: argparse.Namespace) -> int:
             loop_runs = []
             if args.reviewer_loop == "single-shot":
                 multi_run = run_multi_reviewer(
-                    provider=provider,
+                    adapter_factory=adapter_factory,
                     assignments=assignments,
                     intent=intent,
                     diff_excerpt=change_summary.diff_excerpt,
@@ -199,11 +171,10 @@ def _run_review(args: argparse.Namespace) -> int:
                 )
             else:
                 executions = []
-                agent_loop_path = change_summary.changed_files[0] if change_summary.changed_files else "."
                 for index, assignment in enumerate(assignments):
                     trace_id = f"{review_id}-reviewer-{index}"
                     loop_run = run_reviewer_agent_loop(
-                        adapter=_fake_agent_loop_adapter(agent_loop_path),
+                        adapter=adapter_factory.create(),
                         gateway=gateway,
                         assignment=assignment,
                         intent=intent,
@@ -271,7 +242,7 @@ def _run_review(args: argparse.Namespace) -> int:
         else:
             if args.reviewer_loop == "single-shot":
                 reviewer_run = run_single_reviewer(
-                    provider=provider,
+                    adapter=adapter_factory.create(),
                     assignment=assignments[0],
                     intent=intent,
                     diff_excerpt=change_summary.diff_excerpt,
@@ -291,9 +262,8 @@ def _run_review(args: argparse.Namespace) -> int:
                 )
                 store.write_json("reviewer_result.json", reviewer_result_to_dict(reviewer_run.result))
             else:
-                agent_loop_path = change_summary.changed_files[0] if change_summary.changed_files else "."
                 loop_run = run_reviewer_agent_loop(
-                    adapter=_fake_agent_loop_adapter(agent_loop_path),
+                    adapter=adapter_factory.create(),
                     gateway=gateway,
                     assignment=assignments[0],
                     intent=intent,
