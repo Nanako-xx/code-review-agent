@@ -36,7 +36,7 @@ from review_agent.repository_intelligence import (
 from review_agent.reporting import render_markdown_report
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
 from review_agent.reviewer import reviewer_result_to_dict, run_single_reviewer
-from review_agent.run_state import RunPhase, advance_run_state, initial_run_state
+from review_agent.run_state import RunPhase, RunState, advance_run_state, fail_run_state, initial_run_state
 from review_agent.runtime import build_assignments
 from review_agent.tool_gateway import ToolGateway
 
@@ -88,7 +88,28 @@ def _run_review(args: argparse.Namespace) -> int:
         user_intent=args.intent,
         review_focus=args.focus,
     )
-    change_summary = collect_change_summary(repo, args.base, args.head)
+    store = CheckpointStore(repo, review_id)
+    state = initial_run_state(
+        review_id=review_id,
+        repository_path=str(repo),
+        base_revision=args.base,
+        head_revision=args.head,
+    )
+    store.write_state(state)
+    store.write_json("request.json", asdict(request))
+    state = advance_run_state(
+        state,
+        phase=RunPhase.CREATED,
+        message="Request checkpointed",
+        artifacts={"request": "request.json"},
+    )
+    store.write_state(state)
+    try:
+        change_summary = collect_change_summary(repo, args.base, args.head)
+    except Exception as error:
+        _record_failed_review_state(store, state, message="Review failed", error=f"{type(error).__name__}: {error}")
+        print(f"Review failed: {error}", file=sys.stderr)
+        return 1
     intent = build_intent_packet(request, change_summary)
 
     gates = detect_quality_gates(repo)
@@ -121,19 +142,24 @@ def _run_review(args: argparse.Namespace) -> int:
         )
     except AdapterConfigError as error:
         print(f"Reviewer adapter configuration error: {error}")
+        _record_failed_review_state(
+            store,
+            state,
+            message="Review failed before reviewer execution",
+            error=f"{type(error).__name__}: {error}",
+        )
         return 2
     if args.reviewer_mode == "multi" and adapter_factory is None:
-        print("--reviewer-mode multi requires --reviewer-provider fake or openai-compatible")
+        error_message = "--reviewer-mode multi requires --reviewer-provider fake or openai-compatible"
+        print(error_message)
+        _record_failed_review_state(
+            store,
+            state,
+            message="Review failed before reviewer execution",
+            error=error_message,
+        )
         return 2
 
-    store = CheckpointStore(repo, review_id)
-    state = initial_run_state(
-        review_id=review_id,
-        repository_path=str(repo),
-        base_revision=args.base,
-        head_revision=args.head,
-    )
-    store.write_state(state)
     observation_store = ObservationStore(store.run_dir)
     repository_intelligence = build_repository_intelligence(
         repo=repo,
@@ -142,7 +168,6 @@ def _run_review(args: argparse.Namespace) -> int:
         changed_files=change_summary.changed_files,
     )
     repository_intelligence_summary = summarize_repository_intelligence(repository_intelligence)
-    store.write_json("request.json", asdict(request))
     store.write_json("intent.json", asdict(intent))
     store.write_json("risk_packet.json", asdict(risk_packet))
     store.write_json("risk.json", asdict(risk_assessment))
@@ -445,6 +470,10 @@ def _run_resume(args: argparse.Namespace) -> int:
             print(f"    - {error}")
 
     return 0
+
+
+def _record_failed_review_state(store: CheckpointStore, state: RunState, *, message: str, error: str) -> None:
+    store.write_state(fail_run_state(state, message=message, error=error))
 
 
 def _print_preflight_summary(

@@ -163,6 +163,41 @@ def test_cli_openai_compatible_adapter_requires_api_key(git_repo: Path, monkeypa
     assert "Reviewer adapter configuration error" in capsys.readouterr().out
 
 
+def test_cli_review_records_failed_state_when_collection_fails(git_repo: Path, monkeypatch, capsys):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "auth.py").write_text("def check(token):\n    return token == 'ok'\n", encoding="utf-8")
+    run_git(git_repo, "add", "auth.py")
+    run_git(git_repo, "commit", "-m", "add auth check")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    def raise_error(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("review_agent.cli.collect_change_summary", raise_error)
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--non-interactive",
+        ]
+    )
+
+    run_dirs = sorted((git_repo / ".review-agent" / "runs").iterdir())
+    state = json.loads((run_dirs[-1] / "state.json").read_text(encoding="utf-8"))
+
+    assert exit_code == 1
+    assert state["status"] == "failed"
+    assert state["phase"] == "failed"
+    assert "RuntimeError: boom" in state["errors"]
+    assert "Review failed" in capsys.readouterr().err
+
+
 def test_cli_agent_loop_openai_compatible_uses_adapter_factory(git_repo: Path, monkeypatch):
     from review_agent.model_adapter import FakeToolCallingAdapter
     from review_agent.model_protocol import ModelResponseKind, ModelToolCall, ModelTurnResponse
@@ -277,7 +312,11 @@ def test_cli_multi_reviewer_mode_requires_reviewer_provider(git_repo: Path, caps
 
     assert exit_code == 2
     assert "--reviewer-mode multi requires --reviewer-provider" in capsys.readouterr().out
-    assert not (git_repo / ".review-agent").exists()
+    run_dirs = sorted((git_repo / ".review-agent" / "runs").iterdir())
+    state = json.loads((run_dirs[-1] / "state.json").read_text(encoding="utf-8"))
+    assert state["status"] == "failed"
+    assert state["phase"] == "failed"
+    assert "--reviewer-mode multi requires --reviewer-provider" in state["errors"][0]
 
 
 def test_cli_fake_reviewer_writes_observation_store_artifacts(git_repo: Path):
