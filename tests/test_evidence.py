@@ -1,7 +1,7 @@
 from review_agent.evidence import reconcile_evidence, reconciliation_to_dict
+from review_agent.model_protocol import ModelResponse
 from review_agent.models import ReviewerFinding, ReviewerResult, ReviewerResultStatus
 from review_agent.orchestrator import ReviewerExecution
-from review_agent.provider import ModelResponse
 from tests.test_orchestrator import make_assignment
 
 

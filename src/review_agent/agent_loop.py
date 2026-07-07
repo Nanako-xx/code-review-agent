@@ -6,6 +6,7 @@ from typing import Any
 from review_agent.context import build_reviewer_envelope
 from review_agent.model_adapter import ModelAdapter
 from review_agent.model_protocol import (
+    ModelResponse,
     ModelResponseKind,
     ModelToolCall,
     ModelToolResult,
@@ -20,7 +21,6 @@ from review_agent.models import (
     ReviewerResult,
     ReviewerResultStatus,
 )
-from review_agent.provider import ModelResponse
 from review_agent.reviewer import ReviewerResultParseError, parse_reviewer_result, reviewer_result_to_dict
 from review_agent.tool_gateway import ToolGateway, ToolGatewayError
 

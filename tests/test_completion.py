@@ -1,8 +1,8 @@
 from review_agent.completion import check_completion, completion_to_dict
 from review_agent.evidence import ContractCoverage, EvidenceReconciliation
+from review_agent.model_protocol import ModelResponse
 from review_agent.models import IntentPacket, IntentSource, IntentStatus, ReviewerResult, ReviewerResultStatus
 from review_agent.orchestrator import ReviewerExecution
-from review_agent.provider import ModelResponse
 from tests.test_orchestrator import make_assignment
 
 

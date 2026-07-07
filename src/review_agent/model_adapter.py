@@ -84,9 +84,14 @@ class OpenAICompatibleToolAdapter:
     def __init__(self, config: OpenAICompatibleConfig, transport: Transport | None = None) -> None:
         self._config = config
         self._transport = transport or _urllib_transport
+        self._assistant_tool_call_messages: list[dict[str, Any]] = []
 
     def complete_turn(self, request: ModelTurnRequest) -> ModelTurnResponse:
-        payload = _build_openai_tool_payload(self._config.model, request)
+        payload = _build_openai_tool_payload(
+            self._config.model,
+            request,
+            self._assistant_tool_call_messages,
+        )
         headers = {
             "Authorization": f"Bearer {self._config.api_key}",
             "Content-Type": "application/json",
@@ -94,6 +99,13 @@ class OpenAICompatibleToolAdapter:
         url = f"{self._config.base_url.rstrip('/')}/chat/completions"
         try:
             raw = self._transport(url, headers, payload, self._config.timeout_seconds)
+        except json.JSONDecodeError as error:
+            return ModelTurnResponse(
+                kind=ModelResponseKind.INVALID,
+                error=f"provider response was not valid JSON: {error}",
+                provider_name=self.provider_name,
+                model=self._config.model,
+            )
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             return ModelTurnResponse(
                 kind=ModelResponseKind.INVALID,
@@ -101,13 +113,26 @@ class OpenAICompatibleToolAdapter:
                 provider_name=self.provider_name,
                 model=self._config.model,
             )
-        return _parse_openai_tool_response(raw, self.provider_name, self._config.model)
+        response = _parse_openai_tool_response(raw, self.provider_name, self._config.model)
+        if response.kind is ModelResponseKind.TOOL_CALLS:
+            self._assistant_tool_call_messages.append(_assistant_tool_call_message(response.tool_calls))
+        return response
 
 
-def _build_openai_tool_payload(model: str, request: ModelTurnRequest) -> dict[str, Any]:
+def _build_openai_tool_payload(
+    model: str,
+    request: ModelTurnRequest,
+    assistant_tool_call_messages: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     messages = [{"role": "system", "content": request.system}]
     messages.extend(request.messages)
-    messages.extend(_tool_result_message(result) for result in request.tool_results)
+    if request.tool_results:
+        messages.extend(
+            _assistant_and_tool_result_messages(
+                request.tool_results,
+                assistant_tool_call_messages or [],
+            )
+        )
     return {
         "model": model,
         "messages": messages,
@@ -137,7 +162,63 @@ def _tool_result_message(result: ModelToolResult) -> dict[str, Any]:
     }
 
 
+def _assistant_tool_call_message(tool_calls: list[ModelToolCall]) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": call.call_id,
+                "type": "function",
+                "function": {
+                    "name": call.tool_name,
+                    "arguments": json.dumps(call.arguments),
+                },
+            }
+            for call in tool_calls
+        ],
+    }
+
+
+def _assistant_and_tool_result_messages(
+    tool_results: list[ModelToolResult],
+    assistant_tool_call_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    results_by_call_id = {result.call_id: result for result in tool_results}
+    matched_call_ids: set[str] = set()
+    messages: list[dict[str, Any]] = []
+
+    for assistant_message in assistant_tool_call_messages:
+        tool_calls = assistant_message.get("tool_calls", [])
+        matching_call_ids = [tool_call.get("id") for tool_call in tool_calls if tool_call.get("id") in results_by_call_id]
+        if not matching_call_ids:
+            continue
+
+        messages.append(assistant_message)
+        for call_id in matching_call_ids:
+            if call_id is None:
+                continue
+            messages.append(_tool_result_message(results_by_call_id[call_id]))
+            matched_call_ids.add(call_id)
+
+    messages.extend(
+        _tool_result_message(result)
+        for result in tool_results
+        if result.call_id not in matched_call_ids
+    )
+    return messages
+
+
 def _parse_openai_tool_response(raw: dict[str, Any], provider_name: str, model: str) -> ModelTurnResponse:
+    if not isinstance(raw, dict):
+        return ModelTurnResponse(
+            kind=ModelResponseKind.INVALID,
+            error="provider response must be an object",
+            raw={"raw": raw},
+            provider_name=provider_name,
+            model=model,
+        )
+
     try:
         message = raw["choices"][0]["message"]
     except (KeyError, IndexError, TypeError) as error:
@@ -149,7 +230,24 @@ def _parse_openai_tool_response(raw: dict[str, Any], provider_name: str, model: 
             model=model,
         )
 
+    if not isinstance(message, dict):
+        return ModelTurnResponse(
+            kind=ModelResponseKind.INVALID,
+            error="provider response message must be an object",
+            raw=raw,
+            provider_name=provider_name,
+            model=model,
+        )
+
     tool_calls = message.get("tool_calls") or []
+    if not isinstance(tool_calls, list):
+        return ModelTurnResponse(
+            kind=ModelResponseKind.INVALID,
+            error="provider response tool_calls must be a list",
+            raw=raw,
+            provider_name=provider_name,
+            model=model,
+        )
     if tool_calls:
         parsed_calls = []
         for tool_call in tool_calls:
@@ -180,12 +278,24 @@ def _parse_openai_tool_response(raw: dict[str, Any], provider_name: str, model: 
     )
 
 
-def _parse_openai_tool_call(tool_call: dict[str, Any]) -> ModelToolCall | ModelTurnResponse:
+def _parse_openai_tool_call(tool_call: object) -> ModelToolCall | ModelTurnResponse:
+    if not isinstance(tool_call, dict):
+        return ModelTurnResponse(kind=ModelResponseKind.INVALID, error="tool call must be an object")
+
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        return ModelTurnResponse(kind=ModelResponseKind.INVALID, error="tool call function must be an object")
+
+    arguments_text = function.get("arguments", "{}")
+    if not isinstance(arguments_text, str):
+        return ModelTurnResponse(
+            kind=ModelResponseKind.INVALID,
+            error="tool call function arguments must be a JSON string",
+        )
+
     try:
-        function = tool_call["function"]
-        arguments_text = function.get("arguments", "{}")
         arguments = json.loads(arguments_text)
-    except (KeyError, TypeError, json.JSONDecodeError) as error:
+    except json.JSONDecodeError as error:
         return ModelTurnResponse(kind=ModelResponseKind.INVALID, error=f"invalid tool call arguments: {error}")
     if not isinstance(arguments, dict):
         return ModelTurnResponse(kind=ModelResponseKind.INVALID, error="tool call arguments must be a JSON object")
