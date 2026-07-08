@@ -37,6 +37,7 @@ def test_cli_resume_prints_completed_run_summary(git_repo: Path, capsys) -> None
     assert f"Review ID: {run_id}" in output
     assert "Status: completed" in output
     assert "Phase: completed" in output
+    assert "final_risk.json (present)" in output
     assert "report.md (present)" in output
     assert "review_brief.json (present)" in output
 

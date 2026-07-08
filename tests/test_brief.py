@@ -71,6 +71,16 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
         "uncertainties": ["Intent Packet partial"],
         "missing_perspectives": [],
     }
+    final_risk = {
+        "status": "reassessed",
+        "initial_level": "high",
+        "level": "critical",
+        "reasons": ["verified critical finding: data loss"],
+        "escalations": ["verified critical finding: data loss"],
+        "deescalations": [],
+        "uncertainties": [],
+        "signal_refs": ["finding:data-loss"],
+    }
 
     brief = build_review_brief(
         review_id="review-1",
@@ -91,6 +101,7 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
         repository_intelligence_summary="Repository Intelligence\n- modified function check auth.py:1-2",
         reconciliation_payload=reconciliation_payload,
         completion_summary=completion_summary,
+        final_risk_assessment=final_risk,
     )
 
     payload = review_brief_to_dict(brief)
@@ -99,7 +110,8 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
     assert payload["change_intent"]["goal"] == "Add auth token check"
     assert payload["intent_assessment"]["status"] == "partial"
     assert payload["initial_and_final_risk_assessment"]["initial"]["level"] == "high"
-    assert payload["initial_and_final_risk_assessment"]["final"]["status"] == "not_reassessed"
+    assert payload["initial_and_final_risk_assessment"]["final"]["status"] == "reassessed"
+    assert payload["initial_and_final_risk_assessment"]["final"]["level"] == "critical"
     assert payload["quality_gates"][0]["name"] == "python_compile"
     assert payload["change_map_and_repository_impact"]["changed_files"] == ["auth.py"]
     assert payload["verified_findings"][0]["claim"] == "Bad token path is not covered"

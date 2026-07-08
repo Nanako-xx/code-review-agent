@@ -62,6 +62,7 @@ def build_review_brief(
     multi_reviewer_summary: dict[str, object] | None = None,
     reconciliation_payload: dict[str, Any] | None = None,
     completion_summary: dict[str, Any] | None = None,
+    final_risk_assessment: dict[str, Any] | None = None,
 ) -> ReviewBrief:
     observations = observation_summaries or {}
     reconciliation = reconciliation_payload or {}
@@ -88,7 +89,8 @@ def build_review_brief(
         },
         initial_and_final_risk_assessment={
             "initial": _risk_to_dict(risk_assessment),
-            "final": {
+            "final": final_risk_assessment
+            or {
                 "status": "not_reassessed",
                 "level": risk_assessment.level.value,
                 "reasons": ["Final risk reassessment has not run in the local M1 path."],

@@ -20,6 +20,7 @@ class RunPhase(str, Enum):
     REVIEWERS = "reviewers"
     RECONCILIATION = "reconciliation"
     COMPLETION = "completion"
+    FINAL_RISK = "final_risk"
     REPORTING = "reporting"
     COMPLETED = "completed"
     FAILED = "failed"
