@@ -213,3 +213,32 @@ def test_completion_with_uncertainties_when_non_core_contract_coverage_is_partia
     assert result.status == "completed_with_uncertainties"
     assert result.recommendation == "manual_review"
     assert "Adversarial Reviewer incomplete contract coverage: regression_safety" in result.uncertainties
+
+
+def test_completion_blocks_when_final_risk_is_required_but_missing():
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED)],
+        reconciliation=reconciliation_with_coverage(coverage(0, "Core Reviewer")),
+        require_final_risk=True,
+    )
+
+    assert result.status == "blocked"
+    assert result.recommendation == "manual_review"
+    assert "Final risk reassessment not completed" in result.blockers
+
+
+def test_completion_requires_manual_review_when_final_risk_is_high():
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED)],
+        reconciliation=reconciliation_with_coverage(coverage(0, "Core Reviewer")),
+        require_final_risk=True,
+        final_risk_level="high",
+    )
+
+    assert result.status == "completed_with_uncertainties"
+    assert result.recommendation == "manual_review"
+    assert "Final risk is high" in result.uncertainties

@@ -22,6 +22,9 @@ def check_completion(
     quality_results: list[QualityGateResult],
     executions: list[ReviewerExecution],
     reconciliation: EvidenceReconciliation,
+    *,
+    require_final_risk: bool = False,
+    final_risk_level: str | None = None,
 ) -> CompletionResult:
     blockers: list[str] = []
     uncertainties: list[str] = []
@@ -71,6 +74,12 @@ def check_completion(
 
     if reconciliation.remaining_disagreements:
         uncertainties.append("reviewer disagreements remain unresolved")
+
+    if require_final_risk and final_risk_level is None:
+        blockers.append("Final risk reassessment not completed")
+
+    if final_risk_level in {"high", "critical"}:
+        uncertainties.append(f"Final risk is {final_risk_level}")
 
     if blockers:
         return CompletionResult(
