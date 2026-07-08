@@ -11,6 +11,7 @@ from review_agent.brief import build_review_brief, review_brief_to_dict
 from review_agent.checkpoint import CheckpointStore
 from review_agent.completion import check_completion, completion_to_dict
 from review_agent.evidence import reconcile_evidence, reconciliation_to_dict
+from review_agent.final_risk import final_risk_to_dict, reassess_final_risk
 from review_agent.git_repo import ChangeSummary, collect_change_summary
 from review_agent.intent import build_intent_packet
 from review_agent.model_adapter_factory import (
@@ -223,6 +224,8 @@ def _run_review(args: argparse.Namespace) -> int:
     reconciliation_summary = None
     completion_payload = None
     completion_summary = None
+    completion_executions: list[ReviewerExecution] | None = None
+    completion_reconciliation = None
     if adapter_factory is not None and assignments:
         gateway = ToolGateway(
             repository_path=repo,
@@ -301,6 +304,8 @@ def _run_review(args: argparse.Namespace) -> int:
                 "rejected_count": len(reconciliation.rejected_findings),
                 "evidence_quality": reconciliation.evidence_quality,
             }
+            completion_executions = multi_run.executions
+            completion_reconciliation = reconciliation
             completion = check_completion(
                 intent=intent,
                 quality_results=quality_results,
@@ -404,6 +409,43 @@ def _run_review(args: argparse.Namespace) -> int:
                 )
                 store.write_state(state)
 
+    final_risk = reassess_final_risk(
+        initial_risk=risk_assessment,
+        intent_packet=intent,
+        quality_results=quality_results,
+        reviewer_result=reviewer_result,
+        reconciliation_payload=reconciliation_payload,
+        completion_summary=completion_payload,
+    )
+    final_risk_payload = final_risk_to_dict(final_risk)
+    if completion_executions is not None and completion_reconciliation is not None:
+        completion = check_completion(
+            intent=intent,
+            quality_results=quality_results,
+            executions=completion_executions,
+            reconciliation=completion_reconciliation,
+            require_final_risk=True,
+            final_risk_level=final_risk.level.value,
+        )
+        completion_payload = completion_to_dict(completion)
+        store.write_json("completion.json", completion_payload)
+        state = advance_run_state(
+            state,
+            phase=RunPhase.COMPLETION,
+            message="Completion check updated with final risk",
+            artifacts={"completion": "completion.json"},
+        )
+        store.write_state(state)
+        completion_summary = completion_payload
+    store.write_json("final_risk.json", final_risk_payload)
+    state = advance_run_state(
+        state,
+        phase=RunPhase.FINAL_RISK,
+        message="Final risk reassessment completed",
+        artifacts={"final_risk": "final_risk.json"},
+    )
+    store.write_state(state)
+
     brief = build_review_brief(
         review_id=review_id,
         base_revision=args.base,
@@ -418,6 +460,7 @@ def _run_review(args: argparse.Namespace) -> int:
         multi_reviewer_summary=multi_reviewer_summary,
         reconciliation_payload=reconciliation_payload,
         completion_summary=completion_payload,
+        final_risk_assessment=final_risk_payload,
     )
     store.write_json("review_brief.json", review_brief_to_dict(brief))
     report = render_review_brief_markdown(brief)
@@ -426,11 +469,12 @@ def _run_review(args: argparse.Namespace) -> int:
         state,
         phase=RunPhase.COMPLETED,
         message="Review completed",
-        artifacts={"report": "report.md", "review_brief": "review_brief.json"},
+        artifacts={"report": "report.md", "review_brief": "review_brief.json", "final_risk": "final_risk.json"},
     )
     store.write_state(state)
 
     print(f"Review foundation completed: {store.run_dir}")
+    print(f"Final risk: {final_risk.level.value}")
     print(f"Review brief: {store.run_dir / 'report.md'}")
     print(f"Review brief JSON: {store.run_dir / 'review_brief.json'}")
     print(f"Recommendation: {brief.non_binding_recommendation}")

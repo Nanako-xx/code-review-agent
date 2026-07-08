@@ -77,12 +77,14 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, capsys):
     run_dirs = sorted((git_repo / ".review-agent" / "runs").iterdir())
     state = json.loads((run_dirs[-1] / "state.json").read_text(encoding="utf-8"))
     brief = json.loads((run_dirs[-1] / "review_brief.json").read_text(encoding="utf-8"))
+    final_risk = json.loads((run_dirs[-1] / "final_risk.json").read_text(encoding="utf-8"))
 
     assert exit_code == 0
     assert "Preflight" in output
     assert "Changed files: 1" in output
     assert "Intent status:" in output
     assert "Run directory:" in output
+    assert "Final risk:" in output
     assert "Review brief:" in output
     assert "Review brief JSON:" in output
     assert "Recommendation:" in output
@@ -92,8 +94,11 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, capsys):
     assert state["artifacts"]["repository_intelligence"] == "repository_intelligence.json"
     assert state["artifacts"]["report"] == "report.md"
     assert state["artifacts"]["review_brief"] == "review_brief.json"
+    assert state["artifacts"]["final_risk"] == "final_risk.json"
+    assert final_risk["status"] == "reassessed"
     assert brief["review_id"] == run_dirs[-1].name
     assert brief["change_map_and_repository_impact"]["changed_files"] == ["auth.py"]
+    assert brief["initial_and_final_risk_assessment"]["final"]["status"] == "reassessed"
     assert brief["non_binding_recommendation"] == "manual_review"
 
 
