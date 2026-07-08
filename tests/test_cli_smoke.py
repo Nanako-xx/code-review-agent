@@ -76,17 +76,25 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, capsys):
     output = capsys.readouterr().out
     run_dirs = sorted((git_repo / ".review-agent" / "runs").iterdir())
     state = json.loads((run_dirs[-1] / "state.json").read_text(encoding="utf-8"))
+    brief = json.loads((run_dirs[-1] / "review_brief.json").read_text(encoding="utf-8"))
 
     assert exit_code == 0
     assert "Preflight" in output
     assert "Changed files: 1" in output
     assert "Intent status:" in output
     assert "Run directory:" in output
+    assert "Review brief:" in output
+    assert "Review brief JSON:" in output
+    assert "Recommendation:" in output
     assert state["status"] == "completed"
     assert state["phase"] == "completed"
     assert state["artifacts"]["request"] == "request.json"
     assert state["artifacts"]["repository_intelligence"] == "repository_intelligence.json"
     assert state["artifacts"]["report"] == "report.md"
+    assert state["artifacts"]["review_brief"] == "review_brief.json"
+    assert brief["review_id"] == run_dirs[-1].name
+    assert brief["change_map_and_repository_impact"]["changed_files"] == ["auth.py"]
+    assert brief["non_binding_recommendation"] == "manual_review"
 
 
 def test_cli_review_with_fake_reviewer_writes_reviewer_artifacts(git_repo: Path):
@@ -128,7 +136,7 @@ def test_cli_review_with_fake_reviewer_writes_reviewer_artifacts(git_repo: Path)
 
     assert result["status"] == "partial"
     assert raw["provider_name"] == "fake"
-    assert "## Single Reviewer Result" in report
+    assert "## Uncertainties" in report
     assert "Fake reviewer executed." in report
 
 
@@ -355,7 +363,7 @@ def test_cli_fake_reviewer_writes_observation_store_artifacts(git_repo: Path):
 
     envelope = json.loads((run_dir / "reviewer_envelope.json").read_text(encoding="utf-8"))
     assert compare_record["observation_id"] in envelope["messages"][0]["content"]
-    assert "## Observations" in (run_dir / "report.md").read_text(encoding="utf-8")
+    assert "## Verification Evidence" in (run_dir / "report.md").read_text(encoding="utf-8")
 
 
 def test_cli_writes_repository_intelligence_artifacts(git_repo: Path):
@@ -391,7 +399,8 @@ def test_cli_writes_repository_intelligence_artifacts(git_repo: Path):
 
     assert payload["changed_symbols"][0]["qualified_name"] == "add"
     assert any(record["source"] == "repo_intelligence.snapshot" for record in observation_records)
-    assert "## Repository Intelligence" in report
+    assert "## Change Map And Repository Impact" in report
+    assert "Repository intelligence:" in report
     assert "modified function add app.py:1-2" in report
     assert "Repository Intelligence" in envelope["messages"][0]["content"]
 
@@ -443,9 +452,10 @@ def test_cli_multi_reviewer_mode_writes_per_reviewer_artifacts(git_repo: Path):
     assert (run_dir / "reviewer_1_raw_response.json").exists()
     assert (run_dir / "reviewer_0_result.json").exists()
     assert (run_dir / "reviewer_1_result.json").exists()
-    assert "## Multi-Reviewer Summary" in report
-    assert "## Evidence Reconciliation" in report
-    assert "## Completion Status" in report
+    assert "## Change Map And Repository Impact" in report
+    assert "reviewer_count:" in report
+    assert "## Review Contract Coverage" in report
+    assert "## Non-Binding Recommendation" in report
 
 
 def test_cli_agent_loop_fake_reviewer_writes_trace_artifact(git_repo: Path):

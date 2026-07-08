@@ -38,6 +38,7 @@ def test_cli_resume_prints_completed_run_summary(git_repo: Path, capsys) -> None
     assert "Status: completed" in output
     assert "Phase: completed" in output
     assert "report.md (present)" in output
+    assert "review_brief.json (present)" in output
 
 
 def test_cli_resume_missing_run_returns_usage_error(tmp_path: Path, capsys) -> None:
