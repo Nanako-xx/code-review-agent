@@ -99,7 +99,7 @@ def build_review_brief(
             "changed_files": list(changed_files),
             "repository_intelligence_summary": repository_intelligence_summary or "",
             "observation_count": len(observations),
-            "reviewer_summary": dict(multi_reviewer_summary or {}),
+            "reviewer_summary": _reviewer_summary(multi_reviewer_summary, reviewer_result),
         },
         verified_findings=verified_findings,
         rejected_hypotheses=rejected_hypotheses,
@@ -223,6 +223,21 @@ def _verification_evidence(
         for observation_id, summary in observations.items()
     )
     return evidence
+
+
+def _reviewer_summary(
+    multi_reviewer_summary: dict[str, object] | None,
+    reviewer_result: ReviewerResult | None,
+) -> dict[str, object]:
+    if multi_reviewer_summary:
+        return dict(multi_reviewer_summary)
+    if reviewer_result is None:
+        return {}
+    return {
+        "reviewer_count": 1,
+        "status_counts": {reviewer_result.status.value: 1},
+        "single_reviewer_summary": reviewer_result.investigation_summary,
+    }
 
 
 def _human_review_checklist(

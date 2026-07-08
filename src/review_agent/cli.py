@@ -7,6 +7,7 @@ import sys
 import uuid
 
 from review_agent.agent_loop import agent_loop_run_to_dict, run_reviewer_agent_loop
+from review_agent.brief import build_review_brief, review_brief_to_dict
 from review_agent.checkpoint import CheckpointStore
 from review_agent.completion import check_completion, completion_to_dict
 from review_agent.evidence import reconcile_evidence, reconciliation_to_dict
@@ -33,7 +34,7 @@ from review_agent.repository_intelligence import (
     repository_intelligence_to_dict,
     summarize_repository_intelligence,
 )
-from review_agent.reporting import render_markdown_report
+from review_agent.reporting import render_review_brief_markdown
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
 from review_agent.reviewer import reviewer_result_to_dict, run_single_reviewer
 from review_agent.run_state import RunPhase, RunState, advance_run_state, fail_run_state, initial_run_state
@@ -218,7 +219,9 @@ def _run_review(args: argparse.Namespace) -> int:
 
     reviewer_result = None
     multi_reviewer_summary = None
+    reconciliation_payload = None
     reconciliation_summary = None
+    completion_payload = None
     completion_summary = None
     if adapter_factory is not None and assignments:
         gateway = ToolGateway(
@@ -401,29 +404,37 @@ def _run_review(args: argparse.Namespace) -> int:
                 )
                 store.write_state(state)
 
-    report = render_markdown_report(
+    brief = build_review_brief(
         review_id=review_id,
         base_revision=args.base,
         head_revision=args.head,
+        intent_packet=intent,
         risk_assessment=risk_assessment,
         changed_files=change_summary.changed_files,
+        quality_results=quality_results,
         reviewer_result=reviewer_result,
         observation_summaries=observation_store.summaries_by_id(),
         repository_intelligence_summary=repository_intelligence_summary,
         multi_reviewer_summary=multi_reviewer_summary,
-        reconciliation_summary=reconciliation_summary,
-        completion_summary=completion_summary,
+        reconciliation_payload=reconciliation_payload,
+        completion_summary=completion_payload,
     )
+    store.write_json("review_brief.json", review_brief_to_dict(brief))
+    report = render_review_brief_markdown(brief)
     (store.run_dir / "report.md").write_text(report, encoding="utf-8")
     state = advance_run_state(
         state,
         phase=RunPhase.COMPLETED,
         message="Review completed",
-        artifacts={"report": "report.md"},
+        artifacts={"report": "report.md", "review_brief": "review_brief.json"},
     )
     store.write_state(state)
 
     print(f"Review foundation completed: {store.run_dir}")
+    print(f"Review brief: {store.run_dir / 'report.md'}")
+    print(f"Review brief JSON: {store.run_dir / 'review_brief.json'}")
+    print(f"Recommendation: {brief.non_binding_recommendation}")
+    print(f"Remaining uncertainties: {len(brief.uncertainties)}")
     return 0
 
 
