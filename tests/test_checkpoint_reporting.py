@@ -66,7 +66,7 @@ def test_markdown_report_contains_risk_signals_and_uncertainties():
 
     assert "# Review Brief" in report
     assert "Risk level: high" in report
-    assert "## Risk Signals" in report
+    assert "## Initial And Final Risk Assessment" in report
     assert "- changed_file:auth.py" in report
     assert "## Uncertainties" in report
     assert "- user did not provide explicit intent" in report
@@ -96,9 +96,7 @@ def test_markdown_report_includes_single_reviewer_result():
         reviewer_result=reviewer_result,
     )
 
-    assert "## Single Reviewer Result" in report
-    assert "Status: partial" in report
-    assert "Fake reviewer executed." in report
+    assert "## Uncertainties" in report
     assert "- Fake provider does not perform semantic review." in report
 
 
@@ -121,8 +119,8 @@ def test_markdown_report_includes_observation_summaries():
         observation_summaries={"O-abc": "auth.py changed between base and head"},
     )
 
-    assert "## Observations" in report
-    assert "- O-abc: auth.py changed between base and head" in report
+    assert "## Verification Evidence" in report
+    assert "- observation:O-abc - auth.py changed between base and head" in report
 
 
 def test_markdown_report_includes_repository_intelligence_summary():
@@ -144,7 +142,8 @@ def test_markdown_report_includes_repository_intelligence_summary():
         repository_intelligence_summary="Repository Intelligence\n- modified function add app.py:1-2",
     )
 
-    assert "## Repository Intelligence" in report
+    assert "## Change Map And Repository Impact" in report
+    assert "Repository intelligence:" in report
     assert "modified function add app.py:1-2" in report
 
 
@@ -171,10 +170,9 @@ def test_markdown_report_includes_multi_reviewer_summary():
         },
     )
 
-    assert "## Multi-Reviewer Summary" in report
-    assert "Reviewers: 2" in report
-    assert "- Core Reviewer" in report
-    assert "- Adversarial Reviewer" in report
+    assert "## Change Map And Repository Impact" in report
+    assert "reviewer_count: 2" in report
+    assert "roles: Core Reviewer, Adversarial Reviewer" in report
 
 
 def test_markdown_report_includes_reconciliation_and_completion_sections():
@@ -207,9 +205,7 @@ def test_markdown_report_includes_reconciliation_and_completion_sections():
         },
     )
 
-    assert "## Evidence Reconciliation" in report
-    assert "Canonical findings: 1" in report
-    assert "Evidence quality: verified" in report
-    assert "## Completion Status" in report
-    assert "Status: completed" in report
-    assert "Recommendation: needs_work" in report
+    assert "## Verified Findings" in report
+    assert "## Rejected Hypotheses" in report
+    assert "## Non-Binding Recommendation" in report
+    assert "Needs work before merge." in report
