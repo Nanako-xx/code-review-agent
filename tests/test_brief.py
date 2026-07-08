@@ -7,6 +7,7 @@ from review_agent.models import (
     RiskAssessment,
     RiskLevel,
 )
+from review_agent.reporting import render_review_brief_markdown
 
 
 def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> None:
@@ -107,3 +108,47 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
     assert payload["review_contract_coverage"][0]["contract"] == "Behavioral Correctness"
     assert payload["non_binding_recommendation"] == "manual_review"
     assert "auth.py" in payload["human_review_checklist_and_reading_order"][0]
+
+
+def test_render_review_brief_markdown_uses_spec_section_order() -> None:
+    intent = IntentPacket(goal="Add auth token check", status=IntentStatus.SUFFICIENT)
+    risk = RiskAssessment(
+        level=RiskLevel.MEDIUM,
+        dimensions={"impact": "auth path"},
+        reasons=["auth.py changed"],
+        signal_refs=["changed_file:auth.py"],
+        uncertainties=[],
+        suggested_focus=["test adequacy"],
+    )
+    brief = build_review_brief(
+        review_id="review-1",
+        base_revision="base",
+        head_revision="head",
+        intent_packet=intent,
+        risk_assessment=risk,
+        changed_files=["auth.py"],
+        quality_results=[],
+        completion_summary={"recommendation": "manual_review"},
+    )
+
+    markdown = render_review_brief_markdown(brief)
+
+    expected_sections = [
+        "## Change Intent",
+        "## Intent Assessment",
+        "## Initial And Final Risk Assessment",
+        "## Quality Gates",
+        "## Change Map And Repository Impact",
+        "## Verified Findings",
+        "## Rejected Hypotheses",
+        "## Uncertainties",
+        "## Reviewer Disagreements",
+        "## Review Contract Coverage",
+        "## Verification Evidence",
+        "## Human Review Checklist And Reading Order",
+        "## Non-Binding Recommendation",
+    ]
+    positions = [markdown.index(section) for section in expected_sections]
+    assert positions == sorted(positions)
+    assert "Risk level: medium" in markdown
+    assert "Manual review required before merge." in markdown
