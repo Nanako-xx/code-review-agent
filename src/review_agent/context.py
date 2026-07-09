@@ -127,13 +127,13 @@ def _assemble_sections(sections: list[ContextSection], budget: ContextBudget) ->
     compressed: list[str] = []
     omitted: list[str] = []
     rendered: list[str] = []
-    rendered_sections: list[tuple[str, int]] = []
+    rendered_sections: list[dict[str, object]] = []
 
     for index, section in enumerate(sections):
         candidate = section.content
         next_content = "\n\n".join([*rendered, candidate]) if rendered else candidate
         if len(next_content) <= budget.max_message_chars:
-            rendered_sections.append((section.name, _next_section_start(rendered)))
+            rendered_sections.append({"name": section.name, "start": _next_section_start(rendered), "compressed": False})
             rendered.append(candidate)
             included.append(section.name)
             continue
@@ -142,7 +142,7 @@ def _assemble_sections(sections: list[ContextSection], budget: ContextBudget) ->
         available = remaining - _future_section_reserve(sections[index + 1 :], budget)
         if section.required:
             compacted = _compact_text(candidate, max(available, budget.compacted_section_min_chars), section.name)
-            rendered_sections.append((section.name, _next_section_start(rendered)))
+            rendered_sections.append({"name": section.name, "start": _next_section_start(rendered), "compressed": True})
             rendered.append(compacted)
             included.append(section.name)
             compressed.append(section.name)
@@ -150,7 +150,7 @@ def _assemble_sections(sections: list[ContextSection], budget: ContextBudget) ->
 
         if available >= budget.compacted_section_min_chars:
             compacted = _compact_text(candidate, available, section.name)
-            rendered_sections.append((section.name, _next_section_start(rendered)))
+            rendered_sections.append({"name": section.name, "start": _next_section_start(rendered), "compressed": True})
             rendered.append(compacted)
             included.append(section.name)
             compressed.append(section.name)
@@ -163,20 +163,26 @@ def _assemble_sections(sections: list[ContextSection], budget: ContextBudget) ->
     if len(content) > budget.max_message_chars:
         content = _compact_text(content, budget.max_message_chars, "Context Payload")
         whole_payload_compacted = True
-        if "Context Payload" not in compressed:
-            compressed.append("Context Payload")
 
     if whole_payload_compacted:
-        marker = "\n[compacted Context Payload; full content retained in Session/Observation Store]"
+        marker = _compaction_marker("Context Payload")
         retained_prefix_len = (
             budget.max_message_chars - len(marker) if budget.max_message_chars > len(marker) else 0
         )
-        final_included = [
-            section_name for section_name, start_offset in rendered_sections if start_offset < retained_prefix_len
-        ]
+        final_included = []
+        final_compressed = []
+        for row in rendered_sections:
+            section_name = str(row["name"])
+            section_start = int(row["start"])
+            if section_start + len(section_name) <= retained_prefix_len:
+                final_included.append(section_name)
+                if row["compressed"]:
+                    final_compressed.append(section_name)
+        final_compressed.append("Context Payload")
         final_omitted = [section.name for section in sections if section.name not in final_included]
     else:
         final_included = included
+        final_compressed = compressed
         final_omitted = omitted
 
     metadata = {
@@ -185,7 +191,7 @@ def _assemble_sections(sections: list[ContextSection], budget: ContextBudget) ->
         "max_message_chars": budget.max_message_chars,
         "message_chars": len(content),
         "included_sections": final_included,
-        "compressed_sections": compressed,
+        "compressed_sections": final_compressed,
         "omitted_sections": final_omitted,
         "whole_payload_compacted": whole_payload_compacted,
     }
@@ -217,13 +223,17 @@ def _remaining_chars(rendered: list[str], max_chars: int) -> int:
 
 
 def _compact_text(text: str, max_chars: int, section_name: str) -> str:
-    marker = f"\n[compacted {section_name}; full content retained in Session/Observation Store]"
+    marker = _compaction_marker(section_name)
     if max_chars <= len(marker):
         return marker[-max_chars:]
     if len(text) <= max_chars:
         return text
     head = text[: max_chars - len(marker)].rstrip()
     return f"{head}{marker}"
+
+
+def _compaction_marker(section_name: str) -> str:
+    return f"\n[compacted {section_name}; full content retained in Session/Observation Store]"
 
 
 def _assignment_block(assignment: Assignment) -> str:
