@@ -189,6 +189,8 @@ def test_context_payload_metadata_marks_whole_payload_compaction():
     assert "Context Payload" in result.metadata["compressed_sections"]
     assert all(section in content for section in result.metadata["included_sections"])
     assert result.metadata["whole_payload_compacted"] is True
+    normal_compressed = set(result.metadata["compressed_sections"]) - {"Context Payload"}
+    assert normal_compressed.isdisjoint(result.metadata["omitted_sections"])
 
 
 def test_whole_payload_compaction_does_not_infer_sections_from_body_text():
@@ -214,3 +216,18 @@ def test_whole_payload_compaction_does_not_infer_sections_from_body_text():
 
     assert result.metadata["whole_payload_compacted"] is True
     assert "Completion Rules" not in result.metadata["included_sections"]
+
+
+def test_whole_payload_compaction_requires_full_section_header_for_inclusion():
+    result = build_reviewer_context_payload(
+        assignment=_context_assignment(),
+        intent=_context_intent(),
+        code_snippets={"app.py:1-20": "x = 1\n" * 200},
+        observations={"O-1": "observation\n" * 200},
+        context_budget=ContextBudget(max_message_chars=83, compacted_section_min_chars=80),
+    )
+
+    assert result.metadata["whole_payload_compacted"] is True
+    assert result.metadata["included_sections"] == []
+    assert "Assignment" in result.metadata["omitted_sections"]
+    assert result.metadata["message_chars"] <= result.metadata["max_message_chars"]
