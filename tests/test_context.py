@@ -1,3 +1,5 @@
+import pytest
+
 from review_agent.context import ContextBudget, build_reviewer_context_payload, build_reviewer_envelope
 from review_agent.models import Assignment, InitialContext, IntentPacket, IntentSource, IntentStatus
 
@@ -163,3 +165,27 @@ def test_context_budget_applies_to_messages_only_not_tools_or_parameters():
     assert result.metadata["message_chars"] <= 1200
     assert result.metadata["budget_scope"] == "messages_only"
     assert result.metadata["excluded_from_budget"] == ["system", "tools", "parameters"]
+
+
+def test_context_budget_rejects_invalid_limits():
+    with pytest.raises(ValueError, match="max_message_chars"):
+        ContextBudget(max_message_chars=0)
+    with pytest.raises(ValueError, match="compacted_section_min_chars"):
+        ContextBudget(compacted_section_min_chars=0)
+
+
+def test_context_payload_metadata_marks_whole_payload_compaction():
+    result = build_reviewer_context_payload(
+        assignment=_context_assignment(),
+        intent=_context_intent(),
+        code_snippets={"app.py:1-20": "x = 1\n" * 200},
+        observations={"O-1": "observation\n" * 200},
+        context_budget=ContextBudget(max_message_chars=300, compacted_section_min_chars=80),
+    )
+
+    content = result.messages[0]["content"]
+
+    assert result.metadata["message_chars"] <= 300
+    assert "Context Payload" in result.metadata["compressed_sections"]
+    assert all(section in content for section in result.metadata["included_sections"])
+    assert result.metadata["whole_payload_compacted"] is True

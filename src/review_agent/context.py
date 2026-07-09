@@ -22,6 +22,12 @@ class ContextBudget:
     max_message_chars: int = 16000
     compacted_section_min_chars: int = 180
 
+    def __post_init__(self) -> None:
+        if self.max_message_chars <= 0:
+            raise ValueError("max_message_chars must be positive")
+        if self.compacted_section_min_chars <= 0:
+            raise ValueError("compacted_section_min_chars must be positive")
+
 
 @dataclass(frozen=True)
 class ContextAssemblyResult:
@@ -149,19 +155,29 @@ def _assemble_sections(sections: list[ContextSection], budget: ContextBudget) ->
         omitted.append(section.name)
 
     content = "\n\n".join(rendered)
+    whole_payload_compacted = False
     if len(content) > budget.max_message_chars:
         content = _compact_text(content, budget.max_message_chars, "Context Payload")
+        whole_payload_compacted = True
         if "Context Payload" not in compressed:
             compressed.append("Context Payload")
+
+    if whole_payload_compacted:
+        final_included = [section.name for section in sections if section.name in content]
+        final_omitted = [section.name for section in sections if section.name not in final_included]
+    else:
+        final_included = included
+        final_omitted = omitted
 
     metadata = {
         "budget_scope": "messages_only",
         "excluded_from_budget": ["system", "tools", "parameters"],
         "max_message_chars": budget.max_message_chars,
         "message_chars": len(content),
-        "included_sections": included,
+        "included_sections": final_included,
         "compressed_sections": compressed,
-        "omitted_sections": omitted,
+        "omitted_sections": final_omitted,
+        "whole_payload_compacted": whole_payload_compacted,
     }
     return content, metadata
 
