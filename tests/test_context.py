@@ -189,3 +189,28 @@ def test_context_payload_metadata_marks_whole_payload_compaction():
     assert "Context Payload" in result.metadata["compressed_sections"]
     assert all(section in content for section in result.metadata["included_sections"])
     assert result.metadata["whole_payload_compacted"] is True
+
+
+def test_whole_payload_compaction_does_not_infer_sections_from_body_text():
+    assignment = _context_assignment()
+    assignment = Assignment(
+        role=assignment.role,
+        mission="Mentions Completion Rules before the real section",
+        assignment_reason=assignment.assignment_reason,
+        assigned_contract=assignment.assigned_contract,
+        required_checks=assignment.required_checks,
+        initial_context=assignment.initial_context,
+        max_turns=assignment.max_turns,
+        max_tool_calls=assignment.max_tool_calls,
+    )
+
+    result = build_reviewer_context_payload(
+        assignment=assignment,
+        intent=_context_intent(),
+        code_snippets={"app.py:1-20": "x = 1\n" * 200},
+        observations={"O-1": "observation\n" * 200},
+        context_budget=ContextBudget(max_message_chars=300, compacted_section_min_chars=80),
+    )
+
+    assert result.metadata["whole_payload_compacted"] is True
+    assert "Completion Rules" not in result.metadata["included_sections"]

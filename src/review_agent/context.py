@@ -127,11 +127,13 @@ def _assemble_sections(sections: list[ContextSection], budget: ContextBudget) ->
     compressed: list[str] = []
     omitted: list[str] = []
     rendered: list[str] = []
+    rendered_sections: list[tuple[str, int]] = []
 
     for index, section in enumerate(sections):
         candidate = section.content
         next_content = "\n\n".join([*rendered, candidate]) if rendered else candidate
         if len(next_content) <= budget.max_message_chars:
+            rendered_sections.append((section.name, _next_section_start(rendered)))
             rendered.append(candidate)
             included.append(section.name)
             continue
@@ -140,6 +142,7 @@ def _assemble_sections(sections: list[ContextSection], budget: ContextBudget) ->
         available = remaining - _future_section_reserve(sections[index + 1 :], budget)
         if section.required:
             compacted = _compact_text(candidate, max(available, budget.compacted_section_min_chars), section.name)
+            rendered_sections.append((section.name, _next_section_start(rendered)))
             rendered.append(compacted)
             included.append(section.name)
             compressed.append(section.name)
@@ -147,6 +150,7 @@ def _assemble_sections(sections: list[ContextSection], budget: ContextBudget) ->
 
         if available >= budget.compacted_section_min_chars:
             compacted = _compact_text(candidate, available, section.name)
+            rendered_sections.append((section.name, _next_section_start(rendered)))
             rendered.append(compacted)
             included.append(section.name)
             compressed.append(section.name)
@@ -163,7 +167,13 @@ def _assemble_sections(sections: list[ContextSection], budget: ContextBudget) ->
             compressed.append("Context Payload")
 
     if whole_payload_compacted:
-        final_included = [section.name for section in sections if section.name in content]
+        marker = "\n[compacted Context Payload; full content retained in Session/Observation Store]"
+        retained_prefix_len = (
+            budget.max_message_chars - len(marker) if budget.max_message_chars > len(marker) else 0
+        )
+        final_included = [
+            section_name for section_name, start_offset in rendered_sections if start_offset < retained_prefix_len
+        ]
         final_omitted = [section.name for section in sections if section.name not in final_included]
     else:
         final_included = included
@@ -180,6 +190,12 @@ def _assemble_sections(sections: list[ContextSection], budget: ContextBudget) ->
         "whole_payload_compacted": whole_payload_compacted,
     }
     return content, metadata
+
+
+def _next_section_start(rendered: list[str]) -> int:
+    if not rendered:
+        return 0
+    return len("\n\n".join(rendered)) + 2
 
 
 def _future_section_reserve(sections: list[ContextSection], budget: ContextBudget) -> int:
