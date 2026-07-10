@@ -247,13 +247,6 @@ def _validate_manifest_lineage(manifest: SessionManifest) -> None:
     if manifest.revision_change_kind is RevisionChangeKind.HEAD_MOVED:
         if manifest.incremental_from_sha is None:
             raise ValueError("HEAD_MOVED Session incremental_from_sha must be present")
-        if (
-            manifest.original_base_sha.casefold()
-            != manifest.revisions.resolved_base_sha.casefold()
-        ):
-            raise ValueError(
-                "HEAD_MOVED Session original_base_sha must equal resolved_base_sha"
-            )
         return
 
     if manifest.incremental_from_sha is not None:

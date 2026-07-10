@@ -354,6 +354,43 @@ def test_head_moved_child_round_trips_with_incremental_lineage() -> None:
     assert loaded.incremental_from_sha == "c" * 40
 
 
+def test_head_moved_grandchild_after_base_drift_preserves_root_original_base() -> None:
+    root = manifest()
+    base_moved_child = replace(
+        root,
+        review_id="review-base-moved",
+        parent_review_id=root.review_id,
+        root_review_id=root.review_id,
+        revisions=ResolvedRevisions("new-base", "HEAD", "d" * 40, "e" * 40),
+        original_base_sha=root.original_base_sha,
+        incremental_from_sha=None,
+        revision_change_kind=RevisionChangeKind.BASE_MOVED,
+    )
+    head_moved_grandchild = replace(
+        base_moved_child,
+        review_id="review-head-moved",
+        parent_review_id=base_moved_child.review_id,
+        revisions=replace(
+            base_moved_child.revisions,
+            resolved_head_sha="f" * 40,
+        ),
+        incremental_from_sha=base_moved_child.revisions.resolved_head_sha,
+        revision_change_kind=RevisionChangeKind.HEAD_MOVED,
+    )
+
+    loaded = session_manifest_from_dict(
+        session_manifest_to_dict(head_moved_grandchild)
+    )
+
+    assert loaded == head_moved_grandchild
+    assert loaded.original_base_sha == root.revisions.resolved_base_sha
+    assert (
+        loaded.revisions.resolved_base_sha
+        == base_moved_child.revisions.resolved_base_sha
+    )
+    assert loaded.incremental_from_sha == base_moved_child.revisions.resolved_head_sha
+
+
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
@@ -361,7 +398,6 @@ def test_head_moved_child_round_trips_with_incremental_lineage() -> None:
         ({"parent_review_id": "review-child"}, "parent_review_id"),
         ({"root_review_id": "review-child"}, "root_review_id"),
         ({"incremental_from_sha": None}, "incremental_from_sha"),
-        ({"original_base_sha": "d" * 40}, "original_base_sha"),
     ],
 )
 def test_head_moved_child_constructor_rejects_invalid_lineage(
