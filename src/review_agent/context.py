@@ -69,16 +69,15 @@ def build_reviewer_envelope(
     code_snippets: dict[str, str],
     observations: dict[str, str],
     trace_id: str,
+    *,
+    context_budget: ContextBudget | None = None,
 ) -> ModelInvocationEnvelope:
-    content = "\n\n".join(
-        [
-            _assignment_block(assignment),
-            _intent_block(intent),
-            _initial_context_block(assignment),
-            _code_block(code_snippets),
-            _observation_block(observations),
-            _completion_block(assignment),
-        ]
+    context_payload = build_reviewer_context_payload(
+        assignment=assignment,
+        intent=intent,
+        code_snippets=code_snippets,
+        observations=observations,
+        context_budget=context_budget,
     )
 
     return ModelInvocationEnvelope(
@@ -109,7 +108,7 @@ def build_reviewer_envelope(
                 "description": "Find textual references to a symbol name within the authorized repository revision.",
             },
         ],
-        messages=[{"role": "user", "content": content}],
+        messages=context_payload.messages,
         parameters={
             "model": "configured-reviewer-model",
             "max_output_tokens": 4096,
@@ -118,6 +117,7 @@ def build_reviewer_envelope(
             "tool_choice": "auto",
             "response_schema": "reviewer_assignment_result_v1",
             "trace_id": trace_id,
+            "context": context_payload.metadata,
         },
     )
 
