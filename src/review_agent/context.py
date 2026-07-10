@@ -71,6 +71,9 @@ def build_reviewer_envelope(
     trace_id: str,
     *,
     context_budget: ContextBudget | None = None,
+    model: str = "configured-reviewer-model",
+    max_output_tokens: int = 4096,
+    reasoning_effort: str = "medium",
 ) -> ModelInvocationEnvelope:
     context_payload = build_reviewer_context_payload(
         assignment=assignment,
@@ -110,9 +113,9 @@ def build_reviewer_envelope(
         ],
         messages=context_payload.messages,
         parameters={
-            "model": "configured-reviewer-model",
-            "max_output_tokens": 4096,
-            "reasoning_effort": "medium",
+            "model": model,
+            "max_output_tokens": max_output_tokens,
+            "reasoning_effort": reasoning_effort,
             "temperature": 0,
             "tool_choice": "auto",
             "response_schema": "reviewer_assignment_result_v1",

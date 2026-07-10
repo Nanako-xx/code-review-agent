@@ -137,10 +137,13 @@ def test_cli_review_with_fake_reviewer_writes_reviewer_artifacts(git_repo: Path)
 
     result = json.loads((run_dir / "reviewer_result.json").read_text(encoding="utf-8"))
     raw = json.loads((run_dir / "reviewer_raw_response.json").read_text(encoding="utf-8"))
+    envelope = json.loads((run_dir / "reviewer_envelope.json").read_text(encoding="utf-8"))
     report = (run_dir / "report.md").read_text(encoding="utf-8")
 
     assert result["status"] == "partial"
     assert raw["provider_name"] == "fake"
+    assert envelope["parameters"]["model"] == "fake-reviewer"
+    assert envelope["parameters"]["context"]["budget_scope"] == "messages_only"
     assert "## Uncertainties" in report
     assert "Fake reviewer executed." in report
 
@@ -295,10 +298,13 @@ def test_cli_agent_loop_openai_compatible_uses_adapter_factory(git_repo: Path, m
     trace = json.loads((run_dir / "reviewer_agent_trace.json").read_text(encoding="utf-8"))
     result = json.loads((run_dir / "reviewer_result.json").read_text(encoding="utf-8"))
     raw = json.loads((run_dir / "reviewer_raw_response.json").read_text(encoding="utf-8"))
+    envelope = json.loads((run_dir / "reviewer_envelope.json").read_text(encoding="utf-8"))
 
     assert trace["tool_call_count"] == 1
     assert result["status"] == "completed"
     assert raw["provider_name"] == "openai-compatible"
+    assert envelope["parameters"]["model"] == "review-model"
+    assert envelope["parameters"]["context"]["budget_scope"] == "messages_only"
 
 
 def test_cli_multi_reviewer_mode_requires_reviewer_provider(git_repo: Path, capsys):

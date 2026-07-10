@@ -58,6 +58,8 @@ def run_reviewer_agent_loop(
     diff_excerpt: list[str],
     observations: dict[str, str],
     trace_id: str,
+    *,
+    model: str = "configured-reviewer-model",
 ) -> AgentLoopRun:
     envelope = build_reviewer_envelope(
         assignment=assignment,
@@ -65,6 +67,7 @@ def run_reviewer_agent_loop(
         code_snippets={"Diff Excerpt": "\n".join(diff_excerpt)},
         observations=observations,
         trace_id=trace_id,
+        model=model,
     )
     tools = [_tool_spec_from_envelope_tool(tool) for tool in envelope.tools]
     turns: list[AgentLoopTurn] = []
