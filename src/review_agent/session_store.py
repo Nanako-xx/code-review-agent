@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from hashlib import sha256
+import errno
 import hmac
 import json
 import os
@@ -10,7 +11,7 @@ import stat
 import uuid
 from typing import Iterable
 
-from review_agent.checkpoint import _atomic_write_text
+from review_agent.checkpoint import _atomic_write_text, _fsync_parent_directory
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
     SESSION_PHASES,
@@ -42,6 +43,9 @@ class SessionStore:
                 raise FileExistsError(
                     f"Session manifest already exists: {self.session_path}"
                 ) from error
+            except OSError as error:
+                self._fallback_create_without_overwrite(staging, error)
+            _fsync_parent_directory(self.run_dir)
         finally:
             try:
                 staging.unlink(missing_ok=True)
@@ -57,11 +61,28 @@ class SessionStore:
 
     def write(self, manifest: SessionManifest) -> Path:
         current = self.load()
-        if current.review_id != manifest.review_id:
-            raise ValueError(
-                "cannot replace Session with a different review_id: "
-                f"{current.review_id!r} != {manifest.review_id!r}"
-            )
+        immutable_fields = (
+            "schema_version",
+            "review_id",
+            "repository",
+            "revisions",
+            "parent_review_id",
+            "root_review_id",
+            "original_base_sha",
+            "revision_change_kind",
+            "incremental_from_sha",
+            "execution",
+            "created_at",
+        )
+        for field_name in immutable_fields:
+            if getattr(current, field_name) != getattr(manifest, field_name):
+                raise ValueError(
+                    f"cannot modify immutable Session field: {field_name}"
+                )
+        if current.status is RunStatus.COMPLETED:
+            if manifest == current:
+                return self.session_path
+            raise ValueError("completed Session is immutable and cannot be reopened")
         _atomic_write_text(self.session_path, self._serialize(manifest))
         return self.session_path
 
@@ -77,12 +98,17 @@ class SessionStore:
     ) -> SessionManifest:
         phase = _require_session_phase(phase)
         current = self.load()
-        _require_revision_binding(current, revision_binding)
-        artifact_path = self._resolve_regular_artifact(relative_path)
-        try:
-            digest = sha256(artifact_path.read_bytes()).hexdigest()
-        except OSError as error:
-            raise ValueError(f"unable to read artifact file: {relative_path}") from error
+        existing = current.artifacts.get(name)
+        if current.status is RunStatus.COMPLETED and existing is None:
+            raise ValueError("cannot register a new artifact on a completed Session")
+        _require_revision_binding(
+            current,
+            name=name,
+            schema=schema,
+            phase=phase,
+            revision_binding=revision_binding,
+        )
+        digest = self._hash_regular_artifact(relative_path)
         descriptor = ArtifactDescriptor(
             name=name,
             path=relative_path,
@@ -92,7 +118,6 @@ class SessionStore:
             revision_binding=revision_binding,
         )
 
-        existing = current.artifacts.get(name)
         if existing is not None:
             if existing == descriptor:
                 return current
@@ -107,9 +132,14 @@ class SessionStore:
     def validate_artifact(self, descriptor: ArtifactDescriptor) -> bool:
         try:
             current = self.load()
-            _require_revision_binding(current, descriptor.revision_binding)
-            artifact_path = self._resolve_regular_artifact(descriptor.path)
-            actual_hash = sha256(artifact_path.read_bytes()).hexdigest()
+            _require_revision_binding(
+                current,
+                name=descriptor.name,
+                schema=descriptor.schema,
+                phase=descriptor.phase,
+                revision_binding=descriptor.revision_binding,
+            )
+            actual_hash = self._hash_regular_artifact(descriptor.path)
         except (OSError, ValueError, json.JSONDecodeError):
             return False
         return hmac.compare_digest(actual_hash, descriptor.sha256)
@@ -122,6 +152,17 @@ class SessionStore:
     ) -> SessionManifest:
         phase = _require_session_phase(phase)
         current = self.load()
+        checkpoint = current.phases[phase.value]
+        requested_artifacts = _unique_artifact_names(artifact_names)
+        if checkpoint.status is PhaseStatus.COMPLETED:
+            if set(requested_artifacts) == set(checkpoint.artifacts):
+                return current
+            raise ValueError(
+                f"phase {phase.value} is already completed with a different "
+                "artifact set"
+            )
+        if current.status is RunStatus.COMPLETED:
+            raise ValueError("cannot reopen a completed Session")
         phase_index = SESSION_PHASES.index(phase)
         for predecessor in SESSION_PHASES[:phase_index]:
             if (
@@ -132,12 +173,7 @@ class SessionStore:
                     f"cannot complete {phase.value} before {predecessor.value}"
                 )
 
-        checkpoint = current.phases[phase.value]
-        requested_artifacts = _unique_artifact_names(artifact_names)
-        checkpoint_artifacts = _unique_artifact_names(
-            (*checkpoint.artifacts, *requested_artifacts)
-        )
-        for artifact_name in checkpoint_artifacts:
+        for artifact_name in requested_artifacts:
             self._require_valid_phase_artifact(current, phase, artifact_name)
 
         phases = dict(current.phases)
@@ -146,7 +182,7 @@ class SessionStore:
             attempts=checkpoint.attempts + 1,
             started_at=checkpoint.started_at or now,
             completed_at=now,
-            artifacts=checkpoint_artifacts,
+            artifacts=requested_artifacts,
             error=None,
         )
         updated = replace(
@@ -162,6 +198,8 @@ class SessionStore:
 
     def mark_session_completed(self, now: str) -> SessionManifest:
         current = self.load()
+        if current.status is RunStatus.COMPLETED:
+            return current
         incomplete = [
             phase.value
             for phase in SESSION_PHASES
@@ -171,6 +209,25 @@ class SessionStore:
             raise ValueError(
                 "cannot complete Session because phases are not completed: "
                 + ", ".join(incomplete)
+            )
+
+        referenced_artifacts = {
+            artifact_name
+            for checkpoint in current.phases.values()
+            for artifact_name in checkpoint.artifacts
+        }
+        registry_artifacts = set(current.artifacts)
+        if registry_artifacts != referenced_artifacts:
+            orphaned = sorted(registry_artifacts - referenced_artifacts)
+            missing = sorted(referenced_artifacts - registry_artifacts)
+            details: list[str] = []
+            if orphaned:
+                details.append("orphan registry artifacts: " + ", ".join(orphaned))
+            if missing:
+                details.append("unregistered checkpoint artifacts: " + ", ".join(missing))
+            raise ValueError(
+                "artifact registry must exactly match checkpoint artifacts; "
+                + "; ".join(details)
             )
 
         for phase in SESSION_PHASES:
@@ -199,6 +256,10 @@ class SessionStore:
             raise ValueError("error must be a non-empty string")
         current = self.load()
         checkpoint = current.phases[phase.value]
+        if current.status is RunStatus.COMPLETED:
+            raise ValueError("cannot fail a completed Session")
+        if checkpoint.status is PhaseStatus.COMPLETED:
+            raise ValueError(f"cannot fail completed phase: {phase.value}")
         phases = dict(current.phases)
         phases[phase.value] = PhaseCheckpoint(
             status=PhaseStatus.FAILED,
@@ -227,7 +288,7 @@ class SessionStore:
             ensure_ascii=False,
         )
 
-    def _resolve_regular_artifact(self, relative_path: str) -> Path:
+    def _hash_regular_artifact(self, relative_path: str) -> str:
         canonical_path = _canonical_relative_path(relative_path)
         try:
             root = self.run_dir.resolve(strict=True)
@@ -247,13 +308,65 @@ class SessionStore:
                 f"artifact path resolves outside the Session run directory: {relative_path}"
             ) from error
 
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         try:
-            mode = resolved.stat().st_mode
+            file_descriptor = os.open(resolved, flags)
         except OSError as error:
-            raise ValueError(f"unable to inspect artifact file: {relative_path}") from error
-        if not stat.S_ISREG(mode):
-            raise ValueError(f"artifact must be a regular file: {relative_path}")
-        return resolved
+            raise ValueError(
+                f"artifact does not exist or is not a regular file: {relative_path}"
+            ) from error
+        try:
+            try:
+                file_status = os.fstat(file_descriptor)
+            except OSError as error:
+                raise ValueError(
+                    f"unable to inspect artifact file: {relative_path}"
+                ) from error
+            if not stat.S_ISREG(file_status.st_mode):
+                raise ValueError(f"artifact must be a regular file: {relative_path}")
+
+            digest = sha256()
+            while True:
+                try:
+                    chunk = os.read(file_descriptor, 1024 * 1024)
+                except OSError as error:
+                    raise ValueError(
+                        f"unable to read artifact file: {relative_path}"
+                    ) from error
+                if not chunk:
+                    break
+                digest.update(chunk)
+            return digest.hexdigest()
+        finally:
+            os.close(file_descriptor)
+
+    def _fallback_create_without_overwrite(
+        self,
+        staging: Path,
+        link_error: OSError,
+    ) -> None:
+        unsupported_link_errors = {
+            errno.EACCES,
+            errno.ENOSYS,
+            errno.EPERM,
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        }
+        if link_error.errno not in unsupported_link_errors or os.name != "nt":
+            raise link_error
+        try:
+            os.rename(staging, self.session_path)
+        except OSError as error:
+            if self.session_path.exists():
+                raise FileExistsError(
+                    f"Session manifest already exists: {self.session_path}"
+                ) from error
+            raise
 
     def _require_valid_phase_artifact(
         self,
@@ -301,17 +414,34 @@ def _canonical_relative_path(relative_path: str) -> str:
 
 def _require_revision_binding(
     manifest: SessionManifest,
+    *,
+    name: str,
+    schema: str,
+    phase: RunPhase,
     revision_binding: str | None,
 ) -> None:
-    if revision_binding:
-        expected = (
-            f"{manifest.revisions.resolved_base_sha}.."
-            f"{manifest.revisions.resolved_head_sha}"
+    if revision_binding == "":
+        raise ValueError("revision_binding must not be empty")
+    unbound_request = (
+        name == "request"
+        and schema == "review_request_v1"
+        and phase is RunPhase.PREFLIGHT
+    )
+    if revision_binding is None:
+        if unbound_request:
+            return
+        raise ValueError(
+            "revision_binding may be null only for the preflight "
+            "review_request_v1 request artifact"
         )
-        if revision_binding != expected:
-            raise ValueError(
-                "revision_binding must exactly match the Session resolved revisions"
-            )
+    expected = (
+        f"{manifest.revisions.resolved_base_sha}.."
+        f"{manifest.revisions.resolved_head_sha}"
+    )
+    if revision_binding != expected:
+        raise ValueError(
+            "revision_binding must exactly match the Session resolved revisions"
+        )
 
 
 def _unique_artifact_names(artifact_names: Iterable[str]) -> tuple[str, ...]:

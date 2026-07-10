@@ -1,4 +1,5 @@
 from pathlib import Path
+import errno
 import json
 
 import pytest
@@ -81,7 +82,7 @@ def test_checkpoint_store_json_write_uses_unique_same_directory_temps_and_fsync(
     assert temporary_paths[0] != temporary_paths[1]
     assert all(path.name.endswith(".tmp") for path in temporary_paths)
     assert all(not path.exists() for path in temporary_paths)
-    assert len(fsync_calls) == 2
+    assert len(fsync_calls) >= 2
     assert json.loads((store.run_dir / "request.json").read_text(encoding="utf-8")) == {
         "head": "feature"
     }
@@ -109,6 +110,58 @@ def test_checkpoint_store_cleans_temp_and_preserves_destination_when_replace_fai
     assert len(temporary_paths) == 1
     assert not temporary_paths[0].exists()
     assert [path for path in store.run_dir.iterdir() if path.name.endswith(".tmp")] == []
+
+
+def test_checkpoint_store_fsyncs_parent_directory_after_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = CheckpointStore(tmp_path, "review-directory-fsync")
+    directory_descriptor = 987654
+    opened_directories: list[Path] = []
+    fsync_calls: list[int] = []
+    closed_descriptors: list[int] = []
+    real_fsync = checkpoint_module.os.fsync
+
+    def opening_directory(path: object, flags: int) -> int:
+        opened_directories.append(Path(path))
+        return directory_descriptor
+
+    def recording_fsync(file_descriptor: int) -> None:
+        fsync_calls.append(file_descriptor)
+        if file_descriptor != directory_descriptor:
+            real_fsync(file_descriptor)
+
+    def recording_close(file_descriptor: int) -> None:
+        closed_descriptors.append(file_descriptor)
+
+    monkeypatch.setattr(checkpoint_module.os, "open", opening_directory)
+    monkeypatch.setattr(checkpoint_module.os, "fsync", recording_fsync)
+    monkeypatch.setattr(checkpoint_module.os, "close", recording_close)
+
+    store.write_json("request.json", {"head": "HEAD"})
+
+    assert opened_directories == [store.run_dir]
+    assert fsync_calls[-1] == directory_descriptor
+    assert closed_descriptors == [directory_descriptor]
+
+
+def test_checkpoint_store_safely_degrades_when_directory_fsync_is_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = CheckpointStore(tmp_path, "review-directory-fsync-unsupported")
+
+    def unsupported_directory_open(path: object, flags: int) -> int:
+        raise OSError(errno.EACCES, "directory handles are unsupported")
+
+    monkeypatch.setattr(checkpoint_module.os, "open", unsupported_directory_open)
+
+    store.write_json("request.json", {"head": "HEAD"})
+
+    assert json.loads((store.run_dir / "request.json").read_text(encoding="utf-8")) == {
+        "head": "HEAD"
+    }
 
 
 def test_markdown_report_contains_risk_signals_and_uncertainties():

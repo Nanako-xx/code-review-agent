@@ -2,17 +2,23 @@ from __future__ import annotations
 
 from dataclasses import replace
 from hashlib import sha256
+import errno
 import json
+import os
 from pathlib import Path
 
 import pytest
 
+import review_agent.session_store as session_store_module
 from review_agent.revision import RepositoryIdentity, ResolvedRevisions
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
     SESSION_PHASES,
+    ArtifactDescriptor,
+    PhaseCheckpoint,
     PhaseStatus,
     ReviewExecutionConfig,
+    RevisionChangeKind,
     SessionManifest,
     initial_session_manifest,
 )
@@ -43,6 +49,16 @@ def manifest(review_id: str = "review-1") -> SessionManifest:
     )
 
 
+def child_manifest() -> SessionManifest:
+    return replace(
+        manifest("review-child"),
+        parent_review_id="review-parent",
+        root_review_id="review-root",
+        incremental_from_sha="c" * 40,
+        revision_change_kind=RevisionChangeKind.HEAD_MOVED,
+    )
+
+
 def create_store(run_dir: Path) -> SessionStore:
     store = SessionStore(run_dir)
     store.create(manifest())
@@ -58,10 +74,11 @@ def register_artifact(
     revision_binding: str | None = None,
     now: str = "2026-07-10T00:01:00Z",
 ) -> SessionManifest:
+    schema = "review_request_v1" if name == "request" else f"{name}_v1"
     return store.register_existing_artifact(
         name=name,
         relative_path=relative_path,
-        schema=f"{name}_v1",
+        schema=schema,
         phase=phase,
         revision_binding=revision_binding,
         now=now,
@@ -145,6 +162,85 @@ def test_session_store_write_cannot_replace_another_review_session(
     assert store.load() == original
 
 
+@pytest.mark.parametrize(
+    ("field_name", "modified_manifest"),
+    [
+        (
+            "repository",
+            replace(
+                manifest(),
+                repository=RepositoryIdentity("C:/other", "C:/other/.git", None),
+            ),
+        ),
+        (
+            "revisions",
+            replace(
+                manifest(),
+                revisions=ResolvedRevisions("main", "feature", BASE_SHA, HEAD_SHA),
+            ),
+        ),
+        (
+            "execution",
+            replace(
+                manifest(),
+                execution=replace(
+                    manifest().execution,
+                    reviewer_provider="other-provider",
+                ),
+            ),
+        ),
+        ("created_at", replace(manifest(), created_at="2026-07-09T23:59:00Z")),
+    ],
+)
+def test_session_store_write_rejects_immutable_session_metadata(
+    tmp_path: Path,
+    field_name: str,
+    modified_manifest: SessionManifest,
+) -> None:
+    store = create_store(tmp_path)
+
+    with pytest.raises(ValueError, match=field_name):
+        store.write(modified_manifest)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "changes"),
+    [
+        ("parent_review_id", {"parent_review_id": "other-parent"}),
+        ("root_review_id", {"root_review_id": "other-root"}),
+        ("original_base_sha", {"original_base_sha": "d" * 40}),
+        ("incremental_from_sha", {"incremental_from_sha": "d" * 40}),
+        (
+            "revision_change_kind",
+            {
+                "revision_change_kind": RevisionChangeKind.BASE_MOVED,
+                "incremental_from_sha": None,
+            },
+        ),
+    ],
+)
+def test_session_store_write_rejects_immutable_lineage(
+    tmp_path: Path,
+    field_name: str,
+    changes: dict[str, object],
+) -> None:
+    original = child_manifest()
+    store = SessionStore(tmp_path)
+    store.create(original)
+
+    with pytest.raises(ValueError, match=field_name):
+        store.write(replace(original, **changes))
+
+
+def test_session_store_write_rejects_schema_version_mutation(tmp_path: Path) -> None:
+    store = create_store(tmp_path)
+    modified = manifest()
+    object.__setattr__(modified, "schema_version", 2)
+
+    with pytest.raises(ValueError, match="schema_version"):
+        store.write(modified)
+
+
 def test_session_store_load_applies_strict_session_schema_validation(
     tmp_path: Path,
 ) -> None:
@@ -191,6 +287,71 @@ def test_session_store_rejects_mismatched_non_empty_revision_binding(
         register_artifact(store, revision_binding=f"{'c' * 40}..{HEAD_SHA}")
 
     assert store.load().artifacts == {}
+
+
+@pytest.mark.parametrize(
+    ("name", "schema", "phase"),
+    [
+        ("intent", "intent_packet_v1", RunPhase.PREFLIGHT),
+        ("request", "other_request_v1", RunPhase.PREFLIGHT),
+        ("request", "review_request_v1", RunPhase.REPOSITORY_INTELLIGENCE),
+    ],
+)
+def test_session_store_allows_unbound_artifact_only_for_preflight_request(
+    tmp_path: Path,
+    name: str,
+    schema: str,
+    phase: RunPhase,
+) -> None:
+    store = create_store(tmp_path)
+    (tmp_path / "artifact.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="revision_binding"):
+        store.register_existing_artifact(
+            name=name,
+            relative_path="artifact.json",
+            schema=schema,
+            phase=phase,
+            revision_binding=None,
+            now="2026-07-10T00:01:00Z",
+        )
+
+
+def test_session_store_rejects_empty_revision_binding_even_for_request(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    (tmp_path / "request.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="revision_binding"):
+        register_artifact(store, revision_binding="")
+
+
+def test_session_store_validation_enforces_revision_binding_policy(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    artifact_path = tmp_path / "intent.json"
+    artifact_path.write_text("{}", encoding="utf-8")
+    digest = sha256(artifact_path.read_bytes()).hexdigest()
+
+    unbound = ArtifactDescriptor(
+        name="intent",
+        path="intent.json",
+        sha256=digest,
+        schema="intent_packet_v1",
+        phase=RunPhase.PREFLIGHT,
+        revision_binding=None,
+    )
+    empty = replace(
+        unbound,
+        name="request",
+        schema="review_request_v1",
+        revision_binding="",
+    )
+
+    assert store.validate_artifact(unbound) is False
+    assert store.validate_artifact(empty) is False
 
 
 @pytest.mark.parametrize(
@@ -254,6 +415,50 @@ def test_session_store_validation_detects_changed_artifact_bytes(tmp_path: Path)
     assert store.validate_artifact(descriptor) is False
 
 
+def test_session_store_hashes_with_one_open_and_the_same_fstat_read_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = create_store(tmp_path)
+    artifact_path = tmp_path / "request.bin"
+    artifact_path.write_bytes(b"artifact bytes")
+    resolved_artifact = artifact_path.resolve()
+    artifact_open_calls: list[tuple[int, int]] = []
+    fstat_descriptors: list[int] = []
+    read_descriptors: list[int] = []
+    real_open = session_store_module.os.open
+    real_fstat = session_store_module.os.fstat
+    real_read = session_store_module.os.read
+
+    def recording_open(path: object, flags: int, *args: object) -> int:
+        file_descriptor = real_open(path, flags, *args)
+        if Path(path) == resolved_artifact:
+            artifact_open_calls.append((file_descriptor, flags))
+        return file_descriptor
+
+    def recording_fstat(file_descriptor: int):
+        fstat_descriptors.append(file_descriptor)
+        return real_fstat(file_descriptor)
+
+    def recording_read(file_descriptor: int, size: int) -> bytes:
+        read_descriptors.append(file_descriptor)
+        return real_read(file_descriptor, size)
+
+    monkeypatch.setattr(session_store_module.os, "open", recording_open)
+    monkeypatch.setattr(session_store_module.os, "fstat", recording_fstat)
+    monkeypatch.setattr(session_store_module.os, "read", recording_read)
+
+    register_artifact(store, relative_path="request.bin")
+
+    assert len(artifact_open_calls) == 1
+    artifact_descriptor, flags = artifact_open_calls[0]
+    assert fstat_descriptors == [artifact_descriptor]
+    assert read_descriptors
+    assert set(read_descriptors) == {artifact_descriptor}
+    if getattr(os, "O_NOFOLLOW", 0):
+        assert flags & os.O_NOFOLLOW
+
+
 def test_mark_phase_completed_updates_immutable_checkpoint_in_order(
     tmp_path: Path,
 ) -> None:
@@ -279,6 +484,61 @@ def test_mark_phase_completed_updates_immutable_checkpoint_in_order(
     assert updated.last_successful_phase is RunPhase.PREFLIGHT
     assert updated.updated_at == "2026-07-10T00:02:00Z"
     assert isinstance(updated.errors, tuple)
+
+
+def test_mark_phase_completed_is_idempotent_for_the_same_artifact_set(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    (tmp_path / "request.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "intent.json").write_text("{}", encoding="utf-8")
+    register_artifact(store)
+    register_artifact(
+        store,
+        name="intent",
+        relative_path="intent.json",
+        phase=RunPhase.PREFLIGHT,
+        revision_binding=REVISION_BINDING,
+    )
+    completed = store.mark_phase_completed(
+        RunPhase.PREFLIGHT,
+        ["request", "intent"],
+        "2026-07-10T00:02:00Z",
+    )
+    session_bytes = (tmp_path / "session.json").read_bytes()
+
+    repeated = store.mark_phase_completed(
+        RunPhase.PREFLIGHT,
+        ["intent", "request", "request"],
+        "2026-07-10T00:03:00Z",
+    )
+
+    assert repeated == completed
+    assert repeated.phases["preflight"].attempts == 1
+    assert repeated.updated_at == "2026-07-10T00:02:00Z"
+    assert (tmp_path / "session.json").read_bytes() == session_bytes
+
+
+def test_mark_phase_completed_rejects_different_artifacts_after_completion(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    (tmp_path / "request.json").write_text("{}", encoding="utf-8")
+    register_artifact(store)
+    store.mark_phase_completed(
+        RunPhase.PREFLIGHT,
+        ["request"],
+        "2026-07-10T00:02:00Z",
+    )
+
+    with pytest.raises(ValueError, match="already completed"):
+        store.mark_phase_completed(
+            RunPhase.PREFLIGHT,
+            [],
+            "2026-07-10T00:03:00Z",
+        )
+
+    assert store.load().phases["preflight"].attempts == 1
 
 
 @pytest.mark.parametrize(
@@ -316,6 +576,7 @@ def test_mark_phase_completed_rejects_artifact_from_another_phase(
         name="repository",
         relative_path="repository.json",
         phase=RunPhase.REPOSITORY_INTELLIGENCE,
+        revision_binding=REVISION_BINDING,
     )
 
     with pytest.raises(ValueError, match="belongs to phase"):
@@ -386,6 +647,18 @@ def test_mark_session_completed_validates_referenced_artifacts(
     assert store.load().status is RunStatus.RUNNING
 
 
+def test_mark_session_completed_rejects_orphan_registry_artifact(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    (tmp_path / "request.json").write_text("{}", encoding="utf-8")
+    register_artifact(store)
+    mark_all_phases(store)
+
+    with pytest.raises(ValueError, match="registry|orphan"):
+        store.mark_session_completed("2026-07-10T00:10:00Z")
+
+
 def test_mark_session_completed_after_all_phases_and_valid_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -404,6 +677,71 @@ def test_mark_session_completed_after_all_phases_and_valid_artifacts(
         checkpoint.status is PhaseStatus.COMPLETED
         for checkpoint in completed.phases.values()
     )
+
+
+def test_mark_session_completed_is_idempotent_without_rewriting_manifest(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    mark_all_phases(store)
+    completed = store.mark_session_completed("2026-07-10T00:10:00Z")
+    session_bytes = (tmp_path / "session.json").read_bytes()
+
+    repeated = store.mark_session_completed("2026-07-10T00:11:00Z")
+
+    assert repeated == completed
+    assert repeated.updated_at == "2026-07-10T00:10:00Z"
+    assert (tmp_path / "session.json").read_bytes() == session_bytes
+
+
+def test_completed_session_cannot_be_failed_reopened_or_given_new_artifact(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    mark_all_phases(store)
+    completed = store.mark_session_completed("2026-07-10T00:10:00Z")
+    (tmp_path / "late.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="completed Session"):
+        store.mark_session_failed(
+            RunPhase.REVIEWERS,
+            "late failure",
+            "2026-07-10T00:11:00Z",
+        )
+    with pytest.raises(ValueError, match="completed Session"):
+        register_artifact(
+            store,
+            name="late",
+            relative_path="late.json",
+            phase=RunPhase.REPORTING,
+            revision_binding=REVISION_BINDING,
+            now="2026-07-10T00:11:00Z",
+        )
+    with pytest.raises(ValueError, match="completed"):
+        store.write(
+            replace(
+                completed,
+                status=RunStatus.RUNNING,
+                current_phase=RunPhase.REPORTING,
+                updated_at="2026-07-10T00:11:00Z",
+            )
+        )
+
+
+def test_completed_phase_cannot_be_marked_failed(tmp_path: Path) -> None:
+    store = create_store(tmp_path)
+    store.mark_phase_completed(
+        RunPhase.PREFLIGHT,
+        [],
+        "2026-07-10T00:01:00Z",
+    )
+
+    with pytest.raises(ValueError, match="completed phase"):
+        store.mark_session_failed(
+            RunPhase.PREFLIGHT,
+            "late failure",
+            "2026-07-10T00:02:00Z",
+        )
 
 
 def test_mark_session_failed_preserves_last_successful_phase_and_appends_errors(
@@ -455,3 +793,54 @@ def test_mark_session_failed_accepts_only_persisted_session_phases(
             "failed",
             "2026-07-10T00:02:00Z",
         )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows rename has no-replace semantics")
+def test_session_create_falls_back_to_windows_rename_when_link_is_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(tmp_path)
+    rename_calls: list[tuple[Path, Path]] = []
+    real_rename = session_store_module.os.rename
+
+    def unsupported_link(source: object, destination: object) -> None:
+        raise OSError(errno.ENOTSUP, "hard links unsupported")
+
+    def recording_rename(source: object, destination: object) -> None:
+        rename_calls.append((Path(source), Path(destination)))
+        real_rename(source, destination)
+
+    monkeypatch.setattr(session_store_module.os, "link", unsupported_link)
+    monkeypatch.setattr(session_store_module.os, "rename", recording_rename)
+
+    store.create(manifest())
+
+    assert len(rename_calls) == 1
+    assert rename_calls[0][1] == tmp_path / "session.json"
+    assert store.load() == manifest()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows rename has no-replace semantics")
+def test_session_create_fallback_never_overwrites_existing_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(tmp_path)
+    original = manifest()
+    store.create(original)
+
+    def unsupported_link(source: object, destination: object) -> None:
+        raise OSError(errno.ENOTSUP, "hard links unsupported")
+
+    def existing_destination(source: object, destination: object) -> None:
+        assert Path(destination).exists()
+        raise FileExistsError("destination exists")
+
+    monkeypatch.setattr(session_store_module.os, "link", unsupported_link)
+    monkeypatch.setattr(session_store_module.os, "rename", existing_destination)
+
+    with pytest.raises(FileExistsError, match="session.json"):
+        store.create(replace(original, updated_at="2026-07-10T00:01:00Z"))
+
+    assert store.load() == original

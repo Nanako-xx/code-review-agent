@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
+import errno
 import json
 import os
 import uuid
@@ -64,8 +65,36 @@ def _atomic_write_text(path: Path, content: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _fsync_parent_directory(path.parent)
     finally:
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _fsync_parent_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    unsupported_errors = {
+        errno.EACCES,
+        errno.EBADF,
+        errno.EINVAL,
+        errno.ENOSYS,
+        errno.EPERM,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+    try:
+        directory_descriptor = os.open(directory, flags)
+    except OSError as error:
+        if error.errno in unsupported_errors:
+            return
+        raise
+    try:
+        try:
+            os.fsync(directory_descriptor)
+        except OSError as error:
+            if error.errno not in unsupported_errors:
+                raise
+    finally:
+        os.close(directory_descriptor)
