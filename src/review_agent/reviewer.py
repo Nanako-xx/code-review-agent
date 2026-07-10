@@ -84,6 +84,8 @@ def run_single_reviewer(
     diff_excerpt: list[str],
     observations: dict[str, str],
     trace_id: str,
+    *,
+    model: str = "configured-reviewer-model",
 ) -> ReviewerRun:
     envelope = build_reviewer_envelope(
         assignment=assignment,
@@ -91,6 +93,7 @@ def run_single_reviewer(
         code_snippets={"Diff Excerpt": "\n".join(diff_excerpt)},
         observations=observations,
         trace_id=trace_id,
+        model=model,
     )
     request = ModelTurnRequest(
         system=envelope.system,

@@ -46,6 +46,8 @@ def run_multi_reviewer(
     diff_excerpt: list[str],
     observations: dict[str, str],
     trace_id_prefix: str,
+    *,
+    model: str = "configured-reviewer-model",
 ) -> MultiReviewerRun:
     executions: list[ReviewerExecution] = []
     for index, assignment in enumerate(assignments):
@@ -59,6 +61,7 @@ def run_multi_reviewer(
                 diff_excerpt=diff_excerpt,
                 observations=observations,
                 trace_id=trace_id,
+                model=model,
             )
             executions.append(_execution_from_run(index, trace_id, assignment, run))
         except Exception as error:
@@ -71,6 +74,7 @@ def run_multi_reviewer(
                     diff_excerpt=diff_excerpt,
                     observations=observations,
                     error=error,
+                    model=model,
                 )
             )
     return MultiReviewerRun(executions=executions)
@@ -118,6 +122,8 @@ def _failed_execution(
     diff_excerpt: list[str],
     observations: dict[str, str],
     error: Exception,
+    *,
+    model: str,
 ) -> ReviewerExecution:
     error_type = type(error).__name__
     error_message = str(error)
@@ -127,6 +133,7 @@ def _failed_execution(
         code_snippets={"Diff Excerpt": "\n".join(diff_excerpt)},
         observations=observations,
         trace_id=trace_id,
+        model=model,
     )
     return ReviewerExecution(
         reviewer_index=index,

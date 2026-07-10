@@ -161,6 +161,7 @@ def _run_review(args: argparse.Namespace) -> int:
             error=error_message,
         )
         return 2
+    reviewer_invocation_model = _reviewer_invocation_model(args)
 
     observation_store = ObservationStore(store.run_dir)
     repository_intelligence = build_repository_intelligence(
@@ -246,6 +247,7 @@ def _run_review(args: argparse.Namespace) -> int:
                     diff_excerpt=change_summary.diff_excerpt,
                     observations=reviewer_observations,
                     trace_id_prefix=review_id,
+                    model=reviewer_invocation_model,
                 )
             else:
                 executions = []
@@ -259,6 +261,7 @@ def _run_review(args: argparse.Namespace) -> int:
                         diff_excerpt=change_summary.diff_excerpt,
                         observations=reviewer_observations,
                         trace_id=trace_id,
+                        model=reviewer_invocation_model,
                     )
                     loop_runs.append(loop_run)
                     executions.append(
@@ -349,6 +352,7 @@ def _run_review(args: argparse.Namespace) -> int:
                     diff_excerpt=change_summary.diff_excerpt,
                     observations=reviewer_observations,
                     trace_id=f"{review_id}-reviewer-0",
+                    model=reviewer_invocation_model,
                 )
                 reviewer_result = reviewer_run.result
                 store.write_json("reviewer_envelope.json", asdict(reviewer_run.envelope))
@@ -382,6 +386,7 @@ def _run_review(args: argparse.Namespace) -> int:
                     diff_excerpt=change_summary.diff_excerpt,
                     observations=reviewer_observations,
                     trace_id=f"{review_id}-reviewer-0",
+                    model=reviewer_invocation_model,
                 )
                 reviewer_result = loop_run.result
                 store.write_json("reviewer_envelope.json", asdict(loop_run.envelope))
@@ -559,3 +564,13 @@ def _format_quality_gate_summary(quality_results: list[QualityGateResult]) -> st
     if not quality_results:
         return "none"
     return ", ".join(f"{result.name}={result.status}" for result in quality_results)
+
+
+def _reviewer_invocation_model(args: argparse.Namespace) -> str:
+    if args.reviewer_model:
+        return str(args.reviewer_model)
+    if args.reviewer_provider == "fake":
+        return "fake-reviewer"
+    if args.reviewer_provider == "none":
+        return "none"
+    return "configured-reviewer-model"

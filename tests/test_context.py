@@ -252,3 +252,20 @@ def test_reviewer_envelope_records_context_metadata():
     assert "parameters" in metadata["excluded_from_budget"]
     assert envelope.messages[0]["role"] == "user"
     assert len(envelope.messages[0]["content"]) == metadata["message_chars"]
+
+
+def test_reviewer_envelope_uses_explicit_model_parameters():
+    envelope = build_reviewer_envelope(
+        assignment=_context_assignment(),
+        intent=_context_intent(),
+        code_snippets={},
+        observations={},
+        trace_id="trace-model-params",
+        model="deepseek-chat",
+        max_output_tokens=2048,
+        reasoning_effort="high",
+    )
+
+    assert envelope.parameters["model"] == "deepseek-chat"
+    assert envelope.parameters["max_output_tokens"] == 2048
+    assert envelope.parameters["reasoning_effort"] == "high"
