@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -55,9 +56,54 @@ def test_repository_identity_includes_optional_origin_url(git_repo: Path) -> Non
     assert identity.origin_url == origin_url
 
 
+@pytest.mark.parametrize(
+    ("origin_url", "expected"),
+    [
+        (
+            "https://user:token@example.test/acme/review-target.git",
+            "https://example.test/acme/review-target.git",
+        ),
+        (
+            "https://example.test/acme/review-target.git?access_token=secret#credential",
+            "https://example.test/acme/review-target.git",
+        ),
+    ],
+)
+def test_repository_identity_sanitizes_sensitive_origin_url_components(
+    git_repo: Path,
+    origin_url: str,
+    expected: str,
+) -> None:
+    run_git(git_repo, "remote", "add", "origin", origin_url)
+
+    identity = RevisionResolver().repository_identity(git_repo)
+
+    assert identity.origin_url == expected
+    assert "token" not in identity.origin_url
+    assert "secret" not in identity.origin_url
+
+
+def test_repository_identity_omits_origin_that_cannot_be_safely_expressed(
+    git_repo: Path,
+) -> None:
+    run_git(
+        git_repo,
+        "remote",
+        "add",
+        "origin",
+        "https://user:token@/review-target.git?access_token=secret",
+    )
+
+    identity = RevisionResolver().repository_identity(git_repo)
+
+    assert identity.origin_url is None
+
+
 def test_revision_resolver_reports_invalid_revision(git_repo: Path) -> None:
-    with pytest.raises(ValueError, match="missing-revision"):
+    with pytest.raises(ValueError, match="missing-revision") as captured:
         RevisionResolver().resolve_commit(git_repo, "missing-revision")
+
+    assert "fatal:" in str(captured.value)
 
 
 def test_revision_resolver_checks_commit_existence(git_repo: Path) -> None:
@@ -69,3 +115,74 @@ def test_revision_resolver_checks_commit_existence(git_repo: Path) -> None:
     assert resolver.commit_exists(git_repo, head_sha) is True
     assert resolver.commit_exists(git_repo, blob_sha) is False
     assert resolver.commit_exists(git_repo, "0" * 40) is False
+
+
+def test_commit_exists_rejects_revision_names_and_abbreviated_object_ids(
+    git_repo: Path,
+) -> None:
+    head_sha = run_git(git_repo, "rev-parse", "HEAD")
+    branch = run_git(git_repo, "branch", "--show-current")
+    run_git(git_repo, "tag", "release-v1")
+
+    resolver = RevisionResolver()
+
+    for candidate in ("HEAD", branch, "release-v1", head_sha[:12]):
+        with pytest.raises(ValueError, match="full sha1 object ID"):
+            resolver.commit_exists(git_repo, candidate)
+
+
+def test_commit_exists_raises_for_invalid_repository(tmp_path: Path) -> None:
+    not_a_repository = tmp_path / "not-a-repository"
+    not_a_repository.mkdir()
+
+    with pytest.raises(ValueError, match="object format") as captured:
+        RevisionResolver().commit_exists(not_a_repository, "0" * 40)
+
+    assert "not a git repository" in str(captured.value).casefold()
+
+
+def test_commit_exists_raises_when_git_cannot_read_the_object_database(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head_sha = run_git(git_repo, "rev-parse", "HEAD")
+    real_run = subprocess.run
+
+    def run_with_object_read_failure(
+        command: list[str],
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if "cat-file" in command:
+            return subprocess.CompletedProcess(
+                command,
+                128,
+                stdout="",
+                stderr="fatal: permission denied reading object database",
+            )
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run_with_object_read_failure)
+
+    with pytest.raises(ValueError, match="permission denied reading object database"):
+        RevisionResolver().commit_exists(git_repo, head_sha)
+
+
+def test_commit_exists_supports_sha256_repository_object_ids(tmp_path: Path) -> None:
+    repo = tmp_path / "sha256-repo"
+    repo.mkdir()
+    run_git(repo, "init", "--object-format=sha256")
+    run_git(repo, "config", "user.email", "review-agent@example.test")
+    run_git(repo, "config", "user.name", "Review Agent")
+    (repo / "app.py").write_text("print('sha256')\n", encoding="utf-8")
+    run_git(repo, "add", "app.py")
+    run_git(repo, "commit", "-m", "initial sha256 commit")
+    head_sha = run_git(repo, "rev-parse", "HEAD")
+
+    resolver = RevisionResolver()
+
+    assert len(head_sha) == 64
+    assert resolver.commit_exists(repo, head_sha) is True
+    assert resolver.commit_exists(repo, "0" * 64) is False
+    with pytest.raises(ValueError, match="full sha256 object ID"):
+        resolver.commit_exists(repo, head_sha[:16])
