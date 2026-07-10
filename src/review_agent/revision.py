@@ -8,6 +8,15 @@ import subprocess
 from urllib.parse import urlsplit, urlunsplit
 
 
+_SAFE_ORIGIN_URL_SCHEMES = frozenset({"git", "http", "https", "ssh"})
+_SCP_ORIGIN_PATTERN = re.compile(
+    r"^(?:(?P<userinfo>[A-Za-z0-9._~-]+)@)?"
+    r"(?P<host>[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|"
+    r"\[[0-9A-Fa-f:.%]+\])"
+    r":(?P<path>[A-Za-z0-9._~+/@%=-]+)$"
+)
+
+
 @dataclass(frozen=True)
 class RepositoryIdentity:
     canonical_path: str
@@ -167,11 +176,11 @@ def _sanitize_origin_url(origin_url: str | None) -> str | None:
     if origin_url is None:
         return None
     origin = origin_url.strip()
-    if not origin or any(character in origin for character in "\x00\r\n\t"):
+    if not origin or any(character.isspace() for character in origin):
         return None
 
     if "://" not in origin:
-        return _sanitize_scp_or_local_origin(origin)
+        return _sanitize_scp_like_origin(origin)
 
     try:
         parsed = urlsplit(origin)
@@ -179,27 +188,23 @@ def _sanitize_origin_url(origin_url: str | None) -> str | None:
         port = parsed.port
     except ValueError:
         return None
-    if not parsed.scheme or not hostname:
+    scheme = parsed.scheme.casefold()
+    if scheme not in _SAFE_ORIGIN_URL_SCHEMES or not hostname:
         return None
 
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"
     authority = hostname if port is None else f"{hostname}:{port}"
-    sanitized = urlunsplit(
-        (parsed.scheme.casefold(), authority, parsed.path, "", "")
-    )
+    sanitized = urlunsplit((scheme, authority, parsed.path, "", ""))
     return sanitized or None
 
 
-def _sanitize_scp_or_local_origin(origin: str) -> str | None:
-    sanitized = origin.split("#", 1)[0].split("?", 1)[0]
-    if not sanitized:
+def _sanitize_scp_like_origin(origin: str) -> str | None:
+    if "?" in origin or "#" in origin:
         return None
-
-    scp_match = re.fullmatch(
-        r"(?:(?P<userinfo>[^@/:]+)@)?(?P<host>\[[^\]]+\]|[^/:]+):(?P<path>.+)",
-        sanitized,
-    )
+    if re.match(r"^[A-Za-z]:[\\/]", origin):
+        return None
+    scp_match = _SCP_ORIGIN_PATTERN.fullmatch(origin)
     if scp_match is None:
-        return sanitized
+        return None
     return f"{scp_match.group('host')}:{scp_match.group('path')}"

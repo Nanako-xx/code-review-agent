@@ -99,6 +99,43 @@ def test_repository_identity_omits_origin_that_cannot_be_safely_expressed(
     assert identity.origin_url is None
 
 
+@pytest.mark.parametrize(
+    "origin_url",
+    [
+        "ext::sshpass -p supersecret ssh example.test %S repo",
+        "ext::invoke-secret-helper",
+        "ssh example.test repo-with-supersecret",
+        "opaque-origin-alias",
+    ],
+)
+def test_repository_identity_omits_remote_helpers_and_unknown_origin_formats(
+    git_repo: Path,
+    origin_url: str,
+) -> None:
+    run_git(git_repo, "remote", "add", "origin", origin_url)
+
+    identity = RevisionResolver().repository_identity(git_repo)
+
+    assert identity.origin_url is None
+    assert "supersecret" not in repr(identity)
+
+
+def test_repository_identity_sanitizes_strict_scp_like_origin(
+    git_repo: Path,
+) -> None:
+    run_git(
+        git_repo,
+        "remote",
+        "add",
+        "origin",
+        "git@example.test:acme/review-target.git",
+    )
+
+    identity = RevisionResolver().repository_identity(git_repo)
+
+    assert identity.origin_url == "example.test:acme/review-target.git"
+
+
 def test_revision_resolver_reports_invalid_revision(git_repo: Path) -> None:
     with pytest.raises(ValueError, match="missing-revision") as captured:
         RevisionResolver().resolve_commit(git_repo, "missing-revision")
