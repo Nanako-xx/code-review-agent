@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import PurePosixPath, PureWindowsPath
 import re
+from types import MappingProxyType
 from typing import Any, Mapping, TypeVar
 from urllib.parse import urlsplit
 
@@ -22,6 +24,8 @@ SESSION_PHASES = (
 )
 
 _ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_GIT_OBJECT_ID_PATTERN = re.compile(r"^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$")
+_SHA256_PATTERN = re.compile(r"^[0-9A-Fa-f]{64}$")
 
 
 class PhaseStatus(str, Enum):
@@ -82,6 +86,17 @@ class ArtifactDescriptor:
     phase: RunPhase
     revision_binding: str | None
 
+    def __post_init__(self) -> None:
+        _require_non_empty_string(self.name, "name")
+        _require_non_empty_string(self.schema, "schema")
+        _validate_artifact_path(self.path)
+        if not isinstance(self.sha256, str) or not _SHA256_PATTERN.fullmatch(
+            self.sha256
+        ):
+            raise ValueError("sha256 must be a full 64-character hexadecimal digest")
+        if not isinstance(self.phase, RunPhase) or self.phase not in SESSION_PHASES:
+            raise ValueError("phase must be one of the persisted SESSION_PHASES")
+
 
 @dataclass(frozen=True)
 class PhaseCheckpoint:
@@ -89,8 +104,16 @@ class PhaseCheckpoint:
     attempts: int = 0
     started_at: str | None = None
     completed_at: str | None = None
-    artifacts: list[str] = field(default_factory=list)
+    artifacts: tuple[str, ...] = field(default_factory=tuple)
     error: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, PhaseStatus):
+            raise ValueError("status must be a PhaseStatus")
+        if type(self.attempts) is not int or self.attempts < 0:
+            raise ValueError("attempts must be a non-negative integer")
+        artifacts = _immutable_string_tuple(self.artifacts, "artifacts")
+        object.__setattr__(self, "artifacts", artifacts)
 
 
 @dataclass(frozen=True)
@@ -108,11 +131,175 @@ class SessionManifest:
     status: RunStatus
     current_phase: RunPhase
     last_successful_phase: RunPhase | None
-    phases: dict[str, PhaseCheckpoint]
-    artifacts: dict[str, ArtifactDescriptor]
-    errors: list[str]
+    phases: Mapping[str, PhaseCheckpoint]
+    artifacts: Mapping[str, ArtifactDescriptor]
+    errors: tuple[str, ...]
     created_at: str
     updated_at: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SESSION_SCHEMA_VERSION:
+            raise ValueError(
+                "schema_version must equal the supported Session schema version "
+                f"{SESSION_SCHEMA_VERSION}"
+            )
+        _require_non_empty_string(self.review_id, "review_id")
+        _require_non_empty_string(self.root_review_id, "root_review_id")
+        if self.parent_review_id is not None:
+            _require_non_empty_string(self.parent_review_id, "parent_review_id")
+        if not isinstance(self.revision_change_kind, RevisionChangeKind):
+            raise ValueError("revision_change_kind must be a RevisionChangeKind")
+        if not isinstance(self.status, RunStatus):
+            raise ValueError("status must be a RunStatus")
+        if not isinstance(self.current_phase, RunPhase):
+            raise ValueError("current_phase must be a RunPhase")
+        if self.last_successful_phase is not None and not isinstance(
+            self.last_successful_phase,
+            RunPhase,
+        ):
+            raise ValueError("last_successful_phase must be a RunPhase or null")
+
+        _validate_manifest_object_ids(self)
+        _validate_manifest_lineage(self)
+
+        if not isinstance(self.phases, Mapping):
+            raise ValueError("phases must be a mapping")
+        phases = dict(self.phases)
+        expected_phase_names = {phase.value for phase in SESSION_PHASES}
+        if set(phases) != expected_phase_names:
+            raise ValueError("phases must contain exactly the persisted SESSION_PHASES")
+        if any(
+            not isinstance(checkpoint, PhaseCheckpoint)
+            for checkpoint in phases.values()
+        ):
+            raise ValueError("phases values must be PhaseCheckpoint instances")
+
+        if not isinstance(self.artifacts, Mapping):
+            raise ValueError("artifacts must be a mapping")
+        artifacts = dict(self.artifacts)
+        for registry_name, descriptor in artifacts.items():
+            if not isinstance(registry_name, str):
+                raise ValueError("artifact registry keys must be strings")
+            if not isinstance(descriptor, ArtifactDescriptor):
+                raise ValueError(
+                    "artifact registry values must be ArtifactDescriptor instances"
+                )
+            if registry_name != descriptor.name:
+                raise ValueError(
+                    f"artifact registry key {registry_name!r} must match "
+                    f"descriptor.name {descriptor.name!r}"
+                )
+
+        errors = _immutable_string_tuple(self.errors, "errors")
+        object.__setattr__(self, "phases", MappingProxyType(phases))
+        object.__setattr__(self, "artifacts", MappingProxyType(artifacts))
+        object.__setattr__(self, "errors", errors)
+
+
+def _validate_manifest_object_ids(manifest: SessionManifest) -> None:
+    object_ids = {
+        "resolved_base_sha": manifest.revisions.resolved_base_sha,
+        "resolved_head_sha": manifest.revisions.resolved_head_sha,
+        "original_base_sha": manifest.original_base_sha,
+    }
+    if manifest.incremental_from_sha is not None:
+        object_ids["incremental_from_sha"] = manifest.incremental_from_sha
+
+    for field_name, object_id in object_ids.items():
+        if not isinstance(object_id, str) or not _GIT_OBJECT_ID_PATTERN.fullmatch(
+            object_id
+        ):
+            raise ValueError(
+                f"{field_name} must be a full 40- or 64-character hexadecimal "
+                "Git object ID"
+            )
+    if len({len(object_id) for object_id in object_ids.values()}) != 1:
+        raise ValueError(
+            "resolved_base_sha, resolved_head_sha, original_base_sha, and "
+            "incremental_from_sha must use the same object ID format"
+        )
+
+
+def _validate_manifest_lineage(manifest: SessionManifest) -> None:
+    if manifest.revision_change_kind is RevisionChangeKind.INITIAL:
+        if manifest.parent_review_id is not None:
+            raise ValueError("initial Session parent_review_id must be null")
+        if manifest.root_review_id != manifest.review_id:
+            raise ValueError("initial Session root_review_id must equal review_id")
+        if (
+            manifest.original_base_sha.casefold()
+            != manifest.revisions.resolved_base_sha.casefold()
+        ):
+            raise ValueError(
+                "initial Session original_base_sha must equal resolved_base_sha"
+            )
+        if manifest.incremental_from_sha is not None:
+            raise ValueError("initial Session incremental_from_sha must be null")
+        return
+
+    if manifest.parent_review_id is None:
+        raise ValueError("child Session parent_review_id must be present")
+    if manifest.parent_review_id == manifest.review_id:
+        raise ValueError("child Session parent_review_id must not self-reference")
+    if manifest.root_review_id == manifest.review_id:
+        raise ValueError("child Session root_review_id must not self-reference")
+
+    if manifest.revision_change_kind is RevisionChangeKind.HEAD_MOVED:
+        if manifest.incremental_from_sha is None:
+            raise ValueError("HEAD_MOVED Session incremental_from_sha must be present")
+        if (
+            manifest.original_base_sha.casefold()
+            != manifest.revisions.resolved_base_sha.casefold()
+        ):
+            raise ValueError(
+                "HEAD_MOVED Session original_base_sha must equal resolved_base_sha"
+            )
+        return
+
+    if manifest.incremental_from_sha is not None:
+        raise ValueError(
+            "Base drift Session incremental_from_sha must be null because it "
+            "requires a full re-review"
+        )
+
+
+def _require_non_empty_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _validate_artifact_path(path: Any) -> None:
+    if not isinstance(path, str) or not path or path != path.strip():
+        raise ValueError("path must be a non-empty canonical relative path")
+    if "\\" in path:
+        raise ValueError("path must use canonical forward-slash separators")
+
+    posix_path = PurePosixPath(path)
+    windows_path = PureWindowsPath(path)
+    path_parts = path.split("/")
+    if (
+        posix_path.is_absolute()
+        or windows_path.is_absolute()
+        or bool(windows_path.drive)
+        or any(part in {"", ".", ".."} for part in path_parts)
+        or posix_path.as_posix() != path
+    ):
+        raise ValueError(
+            "path must be a canonical relative path without parent traversal"
+        )
+
+
+def _immutable_string_tuple(values: Any, field_name: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{field_name} must be a collection of strings")
+    try:
+        frozen_values = tuple(values)
+    except TypeError as error:
+        raise ValueError(f"{field_name} must be a collection of strings") from error
+    if any(not isinstance(value, str) for value in frozen_values):
+        raise ValueError(f"{field_name} must contain only strings")
+    return frozen_values
 
 
 def initial_session_manifest(
@@ -139,7 +326,7 @@ def initial_session_manifest(
         last_successful_phase=None,
         phases={phase.value: PhaseCheckpoint() for phase in SESSION_PHASES},
         artifacts={},
-        errors=[],
+        errors=(),
         created_at=now,
         updated_at=now,
     )
