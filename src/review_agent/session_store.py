@@ -101,6 +101,13 @@ class SessionStore:
         existing = current.artifacts.get(name)
         if current.status is RunStatus.COMPLETED and existing is None:
             raise ValueError("cannot register a new artifact on a completed Session")
+        if (
+            current.phases[phase.value].status is PhaseStatus.COMPLETED
+            and existing is None
+        ):
+            raise ValueError(
+                f"cannot register a new artifact on completed phase: {phase.value}"
+            )
         _require_revision_binding(
             current,
             name=name,
@@ -156,6 +163,12 @@ class SessionStore:
         requested_artifacts = _unique_artifact_names(artifact_names)
         if checkpoint.status is PhaseStatus.COMPLETED:
             if set(requested_artifacts) == set(checkpoint.artifacts):
+                for artifact_name in checkpoint.artifacts:
+                    self._require_valid_phase_artifact(
+                        current,
+                        phase,
+                        artifact_name,
+                    )
                 return current
             raise ValueError(
                 f"phase {phase.value} is already completed with a different "
@@ -198,8 +211,21 @@ class SessionStore:
 
     def mark_session_completed(self, now: str) -> SessionManifest:
         current = self.load()
+        self._validate_completion_candidate(current)
         if current.status is RunStatus.COMPLETED:
             return current
+
+        updated = replace(
+            current,
+            status=RunStatus.COMPLETED,
+            current_phase=RunPhase.COMPLETED,
+            last_successful_phase=RunPhase.REPORTING,
+            updated_at=now,
+        )
+        self.write(updated)
+        return updated
+
+    def _validate_completion_candidate(self, current: SessionManifest) -> None:
         incomplete = [
             phase.value
             for phase in SESSION_PHASES
@@ -235,16 +261,6 @@ class SessionStore:
             for artifact_name in checkpoint.artifacts:
                 self._require_valid_phase_artifact(current, phase, artifact_name)
 
-        updated = replace(
-            current,
-            status=RunStatus.COMPLETED,
-            current_phase=RunPhase.COMPLETED,
-            last_successful_phase=RunPhase.REPORTING,
-            updated_at=now,
-        )
-        self.write(updated)
-        return updated
-
     def mark_session_failed(
         self,
         phase: RunPhase,
@@ -260,6 +276,20 @@ class SessionStore:
             raise ValueError("cannot fail a completed Session")
         if checkpoint.status is PhaseStatus.COMPLETED:
             raise ValueError(f"cannot fail completed phase: {phase.value}")
+        phase_index = SESSION_PHASES.index(phase)
+        for predecessor in SESSION_PHASES[:phase_index]:
+            predecessor_status = current.phases[predecessor.value].status
+            if predecessor_status is not PhaseStatus.COMPLETED:
+                raise ValueError(
+                    f"cannot fail {phase.value} because predecessor "
+                    f"{predecessor.value} is {predecessor_status.value}"
+                )
+        for successor in SESSION_PHASES[phase_index + 1 :]:
+            if current.phases[successor.value].status is PhaseStatus.COMPLETED:
+                raise ValueError(
+                    f"cannot fail {phase.value} because completed successor "
+                    f"{successor.value} exists"
+                )
         phases = dict(current.phases)
         phases[phase.value] = PhaseCheckpoint(
             status=PhaseStatus.FAILED,

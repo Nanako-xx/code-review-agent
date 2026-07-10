@@ -519,6 +519,35 @@ def test_mark_phase_completed_is_idempotent_for_the_same_artifact_set(
     assert (tmp_path / "session.json").read_bytes() == session_bytes
 
 
+@pytest.mark.parametrize("mutation", ["tamper", "delete"])
+def test_mark_phase_completed_idempotence_revalidates_artifacts(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    store = create_store(tmp_path)
+    artifact_path = tmp_path / "request.json"
+    artifact_path.write_text("{}", encoding="utf-8")
+    register_artifact(store)
+    completed = store.mark_phase_completed(
+        RunPhase.PREFLIGHT,
+        ["request"],
+        "2026-07-10T00:02:00Z",
+    )
+    if mutation == "tamper":
+        artifact_path.write_text('{"tampered":true}', encoding="utf-8")
+    else:
+        artifact_path.unlink()
+
+    with pytest.raises(ValueError, match="validation"):
+        store.mark_phase_completed(
+            RunPhase.PREFLIGHT,
+            ["request"],
+            "2026-07-10T00:03:00Z",
+        )
+
+    assert store.load() == completed
+
+
 def test_mark_phase_completed_rejects_different_artifacts_after_completion(
     tmp_path: Path,
 ) -> None:
@@ -694,6 +723,50 @@ def test_mark_session_completed_is_idempotent_without_rewriting_manifest(
     assert (tmp_path / "session.json").read_bytes() == session_bytes
 
 
+@pytest.mark.parametrize("mutation", ["tamper", "delete"])
+def test_mark_session_completed_idempotence_revalidates_artifacts(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    store = create_store(tmp_path)
+    artifact_path = tmp_path / "request.json"
+    artifact_path.write_text("{}", encoding="utf-8")
+    register_artifact(store)
+    mark_all_phases(store, preflight_artifacts=["request"])
+    completed = store.mark_session_completed("2026-07-10T00:10:00Z")
+    if mutation == "tamper":
+        artifact_path.write_text('{"tampered":true}', encoding="utf-8")
+    else:
+        artifact_path.unlink()
+
+    with pytest.raises(ValueError, match="validation"):
+        store.mark_session_completed("2026-07-10T00:11:00Z")
+
+    assert store.load() == completed
+
+
+def test_mark_session_completed_idempotence_revalidates_registry_consistency(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    mark_all_phases(store)
+    store.mark_session_completed("2026-07-10T00:10:00Z")
+    session_path = tmp_path / "session.json"
+    payload = json.loads(session_path.read_text(encoding="utf-8"))
+    payload["artifacts"]["orphan"] = {
+        "name": "orphan",
+        "path": "orphan.json",
+        "sha256": "c" * 64,
+        "schema": "orphan_v1",
+        "phase": "reporting",
+        "revision_binding": REVISION_BINDING,
+    }
+    session_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="registry|orphan"):
+        store.mark_session_completed("2026-07-10T00:11:00Z")
+
+
 def test_completed_session_cannot_be_failed_reopened_or_given_new_artifact(
     tmp_path: Path,
 ) -> None:
@@ -744,6 +817,34 @@ def test_completed_phase_cannot_be_marked_failed(tmp_path: Path) -> None:
         )
 
 
+def test_completed_phase_rejects_new_artifact_but_allows_identical_registration(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    (tmp_path / "request.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "late.json").write_text("{}", encoding="utf-8")
+    registered = register_artifact(store)
+    completed = store.mark_phase_completed(
+        RunPhase.PREFLIGHT,
+        ["request"],
+        "2026-07-10T00:02:00Z",
+    )
+
+    repeated = register_artifact(store, now="2026-07-10T00:03:00Z")
+
+    assert repeated == completed
+    assert repeated.artifacts["request"] == registered.artifacts["request"]
+    with pytest.raises(ValueError, match="completed phase"):
+        register_artifact(
+            store,
+            name="late",
+            relative_path="late.json",
+            phase=RunPhase.PREFLIGHT,
+            revision_binding=REVISION_BINDING,
+            now="2026-07-10T00:03:00Z",
+        )
+
+
 def test_mark_session_failed_preserves_last_successful_phase_and_appends_errors(
     tmp_path: Path,
 ) -> None:
@@ -755,17 +856,17 @@ def test_mark_session_failed_preserves_last_successful_phase_and_appends_errors(
     )
 
     failed = store.mark_session_failed(
-        RunPhase.REVIEWERS,
+        RunPhase.REPOSITORY_INTELLIGENCE,
         "provider unavailable",
         "2026-07-10T00:02:00Z",
     )
     failed_again = store.mark_session_failed(
-        RunPhase.REVIEWERS,
+        RunPhase.REPOSITORY_INTELLIGENCE,
         "provider still unavailable",
         "2026-07-10T00:03:00Z",
     )
 
-    checkpoint = failed_again.phases[RunPhase.REVIEWERS.value]
+    checkpoint = failed_again.phases[RunPhase.REPOSITORY_INTELLIGENCE.value]
     assert failed.status is RunStatus.FAILED
     assert failed_again.status is RunStatus.FAILED
     assert failed_again.current_phase is RunPhase.FAILED
@@ -780,6 +881,74 @@ def test_mark_session_failed_preserves_last_successful_phase_and_appends_errors(
         "provider still unavailable",
     )
     assert failed_again.updated_at == "2026-07-10T00:03:00Z"
+
+
+@pytest.mark.parametrize(
+    "predecessor_status",
+    [PhaseStatus.PENDING, PhaseStatus.FAILED, PhaseStatus.INVALIDATED],
+)
+def test_mark_session_failed_rejects_non_completed_predecessor(
+    tmp_path: Path,
+    predecessor_status: PhaseStatus,
+) -> None:
+    store = create_store(tmp_path)
+    if predecessor_status is not PhaseStatus.PENDING:
+        current = store.load()
+        phases = dict(current.phases)
+        phases[RunPhase.PREFLIGHT.value] = PhaseCheckpoint(
+            status=predecessor_status,
+            attempts=1,
+            started_at="2026-07-10T00:01:00Z",
+            completed_at=None,
+            artifacts=(),
+            error="preflight unavailable",
+        )
+        store.write(
+            replace(
+                current,
+                status=RunStatus.FAILED,
+                current_phase=RunPhase.FAILED,
+                phases=phases,
+                updated_at="2026-07-10T00:01:00Z",
+            )
+        )
+
+    with pytest.raises(ValueError, match="preflight|predecessor"):
+        store.mark_session_failed(
+            RunPhase.REPOSITORY_INTELLIGENCE,
+            "repository intelligence failed",
+            "2026-07-10T00:02:00Z",
+        )
+
+
+def test_mark_session_failed_rejects_completed_successor(tmp_path: Path) -> None:
+    store = create_store(tmp_path)
+    current = store.load()
+    phases = dict(current.phases)
+    phases[RunPhase.REVIEWERS.value] = PhaseCheckpoint(
+        status=PhaseStatus.COMPLETED,
+        attempts=1,
+        started_at="2026-07-10T00:01:00Z",
+        completed_at="2026-07-10T00:02:00Z",
+        artifacts=(),
+        error=None,
+    )
+    store.write(
+        replace(
+            current,
+            status=RunStatus.RUNNING,
+            current_phase=RunPhase.REVIEWERS,
+            phases=phases,
+            updated_at="2026-07-10T00:02:00Z",
+        )
+    )
+
+    with pytest.raises(ValueError, match="completed successor|reviewers"):
+        store.mark_session_failed(
+            RunPhase.PREFLIGHT,
+            "preflight failed",
+            "2026-07-10T00:03:00Z",
+        )
 
 
 def test_mark_session_failed_accepts_only_persisted_session_phases(
