@@ -231,3 +231,24 @@ def test_whole_payload_compaction_requires_full_section_header_for_inclusion():
     assert result.metadata["included_sections"] == []
     assert "Assignment" in result.metadata["omitted_sections"]
     assert result.metadata["message_chars"] <= result.metadata["max_message_chars"]
+
+
+def test_reviewer_envelope_records_context_metadata():
+    envelope = build_reviewer_envelope(
+        assignment=_context_assignment(),
+        intent=_context_intent(),
+        code_snippets={"app.py:1-20": "x = 1\n" * 200},
+        observations={"O-1": "app.py changed\n" * 200},
+        trace_id="trace-context-metadata",
+        context_budget=ContextBudget(max_message_chars=1500),
+    )
+
+    metadata = envelope.parameters["context"]
+
+    assert metadata["budget_scope"] == "messages_only"
+    assert metadata["message_chars"] <= 1500
+    assert "system" in metadata["excluded_from_budget"]
+    assert "tools" in metadata["excluded_from_budget"]
+    assert "parameters" in metadata["excluded_from_budget"]
+    assert envelope.messages[0]["role"] == "user"
+    assert len(envelope.messages[0]["content"]) == metadata["message_chars"]
