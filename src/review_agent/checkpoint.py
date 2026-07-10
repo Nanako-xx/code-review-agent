@@ -4,6 +4,8 @@ from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
 import json
+import os
+import uuid
 
 from review_agent.run_state import RunState, run_state_from_dict, run_state_to_dict
 
@@ -18,7 +20,13 @@ class CheckpointStore:
 
     def write_json(self, filename: str, payload: dict[str, object]) -> Path:
         path = self.run_dir / filename
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+        content = json.dumps(
+            payload,
+            indent=2,
+            ensure_ascii=False,
+            default=_json_default,
+        )
+        _atomic_write_text(path, content)
         return path
 
     def read_json(self, filename: str) -> dict[str, object]:
@@ -46,3 +54,18 @@ def _json_default(value: object) -> object:
     if isinstance(value, Path):
         return str(value)
     raise TypeError(f"Object is not JSON serializable: {type(value).__name__}")
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
