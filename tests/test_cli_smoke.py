@@ -1,5 +1,7 @@
 from pathlib import Path
+import hashlib
 import json
+import re
 
 from conftest import run_git
 from review_agent.cli import main
@@ -51,12 +53,14 @@ def test_cli_review_writes_current_schema_artifacts(git_repo: Path):
     assert "provided_evidence_refs" not in assignments["assignments"][0]
 
 
-def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, capsys):
+def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypatch, capsys):
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "auth.py").write_text("def check(token):\n    return token == 'ok'\n", encoding="utf-8")
     run_git(git_repo, "add", "auth.py")
     run_git(git_repo, "commit", "-m", "add auth check")
     head = run_git(git_repo, "rev-parse", "HEAD")
+    secret = "session-must-not-persist-this-secret"
+    monkeypatch.setenv("REVIEW_AGENT_API_KEY", secret)
 
     exit_code = main(
         [
@@ -64,11 +68,13 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, capsys):
             "--repo",
             str(git_repo),
             "--base",
-            base,
+            "HEAD~1",
             "--head",
-            head,
+            "HEAD",
             "--intent",
             "Add auth token check",
+            "--reviewer-provider",
+            "fake",
             "--non-interactive",
         ]
     )
@@ -78,9 +84,15 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, capsys):
     state = json.loads((run_dirs[-1] / "state.json").read_text(encoding="utf-8"))
     brief = json.loads((run_dirs[-1] / "review_brief.json").read_text(encoding="utf-8"))
     final_risk = json.loads((run_dirs[-1] / "final_risk.json").read_text(encoding="utf-8"))
+    session_text = (run_dirs[-1] / "session.json").read_text(encoding="utf-8")
+    session = json.loads(session_text)
 
     assert exit_code == 0
     assert "Preflight" in output
+    assert "Requested Base: HEAD~1" in output
+    assert "Requested Head: HEAD" in output
+    assert f"Resolved Base: {base}" in output
+    assert f"Resolved Head: {head}" in output
     assert "Changed files: 1" in output
     assert "Intent status:" in output
     assert "Run directory:" in output
@@ -90,6 +102,10 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, capsys):
     assert "Recommendation:" in output
     assert state["status"] == "completed"
     assert state["phase"] == "completed"
+    assert state["base_revision"] == "HEAD~1"
+    assert state["head_revision"] == "HEAD"
+    assert state["resolved_base_revision"] == base
+    assert state["resolved_head_revision"] == head
     assert state["artifacts"]["request"] == "request.json"
     assert state["artifacts"]["repository_intelligence"] == "repository_intelligence.json"
     assert state["artifacts"]["report"] == "report.md"
@@ -97,9 +113,53 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, capsys):
     assert state["artifacts"]["final_risk"] == "final_risk.json"
     assert final_risk["status"] == "reassessed"
     assert brief["review_id"] == run_dirs[-1].name
+    assert brief["base_revision"] == base
+    assert brief["head_revision"] == head
     assert brief["change_map_and_repository_impact"]["changed_files"] == ["auth.py"]
     assert brief["initial_and_final_risk_assessment"]["final"]["status"] == "reassessed"
     assert brief["non_binding_recommendation"] == "manual_review"
+    assert session["schema_version"] == 1
+    assert session["status"] == "completed"
+    assert session["current_phase"] == "completed"
+    assert session["revisions"] == {
+        "requested_base": "HEAD~1",
+        "requested_head": "HEAD",
+        "resolved_base_sha": base,
+        "resolved_head_sha": head,
+        "original_base_sha": base,
+        "incremental_from_sha": None,
+        "change_kind": "initial",
+    }
+    assert re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", base)
+    assert re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head)
+    assert all(phase["status"] == "completed" for phase in session["phases"].values())
+    assert session["execution"] == {
+        "reviewer_provider": "fake",
+        "reviewer_model": None,
+        "reviewer_base_url": None,
+        "reviewer_api_key_env": "REVIEW_AGENT_API_KEY",
+        "reviewer_mode": "single",
+        "reviewer_loop": "single-shot",
+        "non_interactive": True,
+    }
+    assert secret not in session_text
+
+    binding = f"{base}..{head}"
+    expected_artifacts = {
+        "request": ("request.json", "review_request_v1", "preflight", None),
+        "review_brief": ("review_brief.json", "review_brief_v1", "reporting", binding),
+        "report": ("report.md", "review_report_markdown_v1", "reporting", binding),
+        "final_risk": ("final_risk.json", "final_risk_assessment_v1", "final_risk", binding),
+        "observations": ("observations.jsonl", "observation_log_jsonl_v1", "reporting", binding),
+    }
+    for artifact_name, (relative_path, schema, phase, revision_binding) in expected_artifacts.items():
+        descriptor = session["artifacts"][artifact_name]
+        artifact_path = run_dirs[-1] / relative_path
+        assert descriptor["path"] == relative_path
+        assert descriptor["schema"] == schema
+        assert descriptor["phase"] == phase
+        assert descriptor["revision_binding"] == revision_binding
+        assert descriptor["sha256"] == hashlib.sha256(artifact_path.read_bytes()).hexdigest()
 
 
 def test_cli_review_with_fake_reviewer_writes_reviewer_artifacts(git_repo: Path):
@@ -177,6 +237,12 @@ def test_cli_openai_compatible_adapter_requires_api_key(git_repo: Path, monkeypa
 
     assert exit_code == 2
     assert "Reviewer adapter configuration error" in capsys.readouterr().out
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    session = json.loads((run_dir / "session.json").read_text(encoding="utf-8"))
+    assert session["status"] == "failed"
+    assert session["phases"]["preflight"]["status"] == "completed"
+    assert session["phases"]["repository_intelligence"]["status"] == "completed"
+    assert session["phases"]["reviewers"]["status"] == "failed"
 
 
 def test_cli_review_records_failed_state_when_collection_fails(git_repo: Path, monkeypatch, capsys):
@@ -197,21 +263,52 @@ def test_cli_review_records_failed_state_when_collection_fails(git_repo: Path, m
             "--repo",
             str(git_repo),
             "--base",
-            base,
+            "HEAD~1",
             "--head",
-            head,
+            "HEAD",
             "--non-interactive",
         ]
     )
 
     run_dirs = sorted((git_repo / ".review-agent" / "runs").iterdir())
     state = json.loads((run_dirs[-1] / "state.json").read_text(encoding="utf-8"))
+    session = json.loads((run_dirs[-1] / "session.json").read_text(encoding="utf-8"))
 
     assert exit_code == 1
     assert state["status"] == "failed"
     assert state["phase"] == "failed"
+    assert state["base_revision"] == "HEAD~1"
+    assert state["head_revision"] == "HEAD"
+    assert state["resolved_base_revision"] == base
+    assert state["resolved_head_revision"] == head
     assert "RuntimeError: boom" in state["errors"]
+    assert session["status"] == "failed"
+    assert session["current_phase"] == "failed"
+    assert session["phases"]["preflight"]["status"] == "failed"
+    assert session["phases"]["repository_intelligence"]["status"] == "pending"
+    assert session["revisions"]["resolved_base_sha"] == base
+    assert session["revisions"]["resolved_head_sha"] == head
     assert "Review failed" in capsys.readouterr().err
+
+
+def test_cli_invalid_revision_does_not_create_session(git_repo: Path, capsys):
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            "missing-base",
+            "--head",
+            "HEAD",
+            "--non-interactive",
+        ]
+    )
+
+    assert exit_code == 1
+    assert "unable to resolve revisions" in capsys.readouterr().err
+    run_root = git_repo / ".review-agent" / "runs"
+    assert not run_root.exists() or not list(run_root.iterdir())
 
 
 def test_cli_agent_loop_openai_compatible_uses_adapter_factory(git_repo: Path, monkeypatch):
@@ -333,9 +430,12 @@ def test_cli_multi_reviewer_mode_requires_reviewer_provider(git_repo: Path, caps
     assert "--reviewer-mode multi requires --reviewer-provider" in capsys.readouterr().out
     run_dirs = sorted((git_repo / ".review-agent" / "runs").iterdir())
     state = json.loads((run_dirs[-1] / "state.json").read_text(encoding="utf-8"))
+    session = json.loads((run_dirs[-1] / "session.json").read_text(encoding="utf-8"))
     assert state["status"] == "failed"
     assert state["phase"] == "failed"
     assert "--reviewer-mode multi requires --reviewer-provider" in state["errors"][0]
+    assert session["status"] == "failed"
+    assert session["phases"]["reviewers"]["status"] == "failed"
 
 
 def test_cli_fake_reviewer_writes_observation_store_artifacts(git_repo: Path):
