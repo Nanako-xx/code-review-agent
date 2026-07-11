@@ -1,7 +1,7 @@
 # Review Session Memory、Resume 与 Revision Lineage 设计
 
-日期：2026-07-10  
-状态：待用户确认  
+日期：2026-07-10
+状态：已确认
 上位设计：`docs/superpowers/specs/2026-06-22-evidence-driven-multi-agent-code-review-design.md`
 
 ## 1. 目标
