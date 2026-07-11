@@ -486,6 +486,83 @@ def test_mark_phase_completed_updates_immutable_checkpoint_in_order(
     assert isinstance(updated.errors, tuple)
 
 
+def test_mark_phase_completed_requires_every_registered_artifact_for_that_phase(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    (tmp_path / "request.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "intent.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "repository.json").write_text("{}", encoding="utf-8")
+    register_artifact(store)
+    register_artifact(
+        store,
+        name="intent",
+        relative_path="intent.json",
+        phase=RunPhase.PREFLIGHT,
+        revision_binding=REVISION_BINDING,
+    )
+    register_artifact(
+        store,
+        name="repository",
+        relative_path="repository.json",
+        phase=RunPhase.REPOSITORY_INTELLIGENCE,
+        revision_binding=REVISION_BINDING,
+    )
+
+    with pytest.raises(ValueError, match="registry|artifact set"):
+        store.mark_phase_completed(
+            RunPhase.PREFLIGHT,
+            ["request"],
+            "2026-07-10T00:02:00Z",
+        )
+
+    unchanged = store.load()
+    assert unchanged.phases["preflight"].status is PhaseStatus.PENDING
+    completed = store.mark_phase_completed(
+        RunPhase.PREFLIGHT,
+        ["request", "intent"],
+        "2026-07-10T00:03:00Z",
+    )
+    assert completed.phases["preflight"].artifacts == ("request", "intent")
+
+
+def test_mark_phase_completed_idempotence_rejects_same_phase_registry_orphan(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    (tmp_path / "request.json").write_text("{}", encoding="utf-8")
+    orphan_path = tmp_path / "orphan.json"
+    orphan_path.write_text("{}", encoding="utf-8")
+    register_artifact(store)
+    completed = store.mark_phase_completed(
+        RunPhase.PREFLIGHT,
+        ["request"],
+        "2026-07-10T00:02:00Z",
+    )
+    orphan = ArtifactDescriptor(
+        name="orphan",
+        path="orphan.json",
+        sha256=sha256(orphan_path.read_bytes()).hexdigest(),
+        schema="orphan_v1",
+        phase=RunPhase.PREFLIGHT,
+        revision_binding=REVISION_BINDING,
+    )
+    store.write(
+        replace(
+            completed,
+            artifacts={**completed.artifacts, "orphan": orphan},
+            updated_at="2026-07-10T00:03:00Z",
+        )
+    )
+
+    with pytest.raises(ValueError, match="registry|artifact set"):
+        store.mark_phase_completed(
+            RunPhase.PREFLIGHT,
+            ["request"],
+            "2026-07-10T00:04:00Z",
+        )
+
+
 def test_mark_phase_completed_is_idempotent_for_the_same_artifact_set(
     tmp_path: Path,
 ) -> None:
@@ -680,9 +757,25 @@ def test_mark_session_completed_rejects_orphan_registry_artifact(
     tmp_path: Path,
 ) -> None:
     store = create_store(tmp_path)
-    (tmp_path / "request.json").write_text("{}", encoding="utf-8")
-    register_artifact(store)
     mark_all_phases(store)
+    orphan_path = tmp_path / "orphan.json"
+    orphan_path.write_text("{}", encoding="utf-8")
+    current = store.load()
+    orphan = ArtifactDescriptor(
+        name="orphan",
+        path="orphan.json",
+        sha256=sha256(orphan_path.read_bytes()).hexdigest(),
+        schema="orphan_v1",
+        phase=RunPhase.PREFLIGHT,
+        revision_binding=REVISION_BINDING,
+    )
+    store.write(
+        replace(
+            current,
+            artifacts={"orphan": orphan},
+            updated_at="2026-07-10T00:09:00Z",
+        )
+    )
 
     with pytest.raises(ValueError, match="registry|orphan"):
         store.mark_session_completed("2026-07-10T00:10:00Z")

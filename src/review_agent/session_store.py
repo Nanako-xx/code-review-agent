@@ -163,12 +163,11 @@ class SessionStore:
         requested_artifacts = _unique_artifact_names(artifact_names)
         if checkpoint.status is PhaseStatus.COMPLETED:
             if set(requested_artifacts) == set(checkpoint.artifacts):
-                for artifact_name in checkpoint.artifacts:
-                    self._require_valid_phase_artifact(
-                        current,
-                        phase,
-                        artifact_name,
-                    )
+                self._require_complete_phase_artifact_set(
+                    current,
+                    phase,
+                    checkpoint.artifacts,
+                )
                 return current
             raise ValueError(
                 f"phase {phase.value} is already completed with a different "
@@ -186,8 +185,11 @@ class SessionStore:
                     f"cannot complete {phase.value} before {predecessor.value}"
                 )
 
-        for artifact_name in requested_artifacts:
-            self._require_valid_phase_artifact(current, phase, artifact_name)
+        self._require_complete_phase_artifact_set(
+            current,
+            phase,
+            requested_artifacts,
+        )
 
         phases = dict(current.phases)
         phases[phase.value] = PhaseCheckpoint(
@@ -415,6 +417,35 @@ class SessionStore:
         if not self.validate_artifact(descriptor):
             raise ValueError(f"artifact validation failed: {artifact_name}")
         return descriptor
+
+    def _require_complete_phase_artifact_set(
+        self,
+        manifest: SessionManifest,
+        phase: RunPhase,
+        artifact_names: Iterable[str],
+    ) -> None:
+        names = tuple(artifact_names)
+        for artifact_name in names:
+            self._require_valid_phase_artifact(manifest, phase, artifact_name)
+
+        registry_names = {
+            name
+            for name, descriptor in manifest.artifacts.items()
+            if descriptor.phase is phase
+        }
+        checkpoint_names = set(names)
+        if registry_names != checkpoint_names:
+            omitted = sorted(registry_names - checkpoint_names)
+            unexpected = sorted(checkpoint_names - registry_names)
+            details: list[str] = []
+            if omitted:
+                details.append("omitted registry artifacts: " + ", ".join(omitted))
+            if unexpected:
+                details.append("non-registry artifacts: " + ", ".join(unexpected))
+            raise ValueError(
+                f"phase {phase.value} artifact set must exactly match its registry; "
+                + "; ".join(details)
+            )
 
 
 def _require_session_phase(phase: RunPhase) -> RunPhase:
