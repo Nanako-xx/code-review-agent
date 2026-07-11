@@ -40,7 +40,14 @@ from review_agent.reporting import render_review_brief_markdown
 from review_agent.revision import RevisionResolver
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
 from review_agent.reviewer import reviewer_result_to_dict, run_single_reviewer
-from review_agent.run_state import RunPhase, RunState, advance_run_state, fail_run_state, initial_run_state
+from review_agent.run_state import (
+    RunPhase,
+    RunState,
+    RunStatus,
+    advance_run_state,
+    fail_run_state,
+    initial_run_state,
+)
 from review_agent.runtime import build_assignments
 from review_agent.session import (
     SESSION_PHASES,
@@ -71,7 +78,6 @@ _ARTIFACT_SCHEMAS = {
     "review_brief": "review_brief_v1",
     "report": "review_report_markdown_v1",
     "observations": "observation_log_jsonl_v1",
-    "state": "legacy_run_state_v1",
 }
 
 _PER_REVIEWER_SCHEMAS = {
@@ -196,10 +202,15 @@ def _run_review(args: argparse.Namespace) -> int:
             revisions.resolved_head_sha,
         )
         intent = build_intent_packet(request, change_summary)
-        gates = detect_quality_gates(repo)
+        gates = detect_quality_gates(repo, revision=revisions.resolved_head_sha)
         quality_results = []
         if "python_compile" in gates:
-            quality_results.append(run_python_compile_gate(repo))
+            quality_results.append(
+                run_python_compile_gate(
+                    repo,
+                    revision=revisions.resolved_head_sha,
+                )
+            )
         quality_status = {result.name: result.status for result in quality_results}
         risk_packet = build_risk_packet(change_summary, intent, quality_status)
         risk_assessment = LocalRiskAssessor().assess(risk_packet)
@@ -636,15 +647,7 @@ def _run_review(args: argparse.Namespace) -> int:
             "review_brief": "review_brief.json",
             "report": "report.md",
             "observations": "observations.jsonl",
-            "state": "state.json",
         }
-        state = advance_run_state(
-            state,
-            phase=RunPhase.COMPLETED,
-            message="Review completed",
-            artifacts=reporting_artifacts,
-        )
-        store.write_state(state)
         _complete_session_phase(
             session_store,
             RunPhase.REPORTING,
@@ -652,6 +655,13 @@ def _run_review(args: argparse.Namespace) -> int:
             revision_binding,
         )
         session_store.mark_session_completed(_utc_now())
+        state = advance_run_state(
+            state,
+            phase=RunPhase.COMPLETED,
+            message="Review completed",
+            artifacts=reporting_artifacts,
+        )
+        store.write_state(state)
     except Exception as error:
         error_text = f"{type(error).__name__}: {error}"
         _record_failed_review(
@@ -685,6 +695,41 @@ def _run_resume(args: argparse.Namespace) -> int:
         print(f"Review run not found: {store.run_dir}", file=sys.stderr)
         return 2
 
+    session_path = store.run_dir / "session.json"
+    if session_path.exists():
+        session_store = SessionStore(store.run_dir)
+        try:
+            session = session_store.load()
+        except Exception as error:
+            print(f"Review run has an invalid session.json: {error}", file=sys.stderr)
+            return 2
+
+        print("Resume")
+        print(f"  Review ID: {session.review_id}")
+        print(f"  Status: {session.status.value}")
+        print(f"  Phase: {session.current_phase.value}")
+        print(f"  Repository: {session.repository.canonical_path}")
+        print(f"  Requested Base: {session.revisions.requested_base}")
+        print(f"  Requested Head: {session.revisions.requested_head}")
+        print(f"  Resolved Base: {session.revisions.resolved_base_sha}")
+        print(f"  Resolved Head: {session.revisions.resolved_head_sha}")
+        print(f"  Run directory: {store.run_dir}")
+        print("  Artifacts:")
+        for name, descriptor in sorted(session.artifacts.items()):
+            artifact_path = store.run_dir / descriptor.path
+            if not artifact_path.exists():
+                marker = "missing"
+            elif session_store.validate_artifact(descriptor):
+                marker = "present"
+            else:
+                marker = "invalid"
+            print(f"    - {name}: {descriptor.path} ({marker})")
+        if session.errors:
+            print("  Errors:")
+            for error in session.errors:
+                print(f"    - {error}")
+        return 0
+
     state_path = store.run_dir / "state.json"
     request_path = store.run_dir / "request.json"
     if not state_path.exists():
@@ -696,22 +741,14 @@ def _run_resume(args: argparse.Namespace) -> int:
 
     state = store.read_state()
     request = store.read_json("request.json")
-    session_path = store.run_dir / "session.json"
-    session = SessionStore(store.run_dir).load() if session_path.exists() else None
 
     print("Resume")
     print(f"  Review ID: {state.review_id}")
     print(f"  Status: {state.status.value}")
     print(f"  Phase: {state.phase.value}")
     print(f"  Repository: {state.repository_path}")
-    if session is not None:
-        print(f"  Requested Base: {session.revisions.requested_base}")
-        print(f"  Requested Head: {session.revisions.requested_head}")
-        print(f"  Resolved Base: {session.revisions.resolved_base_sha}")
-        print(f"  Resolved Head: {session.revisions.resolved_head_sha}")
-    else:
-        print(f"  Base: {state.base_revision}")
-        print(f"  Head: {state.head_revision}")
+    print(f"  Base: {state.base_revision}")
+    print(f"  Head: {state.head_revision}")
     print(f"  Message: {state.message}")
     print(f"  Run directory: {store.run_dir}")
     request_repository = request.get("repository_path")
@@ -742,10 +779,14 @@ def _record_failed_review(
     message: str,
     error: str,
 ) -> None:
-    _record_failed_review_state(store, state, message=message, error=error)
+    manifest = session_store.load()
+    if manifest.status is RunStatus.COMPLETED:
+        return
     phase = _first_incomplete_session_phase(session_store)
-    if phase is not None:
-        session_store.mark_session_failed(phase, error, _utc_now())
+    if phase is None:
+        return
+    session_store.mark_session_failed(phase, error, _utc_now())
+    _record_failed_review_state(store, state, message=message, error=error)
 
 
 def _first_incomplete_session_phase(session_store: SessionStore) -> RunPhase | None:

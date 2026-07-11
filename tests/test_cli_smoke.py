@@ -143,6 +143,7 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypat
         "non_interactive": True,
     }
     assert secret not in session_text
+    assert "state" not in session["artifacts"]
 
     binding = f"{base}..{head}"
     expected_artifacts = {
@@ -309,6 +310,62 @@ def test_cli_invalid_revision_does_not_create_session(git_repo: Path, capsys):
     assert "unable to resolve revisions" in capsys.readouterr().err
     run_root = git_repo / ".review-agent" / "runs"
     assert not run_root.exists() or not list(run_root.iterdir())
+
+
+def test_cli_quality_gate_uses_resolved_head_when_worktree_is_dirty(git_repo: Path):
+    (git_repo / "app.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    run_git(git_repo, "add", "app.py")
+    run_git(git_repo, "commit", "-m", "valid target head")
+    (git_repo / "app.py").write_text("def broken(:\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            "HEAD~1",
+            "--head",
+            "HEAD",
+            "--non-interactive",
+        ]
+    )
+
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    quality = json.loads((run_dir / "quality_gates.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert quality["results"][0]["status"] == "passed"
+
+
+def test_cli_quality_gate_uses_non_checked_out_head_commit(git_repo: Path):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "target.py").write_text("def broken(:\n", encoding="utf-8")
+    run_git(git_repo, "add", "target.py")
+    run_git(git_repo, "commit", "-m", "invalid target head")
+    target_head = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "target.py").write_text("def fixed():\n    return 1\n", encoding="utf-8")
+    run_git(git_repo, "add", "target.py")
+    run_git(git_repo, "commit", "-m", "valid current head")
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            base,
+            "--head",
+            target_head,
+            "--non-interactive",
+        ]
+    )
+
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    quality = json.loads((run_dir / "quality_gates.json").read_text(encoding="utf-8"))
+    session = json.loads((run_dir / "session.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert quality["results"][0]["status"] == "failed"
+    assert session["revisions"]["resolved_head_sha"] == target_head
 
 
 def test_cli_agent_loop_openai_compatible_uses_adapter_factory(git_repo: Path, monkeypatch):
