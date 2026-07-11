@@ -150,17 +150,25 @@ def _run_review(args: argparse.Namespace) -> int:
         return 2
 
     review_id = f"review-{uuid.uuid4().hex[:12]}"
-    store = CheckpointStore(repo, review_id)
-    session_store = SessionStore(store.run_dir)
-    session_store.create(
-        initial_session_manifest(
-            review_id=review_id,
-            repository=repository_identity,
-            revisions=revisions,
-            execution=execution_config,
-            now=_utc_now(),
+    try:
+        store = CheckpointStore(repo, review_id)
+        session_store = SessionStore(store.run_dir)
+        session_store.create(
+            initial_session_manifest(
+                review_id=review_id,
+                repository=repository_identity,
+                revisions=revisions,
+                execution=execution_config,
+                now=_utc_now(),
+            )
         )
-    )
+    except Exception as error:
+        print(
+            "Review failed: unable to create review Session: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return 1
     revision_binding = f"{revisions.resolved_base_sha}..{revisions.resolved_head_sha}"
     request = ReviewRequest(
         repository_path=str(repo),
@@ -177,25 +185,25 @@ def _run_review(args: argparse.Namespace) -> int:
         resolved_base_revision=revisions.resolved_base_sha,
         resolved_head_revision=revisions.resolved_head_sha,
     )
-    store.write_state(state)
-    store.write_json("request.json", asdict(request))
-    session_store.register_existing_artifact(
-        name="request",
-        relative_path="request.json",
-        schema=_artifact_schema("request"),
-        phase=RunPhase.PREFLIGHT,
-        revision_binding=None,
-        now=_utc_now(),
-    )
-    state = advance_run_state(
-        state,
-        phase=RunPhase.CREATED,
-        message="Request checkpointed",
-        artifacts={"request": "request.json"},
-    )
-    store.write_state(state)
-
     try:
+        store.write_state(state)
+        store.write_json("request.json", asdict(request))
+        session_store.register_existing_artifact(
+            name="request",
+            relative_path="request.json",
+            schema=_artifact_schema("request"),
+            phase=RunPhase.PREFLIGHT,
+            revision_binding=None,
+            now=_utc_now(),
+        )
+        state = advance_run_state(
+            state,
+            phase=RunPhase.CREATED,
+            message="Request checkpointed",
+            artifacts={"request": "request.json"},
+        )
+        store.write_state(state)
+
         change_summary = collect_change_summary(
             repo,
             revisions.resolved_base_sha,
@@ -655,13 +663,20 @@ def _run_review(args: argparse.Namespace) -> int:
             revision_binding,
         )
         session_store.mark_session_completed(_utc_now())
-        state = advance_run_state(
-            state,
-            phase=RunPhase.COMPLETED,
-            message="Review completed",
-            artifacts=reporting_artifacts,
-        )
-        store.write_state(state)
+        try:
+            completed_state = advance_run_state(
+                state,
+                phase=RunPhase.COMPLETED,
+                message="Review completed",
+                artifacts=reporting_artifacts,
+            )
+            store.write_state(completed_state)
+            state = completed_state
+        except Exception as state_error:
+            _print_recording_warning(
+                "unable to write completed legacy state summary",
+                state_error,
+            )
     except Exception as error:
         error_text = f"{type(error).__name__}: {error}"
         _record_failed_review(
@@ -728,6 +743,14 @@ def _run_resume(args: argparse.Namespace) -> int:
             print("  Errors:")
             for error in session.errors:
                 print(f"    - {error}")
+        if session.status is RunStatus.COMPLETED:
+            try:
+                session_store.mark_session_completed(_utc_now())
+            except Exception as audit_error:
+                print("  Audit: invalid")
+                print(f"  Audit error: {audit_error}")
+                return 2
+            print("  Audit: valid")
         return 0
 
     state_path = store.run_dir / "state.json"
@@ -779,22 +802,54 @@ def _record_failed_review(
     message: str,
     error: str,
 ) -> None:
-    manifest = session_store.load()
-    if manifest.status is RunStatus.COMPLETED:
-        return
-    phase = _first_incomplete_session_phase(session_store)
-    if phase is None:
-        return
-    session_store.mark_session_failed(phase, error, _utc_now())
-    _record_failed_review_state(store, state, message=message, error=error)
+    try:
+        manifest = session_store.load()
+    except Exception as session_error:
+        _print_recording_warning(
+            "unable to load Session while recording failure",
+            session_error,
+        )
+    else:
+        if manifest.status is RunStatus.COMPLETED:
+            return
+        phase = next(
+            (
+                candidate
+                for candidate in SESSION_PHASES
+                if manifest.phases[candidate.value].status
+                is not PhaseStatus.COMPLETED
+            ),
+            None,
+        )
+        if phase is None:
+            _print_recording_warning(
+                "Session finalization remains retryable; no failed phase or "
+                "legacy failed state was fabricated",
+            )
+            return
+        try:
+            session_store.mark_session_failed(phase, error, _utc_now())
+        except Exception as session_error:
+            _print_recording_warning(
+                "unable to mark Session phase failed",
+                session_error,
+            )
+
+    try:
+        _record_failed_review_state(store, state, message=message, error=error)
+    except Exception as state_error:
+        _print_recording_warning(
+            "unable to write legacy failed state",
+            state_error,
+        )
 
 
-def _first_incomplete_session_phase(session_store: SessionStore) -> RunPhase | None:
-    manifest = session_store.load()
-    for phase in SESSION_PHASES:
-        if manifest.phases[phase.value].status is not PhaseStatus.COMPLETED:
-            return phase
-    return None
+def _print_recording_warning(
+    message: str,
+    error: Exception | None = None,
+) -> None:
+    detail = f": {type(error).__name__}: {error}" if error is not None else ""
+    print(f"Warning: {message}{detail}", file=sys.stderr)
 
 
 def _complete_session_phase(

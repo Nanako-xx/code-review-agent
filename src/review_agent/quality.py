@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path, PurePosixPath
 import subprocess
+import tokenize
 
 from review_agent.models import QualityGateResult
 
@@ -20,7 +22,7 @@ def run_python_compile_gate(
 ) -> QualityGateResult:
     if revision is None:
         python_sources = [
-            (str(path), path.read_text(encoding="utf-8-sig"))
+            (str(path), path.read_bytes())
             for path in repo_path.rglob("*.py")
             if ".git" not in path.parts
         ]
@@ -28,7 +30,7 @@ def run_python_compile_gate(
         python_sources = [
             (
                 f"{revision}:{relative_path}",
-                _read_blob(repo_path, object_id).decode("utf-8-sig"),
+                _read_blob(repo_path, object_id),
             )
             for relative_path, object_id in _python_blobs_at_revision(
                 repo_path,
@@ -36,22 +38,35 @@ def run_python_compile_gate(
             )
         ]
 
-    for filename, source in python_sources:
+    for filename, raw_source in python_sources:
         try:
+            source = _decode_python_source(raw_source)
             compile(source, filename, "exec")
-        except (SyntaxError, UnicodeDecodeError) as exc:
-            return QualityGateResult(
-                name="python_compile",
-                status="failed",
-                command=["python", "-c", "compile(source, filename, 'exec')"],
-                summary=f"{type(exc).__name__}: {exc}",
-            )
+        except (LookupError, SyntaxError, UnicodeDecodeError) as exc:
+            return _failed_python_compile_result(filename, exc)
 
     return QualityGateResult(
         name="python_compile",
         status="passed",
         command=["python", "-c", "compile(source, filename, 'exec')"],
         summary=f"Compiled {len(python_sources)} Python files",
+    )
+
+
+def _decode_python_source(raw_source: bytes) -> str:
+    encoding, _ = tokenize.detect_encoding(io.BytesIO(raw_source).readline)
+    return raw_source.decode(encoding)
+
+
+def _failed_python_compile_result(
+    filename: str,
+    error: Exception,
+) -> QualityGateResult:
+    return QualityGateResult(
+        name="python_compile",
+        status="failed",
+        command=["python", "-c", "compile(source, filename, 'exec')"],
+        summary=f"{filename}: {type(error).__name__}: {error}",
     )
 
 

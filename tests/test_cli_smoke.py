@@ -4,7 +4,9 @@ import json
 import re
 
 from conftest import run_git
+from review_agent.checkpoint import CheckpointStore
 from review_agent.cli import main
+from review_agent.session_store import SessionStore
 
 
 def test_cli_review_writes_current_schema_artifacts(git_repo: Path):
@@ -310,6 +312,119 @@ def test_cli_invalid_revision_does_not_create_session(git_repo: Path, capsys):
     assert "unable to resolve revisions" in capsys.readouterr().err
     run_root = git_repo / ".review-agent" / "runs"
     assert not run_root.exists() or not list(run_root.iterdir())
+
+
+def test_cli_session_create_failure_returns_clear_error(git_repo: Path, monkeypatch, capsys):
+    def fail_create(self, manifest):
+        raise OSError("session create unavailable")
+
+    monkeypatch.setattr(SessionStore, "create", fail_create)
+
+    exit_code = main(
+        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD"]
+    )
+
+    assert exit_code == 1
+    error_output = capsys.readouterr().err
+    assert "unable to create review Session" in error_output
+    assert "session create unavailable" in error_output
+
+
+def test_cli_initial_state_write_failure_marks_session_failed(git_repo: Path, monkeypatch, capsys):
+    def fail_state_write(self, state):
+        raise OSError("initial state unavailable")
+
+    monkeypatch.setattr(CheckpointStore, "write_state", fail_state_write)
+
+    exit_code = main(
+        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD"]
+    )
+
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    session = json.loads((run_dir / "session.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert session["status"] == "failed"
+    assert session["phases"]["preflight"]["status"] == "failed"
+    assert "OSError: initial state unavailable" in session["errors"]
+    error_output = capsys.readouterr().err
+    assert "Review failed: initial state unavailable" in error_output
+    assert "Warning:" in error_output
+
+
+def test_cli_request_write_failure_marks_session_and_state_failed(git_repo: Path, monkeypatch, capsys):
+    original_write_json = CheckpointStore.write_json
+
+    def fail_request_write(self, filename, payload):
+        if filename == "request.json":
+            raise OSError("request checkpoint unavailable")
+        return original_write_json(self, filename, payload)
+
+    monkeypatch.setattr(CheckpointStore, "write_json", fail_request_write)
+
+    exit_code = main(
+        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD"]
+    )
+
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    session = json.loads((run_dir / "session.json").read_text(encoding="utf-8"))
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert session["status"] == "failed"
+    assert session["phases"]["preflight"]["status"] == "failed"
+    assert "OSError: request checkpoint unavailable" in session["errors"]
+    assert state["status"] == "failed"
+    assert "OSError: request checkpoint unavailable" in state["errors"]
+    assert "Review failed: request checkpoint unavailable" in capsys.readouterr().err
+
+
+def test_cli_finalization_failure_leaves_retryable_running_session(git_repo: Path, monkeypatch, capsys):
+    def fail_finalization(self, now):
+        raise RuntimeError("session finalization unavailable")
+
+    monkeypatch.setattr(SessionStore, "mark_session_completed", fail_finalization)
+
+    exit_code = main(
+        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD"]
+    )
+
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    session = json.loads((run_dir / "session.json").read_text(encoding="utf-8"))
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert session["status"] == "running"
+    assert session["current_phase"] == "reporting"
+    assert all(phase["status"] == "completed" for phase in session["phases"].values())
+    assert session["errors"] == []
+    assert state["status"] == "running"
+    assert state["phase"] != "failed"
+    error_output = capsys.readouterr().err
+    assert "Review failed: session finalization unavailable" in error_output
+    assert "retryable" in error_output
+
+
+def test_cli_completed_state_write_is_best_effort(git_repo: Path, monkeypatch, capsys):
+    original_write_state = CheckpointStore.write_state
+
+    def fail_completed_state(self, state):
+        if state.status.value == "completed":
+            raise OSError("completed state unavailable")
+        return original_write_state(self, state)
+
+    monkeypatch.setattr(CheckpointStore, "write_state", fail_completed_state)
+
+    exit_code = main(
+        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD"]
+    )
+
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    session = json.loads((run_dir / "session.json").read_text(encoding="utf-8"))
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert session["status"] == "completed"
+    assert state["status"] == "running"
+    error_output = capsys.readouterr().err
+    assert "Warning:" in error_output
+    assert "completed state unavailable" in error_output
 
 
 def test_cli_quality_gate_uses_resolved_head_when_worktree_is_dirty(git_repo: Path):

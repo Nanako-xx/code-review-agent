@@ -64,3 +64,41 @@ def test_revision_python_compile_reads_non_checked_out_commit(git_repo: Path):
 
     assert result.status == "failed"
     assert "bad.py" in result.summary
+
+
+def test_revision_python_compile_accepts_pep263_latin1(git_repo: Path):
+    (git_repo / "latin.py").write_bytes(
+        b"# coding: latin-1\nlabel = 'caf\xe9'\n"
+    )
+    run_git(git_repo, "add", "latin.py")
+    run_git(git_repo, "commit", "-m", "add latin1 python")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    result = run_python_compile_gate(git_repo, revision=head)
+
+    assert result.status == "passed"
+
+
+def test_revision_python_compile_reports_unknown_encoding(git_repo: Path):
+    (git_repo / "unknown_encoding.py").write_bytes(
+        b"# coding: not-a-real-codec\nvalue = 1\n"
+    )
+    run_git(git_repo, "add", "unknown_encoding.py")
+    run_git(git_repo, "commit", "-m", "add unknown encoding")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    result = run_python_compile_gate(git_repo, revision=head)
+
+    assert result.status == "failed"
+    assert "unknown_encoding.py" in result.summary
+    assert "encoding" in result.summary.lower()
+
+
+def test_worktree_python_compile_reports_invalid_encoded_bytes(tmp_path: Path):
+    (tmp_path / "invalid_bytes.py").write_bytes(b"value = '\xff'\n")
+
+    result = run_python_compile_gate(tmp_path)
+
+    assert result.status == "failed"
+    assert "invalid_bytes.py" in result.summary
+    assert "encoding" in result.summary.lower()

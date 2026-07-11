@@ -45,6 +45,7 @@ def test_cli_resume_prints_completed_run_summary(git_repo: Path, capsys) -> None
     assert "final_risk.json (present)" in output
     assert "report.md (present)" in output
     assert "review_brief.json (present)" in output
+    assert "Audit: valid" in output
 
 
 def test_cli_resume_legacy_run_without_session_uses_state_revisions(git_repo: Path, capsys) -> None:
@@ -109,6 +110,7 @@ def test_cli_resume_session_does_not_require_legacy_state(git_repo: Path, capsys
     assert f"Resolved Base: {base}" in output
     assert f"Resolved Head: {head}" in output
     assert "report.md (present)" in output
+    assert "Audit: valid" in output
 
 
 def test_cli_resume_session_ignores_stale_legacy_state(git_repo: Path, capsys) -> None:
@@ -140,6 +142,47 @@ def test_cli_resume_session_ignores_stale_legacy_state(git_repo: Path, capsys) -
     assert f"Repository: {git_repo}" in output
     assert "stale-repository" not in output
     assert "stale-state-error" not in output
+    assert "Audit: valid" in output
+
+
+def test_cli_resume_completed_session_rejects_tampered_report(git_repo: Path, capsys) -> None:
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "auth.py").write_text("def check(token):\n    return bool(token)\n", encoding="utf-8")
+    run_git(git_repo, "add", "auth.py")
+    run_git(git_repo, "commit", "-m", "add auth check")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head]) == 0
+    capsys.readouterr()
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    (run_dir / "report.md").write_text("tampered report\n", encoding="utf-8")
+
+    exit_code = main(["resume", run_dir.name, "--repo", str(git_repo)])
+
+    output = capsys.readouterr().out
+    assert exit_code == 2
+    assert "report: report.md (invalid)" in output
+    assert "Audit: invalid" in output
+    assert "artifact validation failed: report" in output
+
+
+def test_cli_resume_completed_session_rejects_missing_artifact(git_repo: Path, capsys) -> None:
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "auth.py").write_text("def check(token):\n    return bool(token)\n", encoding="utf-8")
+    run_git(git_repo, "add", "auth.py")
+    run_git(git_repo, "commit", "-m", "add auth check")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head]) == 0
+    capsys.readouterr()
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    (run_dir / "report.md").unlink()
+
+    exit_code = main(["resume", run_dir.name, "--repo", str(git_repo)])
+
+    output = capsys.readouterr().out
+    assert exit_code == 2
+    assert "report: report.md (missing)" in output
+    assert "Audit: invalid" in output
+    assert "artifact validation failed: report" in output
 
 
 def test_cli_resume_missing_run_returns_usage_error(tmp_path: Path, capsys) -> None:
