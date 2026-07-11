@@ -99,7 +99,7 @@ class ArtifactDescriptor:
 
 
 @dataclass(frozen=True)
-class PhaseCheckpoint:
+class ReviewerTaskCheckpoint:
     status: PhaseStatus = PhaseStatus.PENDING
     attempts: int = 0
     started_at: str | None = None
@@ -113,7 +113,82 @@ class PhaseCheckpoint:
         if type(self.attempts) is not int or self.attempts < 0:
             raise ValueError("attempts must be a non-negative integer")
         artifacts = _immutable_string_tuple(self.artifacts, "artifacts")
+        for field_name in ("started_at", "completed_at", "error"):
+            value = getattr(self, field_name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{field_name} must be a non-empty string or null")
+        if self.status is PhaseStatus.PENDING:
+            if (
+                self.attempts != 0
+                or self.started_at is not None
+                or self.completed_at is not None
+                or artifacts
+                or self.error is not None
+            ):
+                raise ValueError("pending reviewer task must not contain attempt state")
+        elif self.status is PhaseStatus.RUNNING:
+            if (
+                self.attempts < 1
+                or self.started_at is None
+                or self.completed_at is not None
+                or artifacts
+                or self.error is not None
+            ):
+                raise ValueError("running reviewer task has inconsistent attempt state")
+        elif self.status is PhaseStatus.COMPLETED:
+            if (
+                self.attempts < 1
+                or self.started_at is None
+                or self.completed_at is None
+                or not artifacts
+                or self.error is not None
+            ):
+                raise ValueError("completed reviewer task has inconsistent attempt state")
+        elif self.status in {PhaseStatus.FAILED, PhaseStatus.INVALIDATED}:
+            if (
+                self.attempts < 1
+                or self.started_at is None
+                or self.completed_at is not None
+                or artifacts
+                or self.error is None
+            ):
+                raise ValueError(
+                    f"{self.status.value} reviewer task has inconsistent attempt state"
+                )
         object.__setattr__(self, "artifacts", artifacts)
+
+
+@dataclass(frozen=True)
+class PhaseCheckpoint:
+    status: PhaseStatus = PhaseStatus.PENDING
+    attempts: int = 0
+    started_at: str | None = None
+    completed_at: str | None = None
+    artifacts: tuple[str, ...] = field(default_factory=tuple)
+    error: str | None = None
+    tasks: Mapping[str, ReviewerTaskCheckpoint] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, PhaseStatus):
+            raise ValueError("status must be a PhaseStatus")
+        if type(self.attempts) is not int or self.attempts < 0:
+            raise ValueError("attempts must be a non-negative integer")
+        artifacts = _immutable_string_tuple(self.artifacts, "artifacts")
+        if not isinstance(self.tasks, Mapping):
+            raise ValueError("tasks must be a mapping")
+        tasks = dict(self.tasks)
+        for task_name, checkpoint in tasks.items():
+            if (
+                not isinstance(task_name, str)
+                or not re.fullmatch(r"reviewer-[0-9]+", task_name)
+            ):
+                raise ValueError("reviewer task names must use reviewer-<index>")
+            if not isinstance(checkpoint, ReviewerTaskCheckpoint):
+                raise ValueError(
+                    "reviewer task values must be ReviewerTaskCheckpoint instances"
+                )
+        object.__setattr__(self, "artifacts", artifacts)
+        object.__setattr__(self, "tasks", MappingProxyType(tasks))
 
 
 @dataclass(frozen=True)
@@ -173,6 +248,32 @@ class SessionManifest:
             for checkpoint in phases.values()
         ):
             raise ValueError("phases values must be PhaseCheckpoint instances")
+        for phase_name, checkpoint in phases.items():
+            if phase_name != RunPhase.REVIEWERS.value and checkpoint.tasks:
+                raise ValueError(
+                    "reviewer task checkpoints are allowed only on the reviewers phase"
+                )
+        reviewer_checkpoint = phases[RunPhase.REVIEWERS.value]
+        if reviewer_checkpoint.status is PhaseStatus.COMPLETED:
+            incomplete_tasks = [
+                task_name
+                for task_name, task in reviewer_checkpoint.tasks.items()
+                if task.status is not PhaseStatus.COMPLETED
+            ]
+            if incomplete_tasks:
+                raise ValueError(
+                    "completed reviewers phase contains incomplete tasks: "
+                    + ", ".join(incomplete_tasks)
+                )
+            task_artifacts = {
+                artifact_name
+                for task in reviewer_checkpoint.tasks.values()
+                for artifact_name in task.artifacts
+            }
+            if not task_artifacts.issubset(reviewer_checkpoint.artifacts):
+                raise ValueError(
+                    "completed reviewers phase omits reviewer task artifacts"
+                )
 
         if not isinstance(self.artifacts, Mapping):
             raise ValueError("artifacts must be a mapping")
@@ -369,6 +470,17 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
                 "completed_at": checkpoint.completed_at,
                 "artifacts": list(checkpoint.artifacts),
                 "error": checkpoint.error,
+                "tasks": {
+                    task_name: {
+                        "status": task.status.value,
+                        "attempts": task.attempts,
+                        "started_at": task.started_at,
+                        "completed_at": task.completed_at,
+                        "artifacts": list(task.artifacts),
+                        "error": task.error,
+                    }
+                    for task_name, task in checkpoint.tasks.items()
+                },
             }
             for name, checkpoint in manifest.phases.items()
         },
@@ -589,6 +701,43 @@ def _phase_checkpoint_from_dict(
     payload: Mapping[str, Any],
     context: str,
 ) -> PhaseCheckpoint:
+    required = {"status", "attempts", "started_at", "completed_at", "artifacts", "error"}
+    missing = required - set(payload)
+    if missing:
+        raise ValueError(
+            f"{context} is missing required field(s): {', '.join(sorted(missing))}"
+        )
+    unexpected = set(payload) - required - {"tasks"}
+    if unexpected:
+        names = ", ".join(sorted(str(name).casefold() for name in unexpected))
+        raise ValueError(f"{context} contains unsupported field(s): {names}")
+    attempts = _integer(payload, "attempts", context)
+    if attempts < 0:
+        raise ValueError(f"{context}.attempts must be non-negative")
+    tasks_payload = payload.get("tasks", {})
+    tasks_object = _object(tasks_payload, f"{context}.tasks")
+    tasks = {
+        task_name: _reviewer_task_checkpoint_from_dict(
+            _object(task_payload, f"{context}.tasks.{task_name}"),
+            f"{context}.tasks.{task_name}",
+        )
+        for task_name, task_payload in tasks_object.items()
+    }
+    return PhaseCheckpoint(
+        status=_enum_field(PhaseStatus, payload, "status", context),
+        attempts=attempts,
+        started_at=_optional_string(payload, "started_at", context),
+        completed_at=_optional_string(payload, "completed_at", context),
+        artifacts=_string_list(payload, "artifacts", context),
+        error=_optional_string(payload, "error", context),
+        tasks=tasks,
+    )
+
+
+def _reviewer_task_checkpoint_from_dict(
+    payload: Mapping[str, Any],
+    context: str,
+) -> ReviewerTaskCheckpoint:
     _exact_fields(
         payload,
         {"status", "attempts", "started_at", "completed_at", "artifacts", "error"},
@@ -597,7 +746,7 @@ def _phase_checkpoint_from_dict(
     attempts = _integer(payload, "attempts", context)
     if attempts < 0:
         raise ValueError(f"{context}.attempts must be non-negative")
-    return PhaseCheckpoint(
+    return ReviewerTaskCheckpoint(
         status=_enum_field(PhaseStatus, payload, "status", context),
         attempts=attempts,
         started_at=_optional_string(payload, "started_at", context),

@@ -22,7 +22,7 @@ from review_agent.session import (
     SessionManifest,
     initial_session_manifest,
 )
-from review_agent.session_store import SessionStore
+from review_agent.session_store import PhaseValidation, SessionStore
 
 
 NOW = "2026-07-10T00:00:00Z"
@@ -935,6 +935,296 @@ def test_completed_phase_rejects_new_artifact_but_allows_identical_registration(
             phase=RunPhase.PREFLIGHT,
             revision_binding=REVISION_BINDING,
             now="2026-07-10T00:03:00Z",
+        )
+
+
+def _complete_empty_predecessors(
+    store: SessionStore,
+    through: RunPhase,
+) -> None:
+    target_index = SESSION_PHASES.index(through)
+    for index, phase in enumerate(SESSION_PHASES[:target_index], start=1):
+        store.mark_phase_completed(
+            phase,
+            [],
+            f"2026-07-10T01:{index:02d}:00Z",
+        )
+
+
+def _register_reviewer_result(
+    store: SessionStore,
+    index: int,
+    *,
+    now: str,
+) -> str:
+    name = f"reviewer_{index}_result"
+    relative_path = f"{name}.json"
+    (store.run_dir / relative_path).write_text(
+        json.dumps({"status": "completed", "reviewer": index}),
+        encoding="utf-8",
+    )
+    register_artifact(
+        store,
+        name=name,
+        relative_path=relative_path,
+        phase=RunPhase.REVIEWERS,
+        revision_binding=REVISION_BINDING,
+        now=now,
+    )
+    return name
+
+
+def test_mark_phase_running_is_idempotent_and_counts_new_attempts(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+
+    first = store.mark_phase_running(RunPhase.PREFLIGHT, "2026-07-10T01:00:00Z")
+    repeated = store.mark_phase_running(RunPhase.PREFLIGHT, "2026-07-10T01:01:00Z")
+    store.mark_session_failed(
+        RunPhase.PREFLIGHT,
+        "transient failure",
+        "2026-07-10T01:02:00Z",
+    )
+    retried = store.mark_phase_running(
+        RunPhase.PREFLIGHT,
+        "2026-07-10T01:03:00Z",
+    )
+
+    assert first.phases["preflight"].attempts == 1
+    assert repeated == first
+    assert retried.phases["preflight"].status is PhaseStatus.RUNNING
+    assert retried.phases["preflight"].attempts == 2
+    assert retried.phases["preflight"].started_at == "2026-07-10T01:03:00Z"
+
+
+def test_validate_phase_checks_status_schema_hash_and_revision_binding(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    artifact_path = tmp_path / "request.json"
+    artifact_path.write_text("{}", encoding="utf-8")
+    register_artifact(store)
+    store.mark_phase_completed(
+        RunPhase.PREFLIGHT,
+        ["request"],
+        "2026-07-10T01:00:00Z",
+    )
+
+    valid = store.validate_phase(
+        RunPhase.PREFLIGHT,
+        {"request": "review_request_v1"},
+    )
+    wrong_schema = store.validate_phase(
+        RunPhase.PREFLIGHT,
+        {"request": "review_request_v2"},
+    )
+    artifact_path.write_text('{"tampered":true}', encoding="utf-8")
+    bad_hash = store.validate_phase(RunPhase.PREFLIGHT)
+
+    assert valid == PhaseValidation(RunPhase.PREFLIGHT, True)
+    assert wrong_schema.valid is False
+    assert "schema" in str(wrong_schema.reason)
+    assert bad_hash.valid is False
+    assert "validation" in str(bad_hash.reason)
+
+
+def test_invalidate_from_preserves_upstream_and_removes_downstream_registry(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    phase_artifacts: dict[RunPhase, str] = {}
+    for index, phase in enumerate(SESSION_PHASES[:4]):
+        name = "request" if phase is RunPhase.PREFLIGHT else f"artifact_{index}"
+        relative_path = f"{name}.json"
+        (tmp_path / relative_path).write_text("{}", encoding="utf-8")
+        register_artifact(
+            store,
+            name=name,
+            relative_path=relative_path,
+            phase=phase,
+            revision_binding=(
+                None if phase is RunPhase.PREFLIGHT else REVISION_BINDING
+            ),
+            now=f"2026-07-10T01:{index:02d}:00Z",
+        )
+        store.mark_phase_completed(
+            phase,
+            [name],
+            f"2026-07-10T01:{index:02d}:30Z",
+        )
+        phase_artifacts[phase] = name
+
+    invalidated = store.invalidate_from(
+        RunPhase.REPOSITORY_INTELLIGENCE,
+        "artifact hash mismatch",
+        "2026-07-10T01:10:00Z",
+    )
+
+    assert invalidated.phases["preflight"].status is PhaseStatus.COMPLETED
+    assert invalidated.phases["preflight"].artifacts == ("request",)
+    assert all(
+        invalidated.phases[phase.value].status is PhaseStatus.INVALIDATED
+        for phase in SESSION_PHASES[1:]
+    )
+    assert set(invalidated.artifacts) == {"request"}
+    assert invalidated.last_successful_phase is RunPhase.PREFLIGHT
+    assert invalidated.current_phase is RunPhase.REPOSITORY_INTELLIGENCE
+    assert (tmp_path / f"{phase_artifacts[RunPhase.REVIEWERS]}.json").exists()
+
+
+def test_invalidate_from_can_reopen_completed_session_only_through_recovery_api(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    mark_all_phases(store)
+    completed = store.mark_session_completed("2026-07-10T01:10:00Z")
+
+    recovered = store.invalidate_from(
+        RunPhase.REVIEWERS,
+        "reviewer artifact missing",
+        "2026-07-10T01:11:00Z",
+    )
+
+    assert completed.status is RunStatus.COMPLETED
+    assert recovered.status is RunStatus.RUNNING
+    assert recovered.phases["preflight"].status is PhaseStatus.COMPLETED
+    assert recovered.phases["repository_intelligence"].status is PhaseStatus.COMPLETED
+    assert recovered.phases["reviewers"].status is PhaseStatus.INVALIDATED
+
+
+def test_invalidate_from_is_idempotent_for_same_phase_and_reason(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    store.mark_phase_completed(
+        RunPhase.PREFLIGHT,
+        [],
+        "2026-07-10T01:00:00Z",
+    )
+    first = store.invalidate_from(
+        RunPhase.REPOSITORY_INTELLIGENCE,
+        "missing repository artifact",
+        "2026-07-10T01:01:00Z",
+    )
+    session_bytes = (tmp_path / "session.json").read_bytes()
+
+    repeated = store.invalidate_from(
+        RunPhase.REPOSITORY_INTELLIGENCE,
+        "missing repository artifact",
+        "2026-07-10T01:02:00Z",
+    )
+
+    assert repeated == first
+    assert repeated.errors.count(
+        "invalidated repository_intelligence: missing repository artifact"
+    ) == 1
+    assert (tmp_path / "session.json").read_bytes() == session_bytes
+
+
+def test_reviewer_tasks_resume_only_failed_task_and_preserve_completed_task(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    _complete_empty_predecessors(store, RunPhase.REVIEWERS)
+    store.mark_phase_running(RunPhase.REVIEWERS, "2026-07-10T02:00:00Z")
+    store.initialize_reviewer_tasks(
+        ["reviewer-0", "reviewer-1"],
+        "2026-07-10T02:00:10Z",
+    )
+
+    store.mark_reviewer_task_running("reviewer-0", "2026-07-10T02:01:00Z")
+    artifact_0 = _register_reviewer_result(
+        store,
+        0,
+        now="2026-07-10T02:01:10Z",
+    )
+    completed_zero = store.mark_reviewer_task_completed(
+        "reviewer-0",
+        [artifact_0],
+        "2026-07-10T02:01:20Z",
+    )
+    store.mark_reviewer_task_running("reviewer-1", "2026-07-10T02:02:00Z")
+    store.mark_reviewer_task_failed(
+        "reviewer-1",
+        "provider timeout",
+        "2026-07-10T02:02:10Z",
+    )
+
+    store.mark_phase_running(RunPhase.REVIEWERS, "2026-07-10T02:03:00Z")
+    reused_zero = store.mark_reviewer_task_running(
+        "reviewer-0",
+        "2026-07-10T02:03:10Z",
+    )
+    store.mark_reviewer_task_running("reviewer-1", "2026-07-10T02:03:20Z")
+    artifact_1 = _register_reviewer_result(
+        store,
+        1,
+        now="2026-07-10T02:03:30Z",
+    )
+    store.mark_reviewer_task_completed(
+        "reviewer-1",
+        [artifact_1],
+        "2026-07-10T02:03:40Z",
+    )
+    finished = store.mark_phase_completed(
+        RunPhase.REVIEWERS,
+        [artifact_0, artifact_1],
+        "2026-07-10T02:04:00Z",
+    )
+
+    assert completed_zero.phases["reviewers"].tasks["reviewer-0"].attempts == 1
+    assert reused_zero.phases["reviewers"].tasks["reviewer-0"].attempts == 1
+    assert finished.phases["reviewers"].tasks["reviewer-0"].attempts == 1
+    assert finished.phases["reviewers"].tasks["reviewer-1"].attempts == 2
+    assert finished.phases["reviewers"].status is PhaseStatus.COMPLETED
+    assert store.validate_phase(RunPhase.REVIEWERS).valid is True
+
+
+def test_reviewer_phase_cannot_complete_with_pending_task(tmp_path: Path) -> None:
+    store = create_store(tmp_path)
+    _complete_empty_predecessors(store, RunPhase.REVIEWERS)
+    store.mark_phase_running(RunPhase.REVIEWERS, "2026-07-10T03:00:00Z")
+    store.initialize_reviewer_tasks(
+        ["reviewer-0"],
+        "2026-07-10T03:00:10Z",
+    )
+
+    with pytest.raises(ValueError, match="reviewer tasks complete"):
+        store.mark_phase_completed(
+            RunPhase.REVIEWERS,
+            [],
+            "2026-07-10T03:01:00Z",
+        )
+
+
+def test_reviewer_task_must_enter_running_before_terminal_transition(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    _complete_empty_predecessors(store, RunPhase.REVIEWERS)
+    store.mark_phase_running(RunPhase.REVIEWERS, "2026-07-10T03:10:00Z")
+    store.initialize_reviewer_tasks(
+        ["reviewer-0"],
+        "2026-07-10T03:10:10Z",
+    )
+    artifact = _register_reviewer_result(
+        store,
+        0,
+        now="2026-07-10T03:10:20Z",
+    )
+
+    with pytest.raises(ValueError, match="must be running before completion"):
+        store.mark_reviewer_task_completed(
+            "reviewer-0",
+            [artifact],
+            "2026-07-10T03:10:30Z",
+        )
+    with pytest.raises(ValueError, match="must be running before failure"):
+        store.mark_reviewer_task_failed(
+            "reviewer-0",
+            "provider unavailable",
+            "2026-07-10T03:10:40Z",
         )
 
 

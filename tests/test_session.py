@@ -12,6 +12,7 @@ from review_agent.session import (
     ArtifactDescriptor,
     PhaseCheckpoint,
     PhaseStatus,
+    ReviewerTaskCheckpoint,
     ReviewExecutionConfig,
     RevisionChangeKind,
     SessionManifest,
@@ -88,6 +89,95 @@ def test_session_manifest_round_trips_with_pending_phases() -> None:
     assert payload["revisions"]["resolved_head_sha"] == "b" * 40
     assert list(payload["phases"]) == [phase.value for phase in SESSION_PHASES]
     assert payload["phases"]["preflight"]["status"] == "pending"
+    assert payload["phases"]["reviewers"]["tasks"] == {}
+
+
+def test_session_manifest_round_trips_reviewer_task_checkpoints() -> None:
+    original = manifest()
+    reviewer_checkpoint = PhaseCheckpoint(
+        status=PhaseStatus.RUNNING,
+        attempts=1,
+        started_at=NOW,
+        tasks={
+            "reviewer-0": ReviewerTaskCheckpoint(
+                status=PhaseStatus.COMPLETED,
+                attempts=1,
+                started_at=NOW,
+                completed_at="2026-07-10T00:01:00Z",
+                artifacts=("reviewer_0_result",),
+            ),
+            "reviewer-1": ReviewerTaskCheckpoint(
+                status=PhaseStatus.FAILED,
+                attempts=2,
+                started_at="2026-07-10T00:02:00Z",
+                error="provider unavailable",
+            ),
+        },
+    )
+    original = replace(
+        original,
+        status=RunStatus.RUNNING,
+        current_phase=RunPhase.REVIEWERS,
+        phases={
+            **original.phases,
+            RunPhase.REVIEWERS.value: reviewer_checkpoint,
+        },
+    )
+
+    payload = session_manifest_to_dict(original)
+    loaded = session_manifest_from_dict(payload)
+
+    assert loaded == original
+    assert loaded.phases["reviewers"].tasks["reviewer-0"].artifacts == (
+        "reviewer_0_result",
+    )
+    assert payload["phases"]["reviewers"]["tasks"]["reviewer-1"]["attempts"] == 2
+
+
+def test_session_manifest_loads_batch_a_v1_without_task_fields() -> None:
+    payload = session_manifest_to_dict(manifest())
+    for checkpoint in payload["phases"].values():
+        checkpoint.pop("tasks")
+
+    loaded = session_manifest_from_dict(payload)
+
+    assert all(not checkpoint.tasks for checkpoint in loaded.phases.values())
+
+
+def test_session_manifest_rejects_reviewer_tasks_on_other_phases() -> None:
+    original = manifest()
+    invalid = PhaseCheckpoint(
+        tasks={"reviewer-0": ReviewerTaskCheckpoint()},
+    )
+
+    with pytest.raises(ValueError, match="only on the reviewers phase"):
+        replace(
+            original,
+            phases={**original.phases, RunPhase.PREFLIGHT.value: invalid},
+        )
+
+
+def test_completed_reviewer_phase_rejects_incomplete_task_checkpoint() -> None:
+    original = manifest()
+    invalid = PhaseCheckpoint(
+        status=PhaseStatus.COMPLETED,
+        attempts=1,
+        started_at=NOW,
+        completed_at="2026-07-10T00:01:00Z",
+        tasks={"reviewer-0": ReviewerTaskCheckpoint()},
+    )
+
+    with pytest.raises(ValueError, match="incomplete tasks"):
+        replace(
+            original,
+            phases={**original.phases, RunPhase.REVIEWERS.value: invalid},
+        )
+
+
+@pytest.mark.parametrize("task_name", ["reviewer", "reviewer--1", "reviewer-x", 0])
+def test_phase_checkpoint_rejects_invalid_reviewer_task_names(task_name) -> None:
+    with pytest.raises(ValueError, match="reviewer-<index>"):
+        PhaseCheckpoint(tasks={task_name: ReviewerTaskCheckpoint()})
 
 
 def test_session_manifest_explicitly_round_trips_nested_models_and_enums() -> None:
