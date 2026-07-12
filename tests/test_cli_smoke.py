@@ -4,6 +4,7 @@ import json
 import re
 
 from conftest import run_git
+from review_agent.attempts import AttemptWorkspace
 from review_agent.checkpoint import CheckpointStore
 from review_agent.cli import main
 from review_agent.session_store import SessionStore
@@ -258,7 +259,7 @@ def test_cli_review_records_failed_state_when_collection_fails(git_repo: Path, m
     def raise_error(*args: object, **kwargs: object) -> object:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("review_agent.cli.collect_change_summary", raise_error)
+    monkeypatch.setattr("review_agent.command.collect_change_summary", raise_error)
 
     exit_code = main(
         [
@@ -330,7 +331,7 @@ def test_cli_session_create_failure_returns_clear_error(git_repo: Path, monkeypa
     assert "session create unavailable" in error_output
 
 
-def test_cli_initial_state_write_failure_marks_session_failed(git_repo: Path, monkeypatch, capsys):
+def test_cli_legacy_state_write_failure_does_not_override_session(git_repo: Path, monkeypatch, capsys):
     def fail_state_write(self, state):
         raise OSError("initial state unavailable")
 
@@ -342,24 +343,25 @@ def test_cli_initial_state_write_failure_marks_session_failed(git_repo: Path, mo
 
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
     session = json.loads((run_dir / "session.json").read_text(encoding="utf-8"))
-    assert exit_code == 1
-    assert session["status"] == "failed"
-    assert session["phases"]["preflight"]["status"] == "failed"
-    assert "OSError: initial state unavailable" in session["errors"]
+    assert exit_code == 0
+    assert session["status"] == "completed"
+    assert all(phase["status"] == "completed" for phase in session["phases"].values())
+    assert session["errors"] == []
+    assert not (run_dir / "state.json").exists()
     error_output = capsys.readouterr().err
-    assert "Review failed: initial state unavailable" in error_output
     assert "Warning:" in error_output
+    assert "initial state unavailable" in error_output
 
 
 def test_cli_request_write_failure_marks_session_and_state_failed(git_repo: Path, monkeypatch, capsys):
-    original_write_json = CheckpointStore.write_json
+    original_write_json = AttemptWorkspace.write_json
 
-    def fail_request_write(self, filename, payload):
-        if filename == "request.json":
+    def fail_request_write(self, relative_path, payload):
+        if relative_path == "request.json":
             raise OSError("request checkpoint unavailable")
-        return original_write_json(self, filename, payload)
+        return original_write_json(self, relative_path, payload)
 
-    monkeypatch.setattr(CheckpointStore, "write_json", fail_request_write)
+    monkeypatch.setattr(AttemptWorkspace, "write_json", fail_request_write)
 
     exit_code = main(
         ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD"]
@@ -374,7 +376,9 @@ def test_cli_request_write_failure_marks_session_and_state_failed(git_repo: Path
     assert "OSError: request checkpoint unavailable" in session["errors"]
     assert state["status"] == "failed"
     assert "OSError: request checkpoint unavailable" in state["errors"]
-    assert "Review failed: request checkpoint unavailable" in capsys.readouterr().err
+    error_output = capsys.readouterr().err
+    assert "Review failed:" in error_output
+    assert "request checkpoint unavailable" in error_output
 
 
 def test_cli_finalization_failure_leaves_retryable_running_session(git_repo: Path, monkeypatch, capsys):
@@ -534,7 +538,7 @@ def test_cli_agent_loop_openai_compatible_uses_adapter_factory(git_repo: Path, m
         assert config.base_url == "https://example.test/v1"
         return ToolThenFinalFactory()
 
-    monkeypatch.setattr("review_agent.cli.build_model_adapter_factory_from_config", fake_build_factory, raising=False)
+    monkeypatch.setattr("review_agent.command.build_model_adapter_factory_from_config", fake_build_factory)
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "app.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
     run_git(git_repo, "add", "app.py")

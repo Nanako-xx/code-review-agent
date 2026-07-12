@@ -58,7 +58,7 @@ def _json_default(value: object) -> object:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary = path.with_name(f".tmp-{uuid.uuid4().hex[:12]}.tmp")
     try:
         with temporary.open("w", encoding="utf-8") as handle:
             handle.write(content)

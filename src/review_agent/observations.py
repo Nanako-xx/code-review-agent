@@ -39,6 +39,7 @@ class ObservationStore:
                     "observations.jsonl already exists; use ObservationStore.load() "
                     "with an explicit revision allowlist"
                 )
+            self.jsonl_path.touch(exist_ok=True)
 
     @classmethod
     def load(
@@ -471,7 +472,7 @@ def _validate_raw_artifact_hash(
 
 
 def _atomic_write_bytes(path: Path, content: bytes) -> None:
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary = path.with_name(f".tmp-{uuid.uuid4().hex[:12]}.tmp")
     try:
         with temporary.open("wb") as handle:
             handle.write(content)

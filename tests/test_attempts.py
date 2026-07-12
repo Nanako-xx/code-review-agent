@@ -24,7 +24,7 @@ def test_attempt_workspace_writes_then_atomically_promotes_file(tmp_path: Path) 
 
     assert promoted == tmp_path / "intent.json"
     assert promoted.read_text(encoding="utf-8").endswith("}")
-    assert not list(tmp_path.glob(".intent.json.*.promote"))
+    assert not list(tmp_path.glob(".promote-*"))
 
 
 def test_failed_attempt_never_overwrites_authoritative_artifact(tmp_path: Path) -> None:

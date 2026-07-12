@@ -256,6 +256,86 @@ class SessionStore:
         self.write(updated)
         return updated
 
+    def restart_running_phase(self, phase: RunPhase, now: str) -> SessionManifest:
+        phase = _require_session_phase(phase)
+        current = self.load()
+        checkpoint = current.phases[phase.value]
+        if checkpoint.status is not PhaseStatus.RUNNING:
+            raise ValueError(f"phase {phase.value} is not running")
+        self._require_predecessors_completed(current, phase)
+        phases = dict(current.phases)
+        phases[phase.value] = replace(
+            checkpoint,
+            attempts=checkpoint.attempts + 1,
+            started_at=now,
+            completed_at=None,
+            artifacts=(),
+            error=None,
+        )
+        updated = replace(
+            current,
+            status=RunStatus.RUNNING,
+            current_phase=phase,
+            phases=phases,
+            updated_at=now,
+        )
+        self.write(updated)
+        return updated
+
+    def discard_uncommitted_phase_artifacts(
+        self,
+        phase: RunPhase,
+        preserve_names: Iterable[str],
+        now: str,
+    ) -> SessionManifest:
+        phase = _require_session_phase(phase)
+        preserve = set(_unique_artifact_names(preserve_names))
+        current = self.load()
+        checkpoint = current.phases[phase.value]
+        if checkpoint.status is PhaseStatus.COMPLETED:
+            raise ValueError("cannot discard artifacts from a completed phase")
+        phase_registry = {
+            name
+            for name, descriptor in current.artifacts.items()
+            if descriptor.phase is phase
+        }
+        if not preserve.issubset(phase_registry):
+            raise ValueError("preserved artifacts must already belong to the phase")
+        task_artifacts = {
+            artifact_name
+            for task in checkpoint.tasks.values()
+            if task.status is PhaseStatus.COMPLETED
+            for artifact_name in task.artifacts
+        }
+        if not task_artifacts.issubset(preserve):
+            raise ValueError("completed reviewer task artifacts must be preserved")
+        artifacts = {
+            name: descriptor
+            for name, descriptor in current.artifacts.items()
+            if descriptor.phase is not phase or name in preserve
+        }
+        filtered_checkpoint_artifacts = tuple(
+            name for name in checkpoint.artifacts if name in preserve
+        )
+        if (
+            artifacts == dict(current.artifacts)
+            and filtered_checkpoint_artifacts == checkpoint.artifacts
+        ):
+            return current
+        phases = dict(current.phases)
+        phases[phase.value] = replace(
+            checkpoint,
+            artifacts=filtered_checkpoint_artifacts,
+        )
+        updated = replace(
+            current,
+            phases=phases,
+            artifacts=artifacts,
+            updated_at=now,
+        )
+        self.write(updated)
+        return updated
+
     def initialize_reviewer_tasks(
         self,
         task_names: Iterable[str],
@@ -298,6 +378,33 @@ class SessionStore:
         tasks[task_name] = replace(
             task,
             status=PhaseStatus.RUNNING,
+            attempts=task.attempts + 1,
+            started_at=now,
+            completed_at=None,
+            artifacts=(),
+            error=None,
+        )
+        phases = dict(current.phases)
+        phases[RunPhase.REVIEWERS.value] = replace(checkpoint, tasks=tasks)
+        updated = replace(current, phases=phases, updated_at=now)
+        self.write(updated)
+        return updated
+
+    def restart_running_reviewer_task(
+        self,
+        task_name: str,
+        now: str,
+    ) -> SessionManifest:
+        current = self.load()
+        checkpoint = current.phases[RunPhase.REVIEWERS.value]
+        if checkpoint.status is not PhaseStatus.RUNNING:
+            raise ValueError("reviewers phase must be running")
+        task = _reviewer_task(checkpoint, task_name)
+        if task.status is not PhaseStatus.RUNNING:
+            raise ValueError(f"reviewer task {task_name} is not running")
+        tasks = dict(checkpoint.tasks)
+        tasks[task_name] = replace(
+            task,
             attempts=task.attempts + 1,
             started_at=now,
             completed_at=None,
@@ -465,6 +572,149 @@ class SessionStore:
             phases=phases,
             artifacts=artifacts,
             errors=(*current.errors, error_message),
+            updated_at=now,
+        )
+        self._require_immutable_metadata(current, updated)
+        _atomic_write_text(self.session_path, self._serialize(updated))
+        return updated
+
+    def invalidate_reviewer_task(
+        self,
+        task_name: str,
+        reason: str,
+        now: str,
+    ) -> SessionManifest:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-empty string")
+        current = self.load()
+        reviewer_checkpoint = current.phases[RunPhase.REVIEWERS.value]
+        task = _reviewer_task(reviewer_checkpoint, task_name)
+        if task.status is PhaseStatus.PENDING:
+            raise ValueError("pending reviewer task has no committed state to invalidate")
+        if (
+            task.status is PhaseStatus.INVALIDATED
+            and task.error == reason
+            and current.current_phase is RunPhase.REVIEWERS
+        ):
+            return current
+
+        invalidated_task = ReviewerTaskCheckpoint(
+            status=PhaseStatus.INVALIDATED,
+            attempts=max(1, task.attempts),
+            started_at=task.started_at or now,
+            completed_at=None,
+            artifacts=(),
+            error=reason,
+        )
+        tasks = dict(reviewer_checkpoint.tasks)
+        tasks[task_name] = invalidated_task
+        preserved_task_artifacts = {
+            artifact_name
+            for name, candidate in tasks.items()
+            if name != task_name and candidate.status is PhaseStatus.COMPLETED
+            for artifact_name in candidate.artifacts
+        }
+        phases = dict(current.phases)
+        phases[RunPhase.REVIEWERS.value] = PhaseCheckpoint(
+            status=PhaseStatus.INVALIDATED,
+            attempts=reviewer_checkpoint.attempts,
+            started_at=None,
+            completed_at=None,
+            artifacts=(),
+            error=f"reviewer task {task_name} invalid: {reason}",
+            tasks=tasks,
+        )
+        reviewer_index = SESSION_PHASES.index(RunPhase.REVIEWERS)
+        downstream = set(SESSION_PHASES[reviewer_index + 1 :])
+        for phase in SESSION_PHASES[reviewer_index + 1 :]:
+            checkpoint = phases[phase.value]
+            phases[phase.value] = PhaseCheckpoint(
+                status=PhaseStatus.INVALIDATED,
+                attempts=checkpoint.attempts,
+                started_at=None,
+                completed_at=None,
+                artifacts=(),
+                error=f"invalidated because reviewer task {task_name} is invalid",
+            )
+        artifacts = {
+            name: descriptor
+            for name, descriptor in current.artifacts.items()
+            if (
+                descriptor.phase is not RunPhase.REVIEWERS
+                and descriptor.phase not in downstream
+            )
+            or name in preserved_task_artifacts
+        }
+        message = f"invalidated reviewer task {task_name}: {reason}"
+        updated = replace(
+            current,
+            status=RunStatus.RUNNING,
+            current_phase=RunPhase.REVIEWERS,
+            last_successful_phase=RunPhase.REPOSITORY_INTELLIGENCE,
+            phases=phases,
+            artifacts=artifacts,
+            errors=(*current.errors, message),
+            updated_at=now,
+        )
+        self._require_immutable_metadata(current, updated)
+        _atomic_write_text(self.session_path, self._serialize(updated))
+        return updated
+
+    def invalidate_reviewers_preserving_tasks(
+        self,
+        reason: str,
+        now: str,
+    ) -> SessionManifest:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-empty string")
+        current = self.load()
+        checkpoint = current.phases[RunPhase.REVIEWERS.value]
+        preserved = {
+            artifact_name
+            for task in checkpoint.tasks.values()
+            if task.status is PhaseStatus.COMPLETED
+            for artifact_name in task.artifacts
+        }
+        phases = dict(current.phases)
+        phases[RunPhase.REVIEWERS.value] = PhaseCheckpoint(
+            status=PhaseStatus.INVALIDATED,
+            attempts=checkpoint.attempts,
+            started_at=None,
+            completed_at=None,
+            artifacts=(),
+            error=reason,
+            tasks=checkpoint.tasks,
+        )
+        reviewer_index = SESSION_PHASES.index(RunPhase.REVIEWERS)
+        downstream = set(SESSION_PHASES[reviewer_index + 1 :])
+        for phase in SESSION_PHASES[reviewer_index + 1 :]:
+            candidate = phases[phase.value]
+            phases[phase.value] = PhaseCheckpoint(
+                status=PhaseStatus.INVALIDATED,
+                attempts=candidate.attempts,
+                started_at=None,
+                completed_at=None,
+                artifacts=(),
+                error="invalidated because reviewers aggregate is invalid",
+            )
+        artifacts = {
+            name: descriptor
+            for name, descriptor in current.artifacts.items()
+            if (
+                descriptor.phase is not RunPhase.REVIEWERS
+                and descriptor.phase not in downstream
+            )
+            or name in preserved
+        }
+        message = f"invalidated reviewers: {reason}"
+        updated = replace(
+            current,
+            status=RunStatus.RUNNING,
+            current_phase=RunPhase.REVIEWERS,
+            last_successful_phase=RunPhase.REPOSITORY_INTELLIGENCE,
+            phases=phases,
+            artifacts=artifacts,
+            errors=(*current.errors, message),
             updated_at=now,
         )
         self._require_immutable_metadata(current, updated)

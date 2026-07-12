@@ -145,7 +145,7 @@ def test_cli_resume_session_ignores_stale_legacy_state(git_repo: Path, capsys) -
     assert "Audit: valid" in output
 
 
-def test_cli_resume_completed_session_rejects_tampered_report(git_repo: Path, capsys) -> None:
+def test_cli_resume_completed_session_rebuilds_tampered_reporting_phase(git_repo: Path, capsys) -> None:
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "auth.py").write_text("def check(token):\n    return bool(token)\n", encoding="utf-8")
     run_git(git_repo, "add", "auth.py")
@@ -159,13 +159,13 @@ def test_cli_resume_completed_session_rejects_tampered_report(git_repo: Path, ca
     exit_code = main(["resume", run_dir.name, "--repo", str(git_repo)])
 
     output = capsys.readouterr().out
-    assert exit_code == 2
-    assert "report: report.md (invalid)" in output
-    assert "Audit: invalid" in output
-    assert "artifact validation failed: report" in output
+    assert exit_code == 0
+    assert "Action: continue_session" in output
+    assert "Starting phase: reporting" in output
+    assert "tampered report" not in (run_dir / "report.md").read_text(encoding="utf-8")
 
 
-def test_cli_resume_completed_session_rejects_missing_artifact(git_repo: Path, capsys) -> None:
+def test_cli_resume_completed_session_rebuilds_missing_reporting_artifact(git_repo: Path, capsys) -> None:
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "auth.py").write_text("def check(token):\n    return bool(token)\n", encoding="utf-8")
     run_git(git_repo, "add", "auth.py")
@@ -179,10 +179,10 @@ def test_cli_resume_completed_session_rejects_missing_artifact(git_repo: Path, c
     exit_code = main(["resume", run_dir.name, "--repo", str(git_repo)])
 
     output = capsys.readouterr().out
-    assert exit_code == 2
-    assert "report: report.md (missing)" in output
-    assert "Audit: invalid" in output
-    assert "artifact validation failed: report" in output
+    assert exit_code == 0
+    assert "Action: continue_session" in output
+    assert "Starting phase: reporting" in output
+    assert (run_dir / "report.md").exists()
 
 
 def test_cli_resume_missing_run_returns_usage_error(tmp_path: Path, capsys) -> None:

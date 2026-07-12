@@ -1,6 +1,6 @@
 # Resumable Pipeline 与 Typed Hydration 实施计划
 
-**状态：** 执行中  
+**状态：** 已完成
 **设计来源：** `docs/superpowers/specs/2026-07-10-review-session-memory-resume-design.md` 批次 B  
 **目标：** 在 revision 未变化时，让未完成 Session 从最早不可信阶段真实续跑，并复用所有经过 hash、schema、revision binding 与 typed hydration 验证的上游结果。
 
@@ -124,3 +124,14 @@
 
 - Base/Head drift 的 child Session、lineage 去重与增量优先地图属于批次 C。
 - Batch B 遇到 revision drift 必须阻断，不能在原 Session 上混用旧 artifact 或 evidence。
+
+## 完成记录（2026-07-12）
+
+- `review` 与 `resume` 已统一到 `ReviewPipeline` 的七个可重入阶段；`cli.py` 只保留入口转发，命令编排位于 `command.py`。
+- completed phase 复用前同时校验 checkpoint、registry、schema、hash、revision binding、typed hydration 与 Observation raw artifact。
+- stage/reviewer attempt 使用隔离目录；失败或进程中断不会提交半成品，恢复时创建新 attempt。
+- Repository 与各 Reviewer 使用独立 ObservationStore，Reporting 生成兼容的聚合 `observations.jsonl`，失败 attempt 不进入授权 evidence。
+- Reviewer 子 checkpoint 支持仅重试 failed/running/invalidated task；有效 completed task 不重复调用模型，单 task 篡改只失效该 task 与下游。
+- `resume` 已覆盖 running 中断、failed 阶段、completed audit、artifact 缺失/篡改重建、API 配置重试入口和 Batch A Session 兼容读取。
+- requested revision drift 在批次 B 安全阻断；child Session、lineage 去重与增量优先地图继续由批次 C 实现。
+- 全量 pytest 通过；仅保留既有平台相关 skip。

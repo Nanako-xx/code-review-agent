@@ -748,7 +748,7 @@ Session Manifest 和 Runtime Policy 优先级高于仓库内文件。仓库内�
 
 工程量较大，拆成三个连续批次；三个批次共享本设计，不建设临时架构。
 
-### 批次 A：Session Foundation 与 Revision Binding
+### 批次 A：Session Foundation 与 Revision Binding（已完成）
 
 - Session Manifest、ReviewExecutionConfig、RepositoryIdentity。
 - resolved base/head SHA。
@@ -758,7 +758,7 @@ Session Manifest 和 Runtime Policy 优先级高于仓库内文件。仓库内�
 
 完成标准：新 Review 从创建开始就有不可变 revision binding 和可验证 artifact。
 
-### 批次 B：Resumable Pipeline 与 Typed Hydration
+### 批次 B：Resumable Pipeline 与 Typed Hydration（已完成）
 
 - 拆分 `_run_review()` 为 ReviewPipeline 阶段。
 - Phase checkpoint、artifact validation、下游 invalidation。
@@ -768,7 +768,9 @@ Session Manifest 和 Runtime Policy 优先级高于仓库内文件。仓库内�
 
 完成标准：revision 未变化时，未完成 Session 能真实恢复且不重复有效阶段。
 
-### 批次 C：Revision Drift 与 Incremental Lineage
+实现记录（2026-07-12）：七阶段 `ReviewPipeline`、typed hydration、ObservationStore 恢复、attempt 隔离、reviewer 子 checkpoint、completed audit 和 unchanged-revision resume 已落地；revision drift 当前安全阻断，不在原 Session 上继续。
+
+### 批次 C：Revision Drift 与 Incremental Lineage（待实现）
 
 - ResumePlanner。
 - completed audit mode。

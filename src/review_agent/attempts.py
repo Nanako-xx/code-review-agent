@@ -9,7 +9,11 @@ import stat
 import uuid
 from typing import Any, Mapping
 
-from review_agent.checkpoint import _atomic_write_text, _fsync_parent_directory
+from review_agent.checkpoint import (
+    _atomic_write_text,
+    _fsync_parent_directory,
+    _json_default,
+)
 from review_agent.run_state import RunPhase
 from review_agent.session import SESSION_PHASES
 
@@ -50,7 +54,12 @@ class AttemptWorkspace:
     def write_json(self, relative_path: str, payload: Mapping[str, Any]) -> Path:
         return self.write_text(
             relative_path,
-            json.dumps(payload, indent=2, ensure_ascii=False),
+            json.dumps(
+                payload,
+                indent=2,
+                ensure_ascii=False,
+                default=_json_default,
+            ),
         )
 
     def write_text(self, relative_path: str, content: str) -> Path:
@@ -71,7 +80,7 @@ class AttemptWorkspace:
         source = self._regular_attempt_file(source_relative_path)
         destination = self._run_path(destination_relative_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        staging = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.promote")
+        staging = destination.with_name(f".promote-{uuid.uuid4().hex[:12]}")
         try:
             with source.open("rb") as source_handle, staging.open("xb") as target_handle:
                 shutil.copyfileobj(source_handle, target_handle)
