@@ -156,6 +156,13 @@ def _review_brief() -> ReviewBrief:
             CompletionResult("completed", "needs_work", [], [], [])
         ),
         final_risk_assessment=final_risk_to_dict(final_risk),
+        incremental_priority={
+            "from_revision": "b" * 40,
+            "to_revision": "c" * 40,
+            "changed_files": ["a.py"],
+            "diff_stat": "1 file changed",
+            "diff_excerpt": ["+change"],
+        },
     )
 
 

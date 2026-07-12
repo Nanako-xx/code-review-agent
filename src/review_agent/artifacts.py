@@ -8,6 +8,7 @@ ARTIFACT_SCHEMAS = {
     "risk": "risk_assessment_v1",
     "assignments": "reviewer_assignments_v1",
     "quality_gates": "quality_gate_results_v1",
+    "incremental_priority": "incremental_priority_map_v1",
     "repository_intelligence": "repository_intelligence_v1",
     "repository_observations": "observation_log_jsonl_v1",
     "multi_reviewer": "multi_reviewer_result_v1",

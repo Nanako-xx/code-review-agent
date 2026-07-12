@@ -12,6 +12,10 @@ from review_agent.evidence import (
     RejectedFinding,
 )
 from review_agent.final_risk import FinalRiskAssessment
+from review_agent.incremental import (
+    incremental_priority_from_dict,
+    incremental_priority_to_dict,
+)
 from review_agent.model_protocol import ModelResponse
 from review_agent.models import (
     Assignment,
@@ -639,17 +643,24 @@ def _review_brief_quality_gates(value: Any) -> list[dict[str, Any]]:
 def _review_brief_change_map(value: Any) -> dict[str, Any]:
     context = "review_brief.change_map_and_repository_impact"
     item = _object(value, context)
-    _exact(
-        item,
-        {
-            "changed_files",
-            "repository_intelligence_summary",
-            "observation_count",
-            "reviewer_summary",
-        },
-        context,
-    )
-    return {
+    required = {
+        "changed_files",
+        "repository_intelligence_summary",
+        "observation_count",
+        "reviewer_summary",
+    }
+    missing = required - set(item)
+    if missing:
+        raise ValueError(
+            f"{context} is missing required field(s): {', '.join(sorted(missing))}"
+        )
+    unexpected = set(item) - required - {"incremental_priority"}
+    if unexpected:
+        raise ValueError(
+            f"{context} contains unsupported field(s): "
+            f"{', '.join(sorted(str(name) for name in unexpected))}"
+        )
+    result = {
         "changed_files": _string_list(item, "changed_files", context),
         "repository_intelligence_summary": _string(
             item,
@@ -665,6 +676,16 @@ def _review_brief_change_map(value: Any) -> dict[str, Any]:
             item["reviewer_summary"]
         ),
     }
+    if "incremental_priority" in item:
+        result["incremental_priority"] = incremental_priority_to_dict(
+            incremental_priority_from_dict(
+                _object(
+                    item["incremental_priority"],
+                    f"{context}.incremental_priority",
+                )
+            )
+        )
+    return result
 
 
 def _review_brief_reviewer_summary(value: Any) -> dict[str, Any]:

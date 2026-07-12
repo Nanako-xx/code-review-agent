@@ -30,6 +30,12 @@ from review_agent.hydration import (
     risk_packet_from_dict,
 )
 from review_agent.intent import build_intent_packet
+from review_agent.incremental import (
+    IncrementalPriorityMap,
+    build_incremental_priority_map_from_summary,
+    incremental_priority_from_dict,
+    incremental_priority_to_dict,
+)
 from review_agent.model_adapter_factory import (
     AdapterConfigError,
     ModelAdapterConfig,
@@ -107,6 +113,7 @@ class PipelineContext:
     intent: IntentPacket | None = None
     risk_packet: RiskAssessmentPacket | None = None
     risk_assessment: RiskAssessment | None = None
+    incremental_priority: IncrementalPriorityMap | None = None
     assignments: list[Assignment] = field(default_factory=list)
     quality_results: list[QualityGateResult] = field(default_factory=list)
     repository_intelligence: RepositoryIntelligenceSnapshot | None = None
@@ -313,12 +320,33 @@ class ReviewPipeline:
             {result.name: result.status for result in quality_results},
         )
         risk = LocalRiskAssessor().assess(risk_packet)
+        incremental_priority: IncrementalPriorityMap | None = None
+        if manifest.incremental_from_sha is not None:
+            incremental_summary = self._collect_change_summary(
+                self.context.repository,
+                manifest.incremental_from_sha,
+                revisions.resolved_head_sha,
+            )
+            incremental_priority = build_incremental_priority_map_from_summary(
+                incremental_summary,
+                from_revision=manifest.incremental_from_sha,
+                to_revision=revisions.resolved_head_sha,
+            )
         assignments = [
             replace(
                 assignment,
                 initial_context=replace(
                     assignment.initial_context,
                     changed_files=list(summary.changed_files),
+                    diff_ranges=(
+                        [
+                            f"incremental:{path}"
+                            for path in incremental_priority.changed_files
+                        ]
+                        + [f"full:{path}" for path in summary.changed_files]
+                        if incremental_priority is not None
+                        else list(assignment.initial_context.diff_ranges)
+                    ),
                 ),
             )
             for assignment in build_assignments(risk)
@@ -337,39 +365,78 @@ class ReviewPipeline:
             "quality_gates.json",
             {"results": [asdict(item) for item in quality_results]},
         )
+        if incremental_priority is not None:
+            workspace.write_json(
+                "incremental_priority.json",
+                incremental_priority_to_dict(incremental_priority),
+            )
+        file_specs: dict[str, tuple[str, str]] = {
+            "request": ("request.json", "request.json"),
+            "intent": ("intent.json", "intent.json"),
+            "risk_packet": ("risk_packet.json", "risk_packet.json"),
+            "risk": ("risk.json", "risk.json"),
+            "assignments": ("assignments.json", "assignments.json"),
+            "quality_gates": ("quality_gates.json", "quality_gates.json"),
+        }
+        if incremental_priority is not None:
+            file_specs["incremental_priority"] = (
+                "incremental_priority.json",
+                "incremental_priority.json",
+            )
         artifacts = self._commit_files(
             RunPhase.PREFLIGHT,
             workspace,
-            {
-                "request": ("request.json", "request.json"),
-                "intent": ("intent.json", "intent.json"),
-                "risk_packet": ("risk_packet.json", "risk_packet.json"),
-                "risk": ("risk.json", "risk.json"),
-                "assignments": ("assignments.json", "assignments.json"),
-                "quality_gates": ("quality_gates.json", "quality_gates.json"),
-            },
+            file_specs,
         )
         self.context.change_summary = summary
         self.context.intent = intent
         self.context.risk_packet = risk_packet
         self.context.risk_assessment = risk
+        self.context.incremental_priority = incremental_priority
         self.context.assignments = assignments
         self.context.quality_results = quality_results
         return artifacts
 
     def _load_preflight(self) -> None:
+        manifest = self.context.manifest
         request = review_request_from_dict(self._read_json_artifact("request"))
         intent = intent_from_dict(self._read_json_artifact("intent"))
         risk_packet = risk_packet_from_dict(self._read_json_artifact("risk_packet"))
         risk = risk_assessment_from_dict(self._read_json_artifact("risk"))
         assignments = assignments_from_dict(self._read_json_artifact("assignments"))
         quality = quality_results_from_dict(self._read_json_artifact("quality_gates"))
+        has_incremental_priority = "incremental_priority" in manifest.artifacts
+        if manifest.incremental_from_sha is not None and not has_incremental_priority:
+            raise ValueError(
+                "HEAD_MOVED preflight is missing its incremental priority map"
+            )
+        if manifest.incremental_from_sha is None and has_incremental_priority:
+            raise ValueError(
+                "non-HEAD drift preflight must not contain an incremental priority map"
+            )
+        incremental_priority = (
+            incremental_priority_from_dict(
+                self._read_json_artifact("incremental_priority")
+            )
+            if has_incremental_priority
+            else None
+        )
+        if incremental_priority is not None and (
+            incremental_priority.from_revision.casefold()
+            != manifest.incremental_from_sha.casefold()
+            or incremental_priority.to_revision.casefold()
+            != manifest.revisions.resolved_head_sha.casefold()
+        ):
+            raise ValueError(
+                "incremental priority map does not match the Session lineage"
+            )
         self.context.request = request
         self.context.intent = intent
         self.context.risk_packet = risk_packet
         self.context.risk_assessment = risk
         self.context.assignments = assignments
         self.context.quality_results = quality
+        self.context.incremental_priority = incremental_priority
         self.context.change_summary = _change_summary_from_packet(risk_packet)
 
     def _run_repository_intelligence(self) -> dict[str, str]:
@@ -581,7 +648,7 @@ class ReviewPipeline:
                 gateway=gateway,
                 assignment=assignment,
                 intent=intent,
-                diff_excerpt=summary.diff_excerpt,
+                diff_excerpt=self._review_diff_excerpt(summary),
                 observations=reviewer_observations,
                 trace_id=trace_id,
                 model=model,
@@ -594,7 +661,7 @@ class ReviewPipeline:
                 adapter=adapter_factory.create(),
                 assignment=assignment,
                 intent=intent,
-                diff_excerpt=summary.diff_excerpt,
+                diff_excerpt=self._review_diff_excerpt(summary),
                 observations=reviewer_observations,
                 trace_id=trace_id,
                 model=model,
@@ -898,6 +965,11 @@ class ReviewPipeline:
             reconciliation_payload=reconciliation_payload,
             completion_summary=completion_payload,
             final_risk_assessment=final_risk_payload,
+            incremental_priority=(
+                incremental_priority_to_dict(self.context.incremental_priority)
+                if self.context.incremental_priority is not None
+                else None
+            ),
         )
         workspace.write_json("review_brief.json", review_brief_to_dict(brief))
         workspace.write_text("report.md", render_review_brief_markdown(brief))
@@ -1044,6 +1116,17 @@ class ReviewPipeline:
         if current is not None:
             summaries.update(current.summaries_by_id())
         return summaries
+
+    def _review_diff_excerpt(self, full_summary: ChangeSummary) -> list[str]:
+        priority = self.context.incremental_priority
+        if priority is None:
+            return list(full_summary.diff_excerpt)
+        return [
+            "Incremental priority diff (new changes since parent Head):",
+            *priority.diff_excerpt,
+            "Full review diff (child Base..Head):",
+            *full_summary.diff_excerpt,
+        ]
 
     def _write_compatibility_state(self, message: str) -> bool:
         manifest = self.context.manifest

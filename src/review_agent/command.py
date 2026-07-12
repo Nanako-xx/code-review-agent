@@ -211,8 +211,28 @@ def _run_resume(args: argparse.Namespace) -> int:
         except Exception as error:
             print(f"Resume failed: {type(error).__name__}: {error}", file=sys.stderr)
             return 1
-        _print_session_summary(session_store, store)
+        summary_store = store
+        summary_session_store = session_store
+        if (
+            result.action is ResumeAction.CREATE_INCREMENTAL_SESSION
+            and result.new_review_id is not None
+        ):
+            summary_store = CheckpointStore(
+                repo,
+                result.new_review_id,
+                create=False,
+            )
+            summary_session_store = SessionStore(summary_store.run_dir)
+        _print_session_summary(summary_session_store, summary_store)
         print(f"  Action: {result.action.value}")
+        if result.action is ResumeAction.CREATE_INCREMENTAL_SESSION:
+            print(f"  Parent review: {result.parent_review_id}")
+            print(f"  New review: {result.new_review_id}")
+            if result.change_kind is not None:
+                print(f"  Change: {result.change_kind.value}")
+            print(f"  Full range: {result.full_range}")
+            if result.incremental_range is not None:
+                print(f"  Incremental priority range: {result.incremental_range}")
         if result.starting_phase is not None:
             print(f"  Starting phase: {result.starting_phase.value}")
         if result.reused_phases:

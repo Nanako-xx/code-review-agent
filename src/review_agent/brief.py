@@ -63,6 +63,7 @@ def build_review_brief(
     reconciliation_payload: dict[str, Any] | None = None,
     completion_summary: dict[str, Any] | None = None,
     final_risk_assessment: dict[str, Any] | None = None,
+    incremental_priority: dict[str, Any] | None = None,
 ) -> ReviewBrief:
     observations = observation_summaries or {}
     reconciliation = reconciliation_payload or {}
@@ -70,6 +71,15 @@ def build_review_brief(
     verified_findings = _verified_findings(reconciliation)
     rejected_hypotheses = _rejected_hypotheses(reconciliation, reviewer_result)
     uncertainties = _uncertainties(intent_packet, risk_assessment, reviewer_result, completion)
+
+    change_map: dict[str, Any] = {
+        "changed_files": list(changed_files),
+        "repository_intelligence_summary": repository_intelligence_summary or "",
+        "observation_count": len(observations),
+        "reviewer_summary": _reviewer_summary(multi_reviewer_summary, reviewer_result),
+    }
+    if incremental_priority is not None:
+        change_map["incremental_priority"] = dict(incremental_priority)
 
     return ReviewBrief(
         review_id=review_id,
@@ -97,12 +107,7 @@ def build_review_brief(
             },
         },
         quality_gates=[_quality_result_to_dict(result) for result in quality_results],
-        change_map_and_repository_impact={
-            "changed_files": list(changed_files),
-            "repository_intelligence_summary": repository_intelligence_summary or "",
-            "observation_count": len(observations),
-            "reviewer_summary": _reviewer_summary(multi_reviewer_summary, reviewer_result),
-        },
+        change_map_and_repository_impact=change_map,
         verified_findings=verified_findings,
         rejected_hypotheses=rejected_hypotheses,
         uncertainties=uncertainties,

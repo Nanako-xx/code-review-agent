@@ -16,6 +16,7 @@ from review_agent.session import (
     ReviewExecutionConfig,
     RevisionChangeKind,
     SessionManifest,
+    child_session_manifest,
     initial_session_manifest,
     session_manifest_from_dict,
     session_manifest_to_dict,
@@ -321,6 +322,42 @@ def test_initial_session_has_initial_lineage_and_pending_phases() -> None:
     assert list(initial.phases) == [phase.value for phase in SESSION_PHASES]
     assert all(item.status is PhaseStatus.PENDING for item in initial.phases.values())
     assert all(item.attempts == 0 for item in initial.phases.values())
+
+
+@pytest.mark.parametrize(
+    ("change_kind", "incremental_from_sha"),
+    [
+        (RevisionChangeKind.HEAD_MOVED, "b" * 40),
+        (RevisionChangeKind.BASE_MOVED, None),
+        (RevisionChangeKind.BASE_AND_HEAD_MOVED, None),
+    ],
+)
+def test_child_session_manifest_starts_isolated_and_preserves_root_lineage(
+    change_kind: RevisionChangeKind,
+    incremental_from_sha: str | None,
+) -> None:
+    parent = manifest()
+    child = child_session_manifest(
+        review_id="review-child",
+        parent=parent,
+        repository=parent.repository,
+        revisions=ResolvedRevisions("main", "HEAD", "c" * 40, "d" * 40),
+        change_kind=change_kind,
+        now="2026-07-12T01:00:00Z",
+    )
+
+    assert child.parent_review_id == parent.review_id
+    assert child.root_review_id == parent.root_review_id
+    assert child.original_base_sha == parent.original_base_sha
+    assert child.incremental_from_sha == incremental_from_sha
+    assert child.execution == parent.execution
+    assert child.artifacts == {}
+    assert child.errors == ()
+    assert child.status is RunStatus.CREATED
+    assert all(
+        checkpoint.status is PhaseStatus.PENDING
+        for checkpoint in child.phases.values()
+    )
 
 
 @pytest.mark.parametrize(

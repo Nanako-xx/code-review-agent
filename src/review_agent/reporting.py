@@ -184,6 +184,19 @@ def _change_map_section(brief: ReviewBrief) -> str:
     summary = str(change_map.get("repository_intelligence_summary", "")).strip()
     if summary:
         lines.extend(["", "Repository intelligence:", summary])
+    incremental = change_map.get("incremental_priority")
+    if isinstance(incremental, dict):
+        lines.extend(
+            [
+                "",
+                "Incremental priority map:",
+                f"- Range: {incremental.get('from_revision', '')}..{incremental.get('to_revision', '')}",
+                _string_list(
+                    incremental.get("changed_files", []),
+                    "No incremental files detected",
+                ),
+            ]
+        )
     reviewer_summary = change_map.get("reviewer_summary", {})
     if reviewer_summary:
         lines.extend(["", "Reviewer summary:", _dict_lines(dict(reviewer_summary))])

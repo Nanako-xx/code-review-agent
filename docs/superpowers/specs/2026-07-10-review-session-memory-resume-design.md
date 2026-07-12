@@ -768,9 +768,9 @@ Session Manifest 和 Runtime Policy 优先级高于仓库内文件。仓库内�
 
 完成标准：revision 未变化时，未完成 Session 能真实恢复且不重复有效阶段。
 
-实现记录（2026-07-12）：七阶段 `ReviewPipeline`、typed hydration、ObservationStore 恢复、attempt 隔离、reviewer 子 checkpoint、completed audit 和 unchanged-revision resume 已落地；revision drift 当前安全阻断，不在原 Session 上继续。
+实现记录（2026-07-12）：七阶段 `ReviewPipeline`、typed hydration、ObservationStore 恢复、attempt 隔离、reviewer 子 checkpoint、completed audit 和 unchanged-revision resume 已落地；Batch B 的 revision drift 安全阻断已由 Batch C 的 child Session 派生替代。
 
-### 批次 C：Revision Drift 与 Incremental Lineage（待实现）
+### 批次 C：Revision Drift 与 Incremental Lineage（已完成）
 
 - ResumePlanner。
 - completed audit mode。
@@ -780,6 +780,8 @@ Session Manifest 和 Runtime Policy 优先级高于仓库内文件。仓库内�
 - CLI 输出与端到端测试。
 
 完成标准：revision 变化时不会混用旧 evidence，并产生可审计、幂等的 child Review。
+
+实现记录（2026-07-12）：Base/Head/Both drift 分类、确定性 child ID、root lineage、parent 不可变、child artifact/evidence 隔离、完整 `Base..Head` 重审、Head-only incremental priority map、running/failed child 续跑、损坏 child 阻断及 CLI 端到端输出均已落地。相同 parent/Base/Head 重复 resume 返回同一 child；detached SHA 不产生漂移。全量 pytest 通过，仅保留既有的 2 个平台相关 skip。
 
 ## 18. 完成定义
 

@@ -10,6 +10,10 @@ from pathlib import Path, PurePosixPath
 from review_agent.artifacts import artifact_schema
 from review_agent.checkpoint import CheckpointStore
 from review_agent.hydration import review_request_from_dict
+from review_agent.incremental import (
+    classify_revision_change,
+    deterministic_child_review_id,
+)
 from review_agent.models import ReviewRequest
 from review_agent.pipeline import (
     PHASE_MESSAGES,
@@ -17,15 +21,25 @@ from review_agent.pipeline import (
     PipelineResult,
     ReviewPipeline,
 )
-from review_agent.revision import RevisionResolver
+from review_agent.revision import (
+    RepositoryIdentity,
+    ResolvedRevisions,
+    RevisionResolver,
+)
 from review_agent.run_state import RunPhase, RunStatus
-from review_agent.session import PhaseStatus, SessionManifest
+from review_agent.session import (
+    PhaseStatus,
+    RevisionChangeKind,
+    SessionManifest,
+    child_session_manifest,
+)
 from review_agent.session_store import SessionStore
 
 
 class ResumeAction(str, Enum):
     AUDIT_COMPLETED = "audit_completed"
     CONTINUE_SESSION = "continue_session"
+    CREATE_INCREMENTAL_SESSION = "create_incremental_session"
     BLOCKED = "blocked"
 
 
@@ -40,6 +54,12 @@ class ResumeResult:
     starting_phase: RunPhase | None
     reused_phases: tuple[RunPhase, ...]
     pipeline_result: PipelineResult | None = None
+    parent_review_id: str | None = None
+    new_review_id: str | None = None
+    change_kind: RevisionChangeKind | None = None
+    full_range: str | None = None
+    incremental_range: str | None = None
+    child_created: bool = False
 
 
 class ReviewSessionResumer:
@@ -58,8 +78,19 @@ class ReviewSessionResumer:
 
     def resume(self) -> ResumeResult:
         manifest = self.session_store.load()
-        self._validate_repository_and_revisions(manifest)
+        identity, current_revisions = self._validate_repository_and_revisions(
+            manifest
+        )
         request = self._load_request(manifest)
+        change_kind = classify_revision_change(manifest, current_revisions)
+        if change_kind is not RevisionChangeKind.INITIAL:
+            return self._resume_incremental_child(
+                parent=manifest,
+                repository=identity,
+                revisions=current_revisions,
+                request=request,
+                change_kind=change_kind,
+            )
         pipeline = ReviewPipeline(
             repository=self.repository,
             checkpoint_store=self.checkpoint_store,
@@ -126,7 +157,10 @@ class ReviewSessionResumer:
             pipeline_result=result,
         )
 
-    def _validate_repository_and_revisions(self, manifest: SessionManifest) -> None:
+    def _validate_repository_and_revisions(
+        self,
+        manifest: SessionManifest,
+    ) -> tuple[RepositoryIdentity, ResolvedRevisions]:
         identity = self.resolver.repository_identity(self.repository)
         if _canonical_path(identity.git_common_dir) != _canonical_path(
             manifest.repository.git_common_dir
@@ -143,15 +177,118 @@ class ReviewSessionResumer:
             manifest.revisions.requested_base,
             manifest.revisions.requested_head,
         )
+        return identity, current
+
+    def _resume_incremental_child(
+        self,
+        *,
+        parent: SessionManifest,
+        repository: RepositoryIdentity,
+        revisions: ResolvedRevisions,
+        request: ReviewRequest,
+        change_kind: RevisionChangeKind,
+    ) -> ResumeResult:
+        child_id = deterministic_child_review_id(
+            repository=repository,
+            parent_review_id=parent.review_id,
+            revisions=revisions,
+        )
+        child_checkpoint = CheckpointStore(self.repository, child_id)
+        child_store = SessionStore(child_checkpoint.run_dir)
+        child_created = not child_store.session_path.exists()
+        if child_created:
+            try:
+                child_store.create(
+                    child_session_manifest(
+                        review_id=child_id,
+                        parent=parent,
+                        repository=repository,
+                        revisions=revisions,
+                        change_kind=change_kind,
+                        now=_utc_now(),
+                    )
+                )
+            except FileExistsError:
+                child_created = False
+        try:
+            child = child_store.load()
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise ResumeBlockedError(
+                f"deterministic child Session is invalid: {error}"
+            ) from error
+        self._validate_existing_child(
+            child=child,
+            parent=parent,
+            revisions=revisions,
+            change_kind=change_kind,
+        )
+
+        nested_result: ResumeResult | None = None
+        pipeline_result: PipelineResult | None = None
+        if "request" not in child.artifacts:
+            preflight = child.phases[RunPhase.PREFLIGHT.value]
+            if preflight.status is PhaseStatus.COMPLETED:
+                raise ResumeBlockedError(
+                    "child request artifact is missing from completed preflight"
+                )
+            pipeline_result = ReviewPipeline(
+                repository=self.repository,
+                checkpoint_store=child_checkpoint,
+                session_store=child_store,
+                request=request,
+            ).execute(
+                starting_phase=RunPhase.PREFLIGHT,
+                resuming=preflight.status is not PhaseStatus.PENDING,
+            )
+            starting_phase = RunPhase.PREFLIGHT
+            reused_phases: tuple[RunPhase, ...] = ()
+        else:
+            nested_result = ReviewSessionResumer(
+                repository=self.repository,
+                checkpoint_store=child_checkpoint,
+                session_store=child_store,
+                resolver=self.resolver,
+            ).resume()
+            pipeline_result = nested_result.pipeline_result
+            starting_phase = nested_result.starting_phase
+            reused_phases = nested_result.reused_phases
+
+        incremental_range = (
+            f"{parent.revisions.resolved_head_sha}..{revisions.resolved_head_sha}"
+            if change_kind is RevisionChangeKind.HEAD_MOVED
+            else None
+        )
+        return ResumeResult(
+            action=ResumeAction.CREATE_INCREMENTAL_SESSION,
+            manifest=child_store.load(),
+            starting_phase=starting_phase,
+            reused_phases=reused_phases,
+            pipeline_result=pipeline_result,
+            parent_review_id=parent.review_id,
+            new_review_id=child_id,
+            change_kind=change_kind,
+            full_range=f"{revisions.resolved_base_sha}..{revisions.resolved_head_sha}",
+            incremental_range=incremental_range,
+            child_created=child_created,
+        )
+
+    @staticmethod
+    def _validate_existing_child(
+        *,
+        child: SessionManifest,
+        parent: SessionManifest,
+        revisions: ResolvedRevisions,
+        change_kind: RevisionChangeKind,
+    ) -> None:
         if (
-            current.resolved_base_sha.casefold()
-            != manifest.revisions.resolved_base_sha.casefold()
-            or current.resolved_head_sha.casefold()
-            != manifest.revisions.resolved_head_sha.casefold()
+            child.parent_review_id != parent.review_id
+            or child.root_review_id != parent.root_review_id
+            or child.revisions != revisions
+            or child.revision_change_kind is not change_kind
+            or child.original_base_sha != parent.original_base_sha
         ):
             raise ResumeBlockedError(
-                "requested revisions have drifted; Batch C must create an "
-                "incremental child Session"
+                "deterministic child Session already exists with mismatched lineage"
             )
 
     def _load_request(self, manifest: SessionManifest) -> ReviewRequest:

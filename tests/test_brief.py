@@ -102,6 +102,13 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
         reconciliation_payload=reconciliation_payload,
         completion_summary=completion_summary,
         final_risk_assessment=final_risk,
+        incremental_priority={
+            "from_revision": "b" * 40,
+            "to_revision": "c" * 40,
+            "changed_files": ["auth.py"],
+            "diff_stat": "1 file changed",
+            "diff_excerpt": ["+reject bad token"],
+        },
     )
 
     payload = review_brief_to_dict(brief)
@@ -114,12 +121,21 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
     assert payload["initial_and_final_risk_assessment"]["final"]["level"] == "critical"
     assert payload["quality_gates"][0]["name"] == "python_compile"
     assert payload["change_map_and_repository_impact"]["changed_files"] == ["auth.py"]
+    assert (
+        payload["change_map_and_repository_impact"]["incremental_priority"][
+            "changed_files"
+        ]
+        == ["auth.py"]
+    )
     assert payload["verified_findings"][0]["claim"] == "Bad token path is not covered"
     assert payload["rejected_hypotheses"][0]["claim"] == "Session storage changed"
     assert payload["reviewer_disagreements"] == ["core and adversarial disagree on token expiry"]
     assert payload["review_contract_coverage"][0]["contract"] == "Behavioral Correctness"
     assert payload["non_binding_recommendation"] == "manual_review"
     assert "auth.py" in payload["human_review_checklist_and_reading_order"][0]
+    markdown = render_review_brief_markdown(brief)
+    assert "Incremental priority map:" in markdown
+    assert f"{'b' * 40}..{'c' * 40}" in markdown
 
 
 def test_render_review_brief_markdown_uses_spec_section_order() -> None:

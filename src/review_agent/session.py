@@ -426,6 +426,44 @@ def initial_session_manifest(
     )
 
 
+def child_session_manifest(
+    *,
+    review_id: str,
+    parent: SessionManifest,
+    repository: RepositoryIdentity,
+    revisions: ResolvedRevisions,
+    change_kind: RevisionChangeKind,
+    now: str,
+) -> SessionManifest:
+    if change_kind is RevisionChangeKind.INITIAL:
+        raise ValueError("child Session change_kind must describe revision drift")
+    incremental_from_sha = (
+        parent.revisions.resolved_head_sha
+        if change_kind is RevisionChangeKind.HEAD_MOVED
+        else None
+    )
+    return SessionManifest(
+        schema_version=SESSION_SCHEMA_VERSION,
+        review_id=review_id,
+        parent_review_id=parent.review_id,
+        root_review_id=parent.root_review_id,
+        repository=repository,
+        revisions=revisions,
+        original_base_sha=parent.original_base_sha,
+        incremental_from_sha=incremental_from_sha,
+        revision_change_kind=change_kind,
+        execution=parent.execution,
+        status=RunStatus.CREATED,
+        current_phase=RunPhase.CREATED,
+        last_successful_phase=None,
+        phases={phase.value: PhaseCheckpoint() for phase in SESSION_PHASES},
+        artifacts={},
+        errors=(),
+        created_at=now,
+        updated_at=now,
+    )
+
+
 def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
     return {
         "schema_version": manifest.schema_version,

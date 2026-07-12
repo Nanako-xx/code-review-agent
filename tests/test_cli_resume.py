@@ -185,6 +185,60 @@ def test_cli_resume_completed_session_rebuilds_missing_reporting_artifact(git_re
     assert (run_dir / "report.md").exists()
 
 
+def test_cli_resume_revision_drift_creates_and_prints_child_session(
+    git_repo: Path,
+    capsys,
+) -> None:
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "auth.py").write_text(
+        "def check(token):\n    return bool(token)\n",
+        encoding="utf-8",
+    )
+    run_git(git_repo, "add", "auth.py")
+    run_git(git_repo, "commit", "-m", "add auth check")
+    parent_head = run_git(git_repo, "rev-parse", "HEAD")
+    assert (
+        main(
+            [
+                "review",
+                "--repo",
+                str(git_repo),
+                "--base",
+                base,
+                "--head",
+                "HEAD",
+                "--intent",
+                "Add auth token check",
+                "--non-interactive",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    runs_root = git_repo / ".review-agent" / "runs"
+    parent_id = next(runs_root.iterdir()).name
+    (git_repo / "later.py").write_text("value = 1\n", encoding="utf-8")
+    run_git(git_repo, "add", "later.py")
+    run_git(git_repo, "commit", "-m", "move symbolic head")
+    child_head = run_git(git_repo, "rev-parse", "HEAD")
+
+    assert main(["resume", parent_id, "--repo", str(git_repo)]) == 0
+
+    output = capsys.readouterr().out
+    child_line = next(
+        line for line in output.splitlines() if line.strip().startswith("New review:")
+    )
+    child_id = child_line.split(":", 1)[1].strip()
+    assert "Action: create_incremental_session" in output
+    assert f"Parent review: {parent_id}" in output
+    assert f"Review ID: {child_id}" in output
+    assert "Change: head_moved" in output
+    assert f"Full range: {base}..{child_head}" in output
+    assert f"Incremental priority range: {parent_head}..{child_head}" in output
+    assert (runs_root / child_id / "incremental_priority.json").exists()
+    assert (runs_root / child_id / "report.md").exists()
+
+
 def test_cli_resume_missing_run_returns_usage_error(tmp_path: Path, capsys) -> None:
     exit_code = main(["resume", "missing-review", "--repo", str(tmp_path)])
 
