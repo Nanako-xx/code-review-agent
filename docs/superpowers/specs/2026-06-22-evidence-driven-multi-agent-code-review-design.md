@@ -1310,7 +1310,7 @@ M1 完成时，应能在一个本地 Python Git 仓库中：
 11. 生成人类可审计的 Markdown/JSON Review Brief。
 12. 不修改代码、不自动发布评论、不自动合并。
 
-### 23.1 实现状态（2026-07-13）
+### 23.1 实现状态（2026-07-14）
 
 Runtime Review Contract Enforcement 已落地：合法 Observation revision allowlist、严格新 Finding 输出、assigned Contract completion validator、Agent Loop completion 拒绝/重试、single/multi/no-provider 统一 reconciliation/completion，以及无 Core Reviewer 时 `blocked` 均已进入主路径。`Session.status=completed` 仅表示执行生命周期结束，审查结论以 `completion.json` 为准。
 
@@ -1322,7 +1322,9 @@ Deterministic Quality Gates 已落地：固定 Head 的 Gate Plan 与安全发�
 
 Model-Assisted Risk Assessor 与 Portfolio Planner 已落地：Session schema v3 为 Risk、Portfolio 和 Reviewer 保存独立模型阶段配置，旧 v1/v2 Session 严格 hydrate 为 local planning 并保留原调度语义。Risk Assessor 只读取最小 Risk Packet，模型 proposal 经严格解析、有限重试、`signal_refs` allowlist 和本地风险下限编译后才成为权威 Risk；模型失败会确定性降级，并把不确定性暴露到 Planning Summary 与 Brief。Portfolio Planner 的 candidate proposal 同样不具调度权，Runtime 负责角色数量、Core Contract、权限和风险预算，必要时补齐 Core、Adversarial 与 Specialist。新 Session 的 `single`/`multi` 分别顺序/并行执行完整 portfolio；envelope、raw response、decision、authoritative plan 和稳定 invocation metadata 均作为可恢复、可审计 artifact 保存。
 
-仍待后续本地批次实现：语义 Reconciler 和有界补充调查。Eval 与 GitHub/PR 集成继续独立延期。
+Semantic Evidence Reconciler 与有界补充调查已落地：Session schema v4 增加独立语义分析和补充调查阶段；确定性 pre-pass、严格模型 proposal 编译、严重 Finding 保守保留、stable request/wave/task/invocation ID、按风险编译且持久化的 effective policy、全局预算与有限波次、single/limited-multi 稳定调度、失败证据隔离、unknown consumption、最小范围恢复和 revision-drift 重算均进入主路径。权威 `semantic_reconciliation.json` 同时投影兼容的 `reconciliation.json`，Completion、Final Risk 与 JSON/Markdown Brief 会完整消费 fallback、冲突、补充状态、预算和 policy action。v1/v2/v3 Session 保持原 phase 与 resume 语义，不会隐式调用 Semantic Reconciler。
+
+仍待后续独立批次实现：Durable Project/Review Feedback Memory、Eval Harness，以及 GitHub/PR 集成。自动修复、自动发布评论和自动合并继续不在当前本地审查路径内。
 
 ## 24. 实现同步原则
 

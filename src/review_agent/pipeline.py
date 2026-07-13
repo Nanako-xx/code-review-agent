@@ -6,16 +6,23 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
-from time import perf_counter
 from typing import Any, Callable, Mapping
 
-from review_agent.agent_loop import AgentLoopRun, agent_loop_run_to_dict, run_reviewer_agent_loop
+from review_agent.agent_loop import AgentLoopRun, agent_loop_run_to_dict
 from review_agent.artifacts import artifact_schema
 from review_agent.attempts import AttemptWorkspace
 from review_agent.brief import ReviewBrief, build_review_brief, review_brief_to_dict
 from review_agent.checkpoint import CheckpointStore
 from review_agent.completion import CompletionResult, check_completion, completion_to_dict
-from review_agent.evidence import EvidenceReconciliation, reconcile_evidence, reconciliation_to_dict
+from review_agent.context import REVIEWER_TOOL_NAMES
+from review_agent.evidence import (
+    EvidenceReconciliation,
+    ReconciliationPrepass,
+    build_reconciliation_prepass,
+    reconcile_evidence,
+    reconciliation_prepass_to_dict,
+    reconciliation_to_dict,
+)
 from review_agent.final_risk import FinalRiskAssessment, final_risk_to_dict, reassess_final_risk
 from review_agent.git_repo import (
     ChangeSummary,
@@ -40,6 +47,7 @@ from review_agent.hydration import (
     reviewer_execution_from_artifacts,
     risk_assessment_from_dict,
     risk_packet_from_dict,
+    semantic_reconciliation_from_dict,
 )
 from review_agent.intent import (
     apply_user_decision,
@@ -90,17 +98,17 @@ from review_agent.models import (
     IntentOrigin,
     IntentPacket,
     IntentSource,
+    InitialContext,
     QualityGateResult,
     ReviewRequest,
     ReviewerResult,
     RiskAssessment,
     RiskAssessmentPacket,
 )
-from review_agent.observations import ObservationStore
+from review_agent.observations import Observation, ObservationStore
 from review_agent.orchestrator import (
     MultiReviewerRun,
     ReviewerExecution,
-    failed_reviewer_execution,
     multi_reviewer_run_to_dict,
 )
 from review_agent.quality import (
@@ -133,7 +141,22 @@ from review_agent.repository_intelligence import (
     summarize_repository_intelligence,
 )
 from review_agent.reporting import render_review_brief_markdown
+from review_agent.reconciler import (
+    SemanticConflict,
+    SemanticReconcilerRun,
+    SemanticReconciliation,
+    SupplementalSemanticSummary,
+    reconciliation_packet_to_dict,
+    reconcile_semantically,
+    semantic_reconciliation_to_dict,
+    semantic_to_evidence_reconciliation,
+)
 from review_agent.reviewer import reviewer_result_to_dict, run_single_reviewer
+from review_agent.reviewer_task_executor import (
+    ReviewerTask,
+    ReviewerTaskExecutor,
+    ReviewerTaskRun,
+)
 from review_agent.reviewer_runtime import reviewer_runtime_to_dict
 from review_agent.review_contract import validate_reviewer_completion
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
@@ -144,9 +167,24 @@ from review_agent.session import (
     PhaseStatus,
     ReviewExecutionConfig,
     SessionManifest,
+    SupplementalBudget,
+    SupplementalPolicy,
+    SupplementalTaskStatus,
+    session_phases_for_schema,
 )
 from review_agent.session_store import SessionStore
 from review_agent.tool_gateway import ToolGateway
+from review_agent.supplemental import (
+    BudgetAmount,
+    ReviewerBudgetCaps,
+    SupplementalPlan,
+    SupplementalTaskSpec,
+    SupplementalRuntimeLimits,
+    compile_supplemental_plan,
+    effective_policy_for_risk,
+    stable_assignment_digest,
+    stable_invocation_id,
+)
 
 
 PHASE_MESSAGES = {
@@ -157,11 +195,17 @@ PHASE_MESSAGES = {
     RunPhase.INTENT_RESOLUTION: "Intent resolution completed",
     RunPhase.PLANNING: "Risk and reviewer planning completed",
     RunPhase.REVIEWERS: "Reviewer execution completed",
+    RunPhase.RECONCILIATION_ANALYSIS: "Semantic reconciliation analysis completed",
+    RunPhase.SUPPLEMENTAL_INVESTIGATION: "Bounded supplemental investigation completed",
     RunPhase.RECONCILIATION: "Evidence reconciliation completed",
     RunPhase.COMPLETION: "Completion check completed",
     RunPhase.FINAL_RISK: "Final risk reassessment completed",
     RunPhase.REPORTING: "Reporting completed",
 }
+
+_SUPPLEMENTAL_BUDGET_EXHAUSTED_ERROR = (
+    "supplemental budget exhausted before another task attempt"
+)
 
 
 class PipelineError(RuntimeError):
@@ -227,8 +271,15 @@ class PipelineContext:
     repository_observations: ObservationStore | None = None
     reviewer_observations: dict[int, ObservationStore] = field(default_factory=dict)
     reviewer_executions: list[ReviewerExecution] = field(default_factory=list)
+    supplemental_executions: list[ReviewerExecution] = field(default_factory=list)
+    supplemental_observations: dict[str, ObservationStore] = field(default_factory=dict)
+    supplemental_task_ids_by_trace: dict[str, str] = field(default_factory=dict)
     reviewer_result: ReviewerResult | None = None
     multi_run: MultiReviewerRun | None = None
+    reconciliation_prepass: ReconciliationPrepass | None = None
+    semantic_run: SemanticReconcilerRun | None = None
+    semantic_reconciliation: SemanticReconciliation | None = None
+    supplemental_plan: SupplementalPlan | None = None
     reconciliation: EvidenceReconciliation | None = None
     completion: CompletionResult | None = None
     final_risk: FinalRiskAssessment | None = None
@@ -263,6 +314,13 @@ class PipelineResult:
     open_questions: tuple[ClarificationQuestion, ...] = ()
 
 
+@dataclass(frozen=True)
+class SupplementalStateFailure:
+    wave_id: str
+    task_id: str | None
+    reason: str
+
+
 class ReviewPipeline:
     def __init__(
         self,
@@ -293,7 +351,7 @@ class ReviewPipeline:
         starting_phase: RunPhase = RunPhase.PREFLIGHT,
         resuming: bool = False,
     ) -> PipelineResult:
-        phases = tuple(PHASE_MESSAGES)
+        phases = session_phases_for_schema(self.context.manifest.schema_version)
         if starting_phase not in phases:
             raise ValueError("starting_phase must be a persisted Pipeline phase")
         starting_index = phases.index(starting_phase)
@@ -383,6 +441,144 @@ class ReviewPipeline:
                 failures[task_name] = f"{type(error).__name__}: {error}"
         return failures
 
+    def validate_completed_supplemental_state(
+        self,
+    ) -> tuple[SupplementalStateFailure, ...]:
+        """Locate the smallest invalid committed supplemental boundary."""
+
+        manifest = self.context.manifest
+        failures: list[SupplementalStateFailure] = []
+        for wave in sorted(
+            manifest.supplemental_waves.values(),
+            key=lambda item: item.wave_index,
+        ):
+            task_failed = False
+            for task_id, task in sorted(wave.tasks.items()):
+                if task.status not in {
+                    SupplementalTaskStatus.COMPLETED,
+                    SupplementalTaskStatus.PARTIAL,
+                    SupplementalTaskStatus.FAILED,
+                }:
+                    continue
+                try:
+                    if task.artifacts:
+                        self._validate_supplemental_artifacts(task.artifacts)
+                    if task.status in {
+                        SupplementalTaskStatus.COMPLETED,
+                        SupplementalTaskStatus.PARTIAL,
+                    }:
+                        self._load_supplemental_task(task_id)
+                except Exception as error:
+                    failures.append(
+                        SupplementalStateFailure(
+                            wave_id=wave.wave_id,
+                            task_id=task_id,
+                            reason=f"{type(error).__name__}: {error}",
+                        )
+                    )
+                    task_failed = True
+            if task_failed:
+                continue
+            try:
+                task_artifacts = {
+                    artifact_name
+                    for task in wave.tasks.values()
+                    for artifact_name in task.artifacts
+                }
+                wave_artifacts = tuple(
+                    artifact_name
+                    for artifact_name in wave.artifacts
+                    if artifact_name not in task_artifacts
+                )
+                self._validate_supplemental_artifacts(wave_artifacts)
+                plan_name = f"supplemental_wave_{wave.wave_id}_plan"
+                if plan_name not in wave.artifacts:
+                    raise ValueError("completed supplemental wave has no plan artifact")
+                plan = _supplemental_plan_from_dict(
+                    self._read_json_artifact(plan_name)
+                )
+                if (
+                    plan.wave_id != wave.wave_id
+                    or plan.wave_index != wave.wave_index
+                    or plan.trigger_digest != wave.trigger_digest
+                    or {task.task_id for task in plan.tasks} != set(wave.tasks)
+                ):
+                    raise ValueError(
+                        "supplemental wave plan does not match its Session checkpoint"
+                    )
+                for spec in plan.tasks:
+                    if (
+                        stable_assignment_digest(spec.assignment)
+                        != wave.tasks[spec.task_id].assignment_digest
+                    ):
+                        raise ValueError(
+                            "supplemental wave plan assignment digest mismatch"
+                        )
+                summary_name = f"supplemental_wave_{wave.wave_id}_summary"
+                if summary_name not in wave.artifacts:
+                    raise ValueError(
+                        "completed supplemental wave has no terminal summary"
+                    )
+                summary = self._read_json_artifact(summary_name)
+                if (
+                    summary.get("schema_version")
+                    != "supplemental_wave_summary_v1"
+                    or summary.get("wave_id") != wave.wave_id
+                    or summary.get("wave_index") != wave.wave_index
+                    or summary.get("stop_reason") != wave.stop_reason
+                ):
+                    raise ValueError(
+                        "supplemental wave summary does not match its checkpoint"
+                    )
+                semantic_payload = summary.get("semantic_reconciliation")
+                if not isinstance(semantic_payload, Mapping):
+                    raise ValueError(
+                        "supplemental wave summary lacks semantic reconciliation"
+                    )
+                semantic_reconciliation_from_dict(semantic_payload)
+                next_plan = summary.get("next_plan")
+                if next_plan is not None:
+                    if not isinstance(next_plan, Mapping):
+                        raise ValueError(
+                            "supplemental wave next_plan must be an object or null"
+                        )
+                    _supplemental_plan_from_dict(next_plan)
+                for artifact_name in wave_artifacts:
+                    self._read_json_artifact(artifact_name)
+            except Exception as error:
+                failures.append(
+                    SupplementalStateFailure(
+                        wave_id=wave.wave_id,
+                        task_id=None,
+                        reason=f"{type(error).__name__}: {error}",
+                    )
+                )
+        return tuple(failures)
+
+    def _validate_supplemental_artifacts(
+        self,
+        artifact_names: tuple[str, ...],
+    ) -> None:
+        manifest = self.context.manifest
+        for artifact_name in artifact_names:
+            descriptor = manifest.artifacts.get(artifact_name)
+            if descriptor is None:
+                raise ValueError(
+                    f"supplemental artifact is not registered: {artifact_name}"
+                )
+            if descriptor.phase is not RunPhase.SUPPLEMENTAL_INVESTIGATION:
+                raise ValueError(
+                    f"supplemental artifact belongs to another phase: {artifact_name}"
+                )
+            if descriptor.schema != artifact_schema(artifact_name):
+                raise ValueError(
+                    f"supplemental artifact schema is invalid: {artifact_name}"
+                )
+            if not self.context.session_store.validate_artifact(descriptor):
+                raise ValueError(
+                    f"supplemental artifact hash is invalid: {artifact_name}"
+                )
+
     def apply_submitted_intent_decisions(self) -> None:
         """Hydrate committed decisions into the in-memory clarification state."""
 
@@ -419,11 +615,74 @@ class ReviewPipeline:
             )
         elif phase is RunPhase.INTENT_RESOLUTION and checkpoint.user_decisions:
             preserve = checkpoint.artifacts
+        elif phase is RunPhase.SUPPLEMENTAL_INVESTIGATION:
+            preserve = self._prepare_supplemental_resume(checkpoint, resuming=resuming)
         self.context.session_store.discard_uncommitted_phase_artifacts(
             phase,
             preserve,
             self._clock(),
         )
+
+    def _prepare_supplemental_resume(
+        self,
+        _checkpoint: object,
+        *,
+        resuming: bool,
+    ) -> tuple[str, ...]:
+        """Conservatively close crash windows and retain committed wave state."""
+
+        if resuming:
+            manifest = self.context.manifest
+            for wave in sorted(
+                manifest.supplemental_waves.values(),
+                key=lambda item: item.wave_index,
+            ):
+                for task_id, task in sorted(wave.tasks.items()):
+                    if task.status is SupplementalTaskStatus.RUNNING:
+                        invocation_id = stable_invocation_id(
+                            task_or_batch_id=task_id,
+                            logical_turn=0,
+                            request_digest=task.assignment_digest,
+                        )
+                        self.context.session_store.mark_task_unknown(
+                            task_id,
+                            invocation_id,
+                            "resume detected an interrupted provider attempt; reserved usage was retained",
+                            self._clock(),
+                        )
+                    elif task.status is SupplementalTaskStatus.RESERVED:
+                        self.context.session_store.mark_task_running(
+                            task_id,
+                            self._clock(),
+                        )
+                        self.context.session_store.mark_task_failed(
+                            task_id,
+                            "resume cancelled a reserved task that was never submitted",
+                            SupplementalBudget(tasks=1),
+                            self._clock(),
+                        )
+
+        manifest = self.context.manifest
+        preserve: set[str] = set()
+        for wave in manifest.supplemental_waves.values():
+            if wave.status is PhaseStatus.COMPLETED:
+                preserve.update(wave.artifacts)
+            for task in wave.tasks.values():
+                if task.status in {
+                    SupplementalTaskStatus.COMPLETED,
+                    SupplementalTaskStatus.PARTIAL,
+                }:
+                    preserve.update(task.artifacts)
+            if wave.status is not PhaseStatus.COMPLETED:
+                prefix = f"supplemental_wave_{wave.wave_id}_"
+                preserve.update(
+                    name
+                    for name, descriptor in manifest.artifacts.items()
+                    if descriptor.phase is RunPhase.SUPPLEMENTAL_INVESTIGATION
+                    and name.startswith(prefix)
+                    and name.endswith(("_plan", "_budget"))
+                )
+        return tuple(sorted(preserve))
 
     def _run_phase(self, phase: RunPhase) -> dict[str, str]:
         dispatch = {
@@ -434,6 +693,8 @@ class ReviewPipeline:
             RunPhase.INTENT_RESOLUTION: self._run_intent_resolution,
             RunPhase.PLANNING: self._run_planning,
             RunPhase.REVIEWERS: self._run_reviewers,
+            RunPhase.RECONCILIATION_ANALYSIS: self._run_reconciliation_analysis,
+            RunPhase.SUPPLEMENTAL_INVESTIGATION: self._run_supplemental_investigation,
             RunPhase.RECONCILIATION: self._run_reconciliation,
             RunPhase.COMPLETION: self._run_completion,
             RunPhase.FINAL_RISK: self._run_final_risk,
@@ -450,6 +711,8 @@ class ReviewPipeline:
             RunPhase.INTENT_RESOLUTION: self._load_intent_resolution,
             RunPhase.PLANNING: self._load_planning,
             RunPhase.REVIEWERS: self._load_reviewers,
+            RunPhase.RECONCILIATION_ANALYSIS: self._load_reconciliation_analysis,
+            RunPhase.SUPPLEMENTAL_INVESTIGATION: self._load_supplemental_investigation,
             RunPhase.RECONCILIATION: self._load_reconciliation,
             RunPhase.COMPLETION: self._load_completion,
             RunPhase.FINAL_RISK: self._load_final_risk,
@@ -1624,80 +1887,30 @@ class ReviewPipeline:
         intent = _required(self.context.intent, "intent")
         trace_id = f"{manifest.review_id}-reviewer-{index}"
         model = _reviewer_invocation_model(manifest.execution)
-        started_at = perf_counter()
-        loop_run: AgentLoopRun | None = None
-        reviewer_observations = dict(pending.initial_observations)
-        try:
-            gateway = ToolGateway(
-                repository_path=self.context.repository,
-                base_revision=manifest.revisions.resolved_base_sha,
-                head_revision=manifest.revisions.resolved_head_sha,
-                observation_store=observations,
-            )
-            for changed_file in summary.changed_files:
-                gateway.execute("compare_base_head", {"path": changed_file})
-            reviewer_observations.update(observations.summaries_by_id())
-            if pending.creation_error is not None:
-                raise pending.creation_error
-            if pending.adapter is None:
-                raise RuntimeError("reviewer adapter creation returned no adapter")
-
-            if manifest.execution.reviewer_loop == "agent-loop":
-                loop_run = run_reviewer_agent_loop(
-                    adapter=pending.adapter,
-                    gateway=gateway,
-                    assignment=assignment,
-                    intent=intent,
-                    diff_excerpt=self._review_diff_excerpt(summary),
-                    observations=reviewer_observations,
-                    trace_id=trace_id,
-                    model=model,
-                )
-                execution = ReviewerExecution(
-                    reviewer_index=index,
-                    trace_id=trace_id,
-                    assignment=assignment,
-                    envelope=loop_run.envelope,
-                    response=loop_run.response,
-                    result=loop_run.result,
-                    runtime=loop_run.runtime,
-                )
-            else:
-                run = run_single_reviewer(
-                    adapter=pending.adapter,
-                    assignment=assignment,
-                    intent=intent,
-                    diff_excerpt=self._review_diff_excerpt(summary),
-                    observations=reviewer_observations,
-                    trace_id=trace_id,
-                    model=model,
-                )
-                execution = ReviewerExecution(
-                    reviewer_index=index,
-                    trace_id=trace_id,
-                    assignment=assignment,
-                    envelope=run.envelope,
-                    response=run.response,
-                    result=run.result,
-                    runtime=run.runtime,
-                )
-        except Exception as error:
-            reviewer_observations = dict(pending.initial_observations)
-            reviewer_observations.update(observations.summaries_by_id())
-            execution = failed_reviewer_execution(
-                index=index,
-                trace_id=trace_id,
-                assignment=assignment,
-                intent=intent,
-                diff_excerpt=self._review_diff_excerpt(summary),
-                observations=reviewer_observations,
-                error=error,
-                model=model,
-                elapsed_seconds=perf_counter() - started_at,
-                retained_observation_refs=tuple(
-                    sorted(reviewer_observations)
-                ),
-            )
+        task = ReviewerTask.for_initial(
+            task_id=pending.task_name,
+            reviewer_index=index,
+            assignment=assignment,
+            intent=intent,
+            trace_id=trace_id,
+            changed_files=tuple(summary.changed_files),
+            initial_observations=pending.initial_observations,
+            allowed_tools=REVIEWER_TOOL_NAMES,
+            diff_excerpt=tuple(self._review_diff_excerpt(summary)),
+        )
+        task_run = ReviewerTaskExecutor(
+            repository_path=self.context.repository,
+            base_revision=manifest.revisions.resolved_base_sha,
+            head_revision=manifest.revisions.resolved_head_sha,
+            reviewer_loop=manifest.execution.reviewer_loop,
+            model=model,
+        ).execute(
+            task,
+            adapter=pending.adapter,
+            observation_store=observations,
+            creation_error=pending.creation_error,
+        )
+        execution = task_run.execution
 
         names = _reviewer_artifact_names(
             index,
@@ -1733,8 +1946,16 @@ class ReviewPipeline:
         }
         if names.trace is not None:
             trace_payload = (
-                agent_loop_run_to_dict(loop_run)["trace"]
-                if loop_run is not None
+                agent_loop_run_to_dict(
+                    AgentLoopRun(
+                        envelope=execution.envelope,
+                        response=execution.response,
+                        result=execution.result,
+                        trace=task_run.loop_trace,
+                        runtime=execution.runtime,
+                    )
+                )["trace"]
+                if task_run.loop_trace is not None
                 else {
                     "trace_id": trace_id,
                     "tool_call_count": execution.runtime.tool_calls,
@@ -1903,25 +2124,1248 @@ class ReviewPipeline:
             result_payload=result_payload,
         )
 
-    def _run_reconciliation(self) -> dict[str, str]:
-        reconciliation = reconcile_evidence(
-            executions=self.context.reviewer_executions,
-            authorized_observation_ids=set(self._authorized_observation_summaries()),
+    def _run_reconciliation_analysis(self) -> dict[str, str]:
+        manifest = self.context.manifest
+        prepass = self._build_reconciliation_prepass()
+        observations = self._authorized_observation_catalog()
+        semantic_run = self._run_semantic_reconciler(prepass, observations)
+        plan = self._compile_supplemental_plan(
+            semantic_run,
+            wave_index=1,
+            prior_task_count=0,
+            prior_request_ids=(),
         )
+
+        workspace = self._phase_workspace(RunPhase.RECONCILIATION_ANALYSIS)
+        workspace.write_json(
+            "reconciliation_prepass.json",
+            reconciliation_prepass_to_dict(prepass),
+        )
+        workspace.write_json(
+            "reconciliation_packet.json",
+            reconciliation_packet_to_dict(semantic_run.packet),
+        )
+        workspace.write_json(
+            "supplemental_initial_plan.json",
+            _supplemental_plan_to_dict(plan),
+        )
+        workspace.write_json(
+            "reconciliation_analysis_summary.json",
+            {
+                "schema_version": "reconciliation_analysis_summary_v1",
+                "status": semantic_run.status,
+                "semantic_reconciliation": semantic_reconciliation_to_dict(
+                    semantic_run.reconciliation
+                ),
+                "supplemental_request_count": len(
+                    semantic_run.supplemental_requests
+                ),
+                "supplemental_plan_status": plan.status,
+                "batch_count": len(semantic_run.batches),
+            },
+        )
+        files: dict[str, tuple[str, str]] = {
+            "reconciliation_prepass": (
+                "reconciliation_prepass.json",
+                "reconciliation_prepass.json",
+            ),
+            "reconciliation_packet": (
+                "reconciliation_packet.json",
+                "reconciliation_packet.json",
+            ),
+            "supplemental_initial_plan": (
+                "supplemental_initial_plan.json",
+                "supplemental_initial_plan.json",
+            ),
+            "reconciliation_analysis_summary": (
+                "reconciliation_analysis_summary.json",
+                "reconciliation_analysis_summary.json",
+            ),
+        }
+        for batch in semantic_run.batches:
+            prefix = f"reconciler_{batch.batch.batch_id}"
+            workspace.write_json(
+                f"reconciler/{batch.batch.batch_id}/envelope.json",
+                dict(batch.envelope),
+            )
+            workspace.write_json(
+                f"reconciler/{batch.batch.batch_id}/raw_response.json",
+                batch.raw_response_to_dict(),
+            )
+            workspace.write_json(
+                f"reconciler/{batch.batch.batch_id}/decision.json",
+                batch.decision_to_dict(),
+            )
+            files[f"{prefix}_envelope"] = (
+                f"reconciler/{batch.batch.batch_id}/envelope.json",
+                f"reconciler/{batch.batch.batch_id}/envelope.json",
+            )
+            files[f"{prefix}_raw_response"] = (
+                f"reconciler/{batch.batch.batch_id}/raw_response.json",
+                f"reconciler/{batch.batch.batch_id}/raw_response.json",
+            )
+            files[f"{prefix}_decision"] = (
+                f"reconciler/{batch.batch.batch_id}/decision.json",
+                f"reconciler/{batch.batch.batch_id}/decision.json",
+            )
+        artifacts = self._commit_files(
+            RunPhase.RECONCILIATION_ANALYSIS,
+            workspace,
+            files,
+        )
+        self.context.reconciliation_prepass = prepass
+        self.context.semantic_run = semantic_run
+        self.context.semantic_reconciliation = semantic_run.reconciliation
+        self.context.supplemental_plan = plan
+        return artifacts
+
+    def _load_reconciliation_analysis(self) -> None:
+        summary = self._read_json_artifact("reconciliation_analysis_summary")
+        semantic_payload = summary.get("semantic_reconciliation")
+        if not isinstance(semantic_payload, Mapping):
+            raise ValueError(
+                "reconciliation analysis summary is missing semantic_reconciliation"
+            )
+        self.context.semantic_reconciliation = semantic_reconciliation_from_dict(
+            semantic_payload
+        )
+        self.context.supplemental_plan = _supplemental_plan_from_dict(
+            self._read_json_artifact("supplemental_initial_plan")
+        )
+        self.context.semantic_run = None
+        self.context.reconciliation_prepass = None
+
+    def _run_semantic_reconciler(
+        self,
+        prepass: ReconciliationPrepass,
+        observations: Mapping[str, Observation],
+    ) -> SemanticReconcilerRun:
+        manifest = self.context.manifest
+        stage = manifest.execution.semantic_reconciler
+        adapter = self._model_stage_adapter(
+            stage,
+            stage_label="semantic-reconciler",
+        )
+        intent = _required(self.context.intent, "intent")
+        effective_policy = self._effective_supplemental_policy()
+        return reconcile_semantically(
+            prepass,
+            observations,
+            intent_summary={
+                "goal": intent.goal,
+                "acceptance_criteria": list(intent.acceptance_criteria),
+                "scope": list(intent.scope),
+                "constraints": list(intent.constraints),
+                "status": intent.status.value,
+                "uncertainties": list(intent.uncertainties),
+            },
+            policy_summary={
+                "supplemental_policy": asdict(
+                    effective_policy
+                ),
+            },
+            adapter=adapter,
+            model=_model_stage_name(
+                stage,
+                "configured-semantic-reconciler-model",
+            ),
+            max_output_tokens=stage.max_output_tokens,
+            max_provider_attempts=stage.max_provider_attempts,
+            max_elapsed_seconds=stage.max_elapsed_seconds,
+        )
+
+    def _effective_supplemental_policy(self) -> SupplementalPolicy:
+        manifest = self.context.manifest
+        risk = _required(self.context.risk_assessment, "risk assessment")
+        return effective_policy_for_risk(
+            risk.level,
+            manifest.execution.supplemental_policy,
+        )
+
+    def _compile_supplemental_plan(
+        self,
+        semantic_run: SemanticReconcilerRun,
+        *,
+        wave_index: int,
+        prior_task_count: int,
+        prior_request_ids: tuple[str, ...],
+    ) -> SupplementalPlan:
+        manifest = self.context.manifest
+        risk = _required(self.context.risk_assessment, "risk assessment")
+        contexts: dict[str, InitialContext] = {}
+        for request in semantic_run.supplemental_requests:
+            changed_files: set[str] = set()
+            code_ranges: set[str] = set()
+            for candidate_id in request.source_candidate_ids:
+                candidate = semantic_run.packet.candidate_catalog.get(candidate_id)
+                if candidate is None or candidate.path is None:
+                    continue
+                changed_files.add(candidate.path)
+                if candidate.line is not None:
+                    code_ranges.add(f"{candidate.path}:{candidate.line}")
+            contexts[request.request_id] = InitialContext(
+                changed_files=sorted(changed_files),
+                code_ranges=sorted(code_ranges),
+                observation_refs=sorted(
+                    ref
+                    for ref in request.reason_refs
+                    if ref in semantic_run.packet.allowed_observation_ids
+                ),
+                signal_refs=sorted(
+                    {
+                        request.source_disagreement_id,
+                        *request.source_candidate_ids,
+                    }
+                ),
+            )
+        return compile_supplemental_plan(
+            review_id=manifest.review_id,
+            base_sha=manifest.revisions.resolved_base_sha,
+            head_sha=manifest.revisions.resolved_head_sha,
+            risk_level=risk.level,
+            wave_index=wave_index,
+            trigger_digest=_payload_digest(
+                semantic_reconciliation_to_dict(semantic_run.reconciliation)
+            ),
+            requests=semantic_run.supplemental_requests,
+            configured_policy=manifest.execution.supplemental_policy,
+            prior_task_count=prior_task_count,
+            prior_request_ids=prior_request_ids,
+            initial_context_by_request=contexts,
+            reviewer_budget_caps=ReviewerBudgetCaps(),
+            allowed_tools=REVIEWER_TOOL_NAMES,
+        )
+
+    def _build_reconciliation_prepass(self) -> ReconciliationPrepass:
+        manifest = self.context.manifest
+        executions = [
+            *self.context.reviewer_executions,
+            *self.context.supplemental_executions,
+        ]
+        metadata = {
+            trace_id: {"origin": "supplemental", "task_id": task_id}
+            for trace_id, task_id in self.context.supplemental_task_ids_by_trace.items()
+        }
+        return build_reconciliation_prepass(
+            executions,
+            self._authorized_observation_catalog(),
+            review_id=manifest.review_id,
+            base_sha=manifest.revisions.resolved_base_sha,
+            head_sha=manifest.revisions.resolved_head_sha,
+            execution_metadata_by_trace_id=metadata,
+        )
+
+    def _authorized_observation_catalog(self) -> dict[str, Observation]:
+        catalog: dict[str, Observation] = {}
+        for store in self._observation_stores():
+            for observation in store.list_observations():
+                existing = catalog.get(observation.observation_id)
+                if existing is not None and existing != observation:
+                    raise ValueError(
+                        "authorized Observation ID collision: "
+                        + observation.observation_id
+                    )
+                catalog[observation.observation_id] = observation
+        return {key: catalog[key] for key in sorted(catalog)}
+
+    def _run_supplemental_investigation(self) -> dict[str, str]:
+        self._load_existing_supplemental_progress()
+        plan = _required(self.context.supplemental_plan, "supplemental plan")
+        semantic = _required(
+            self.context.semantic_reconciliation,
+            "semantic reconciliation",
+        )
+        adapter_factory = self._model_adapter_factory()
+
+        if plan.status != "planned" or not plan.tasks:
+            if plan.status == "max_waves":
+                status, stop_reason = "budget_exhausted", "max_waves"
+            elif plan.status == "policy_limited":
+                status, stop_reason = "budget_exhausted", "budget_exhausted"
+            else:
+                status, stop_reason = "not_needed", "no_requests"
+            semantic = self._semantic_with_supplemental_summary(
+                semantic,
+                status=status,
+                stop_reason=stop_reason,
+                planned_tasks=0,
+                unavailable=0,
+                policy_actions=plan.policy_actions,
+            )
+            self._write_terminal_supplemental_summary(plan, semantic)
+            self.context.semantic_reconciliation = semantic
+            return self._phase_artifacts(RunPhase.SUPPLEMENTAL_INVESTIGATION)
+
+        if adapter_factory is None:
+            semantic = self._semantic_with_supplemental_summary(
+                semantic,
+                status="unavailable",
+                stop_reason="unavailable",
+                planned_tasks=len(plan.tasks),
+                unavailable=len(plan.tasks),
+                policy_actions=plan.policy_actions,
+            )
+            self._write_terminal_supplemental_summary(plan, semantic)
+            self.context.semantic_reconciliation = semantic
+            return self._phase_artifacts(RunPhase.SUPPLEMENTAL_INVESTIGATION)
+
+        while plan.status == "planned" and plan.tasks:
+            self._ensure_supplemental_wave_plan(plan)
+            task_assignments = {
+                task.task_id: stable_assignment_digest(task.assignment)
+                for task in plan.tasks
+            }
+            self.context.session_store.initialize_wave(
+                plan.wave_id,
+                task_assignments,
+                self._clock(),
+                trigger_digest=plan.trigger_digest,
+                effective_policy=self._effective_supplemental_policy(),
+            )
+            self._execute_supplemental_wave(plan, adapter_factory)
+
+            prepass = self._build_reconciliation_prepass()
+            semantic_run = self._run_semantic_reconciler(
+                prepass,
+                self._authorized_observation_catalog(),
+            )
+            self.context.reconciliation_prepass = prepass
+            self.context.semantic_run = semantic_run
+
+            manifest = self.context.manifest
+            wave = manifest.supplemental_waves[plan.wave_id]
+            semantic_run = self._retain_incomplete_supplemental_disagreements(
+                semantic_run,
+                plan,
+                wave.tasks,
+            )
+            self.context.semantic_run = semantic_run
+            has_task_failure = any(
+                task.status
+                in {SupplementalTaskStatus.PARTIAL, SupplementalTaskStatus.FAILED}
+                for task in wave.tasks.values()
+            )
+            exhausted_before_retry = any(
+                task.error == _SUPPLEMENTAL_BUDGET_EXHAUSTED_ERROR
+                for task in wave.tasks.values()
+            )
+            prior_request_ids = tuple(
+                request_id
+                for completed_wave in manifest.supplemental_waves.values()
+                for request_id in self._wave_request_ids(completed_wave.wave_id)
+            )
+            prior_task_count = sum(
+                len(completed_wave.tasks)
+                for completed_wave in manifest.supplemental_waves.values()
+            )
+            next_plan: SupplementalPlan | None = None
+            if exhausted_before_retry:
+                stop_reason = "budget_exhausted"
+            elif has_task_failure:
+                stop_reason = "task_failure"
+            elif semantic_run.status in {"fallback", "partial"}:
+                stop_reason = "model_fallback"
+            elif not semantic_run.supplemental_requests:
+                stop_reason = (
+                    "resolved"
+                    if not semantic_run.reconciliation.remaining_disagreements
+                    else "no_requests"
+                )
+            elif plan.wave_index >= plan.limits.max_waves:
+                stop_reason = "max_waves"
+            else:
+                next_plan = self._compile_supplemental_plan(
+                    semantic_run,
+                    wave_index=plan.wave_index + 1,
+                    prior_task_count=prior_task_count,
+                    prior_request_ids=prior_request_ids,
+                )
+                if next_plan.status == "planned":
+                    # This wave's targeted questions completed successfully; a
+                    # newly compiled question may proceed in the next wave.
+                    stop_reason = "resolved"
+                elif next_plan.status == "max_waves":
+                    stop_reason = "max_waves"
+                elif next_plan.status == "policy_limited":
+                    stop_reason = "budget_exhausted"
+                else:
+                    stop_reason = "no_requests"
+
+            status = self._supplemental_status(stop_reason)
+            semantic = self._semantic_with_supplemental_summary(
+                semantic_run.reconciliation,
+                status=status,
+                stop_reason=stop_reason,
+                planned_tasks=0,
+                unavailable=0,
+                policy_actions=(
+                    *plan.policy_actions,
+                    *(next_plan.policy_actions if next_plan is not None else ()),
+                ),
+            )
+            wave_artifacts = self._write_supplemental_wave_outcome(
+                plan,
+                semantic_run,
+                semantic,
+                next_plan,
+                stop_reason,
+            )
+            self.context.session_store.mark_wave_completed(
+                plan.wave_id,
+                wave_artifacts,
+                stop_reason,
+                self._clock(),
+            )
+            self.context.semantic_reconciliation = semantic
+            self.context.supplemental_plan = next_plan or plan
+
+            if next_plan is None or next_plan.status != "planned":
+                break
+            plan = next_plan
+
+        return self._phase_artifacts(RunPhase.SUPPLEMENTAL_INVESTIGATION)
+
+    def _retain_incomplete_supplemental_disagreements(
+        self,
+        semantic_run: SemanticReconcilerRun,
+        plan: SupplementalPlan,
+        checkpoints: Mapping[str, Any],
+    ) -> SemanticReconcilerRun:
+        incomplete_specs = [
+            spec
+            for spec in plan.tasks
+            if checkpoints[spec.task_id].status
+            in {SupplementalTaskStatus.PARTIAL, SupplementalTaskStatus.FAILED}
+        ]
+        if not incomplete_specs:
+            return semantic_run
+
+        reconciliation = semantic_run.reconciliation
+        resolved = list(reconciliation.conflicts_resolved)
+        remaining = list(reconciliation.remaining_disagreements)
+        policy_actions = list(reconciliation.policy_actions)
+        uncertainties = list(reconciliation.uncertainties)
+
+        for spec in incomplete_specs:
+            checkpoint = checkpoints[spec.task_id]
+            candidate_ids = tuple(sorted(spec.source_candidate_ids))
+            matches = [
+                conflict
+                for conflict in (*resolved, *remaining)
+                if tuple(sorted(conflict.candidate_ids)) == candidate_ids
+            ]
+            resolved = [item for item in resolved if item not in matches]
+            remaining = [item for item in remaining if item not in matches]
+            prior = matches[0] if matches else None
+            status = checkpoint.status.value
+            detail = checkpoint.error or "no usable supplemental result"
+            remaining.append(
+                SemanticConflict(
+                    conflict_id=(
+                        prior.conflict_id
+                        if prior is not None
+                        else "D-"
+                        + _payload_digest(
+                            {
+                                "source_disagreement_id": spec.source_disagreement_id,
+                                "candidate_ids": list(candidate_ids),
+                            }
+                        )[:32]
+                    ),
+                    candidate_ids=candidate_ids,
+                    status="unresolved",
+                    issue=(
+                        prior.issue
+                        if prior is not None
+                        else "Supplemental investigation did not resolve "
+                        + spec.source_disagreement_id
+                    ),
+                    resolution=(
+                        f"Runtime retained the disagreement because task "
+                        f"{spec.task_id} ended {status}: {detail}"
+                    ),
+                    decision_refs=(
+                        prior.decision_refs
+                        if prior is not None
+                        else tuple(
+                            sorted(
+                                spec.assignment.initial_context.observation_refs
+                            )
+                        )
+                    ),
+                    decision_source="runtime_policy",
+                )
+            )
+            policy_actions.append(
+                "retained_disagreement_after_supplemental_"
+                f"{status}:{spec.source_disagreement_id}"
+            )
+            uncertainties.append(
+                f"Supplemental task {spec.task_id} ended {status}; its material "
+                "disagreement remains unresolved."
+            )
+
+        updated = replace(
+            reconciliation,
+            status=(
+                "partial" if reconciliation.status == "accepted" else reconciliation.status
+            ),
+            conflicts_resolved=tuple(
+                sorted(resolved, key=lambda item: item.conflict_id)
+            ),
+            remaining_disagreements=tuple(
+                sorted(
+                    {item.conflict_id: item for item in remaining}.values(),
+                    key=lambda item: item.conflict_id,
+                )
+            ),
+            policy_actions=tuple(_dedupe(policy_actions)),
+            uncertainties=tuple(_dedupe(uncertainties)),
+        )
+        return replace(semantic_run, reconciliation=updated)
+
+    def _load_supplemental_investigation(self) -> None:
+        self._load_existing_supplemental_progress(require_terminal=True)
+
+    def _load_existing_supplemental_progress(
+        self,
+        *,
+        require_terminal: bool = False,
+    ) -> None:
+        manifest = self.context.manifest
+        self.context.supplemental_executions = []
+        self.context.supplemental_observations = {}
+        self.context.supplemental_task_ids_by_trace = {}
+        latest_semantic = self.context.semantic_reconciliation
+        latest_plan = self.context.supplemental_plan
+
+        for wave in sorted(
+            manifest.supplemental_waves.values(),
+            key=lambda item: item.wave_index,
+        ):
+            plan_name = f"supplemental_wave_{wave.wave_id}_plan"
+            if plan_name in manifest.artifacts:
+                latest_plan = _supplemental_plan_from_dict(
+                    self._read_json_artifact(plan_name)
+                )
+            planned_task_ids = (
+                [
+                    spec.task_id
+                    for spec in latest_plan.tasks
+                    if spec.wave_id == wave.wave_id and spec.task_id in wave.tasks
+                ]
+                if latest_plan is not None
+                else []
+            )
+            ordered_task_ids = [
+                *planned_task_ids,
+                *sorted(set(wave.tasks) - set(planned_task_ids)),
+            ]
+            for task_id in ordered_task_ids:
+                task = wave.tasks[task_id]
+                if task.status not in {
+                    SupplementalTaskStatus.COMPLETED,
+                    SupplementalTaskStatus.PARTIAL,
+                }:
+                    continue
+                execution, observations = self._load_supplemental_task(task_id)
+                self.context.supplemental_executions.append(execution)
+                self.context.supplemental_observations[task_id] = observations
+                self.context.supplemental_task_ids_by_trace[
+                    execution.trace_id
+                ] = task_id
+            summary_name = f"supplemental_wave_{wave.wave_id}_summary"
+            if summary_name in manifest.artifacts:
+                summary = self._read_json_artifact(summary_name)
+                payload = summary.get("semantic_reconciliation")
+                if not isinstance(payload, Mapping):
+                    raise ValueError(
+                        f"supplemental wave summary lacks semantic result: {wave.wave_id}"
+                    )
+                latest_semantic = semantic_reconciliation_from_dict(payload)
+                next_payload = summary.get("next_plan")
+                if next_payload is not None:
+                    if not isinstance(next_payload, Mapping):
+                        raise ValueError("supplemental next_plan must be an object or null")
+                    latest_plan = _supplemental_plan_from_dict(next_payload)
+
+        phase = manifest.phases[RunPhase.SUPPLEMENTAL_INVESTIGATION.value]
+        terminal_summaries = [
+            name
+            for name in phase.artifacts
+            if name.startswith("supplemental_wave_") and name.endswith("_summary")
+        ]
+        if not manifest.supplemental_waves and terminal_summaries:
+            summary = self._read_json_artifact(sorted(terminal_summaries)[-1])
+            payload = summary.get("semantic_reconciliation")
+            if not isinstance(payload, Mapping):
+                raise ValueError("terminal supplemental summary lacks semantic result")
+            latest_semantic = semantic_reconciliation_from_dict(payload)
+
+        if require_terminal and latest_semantic is None:
+            raise ValueError("supplemental phase has no terminal semantic result")
+        self.context.semantic_reconciliation = latest_semantic
+        self.context.supplemental_plan = latest_plan
+
+    def _ensure_supplemental_wave_plan(self, plan: SupplementalPlan) -> None:
+        artifact_name = f"supplemental_wave_{plan.wave_id}_plan"
+        manifest = self.context.manifest
+        if artifact_name in manifest.artifacts:
+            loaded = _supplemental_plan_from_dict(
+                self._read_json_artifact(artifact_name)
+            )
+            if loaded != plan:
+                raise ValueError(
+                    f"persisted supplemental plan differs for wave {plan.wave_id}"
+                )
+            return
+        workspace = self._phase_workspace(RunPhase.SUPPLEMENTAL_INVESTIGATION)
+        relative = f"{_wave_storage_root(plan.wave_id)}/plan.json"
+        workspace.write_json(relative, _supplemental_plan_to_dict(plan))
+        self._commit_files(
+            RunPhase.SUPPLEMENTAL_INVESTIGATION,
+            workspace,
+            {artifact_name: (relative, relative)},
+        )
+
+    def _execute_supplemental_wave(
+        self,
+        plan: SupplementalPlan,
+        adapter_factory: ModelAdapterFactory,
+    ) -> None:
+        manifest = self.context.manifest
+        wave = manifest.supplemental_waves[plan.wave_id]
+        pending_specs = [
+            spec
+            for spec in plan.tasks
+            if wave.tasks[spec.task_id].status
+            not in {
+                SupplementalTaskStatus.COMPLETED,
+                SupplementalTaskStatus.PARTIAL,
+            }
+        ]
+        concurrency = (
+            1
+            if manifest.execution.reviewer_mode == "single"
+            else max(1, plan.max_concurrency)
+        )
+        for offset in range(0, len(pending_specs), concurrency):
+            chunk = pending_specs[offset : offset + concurrency]
+            runnable: list[tuple[SupplementalTaskSpec, ModelAdapter | None, Exception | None]] = []
+            for spec in chunk:
+                reservation = _session_budget(spec.budget_reservation)
+                try:
+                    self.context.session_store.reserve_task_budget(
+                        spec.task_id,
+                        reservation,
+                        self._clock(),
+                    )
+                except ValueError as error:
+                    # A prior interrupted attempt may have consumed the
+                    # remaining global budget. Its FAILED state is already a
+                    # terminal, auditable wave outcome.
+                    checkpoint = self.context.manifest.supplemental_waves[
+                        plan.wave_id
+                    ].tasks[spec.task_id]
+                    if checkpoint.status is SupplementalTaskStatus.FAILED:
+                        continue
+                    if "remaining global budget" in str(error):
+                        self.context.session_store.mark_task_unrunnable(
+                            spec.task_id,
+                            _SUPPLEMENTAL_BUDGET_EXHAUSTED_ERROR,
+                            self._clock(),
+                        )
+                        continue
+                    raise
+                self.context.session_store.mark_task_running(
+                    spec.task_id,
+                    self._clock(),
+                )
+                try:
+                    adapter = adapter_factory.create()
+                    creation_error: Exception | None = None
+                except Exception as error:
+                    adapter = None
+                    creation_error = error
+                runnable.append((spec, adapter, creation_error))
+
+            futures: dict[str, Future[_SupplementalAttempt]] = {}
+            executor: ThreadPoolExecutor | None = None
+            try:
+                if len(runnable) > 1:
+                    executor = ThreadPoolExecutor(
+                        max_workers=min(len(runnable), concurrency),
+                        thread_name_prefix="supplemental-reviewer",
+                    )
+                    futures = {
+                        spec.task_id: executor.submit(
+                            self._investigate_supplemental_task,
+                            spec,
+                            adapter,
+                            creation_error,
+                        )
+                        for spec, adapter, creation_error in runnable
+                    }
+                for spec, adapter, creation_error in runnable:
+                    attempt = (
+                        futures[spec.task_id].result()
+                        if executor is not None
+                        else self._investigate_supplemental_task(
+                            spec,
+                            adapter,
+                            creation_error,
+                        )
+                    )
+                    execution, observations, artifact_names = (
+                        self._commit_supplemental_attempt(attempt)
+                    )
+                    charged = _charged_supplemental_budget(
+                        attempt.task_run,
+                        spec.budget_reservation,
+                    )
+                    validation = validate_reviewer_completion(
+                        execution.assignment,
+                        execution.result,
+                        {
+                            *self._reviewer_authorized_observation_summaries(
+                                observations
+                            ),
+                            *spec.assignment.initial_context.observation_refs,
+                        },
+                    )
+                    if execution.result.status.value == "completed" and validation.accepted:
+                        self.context.session_store.mark_task_completed(
+                            spec.task_id,
+                            artifact_names,
+                            charged,
+                            self._clock(),
+                        )
+                    elif execution.result.status.value == "failed":
+                        reason = (
+                            execution.result.investigation_summary
+                            or "supplemental Reviewer execution failed"
+                        )
+                        self.context.session_store.mark_task_failed(
+                            spec.task_id,
+                            reason,
+                            charged,
+                            self._clock(),
+                            artifact_names=artifact_names,
+                        )
+                    else:
+                        reason = "; ".join(validation.deficiencies) or (
+                            execution.result.investigation_summary
+                            or f"supplemental reviewer returned {execution.result.status.value}"
+                        )
+                        self.context.session_store.mark_task_partial(
+                            spec.task_id,
+                            artifact_names,
+                            reason,
+                            charged,
+                            self._clock(),
+                        )
+                    if execution.result.status.value != "failed":
+                        self.context.supplemental_executions.append(execution)
+                        self.context.supplemental_observations[
+                            spec.task_id
+                        ] = observations
+                        self.context.supplemental_task_ids_by_trace[
+                            execution.trace_id
+                        ] = spec.task_id
+            finally:
+                if executor is not None:
+                    executor.shutdown(wait=True)
+
+    def _investigate_supplemental_task(
+        self,
+        spec: SupplementalTaskSpec,
+        adapter: ModelAdapter | None,
+        creation_error: Exception | None,
+    ) -> "_SupplementalAttempt":
+        manifest = self.context.manifest
+        attempt_index = manifest.phases[
+            RunPhase.SUPPLEMENTAL_INVESTIGATION.value
+        ].attempts
+        workspace = AttemptWorkspace(
+            self.context.checkpoint_store.run_dir,
+            RunPhase.SUPPLEMENTAL_INVESTIGATION,
+            attempt_index,
+            task_id=spec.task_id,
+        )
+        workspace.prepare()
+        observations = ObservationStore(workspace.path)
+        all_summaries = self._authorized_observation_summaries()
+        initial_observations = {
+            observation_id: all_summaries[observation_id]
+            for observation_id in spec.assignment.initial_context.observation_refs
+            if observation_id in all_summaries
+        }
+        reviewer_index = self._supplemental_reviewer_index(spec.task_id)
+        task = ReviewerTask.for_supplemental(
+            spec,
+            reviewer_index=reviewer_index,
+            intent=_required(self.context.intent, "intent"),
+            initial_observations=initial_observations,
+        )
+        task_run = ReviewerTaskExecutor(
+            repository_path=self.context.repository,
+            base_revision=manifest.revisions.resolved_base_sha,
+            head_revision=manifest.revisions.resolved_head_sha,
+            reviewer_loop=manifest.execution.reviewer_loop,
+            model=_reviewer_invocation_model(manifest.execution),
+        ).execute(
+            task,
+            adapter=adapter,
+            observation_store=observations,
+            creation_error=creation_error,
+        )
+        execution = task_run.execution
+        prefix = f"supplemental_task_{spec.task_id}"
+        base = _supplemental_task_storage_root(spec.wave_id, spec.task_id)
+        workspace.write_json(
+            "spec.json",
+            {
+                "schema_version": "supplemental_task_spec_v1",
+                "reviewer_index": reviewer_index,
+                "task": _supplemental_task_spec_to_dict(spec),
+            },
+        )
+        workspace.write_json("assignment.json", asdict(spec.assignment))
+        workspace.write_json("envelope.json", asdict(execution.envelope))
+        workspace.write_json(
+            "raw_response.json",
+            {
+                "provider_name": execution.response.provider_name,
+                "model": execution.response.model,
+                "content": execution.response.content,
+                "raw": execution.response.raw,
+                "runtime": reviewer_runtime_to_dict(execution.runtime),
+            },
+        )
+        workspace.write_json(
+            "result.json",
+            reviewer_result_to_dict(execution.result),
+        )
+        trace_payload = (
+            agent_loop_run_to_dict(
+                AgentLoopRun(
+                    envelope=execution.envelope,
+                    response=execution.response,
+                    result=execution.result,
+                    trace=task_run.loop_trace,
+                    runtime=execution.runtime,
+                )
+            )["trace"]
+            if task_run.loop_trace is not None
+            else {
+                "trace_id": execution.trace_id,
+                "tool_call_count": execution.runtime.tool_calls,
+                "provider_attempt_count": execution.runtime.provider_attempts,
+                "final_status": execution.result.status.value,
+                "turns": [],
+            }
+        )
+        workspace.write_json("agent_trace.json", trace_payload)
+        file_specs = {
+            f"{prefix}_spec": ("spec.json", f"{base}/spec.json"),
+            f"{prefix}_assignment": (
+                "assignment.json",
+                f"{base}/assignment.json",
+            ),
+            f"{prefix}_envelope": ("envelope.json", f"{base}/envelope.json"),
+            f"{prefix}_raw_response": (
+                "raw_response.json",
+                f"{base}/raw_response.json",
+            ),
+            f"{prefix}_result": ("result.json", f"{base}/result.json"),
+            f"{prefix}_agent_trace": (
+                "agent_trace.json",
+                f"{base}/agent_trace.json",
+            ),
+        }
+        return _SupplementalAttempt(
+            spec=spec,
+            workspace=workspace,
+            observations=observations,
+            task_run=task_run,
+            file_specs=file_specs,
+            observation_name=f"{prefix}_observations",
+        )
+
+    def _commit_supplemental_attempt(
+        self,
+        attempt: "_SupplementalAttempt",
+    ) -> tuple[ReviewerExecution, ObservationStore, tuple[str, ...]]:
+        committed = self._commit_files(
+            RunPhase.SUPPLEMENTAL_INVESTIGATION,
+            attempt.workspace,
+            attempt.file_specs,
+        )
+        base = (
+            _supplemental_task_storage_root(
+                attempt.spec.wave_id,
+                attempt.spec.task_id,
+            )
+        )
+        observation_path = self._commit_observation_store(
+            phase=RunPhase.SUPPLEMENTAL_INVESTIGATION,
+            workspace=attempt.workspace,
+            source=attempt.observations,
+            destination_root=base,
+            artifact_name=attempt.observation_name,
+        )
+        committed[attempt.observation_name] = observation_path
+        authoritative = self._load_observation_artifact(attempt.observation_name)
+        return attempt.task_run.execution, authoritative, tuple(committed)
+
+    def _load_supplemental_task(
+        self,
+        task_id: str,
+    ) -> tuple[ReviewerExecution, ObservationStore]:
+        manifest = self.context.manifest
+        prefix = f"supplemental_task_{task_id}"
+        spec_payload = self._read_json_artifact(f"{prefix}_spec")
+        reviewer_index = spec_payload.get("reviewer_index")
+        task_payload = spec_payload.get("task")
+        if type(reviewer_index) is not int or reviewer_index < 0:
+            raise ValueError("supplemental task spec has invalid reviewer_index")
+        if not isinstance(task_payload, Mapping):
+            raise ValueError("supplemental task spec lacks task payload")
+        spec = _supplemental_task_spec_from_dict(task_payload)
+        if spec.task_id != task_id:
+            raise ValueError("supplemental task spec ID mismatch")
+        assignment = assignments_from_dict(
+            {"assignments": [self._read_json_artifact(f"{prefix}_assignment")]}
+        )[0]
+        if assignment != spec.assignment:
+            raise ValueError("supplemental task assignment artifact mismatch")
+        checkpoint = next(
+            wave.tasks[task_id]
+            for wave in manifest.supplemental_waves.values()
+            if task_id in wave.tasks
+        )
+        if stable_assignment_digest(assignment) != checkpoint.assignment_digest:
+            raise ValueError("supplemental assignment digest mismatch")
+        envelope_payload = self._read_json_artifact(f"{prefix}_envelope")
+        parameters = envelope_payload.get("parameters")
+        if not isinstance(parameters, Mapping) or not isinstance(
+            parameters.get("trace_id"), str
+        ):
+            raise ValueError("supplemental envelope is missing trace_id")
+        execution = reviewer_execution_from_artifacts(
+            reviewer_index=reviewer_index,
+            trace_id=parameters["trace_id"],
+            assignment=assignment,
+            envelope_payload=envelope_payload,
+            response_payload=self._read_json_artifact(f"{prefix}_raw_response"),
+            result_payload=self._read_json_artifact(f"{prefix}_result"),
+        )
+        observations = self._load_observation_artifact(f"{prefix}_observations")
+        return execution, observations
+
+    def _write_supplemental_wave_outcome(
+        self,
+        plan: SupplementalPlan,
+        semantic_run: SemanticReconcilerRun,
+        semantic: SemanticReconciliation,
+        next_plan: SupplementalPlan | None,
+        stop_reason: str,
+    ) -> tuple[str, ...]:
+        workspace = self._phase_workspace(RunPhase.SUPPLEMENTAL_INVESTIGATION)
+        root = _wave_storage_root(plan.wave_id)
+        budget_payload = self._supplemental_budget_payload()
+        decision_payload = {
+            "schema_version": "semantic_reconciler_decision_v1",
+            "wave_id": plan.wave_id,
+            "status": semantic_run.status,
+            "semantic_reconciliation": semantic_reconciliation_to_dict(
+                semantic_run.reconciliation
+            ),
+            "batches": [
+                batch.decision_to_dict() for batch in semantic_run.batches
+            ],
+        }
+        wave = self.context.manifest.supplemental_waves[plan.wave_id]
+        status_counts: dict[str, int] = {}
+        for task in wave.tasks.values():
+            status_counts[task.status.value] = status_counts.get(task.status.value, 0) + 1
+        summary_payload = {
+            "schema_version": "supplemental_wave_summary_v1",
+            "wave_id": plan.wave_id,
+            "wave_index": plan.wave_index,
+            "status_counts": status_counts,
+            "stop_reason": stop_reason,
+            "semantic_reconciliation": semantic_reconciliation_to_dict(semantic),
+            "next_plan": (
+                _supplemental_plan_to_dict(next_plan)
+                if next_plan is not None
+                else None
+            ),
+        }
+        workspace.write_json(f"{root}/budget.json", budget_payload)
+        workspace.write_json(f"{root}/reconciler_decision.json", decision_payload)
+        workspace.write_json(f"{root}/summary.json", summary_payload)
+        names = {
+            f"supplemental_wave_{plan.wave_id}_budget": (
+                f"{root}/budget.json",
+                f"{root}/budget.json",
+            ),
+            f"supplemental_wave_{plan.wave_id}_reconciler_decision": (
+                f"{root}/reconciler_decision.json",
+                f"{root}/reconciler_decision.json",
+            ),
+            f"supplemental_wave_{plan.wave_id}_summary": (
+                f"{root}/summary.json",
+                f"{root}/summary.json",
+            ),
+        }
+        committed = self._commit_files(
+            RunPhase.SUPPLEMENTAL_INVESTIGATION,
+            workspace,
+            names,
+        )
+        current = self.context.manifest
+        return tuple(
+            sorted(
+                name
+                for name, descriptor in current.artifacts.items()
+                if descriptor.phase is RunPhase.SUPPLEMENTAL_INVESTIGATION
+                and (
+                    name.startswith(f"supplemental_wave_{plan.wave_id}_")
+                    or name.startswith("supplemental_task_")
+                    and any(
+                        name.startswith(f"supplemental_task_{task_id}_")
+                        for task_id in wave.tasks
+                    )
+                )
+            )
+        )
+
+    def _write_terminal_supplemental_summary(
+        self,
+        plan: SupplementalPlan,
+        semantic: SemanticReconciliation,
+    ) -> None:
+        workspace = self._phase_workspace(RunPhase.SUPPLEMENTAL_INVESTIGATION)
+        root = _wave_storage_root(plan.wave_id)
+        name = f"supplemental_wave_{plan.wave_id}_summary"
+        workspace.write_json(
+            f"{root}/summary.json",
+            {
+                "schema_version": "supplemental_wave_summary_v1",
+                "wave_id": plan.wave_id,
+                "wave_index": plan.wave_index,
+                "status_counts": {},
+                "stop_reason": semantic.supplemental.stop_reason,
+                "semantic_reconciliation": semantic_reconciliation_to_dict(semantic),
+                "next_plan": None,
+            },
+        )
+        self._commit_files(
+            RunPhase.SUPPLEMENTAL_INVESTIGATION,
+            workspace,
+            {name: (f"{root}/summary.json", f"{root}/summary.json")},
+        )
+
+    def _semantic_with_supplemental_summary(
+        self,
+        semantic: SemanticReconciliation,
+        *,
+        status: str,
+        stop_reason: str,
+        planned_tasks: int,
+        unavailable: int,
+        policy_actions: tuple[str, ...],
+    ) -> SemanticReconciliation:
+        manifest = self.context.manifest
+        waves = list(manifest.supplemental_waves.values())
+        tasks = [task for wave in waves for task in wave.tasks.values()]
+        completed = sum(
+            task.status is SupplementalTaskStatus.COMPLETED for task in tasks
+        )
+        partial = sum(
+            task.status is SupplementalTaskStatus.PARTIAL for task in tasks
+        )
+        failed = sum(
+            task.status is SupplementalTaskStatus.FAILED for task in tasks
+        )
+        total_tasks = len(tasks) if tasks else planned_tasks
+        summary = SupplementalSemanticSummary(
+            status=status,
+            waves=len(waves),
+            tasks=total_tasks,
+            completed=completed,
+            partial=partial,
+            failed=failed,
+            unavailable=unavailable,
+            budget=self._supplemental_budget_payload(),
+            stop_reason=stop_reason,
+        )
+        uncertainty_by_status = {
+            "partial": "Supplemental investigation returned partial evidence.",
+            "failed": "Supplemental investigation failed for one or more tasks.",
+            "unavailable": "Supplemental Reviewer provider is unavailable.",
+            "budget_exhausted": "Supplemental investigation stopped at a Runtime budget boundary.",
+        }
+        extra = uncertainty_by_status.get(status)
+        return replace(
+            semantic,
+            status=(
+                "partial"
+                if status in {"partial", "failed", "unavailable", "budget_exhausted"}
+                and semantic.status == "accepted"
+                else semantic.status
+            ),
+            supplemental=summary,
+            policy_actions=tuple(
+                _dedupe([*semantic.policy_actions, *policy_actions])
+            ),
+            uncertainties=tuple(
+                _dedupe(
+                    [
+                        *semantic.uncertainties,
+                        *([extra] if extra is not None else []),
+                    ]
+                )
+            ),
+        )
+
+    def _supplemental_status(self, stop_reason: str) -> str:
+        if stop_reason == "budget_exhausted" or stop_reason == "max_waves":
+            return "budget_exhausted"
+        if stop_reason == "task_failure":
+            manifest = self.context.manifest
+            has_partial = any(
+                task.status is SupplementalTaskStatus.PARTIAL
+                for wave in manifest.supplemental_waves.values()
+                for task in wave.tasks.values()
+            )
+            return "partial" if has_partial else "failed"
+        if stop_reason == "model_fallback":
+            return "partial"
+        return "completed"
+
+    def _supplemental_budget_payload(self) -> dict[str, Any]:
+        manifest = self.context.manifest
+        policy = next(
+            (
+                wave.effective_policy
+                for wave in sorted(
+                    manifest.supplemental_waves.values(),
+                    key=lambda item: item.wave_index,
+                )
+            ),
+            self._effective_supplemental_policy(),
+        )
+        charged = SupplementalBudget()
+        unknown = SupplementalBudget()
+        reserved = SupplementalBudget()
+        for wave in manifest.supplemental_waves.values():
+            for task in wave.tasks.values():
+                charged = charged + task.charged
+                unknown = unknown + task.unknown_consumed
+                reserved = reserved + task.reservation
+        limits = SupplementalBudget(
+            tasks=policy.max_tasks,
+            tool_calls=policy.max_total_tool_calls,
+            tokens=policy.max_total_tokens,
+            elapsed_seconds=policy.max_elapsed_seconds,
+        )
+        consumed = charged + unknown + reserved
+        remaining = SupplementalBudget(
+            tasks=max(0, limits.tasks - consumed.tasks),
+            tool_calls=max(0, limits.tool_calls - consumed.tool_calls),
+            tokens=max(0, limits.tokens - consumed.tokens),
+            elapsed_seconds=max(
+                0.0,
+                limits.elapsed_seconds - consumed.elapsed_seconds,
+            ),
+        )
+        return {
+            "limits": asdict(limits),
+            "charged": asdict(charged),
+            "unknown_consumed": asdict(unknown),
+            "reserved": asdict(reserved),
+            "remaining": asdict(remaining),
+        }
+
+    def _supplemental_reviewer_index(self, task_id: str) -> int:
+        manifest = self.context.manifest
+        ordered = [
+            candidate_task_id
+            for wave in sorted(
+                manifest.supplemental_waves.values(),
+                key=lambda item: item.wave_index,
+            )
+            for candidate_task_id in sorted(wave.tasks)
+        ]
+        return len(self.context.reviewer_executions) + ordered.index(task_id)
+
+    def _wave_request_ids(self, wave_id: str) -> tuple[str, ...]:
+        name = f"supplemental_wave_{wave_id}_plan"
+        if name not in self.context.manifest.artifacts:
+            return ()
+        return _supplemental_plan_from_dict(
+            self._read_json_artifact(name)
+        ).request_ids
+
+    def _phase_artifacts(self, phase: RunPhase) -> dict[str, str]:
+        return {
+            name: descriptor.path
+            for name, descriptor in self.context.manifest.artifacts.items()
+            if descriptor.phase is phase
+        }
+
+    def _run_reconciliation(self) -> dict[str, str]:
+        semantic = self.context.semantic_reconciliation
+        if semantic is not None:
+            reconciliation = semantic_to_evidence_reconciliation(semantic)
+        else:
+            reconciliation = reconcile_evidence(
+                executions=self.context.reviewer_executions,
+                authorized_observation_ids=set(
+                    self._authorized_observation_summaries()
+                ),
+            )
         workspace = self._phase_workspace(RunPhase.RECONCILIATION)
         workspace.write_json(
             "reconciliation.json",
             reconciliation_to_dict(reconciliation),
         )
+        files: dict[str, tuple[str, str]] = {
+            "reconciliation": (
+                "reconciliation.json",
+                "reconciliation.json",
+            )
+        }
+        if semantic is not None:
+            workspace.write_json(
+                "semantic_reconciliation.json",
+                semantic_reconciliation_to_dict(semantic),
+            )
+            workspace.write_json(
+                "supplemental_summary.json",
+                {
+                    "schema_version": "supplemental_summary_v1",
+                    **semantic.supplemental.to_dict(),
+                },
+            )
+            files.update(
+                {
+                    "semantic_reconciliation": (
+                        "semantic_reconciliation.json",
+                        "semantic_reconciliation.json",
+                    ),
+                    "supplemental_summary": (
+                        "supplemental_summary.json",
+                        "supplemental_summary.json",
+                    ),
+                }
+            )
         artifacts = self._commit_files(
             RunPhase.RECONCILIATION,
             workspace,
-            {
-                "reconciliation": (
-                    "reconciliation.json",
-                    "reconciliation.json",
-                )
-            },
+            files,
         )
         self.context.reconciliation = reconciliation
         return artifacts
@@ -1933,6 +3377,13 @@ class ReviewPipeline:
             return
         self.context.reconciliation = reconciliation_from_dict(
             self._read_json_artifact("reconciliation")
+        )
+        self.context.semantic_reconciliation = (
+            semantic_reconciliation_from_dict(
+                self._read_json_artifact("semantic_reconciliation")
+            )
+            if "semantic_reconciliation" in self.context.manifest.artifacts
+            else None
         )
 
     def _run_completion(self) -> dict[str, str]:
@@ -1954,6 +3405,13 @@ class ReviewPipeline:
                 if store is not None
                 for observation_id in store.summaries_by_id()
             },
+            semantic_reconciliation=(
+                semantic_reconciliation_to_dict(
+                    self.context.semantic_reconciliation
+                )
+                if self.context.semantic_reconciliation is not None
+                else None
+            ),
         )
         workspace = self._phase_workspace(RunPhase.COMPLETION)
         workspace.write_json("completion.json", completion_to_dict(completion))
@@ -1992,6 +3450,13 @@ class ReviewPipeline:
             reviewer_result=self.context.reviewer_result,
             reconciliation_payload=reconciliation_payload,
             completion_summary=completion_payload,
+            semantic_reconciliation=(
+                semantic_reconciliation_to_dict(
+                    self.context.semantic_reconciliation
+                )
+                if self.context.semantic_reconciliation is not None
+                else None
+            ),
         )
         workspace = self._phase_workspace(RunPhase.FINAL_RISK)
         workspace.write_json("final_risk.json", final_risk_to_dict(final_risk))
@@ -2018,6 +3483,11 @@ class ReviewPipeline:
         reconciliation_payload = (
             reconciliation_to_dict(self.context.reconciliation)
             if self.context.reconciliation is not None
+            else None
+        )
+        semantic_payload = (
+            semantic_reconciliation_to_dict(self.context.semantic_reconciliation)
+            if self.context.semantic_reconciliation is not None
             else None
         )
         completion_payload = (
@@ -2089,6 +3559,7 @@ class ReviewPipeline:
                 else None
             ),
             planning_summary=self.context.planning_summary,
+            semantic_reconciliation_payload=semantic_payload,
         )
         workspace.write_json("review_brief.json", review_brief_to_dict(brief))
         workspace.write_text("report.md", render_review_brief_markdown(brief))
@@ -2232,6 +3703,10 @@ class ReviewPipeline:
             self.context.reviewer_observations[index]
             for index in sorted(self.context.reviewer_observations)
         )
+        stores.extend(
+            self.context.supplemental_observations[task_id]
+            for task_id in sorted(self.context.supplemental_observations)
+        )
         return stores
 
     def _authorized_observation_summaries(
@@ -2358,6 +3833,16 @@ class _ReviewerAttempt:
     workspace: AttemptWorkspace
     observations: ObservationStore
     execution: ReviewerExecution
+    file_specs: dict[str, tuple[str, str]]
+    observation_name: str
+
+
+@dataclass(frozen=True)
+class _SupplementalAttempt:
+    spec: SupplementalTaskSpec
+    workspace: AttemptWorkspace
+    observations: ObservationStore
+    task_run: ReviewerTaskRun
     file_specs: dict[str, tuple[str, str]]
     observation_name: str
 
@@ -2754,6 +4239,233 @@ def _reviewer_invocation_model(config: ReviewExecutionConfig) -> str:
     if config.reviewer_provider == "none":
         return "none"
     return "configured-reviewer-model"
+
+
+def _supplemental_plan_to_dict(plan: SupplementalPlan) -> dict[str, Any]:
+    if not isinstance(plan, SupplementalPlan):
+        raise ValueError("plan must be a SupplementalPlan")
+    return asdict(plan)
+
+
+def _supplemental_plan_from_dict(payload: Mapping[str, Any]) -> SupplementalPlan:
+    item = _exact_mapping(
+        payload,
+        {
+            "review_id",
+            "base_sha",
+            "head_sha",
+            "wave_index",
+            "wave_id",
+            "trigger_digest",
+            "limits",
+            "status",
+            "tasks",
+            "request_ids",
+            "dropped_request_ids",
+            "policy_actions",
+            "schema_version",
+        },
+        "supplemental plan",
+    )
+    limits_payload = _exact_mapping(
+        item["limits"],
+        {
+            "max_waves",
+            "max_tasks",
+            "max_tasks_per_wave",
+            "max_concurrency",
+            "max_turns_per_task",
+            "max_tool_calls_per_task",
+            "max_total_tokens_per_task",
+            "max_total_tokens",
+            "max_elapsed_seconds",
+            "policy_version",
+        },
+        "supplemental plan limits",
+    )
+    limits = SupplementalRuntimeLimits(**limits_payload)
+    tasks_payload = item["tasks"]
+    if not isinstance(tasks_payload, list):
+        raise ValueError("supplemental plan tasks must be a list")
+    return SupplementalPlan(
+        review_id=_text_field(item, "review_id", "supplemental plan"),
+        base_sha=_text_field(item, "base_sha", "supplemental plan"),
+        head_sha=_text_field(item, "head_sha", "supplemental plan"),
+        wave_index=_integer_field(item, "wave_index", "supplemental plan"),
+        wave_id=_text_field(item, "wave_id", "supplemental plan"),
+        trigger_digest=_text_field(item, "trigger_digest", "supplemental plan"),
+        limits=limits,
+        status=_text_field(item, "status", "supplemental plan"),
+        tasks=tuple(
+            _supplemental_task_spec_from_dict(task) for task in tasks_payload
+        ),
+        request_ids=_text_tuple(item["request_ids"], "supplemental plan request_ids"),
+        dropped_request_ids=_text_tuple(
+            item["dropped_request_ids"],
+            "supplemental plan dropped_request_ids",
+        ),
+        policy_actions=_text_tuple(
+            item["policy_actions"],
+            "supplemental plan policy_actions",
+        ),
+        schema_version=_text_field(
+            item,
+            "schema_version",
+            "supplemental plan",
+        ),
+    )
+
+
+def _supplemental_task_spec_to_dict(
+    spec: SupplementalTaskSpec,
+) -> dict[str, Any]:
+    if not isinstance(spec, SupplementalTaskSpec):
+        raise ValueError("spec must be a SupplementalTaskSpec")
+    return asdict(spec)
+
+
+def _supplemental_task_spec_from_dict(
+    payload: Mapping[str, Any],
+) -> SupplementalTaskSpec:
+    item = _exact_mapping(
+        payload,
+        {
+            "request_id",
+            "wave_id",
+            "task_id",
+            "source_candidate_ids",
+            "source_disagreement_id",
+            "assignment",
+            "allowed_tools",
+            "budget_reservation",
+            "bootstrap_policy",
+        },
+        "supplemental task spec",
+    )
+    assignment_payload = item["assignment"]
+    if not isinstance(assignment_payload, Mapping):
+        raise ValueError("supplemental task assignment must be an object")
+    assignment = assignments_from_dict(
+        {"assignments": [dict(assignment_payload)]}
+    )[0]
+    budget_payload = _exact_mapping(
+        item["budget_reservation"],
+        {"tasks", "tool_calls", "tokens", "elapsed_seconds"},
+        "supplemental task budget_reservation",
+    )
+    return SupplementalTaskSpec(
+        request_id=_text_field(item, "request_id", "supplemental task spec"),
+        wave_id=_text_field(item, "wave_id", "supplemental task spec"),
+        task_id=_text_field(item, "task_id", "supplemental task spec"),
+        source_candidate_ids=_text_tuple(
+            item["source_candidate_ids"],
+            "supplemental task source_candidate_ids",
+        ),
+        source_disagreement_id=_text_field(
+            item,
+            "source_disagreement_id",
+            "supplemental task spec",
+        ),
+        assignment=assignment,
+        allowed_tools=_text_tuple(
+            item["allowed_tools"],
+            "supplemental task allowed_tools",
+        ),
+        budget_reservation=BudgetAmount(**budget_payload),
+        bootstrap_policy=_text_field(
+            item,
+            "bootstrap_policy",
+            "supplemental task spec",
+        ),
+    )
+
+
+def _session_budget(amount: BudgetAmount) -> SupplementalBudget:
+    if not isinstance(amount, BudgetAmount):
+        raise ValueError("amount must be a BudgetAmount")
+    return SupplementalBudget(
+        tasks=amount.tasks,
+        tool_calls=amount.tool_calls,
+        tokens=amount.tokens,
+        elapsed_seconds=amount.elapsed_seconds,
+    )
+
+
+def _charged_supplemental_budget(
+    task_run: ReviewerTaskRun,
+    reservation: BudgetAmount,
+) -> SupplementalBudget:
+    if not isinstance(task_run, ReviewerTaskRun):
+        raise ValueError("task_run must be a ReviewerTaskRun")
+    if not isinstance(reservation, BudgetAmount):
+        raise ValueError("reservation must be a BudgetAmount")
+    consumption = task_run.budget_consumption
+    charged = (
+        consumption
+        if task_run.usage_available
+        else reservation.max_with(consumption)
+    )
+    charged = BudgetAmount(
+        tasks=1,
+        tool_calls=charged.tool_calls,
+        tokens=charged.tokens,
+        elapsed_seconds=charged.elapsed_seconds,
+    )
+    if (
+        charged.tool_calls > reservation.tool_calls
+        or charged.tokens > reservation.tokens
+        or charged.elapsed_seconds > reservation.elapsed_seconds
+    ):
+        raise ValueError("supplemental task consumption exceeded its reservation")
+    return _session_budget(charged)
+
+
+def _exact_mapping(
+    value: Any,
+    fields: set[str],
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{context} must be an object")
+    item = dict(value)
+    if set(item) != fields:
+        raise ValueError(f"{context} must contain exact fields")
+    return item
+
+
+def _text_field(value: Mapping[str, Any], key: str, context: str) -> str:
+    item = value.get(key)
+    if not isinstance(item, str) or not item.strip():
+        raise ValueError(f"{context}.{key} must be a non-empty string")
+    return item
+
+
+def _integer_field(value: Mapping[str, Any], key: str, context: str) -> int:
+    item = value.get(key)
+    if type(item) is not int:
+        raise ValueError(f"{context}.{key} must be an integer")
+    return item
+
+
+def _text_tuple(value: Any, context: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() for item in value
+    ):
+        raise ValueError(f"{context} must be a list of non-empty strings")
+    return tuple(value)
+
+
+def _wave_storage_root(wave_id: str) -> str:
+    if not isinstance(wave_id, str) or not wave_id.startswith("W-"):
+        raise ValueError("wave_id must be a stable W- identifier")
+    return f"s/w-{wave_id.removeprefix('W-')[:32]}"
+
+
+def _supplemental_task_storage_root(wave_id: str, task_id: str) -> str:
+    _wave_storage_root(wave_id)
+    if not isinstance(task_id, str) or not task_id.startswith("STASK-"):
+        raise ValueError("task_id must be a stable STASK- identifier")
+    return f"s/t-{task_id.removeprefix('STASK-')[:32]}"
 
 
 def _utc_now() -> str:

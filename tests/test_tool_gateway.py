@@ -76,6 +76,54 @@ def test_tool_gateway_rejects_unauthorized_revision(git_repo: Path, tmp_path: Pa
         gateway.execute("read_range", {"path": "app.py", "revision": "main", "line_start": 1, "line_end": 1})
 
 
+def test_tool_gateway_denies_tools_outside_allowlist_and_counts_attempt_without_observation(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    store = ObservationStore(tmp_path / "allowed-tools")
+    gateway = ToolGateway(
+        git_repo,
+        base_revision=head,
+        head_revision=head,
+        observation_store=store,
+        allowed_tools=("read_range",),
+    )
+
+    with pytest.raises(ToolGatewayError, match="not allowed") as caught:
+        gateway.execute("compare_base_head", {"path": "app.py"})
+
+    assert caught.value.code == "tool_not_allowed"
+    assert caught.value.tool_name == "compare_base_head"
+    assert gateway.attempted_tool_calls == 1
+    assert gateway.denied_tool_calls == 1
+    assert store.list_observations() == []
+
+    gateway.execute(
+        "read_range",
+        {"path": "app.py", "revision": "head", "line_start": 1, "line_end": 1},
+    )
+    assert gateway.attempted_tool_calls == 2
+    assert gateway.denied_tool_calls == 1
+    assert len(store.list_observations()) == 1
+
+
+def test_tool_gateway_rejects_unknown_constructor_allowlist_item(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    with pytest.raises(ValueError, match="unsupported allowed tool"):
+        ToolGateway(
+            git_repo,
+            base_revision=head,
+            head_revision=head,
+            observation_store=ObservationStore(tmp_path / "unknown-tool"),
+            allowed_tools=("write_file",),
+        )
+
+
 def test_tool_gateway_list_symbols_records_ast_observation(git_repo: Path, tmp_path: Path):
     (git_repo / "auth.py").write_text("def check_role(role):\n    return role == 'admin'\n", encoding="utf-8")
     run_git(git_repo, "add", "auth.py")

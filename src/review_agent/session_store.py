@@ -20,8 +20,14 @@ from review_agent.session import (
     ArtifactDescriptor,
     PhaseCheckpoint,
     PhaseStatus,
+    ReviewWaveCheckpoint,
     ReviewerTaskCheckpoint,
     SessionManifest,
+    SupplementalBudget,
+    SupplementalPolicy,
+    SupplementalTaskCheckpoint,
+    SupplementalTaskStatus,
+    session_phases_for_schema,
     session_manifest_from_dict,
     session_manifest_to_dict,
 )
@@ -89,7 +95,7 @@ class SessionStore:
         if manifest.schema_version not in RESUMABLE_SESSION_SCHEMA_VERSIONS:
             raise ValueError(
                 "schema v1 Session is available for read-only audit; start a new "
-                "schema v3 Session to use state transitions"
+                "schema v4 Session to use state transitions"
             )
 
     @staticmethod
@@ -710,6 +716,717 @@ class SessionStore:
         self.write(updated)
         return updated
 
+    def initialize_wave(
+        self,
+        wave_id: str,
+        task_assignments: Mapping[str, str],
+        now: str,
+        *,
+        trigger_digest: str,
+        effective_policy: SupplementalPolicy | None = None,
+    ) -> SessionManifest:
+        if not isinstance(task_assignments, Mapping):
+            raise ValueError("task_assignments must be a mapping")
+        if effective_policy is not None and not isinstance(
+            effective_policy,
+            SupplementalPolicy,
+        ):
+            raise ValueError("effective_policy must be a SupplementalPolicy")
+        assignments = dict(task_assignments)
+        if not assignments:
+            raise ValueError("a supplemental wave must contain at least one task")
+
+        current = self.load()
+        self._require_supplemental_phase_running(current)
+        effective_policy = (
+            effective_policy or current.execution.supplemental_policy
+        )
+        existing = current.supplemental_waves.get(wave_id)
+        if existing is not None:
+            expected_assignments = {
+                task_id: task.assignment_digest
+                for task_id, task in existing.tasks.items()
+            }
+            if (
+                existing.trigger_digest != trigger_digest
+                or existing.effective_policy != effective_policy
+                or expected_assignments != assignments
+            ):
+                raise ValueError(
+                    f"supplemental wave {wave_id} is already initialized differently"
+                )
+            if existing.status in {PhaseStatus.RUNNING, PhaseStatus.COMPLETED}:
+                return current
+            if existing.status not in {PhaseStatus.FAILED, PhaseStatus.INVALIDATED}:
+                raise ValueError(
+                    f"supplemental wave {wave_id} cannot be resumed from "
+                    f"{existing.status.value}"
+                )
+            if any(
+                task.status in {
+                    SupplementalTaskStatus.RESERVED,
+                    SupplementalTaskStatus.RUNNING,
+                }
+                for task in existing.tasks.values()
+            ):
+                raise ValueError(
+                    "cannot resume a supplemental wave with active task reservations"
+                )
+            waves = dict(current.supplemental_waves)
+            waves[wave_id] = replace(
+                existing,
+                status=PhaseStatus.RUNNING,
+                attempts=existing.attempts + 1,
+                started_at=now,
+                completed_at=None,
+                artifacts=(),
+                stop_reason=None,
+                error=None,
+            )
+            updated = replace(
+                current,
+                supplemental_waves=waves,
+                updated_at=now,
+            )
+            self.write(updated)
+            return updated
+
+        policy = effective_policy
+        waves = dict(current.supplemental_waves)
+        if any(
+            candidate.effective_policy != policy
+            for candidate in waves.values()
+        ):
+            raise ValueError(
+                "supplemental waves must share one effective Runtime policy"
+            )
+        wave_index = len(waves) + 1
+        if wave_index > policy.max_waves:
+            raise ValueError("supplemental wave exceeds policy max_waves")
+        if len(assignments) > policy.max_tasks_per_wave:
+            raise ValueError(
+                "supplemental wave exceeds policy max_tasks_per_wave"
+            )
+        if sum(len(wave.tasks) for wave in waves.values()) + len(assignments) > policy.max_tasks:
+            raise ValueError("supplemental tasks exceed policy max_tasks")
+        incomplete_waves = [
+            candidate.wave_id
+            for candidate in waves.values()
+            if candidate.status is not PhaseStatus.COMPLETED
+        ]
+        if incomplete_waves:
+            raise ValueError(
+                "cannot initialize a new supplemental wave before prior waves "
+                "complete: " + ", ".join(incomplete_waves)
+            )
+
+        tasks = {
+            task_id: SupplementalTaskCheckpoint(
+                task_id=task_id,
+                assignment_digest=assignment_digest,
+            )
+            for task_id, assignment_digest in assignments.items()
+        }
+        wave = ReviewWaveCheckpoint(
+            wave_id=wave_id,
+            wave_index=wave_index,
+            trigger_digest=trigger_digest,
+            effective_policy=policy,
+            status=PhaseStatus.RUNNING,
+            attempts=1,
+            started_at=now,
+            tasks=tasks,
+        )
+        waves[wave_id] = wave
+        updated = replace(
+            current,
+            supplemental_waves=waves,
+            updated_at=now,
+        )
+        self.write(updated)
+        return updated
+
+    def reserve_task_budget(
+        self,
+        task_id: str,
+        reservation: SupplementalBudget,
+        now: str,
+    ) -> SessionManifest:
+        if not isinstance(reservation, SupplementalBudget):
+            raise ValueError("reservation must be a SupplementalBudget")
+        current = self.load()
+        self._require_supplemental_phase_running(current)
+        wave_id, wave, task = _supplemental_task(current, task_id)
+        if wave.status is not PhaseStatus.RUNNING:
+            raise ValueError(f"supplemental wave {wave_id} must be running")
+        if task.status in {
+            SupplementalTaskStatus.RESERVED,
+            SupplementalTaskStatus.RUNNING,
+        }:
+            if task.reservation == reservation:
+                return current
+            raise ValueError(
+                f"supplemental task {task_id} already has a different reservation"
+            )
+        if task.status in {
+            SupplementalTaskStatus.COMPLETED,
+            SupplementalTaskStatus.PARTIAL,
+        }:
+            raise ValueError(f"cannot reserve completed supplemental task: {task_id}")
+        if task.status not in {
+            SupplementalTaskStatus.PENDING,
+            SupplementalTaskStatus.FAILED,
+            SupplementalTaskStatus.INVALIDATED,
+        }:
+            raise ValueError(
+                f"supplemental task {task_id} cannot be reserved from "
+                f"{task.status.value}"
+            )
+
+        policy = wave.effective_policy
+        _require_task_reservation_within_policy(reservation, policy)
+        active = sum(
+            candidate.status
+            in {SupplementalTaskStatus.RESERVED, SupplementalTaskStatus.RUNNING}
+            for candidate_wave in current.supplemental_waves.values()
+            for candidate in candidate_wave.tasks.values()
+        )
+        if active >= policy.max_concurrency:
+            raise ValueError("supplemental reservation exceeds policy max_concurrency")
+        consumed = _supplemental_consumption(current)
+        ceiling = _supplemental_budget_ceiling(current)
+        if not (consumed + reservation).fits_within(ceiling):
+            raise ValueError("supplemental reservation exceeds remaining global budget")
+
+        updated_task = replace(
+            task,
+            status=SupplementalTaskStatus.RESERVED,
+            started_at=None,
+            completed_at=None,
+            artifacts=(),
+            reservation=reservation,
+            error=None,
+        )
+        updated = _replace_supplemental_task(
+            current,
+            wave_id,
+            task_id,
+            updated_task,
+            now,
+        )
+        self.write(updated)
+        return updated
+
+    def mark_task_running(self, task_id: str, now: str) -> SessionManifest:
+        current = self.load()
+        self._require_supplemental_phase_running(current)
+        wave_id, wave, task = _supplemental_task(current, task_id)
+        if wave.status is not PhaseStatus.RUNNING:
+            raise ValueError(f"supplemental wave {wave_id} must be running")
+        if task.status is SupplementalTaskStatus.RUNNING:
+            return current
+        if task.status in {
+            SupplementalTaskStatus.COMPLETED,
+            SupplementalTaskStatus.PARTIAL,
+        }:
+            self._require_supplemental_task_artifacts(
+                current,
+                task_id,
+                task.artifacts,
+            )
+            return current
+        if task.status is not SupplementalTaskStatus.RESERVED:
+            raise ValueError(
+                f"supplemental task {task_id} must be reserved before running"
+            )
+        updated_task = replace(
+            task,
+            status=SupplementalTaskStatus.RUNNING,
+            attempts=task.attempts + 1,
+            started_at=now,
+            completed_at=None,
+            artifacts=(),
+            error=None,
+        )
+        updated = _replace_supplemental_task(
+            current,
+            wave_id,
+            task_id,
+            updated_task,
+            now,
+        )
+        self.write(updated)
+        return updated
+
+    def mark_task_completed(
+        self,
+        task_id: str,
+        artifact_names: Iterable[str],
+        charged: SupplementalBudget,
+        now: str,
+    ) -> SessionManifest:
+        return self._mark_task_with_artifacts(
+            task_id,
+            artifact_names,
+            charged,
+            now,
+            status=SupplementalTaskStatus.COMPLETED,
+            error=None,
+        )
+
+    def mark_task_partial(
+        self,
+        task_id: str,
+        artifact_names: Iterable[str],
+        error: str,
+        charged: SupplementalBudget,
+        now: str,
+    ) -> SessionManifest:
+        _require_non_empty_string(error, "error")
+        return self._mark_task_with_artifacts(
+            task_id,
+            artifact_names,
+            charged,
+            now,
+            status=SupplementalTaskStatus.PARTIAL,
+            error=error,
+        )
+
+    def _mark_task_with_artifacts(
+        self,
+        task_id: str,
+        artifact_names: Iterable[str],
+        charged: SupplementalBudget,
+        now: str,
+        *,
+        status: SupplementalTaskStatus,
+        error: str | None,
+    ) -> SessionManifest:
+        if not isinstance(charged, SupplementalBudget):
+            raise ValueError("charged must be a SupplementalBudget")
+        names = _unique_artifact_names(artifact_names)
+        current = self.load()
+        self._require_supplemental_phase_running(current)
+        wave_id, wave, task = _supplemental_task(current, task_id)
+        if wave.status is not PhaseStatus.RUNNING:
+            raise ValueError(f"supplemental wave {wave_id} must be running")
+        if task.status is status:
+            if (
+                set(task.artifacts) == set(names)
+                and charged.fits_within(task.charged)
+                and task.error == error
+            ):
+                self._require_supplemental_task_artifacts(current, task_id, names)
+                return current
+            raise ValueError(
+                f"supplemental task {task_id} is already {status.value} "
+                "with different committed state"
+            )
+        if task.status is not SupplementalTaskStatus.RUNNING:
+            raise ValueError(
+                f"supplemental task {task_id} must be running before "
+                f"becoming {status.value}"
+            )
+        _require_task_charge(charged, task.reservation)
+        self._require_supplemental_task_artifacts(current, task_id, names)
+        updated_task = replace(
+            task,
+            status=status,
+            completed_at=now,
+            artifacts=names,
+            reservation=SupplementalBudget(),
+            charged=task.charged + charged,
+            error=error,
+        )
+        updated = _replace_supplemental_task(
+            current,
+            wave_id,
+            task_id,
+            updated_task,
+            now,
+        )
+        self.write(updated)
+        return updated
+
+    def mark_task_failed(
+        self,
+        task_id: str,
+        error: str,
+        charged: SupplementalBudget,
+        now: str,
+        *,
+        artifact_names: Iterable[str] = (),
+    ) -> SessionManifest:
+        _require_non_empty_string(error, "error")
+        if not isinstance(charged, SupplementalBudget):
+            raise ValueError("charged must be a SupplementalBudget")
+        names = _unique_artifact_names(artifact_names)
+        current = self.load()
+        self._require_supplemental_phase_running(current)
+        wave_id, wave, task = _supplemental_task(current, task_id)
+        if wave.status is not PhaseStatus.RUNNING:
+            raise ValueError(f"supplemental wave {wave_id} must be running")
+        if task.status is SupplementalTaskStatus.FAILED:
+            if (
+                task.error == error
+                and charged.fits_within(task.charged)
+                and set(task.artifacts) == set(names)
+            ):
+                if names:
+                    self._require_supplemental_task_artifacts(
+                        current,
+                        task_id,
+                        names,
+                    )
+                return current
+            raise ValueError(
+                f"supplemental task {task_id} is already failed differently"
+            )
+        if task.status is not SupplementalTaskStatus.RUNNING:
+            raise ValueError(
+                f"supplemental task {task_id} must be running before failure"
+            )
+        _require_task_charge(charged, task.reservation)
+        if names:
+            self._require_supplemental_task_artifacts(current, task_id, names)
+        updated_task = replace(
+            task,
+            status=SupplementalTaskStatus.FAILED,
+            completed_at=None,
+            artifacts=names,
+            reservation=SupplementalBudget(),
+            charged=task.charged + charged,
+            error=error,
+        )
+        updated = _replace_supplemental_task(
+            current,
+            wave_id,
+            task_id,
+            updated_task,
+            now,
+        )
+        self.write(updated)
+        return updated
+
+    def mark_task_unrunnable(
+        self,
+        task_id: str,
+        error: str,
+        now: str,
+    ) -> SessionManifest:
+        """Close a task that cannot reserve another bounded attempt."""
+
+        _require_non_empty_string(error, "error")
+        current = self.load()
+        self._require_supplemental_phase_running(current)
+        wave_id, wave, task = _supplemental_task(current, task_id)
+        if wave.status is not PhaseStatus.RUNNING:
+            raise ValueError(f"supplemental wave {wave_id} must be running")
+        if task.status is SupplementalTaskStatus.FAILED and task.error == error:
+            return current
+        if task.status not in {
+            SupplementalTaskStatus.PENDING,
+            SupplementalTaskStatus.FAILED,
+            SupplementalTaskStatus.INVALIDATED,
+        }:
+            raise ValueError(
+                f"supplemental task {task_id} cannot become unrunnable from "
+                f"{task.status.value}"
+            )
+        updated_task = replace(
+            task,
+            status=SupplementalTaskStatus.FAILED,
+            attempts=max(1, task.attempts),
+            started_at=task.started_at or now,
+            completed_at=None,
+            artifacts=(),
+            reservation=SupplementalBudget(),
+            error=error,
+        )
+        updated = _replace_supplemental_task(
+            current,
+            wave_id,
+            task_id,
+            updated_task,
+            now,
+        )
+        self.write(updated)
+        return updated
+
+    def mark_task_unknown(
+        self,
+        task_id: str,
+        invocation_id: str,
+        error: str,
+        now: str,
+    ) -> SessionManifest:
+        _require_non_empty_string(error, "error")
+        current = self.load()
+        self._require_supplemental_phase_running(current)
+        wave_id, wave, task = _supplemental_task(current, task_id)
+        if wave.status is not PhaseStatus.RUNNING:
+            raise ValueError(f"supplemental wave {wave_id} must be running")
+        if invocation_id in task.unknown_invocation_ids:
+            if task.status is SupplementalTaskStatus.FAILED and task.error == error:
+                return current
+            raise ValueError(
+                f"supplemental invocation {invocation_id} is already recorded"
+            )
+        if any(
+            invocation_id in candidate.unknown_invocation_ids
+            for candidate_wave in current.supplemental_waves.values()
+            for candidate in candidate_wave.tasks.values()
+        ):
+            raise ValueError(
+                f"supplemental invocation {invocation_id} belongs to another task"
+            )
+        if task.status is not SupplementalTaskStatus.RUNNING:
+            raise ValueError(
+                f"supplemental task {task_id} must be running before unknown usage"
+            )
+        updated_task = replace(
+            task,
+            status=SupplementalTaskStatus.FAILED,
+            completed_at=None,
+            artifacts=(),
+            reservation=SupplementalBudget(),
+            unknown_consumed=task.unknown_consumed + task.reservation,
+            unknown_invocation_ids=(*task.unknown_invocation_ids, invocation_id),
+            error=error,
+        )
+        updated = _replace_supplemental_task(
+            current,
+            wave_id,
+            task_id,
+            updated_task,
+            now,
+        )
+        self.write(updated)
+        return updated
+
+    def mark_wave_completed(
+        self,
+        wave_id: str,
+        artifact_names: Iterable[str],
+        stop_reason: str,
+        now: str,
+    ) -> SessionManifest:
+        names = _unique_artifact_names(artifact_names)
+        current = self.load()
+        supplemental_phase = self._require_supplemental_phase_running(current)
+        wave = _supplemental_wave(current, wave_id)
+        if wave.status is PhaseStatus.COMPLETED:
+            if set(wave.artifacts) == set(names) and wave.stop_reason == stop_reason:
+                for artifact_name in names:
+                    self._require_valid_phase_artifact(
+                        current,
+                        RunPhase.SUPPLEMENTAL_INVESTIGATION,
+                        artifact_name,
+                    )
+                return current
+            raise ValueError(
+                f"supplemental wave {wave_id} is already completed differently"
+            )
+        if wave.status is not PhaseStatus.RUNNING:
+            raise ValueError(f"supplemental wave {wave_id} must be running")
+        incomplete = [
+            task_id
+            for task_id, task in wave.tasks.items()
+            if task.status
+            not in {
+                SupplementalTaskStatus.COMPLETED,
+                SupplementalTaskStatus.PARTIAL,
+                SupplementalTaskStatus.FAILED,
+            }
+        ]
+        if incomplete:
+            raise ValueError(
+                "cannot complete supplemental wave before tasks terminate: "
+                + ", ".join(incomplete)
+            )
+        for artifact_name in names:
+            self._require_valid_phase_artifact(
+                current,
+                RunPhase.SUPPLEMENTAL_INVESTIGATION,
+                artifact_name,
+            )
+        task_artifacts = {
+            artifact_name
+            for task in wave.tasks.values()
+            for artifact_name in task.artifacts
+        }
+        if not task_artifacts.issubset(names):
+            raise ValueError(
+                "supplemental wave artifact set omits committed task artifacts"
+            )
+
+        completed_wave = replace(
+            wave,
+            status=PhaseStatus.COMPLETED,
+            completed_at=now,
+            artifacts=names,
+            stop_reason=stop_reason,
+            error=None,
+        )
+        waves = dict(current.supplemental_waves)
+        waves[wave_id] = completed_wave
+        phases = dict(current.phases)
+        phases[RunPhase.SUPPLEMENTAL_INVESTIGATION.value] = replace(
+            supplemental_phase,
+            artifacts=tuple(
+                dict.fromkeys((*supplemental_phase.artifacts, *names))
+            ),
+        )
+        updated = replace(
+            current,
+            phases=phases,
+            supplemental_waves=waves,
+            updated_at=now,
+        )
+        self.write(updated)
+        return updated
+
+    def invalidate_wave_from(
+        self,
+        wave_id: str,
+        reason: str,
+        now: str,
+        *,
+        task_id: str | None = None,
+    ) -> SessionManifest:
+        _require_non_empty_string(reason, "reason")
+        current = self.load()
+        self._require_supplemental_layout(current)
+        target = _supplemental_wave(current, wave_id)
+        if task_id is not None and task_id not in target.tasks:
+            raise ValueError(
+                f"supplemental task {task_id} does not belong to wave {wave_id}"
+            )
+        waves = dict(current.supplemental_waves)
+        target_index = target.wave_index
+
+        preserved_supplemental: set[str] = set()
+        for candidate in waves.values():
+            if candidate.wave_index < target_index:
+                preserved_supplemental.update(candidate.artifacts)
+                preserved_supplemental.update(
+                    artifact_name
+                    for task in candidate.tasks.values()
+                    for artifact_name in task.artifacts
+                )
+            elif candidate.wave_index == target_index:
+                plan_name = f"supplemental_wave_{candidate.wave_id}_plan"
+                if plan_name in current.artifacts:
+                    preserved_supplemental.add(plan_name)
+                preserved_supplemental.update(
+                    artifact_name
+                    for candidate_task_id, task in candidate.tasks.items()
+                    if task_id is None or candidate_task_id != task_id
+                    for artifact_name in task.artifacts
+                )
+
+        for candidate_id, candidate in tuple(waves.items()):
+            if candidate.wave_index < target_index:
+                continue
+            tasks = dict(candidate.tasks)
+            invalidate_all_tasks = candidate.wave_index > target_index
+            for candidate_task_id, task in tuple(tasks.items()):
+                should_invalidate = invalidate_all_tasks or (
+                    candidate.wave_index == target_index
+                    and task_id is not None
+                    and candidate_task_id == task_id
+                )
+                if not should_invalidate:
+                    continue
+                if task.status in {
+                    SupplementalTaskStatus.RESERVED,
+                    SupplementalTaskStatus.RUNNING,
+                }:
+                    raise ValueError(
+                        "active supplemental task must be charged or marked unknown "
+                        "before invalidation"
+                    )
+                tasks[candidate_task_id] = replace(
+                    task,
+                    status=SupplementalTaskStatus.INVALIDATED,
+                    completed_at=None,
+                    artifacts=(),
+                    reservation=SupplementalBudget(),
+                    error=(
+                        reason
+                        if candidate.wave_index == target_index
+                        else f"invalidated because wave {wave_id} is invalid"
+                    ),
+                )
+            waves[candidate_id] = replace(
+                candidate,
+                status=PhaseStatus.INVALIDATED,
+                completed_at=None,
+                artifacts=(),
+                tasks=tasks,
+                stop_reason=None,
+                error=(
+                    reason
+                    if candidate.wave_index == target_index
+                    else f"invalidated because wave {wave_id} is invalid"
+                ),
+            )
+
+        layout = session_phases_for_schema(current.schema_version)
+        supplemental_index = layout.index(RunPhase.SUPPLEMENTAL_INVESTIGATION)
+        downstream = set(layout[supplemental_index + 1 :])
+        artifacts = {
+            name: descriptor
+            for name, descriptor in current.artifacts.items()
+            if (
+                descriptor.phase is RunPhase.SUPPLEMENTAL_INVESTIGATION
+                and name in preserved_supplemental
+            )
+            or (
+                descriptor.phase is not RunPhase.SUPPLEMENTAL_INVESTIGATION
+                and descriptor.phase not in downstream
+            )
+        }
+        phases = dict(current.phases)
+        supplemental_error = f"supplemental wave {wave_id} invalid: {reason}"
+        phases[RunPhase.SUPPLEMENTAL_INVESTIGATION.value] = PhaseCheckpoint(
+            status=PhaseStatus.INVALIDATED,
+            attempts=phases[RunPhase.SUPPLEMENTAL_INVESTIGATION.value].attempts,
+            error=supplemental_error,
+        )
+        for phase in layout[supplemental_index + 1 :]:
+            checkpoint = phases[phase.value]
+            phases[phase.value] = PhaseCheckpoint(
+                status=PhaseStatus.INVALIDATED,
+                attempts=checkpoint.attempts,
+                error=f"invalidated because supplemental wave {wave_id} is invalid",
+            )
+
+        error_message = f"invalidated supplemental wave {wave_id}: {reason}"
+        updated = replace(
+            current,
+            status=RunStatus.RUNNING,
+            current_phase=RunPhase.SUPPLEMENTAL_INVESTIGATION,
+            last_successful_phase=next(
+                (
+                    phase
+                    for phase in reversed(layout[:supplemental_index])
+                    if phases[phase.value].status is PhaseStatus.COMPLETED
+                ),
+                None,
+            ),
+            phases=phases,
+            artifacts=artifacts,
+            supplemental_waves=waves,
+            errors=(*current.errors, error_message),
+            updated_at=now,
+        )
+        if updated == current:
+            return current
+        self._require_immutable_metadata(current, updated)
+        _atomic_write_text(self.session_path, self._serialize(updated))
+        return updated
+
     def invalidate_from(
         self,
         phase: RunPhase,
@@ -721,8 +1438,13 @@ class SessionStore:
             raise ValueError("reason must be a non-empty string")
         current = self.load()
         self._require_current_layout(current)
-        phase_index = SESSION_PHASES.index(phase)
-        invalidated_phases = set(SESSION_PHASES[phase_index:])
+        layout = session_phases_for_schema(current.schema_version)
+        if phase not in layout:
+            raise ValueError(
+                f"phase {phase.value} is not part of this Session schema layout"
+            )
+        phase_index = layout.index(phase)
+        invalidated_phases = set(layout[phase_index:])
         checkpoint = current.phases[phase.value]
         if (
             current.status is RunStatus.RUNNING
@@ -733,7 +1455,7 @@ class SessionStore:
                 current.phases[candidate.value].status
                 is PhaseStatus.INVALIDATED
                 and not current.phases[candidate.value].artifacts
-                for candidate in SESSION_PHASES[phase_index:]
+                for candidate in layout[phase_index:]
             )
             and not any(
                 descriptor.phase in invalidated_phases
@@ -742,7 +1464,7 @@ class SessionStore:
         ):
             return current
         phases = dict(current.phases)
-        for candidate in SESSION_PHASES[phase_index:]:
+        for candidate in layout[phase_index:]:
             checkpoint = phases[candidate.value]
             candidate_reason = (
                 reason
@@ -766,11 +1488,14 @@ class SessionStore:
         last_successful = next(
             (
                 candidate
-                for candidate in reversed(SESSION_PHASES[:phase_index])
+                for candidate in reversed(layout[:phase_index])
                 if phases[candidate.value].status is PhaseStatus.COMPLETED
             ),
             None,
         )
+        supplemental_waves = current.supplemental_waves
+        if RunPhase.SUPPLEMENTAL_INVESTIGATION in invalidated_phases:
+            supplemental_waves = {}
         error_message = f"invalidated {phase.value}: {reason}"
         updated = replace(
             current,
@@ -779,6 +1504,7 @@ class SessionStore:
             last_successful_phase=last_successful,
             phases=phases,
             artifacts=artifacts,
+            supplemental_waves=supplemental_waves,
             errors=(*current.errors, error_message),
             updated_at=now,
         )
@@ -833,9 +1559,10 @@ class SessionStore:
             error=f"reviewer task {task_name} invalid: {reason}",
             tasks=tasks,
         )
-        reviewer_index = SESSION_PHASES.index(RunPhase.REVIEWERS)
-        downstream = set(SESSION_PHASES[reviewer_index + 1 :])
-        for phase in SESSION_PHASES[reviewer_index + 1 :]:
+        layout = session_phases_for_schema(current.schema_version)
+        reviewer_index = layout.index(RunPhase.REVIEWERS)
+        downstream = set(layout[reviewer_index + 1 :])
+        for phase in layout[reviewer_index + 1 :]:
             checkpoint = phases[phase.value]
             phases[phase.value] = PhaseCheckpoint(
                 status=PhaseStatus.INVALIDATED,
@@ -862,6 +1589,7 @@ class SessionStore:
             last_successful_phase=RunPhase.PLANNING,
             phases=phases,
             artifacts=artifacts,
+            supplemental_waves={},
             errors=(*current.errors, message),
             updated_at=now,
         )
@@ -895,9 +1623,10 @@ class SessionStore:
             error=reason,
             tasks=checkpoint.tasks,
         )
-        reviewer_index = SESSION_PHASES.index(RunPhase.REVIEWERS)
-        downstream = set(SESSION_PHASES[reviewer_index + 1 :])
-        for phase in SESSION_PHASES[reviewer_index + 1 :]:
+        layout = session_phases_for_schema(current.schema_version)
+        reviewer_index = layout.index(RunPhase.REVIEWERS)
+        downstream = set(layout[reviewer_index + 1 :])
+        for phase in layout[reviewer_index + 1 :]:
             candidate = phases[phase.value]
             phases[phase.value] = PhaseCheckpoint(
                 status=PhaseStatus.INVALIDATED,
@@ -924,6 +1653,7 @@ class SessionStore:
             last_successful_phase=RunPhase.PLANNING,
             phases=phases,
             artifacts=artifacts,
+            supplemental_waves={},
             errors=(*current.errors, message),
             updated_at=now,
         )
@@ -1027,7 +1757,7 @@ class SessionStore:
         self._require_current_layout(current)
         incomplete = [
             phase.value
-            for phase in SESSION_PHASES
+            for phase in session_phases_for_schema(current.schema_version)
             if current.phases[phase.value].status is not PhaseStatus.COMPLETED
         ]
         if incomplete:
@@ -1055,7 +1785,7 @@ class SessionStore:
                 + "; ".join(details)
             )
 
-        for phase in SESSION_PHASES:
+        for phase in session_phases_for_schema(current.schema_version):
             checkpoint = current.phases[phase.value]
             if phase is RunPhase.REVIEWERS and checkpoint.tasks:
                 self._require_reviewer_tasks_completed(checkpoint)
@@ -1078,15 +1808,20 @@ class SessionStore:
             raise ValueError("cannot fail a completed Session")
         if checkpoint.status is PhaseStatus.COMPLETED:
             raise ValueError(f"cannot fail completed phase: {phase.value}")
-        phase_index = SESSION_PHASES.index(phase)
-        for predecessor in SESSION_PHASES[:phase_index]:
+        layout = session_phases_for_schema(current.schema_version)
+        if phase not in layout:
+            raise ValueError(
+                f"phase {phase.value} is not part of this Session schema layout"
+            )
+        phase_index = layout.index(phase)
+        for predecessor in layout[:phase_index]:
             predecessor_status = current.phases[predecessor.value].status
             if predecessor_status is not PhaseStatus.COMPLETED:
                 raise ValueError(
                     f"cannot fail {phase.value} because predecessor "
                     f"{predecessor.value} is {predecessor_status.value}"
                 )
-        for successor in SESSION_PHASES[phase_index + 1 :]:
+        for successor in layout[phase_index + 1 :]:
             if current.phases[successor.value].status is PhaseStatus.COMPLETED:
                 raise ValueError(
                     f"cannot fail {phase.value} because completed successor "
@@ -1126,8 +1861,13 @@ class SessionStore:
         manifest: SessionManifest,
         phase: RunPhase,
     ) -> None:
-        phase_index = SESSION_PHASES.index(phase)
-        for predecessor in SESSION_PHASES[:phase_index]:
+        layout = session_phases_for_schema(manifest.schema_version)
+        if phase not in layout:
+            raise ValueError(
+                f"phase {phase.value} is not part of this Session schema layout"
+            )
+        phase_index = layout.index(phase)
+        for predecessor in layout[:phase_index]:
             status = manifest.phases[predecessor.value].status
             if status is not PhaseStatus.COMPLETED:
                 raise ValueError(
@@ -1140,10 +1880,15 @@ class SessionStore:
         manifest: SessionManifest,
         phase: RunPhase,
     ) -> None:
-        phase_index = SESSION_PHASES.index(phase)
+        layout = session_phases_for_schema(manifest.schema_version)
+        if phase not in layout:
+            raise ValueError(
+                f"phase {phase.value} is not part of this Session schema layout"
+            )
+        phase_index = layout.index(phase)
         completed = [
             successor.value
-            for successor in SESSION_PHASES[phase_index + 1 :]
+            for successor in layout[phase_index + 1 :]
             if manifest.phases[successor.value].status is PhaseStatus.COMPLETED
         ]
         if completed:
@@ -1165,6 +1910,54 @@ class SessionStore:
             self._require_valid_phase_artifact(
                 manifest,
                 RunPhase.REVIEWERS,
+                artifact_name,
+            )
+
+    @staticmethod
+    def _require_supplemental_layout(manifest: SessionManifest) -> PhaseCheckpoint:
+        if manifest.schema_version != SESSION_SCHEMA_VERSION:
+            raise ValueError(
+                "supplemental investigation is available only for current "
+                "Session schema Sessions"
+            )
+        checkpoint = manifest.phases.get(
+            RunPhase.SUPPLEMENTAL_INVESTIGATION.value
+        )
+        if checkpoint is None:
+            raise ValueError(
+                "supplemental investigation phase is missing from Session layout"
+            )
+        return checkpoint
+
+    @classmethod
+    def _require_supplemental_phase_running(
+        cls,
+        manifest: SessionManifest,
+    ) -> PhaseCheckpoint:
+        checkpoint = cls._require_supplemental_layout(manifest)
+        if (
+            manifest.status is not RunStatus.RUNNING
+            or manifest.current_phase is not RunPhase.SUPPLEMENTAL_INVESTIGATION
+            or checkpoint.status is not PhaseStatus.RUNNING
+        ):
+            raise ValueError("supplemental investigation phase must be running")
+        return checkpoint
+
+    def _require_supplemental_task_artifacts(
+        self,
+        manifest: SessionManifest,
+        task_id: str,
+        artifact_names: Iterable[str],
+    ) -> None:
+        names = tuple(artifact_names)
+        if not names:
+            raise ValueError(
+                f"supplemental task {task_id} must commit artifacts"
+            )
+        for artifact_name in names:
+            self._require_valid_phase_artifact(
+                manifest,
+                RunPhase.SUPPLEMENTAL_INVESTIGATION,
                 artifact_name,
             )
 
@@ -1315,6 +2108,123 @@ class SessionStore:
                 f"phase {phase.value} artifact set must exactly match its registry; "
                 + "; ".join(details)
             )
+
+
+def _supplemental_wave(
+    manifest: SessionManifest,
+    wave_id: str,
+) -> ReviewWaveCheckpoint:
+    _require_non_empty_string(wave_id, "wave_id")
+    wave = manifest.supplemental_waves.get(wave_id)
+    if wave is None:
+        raise ValueError(f"supplemental wave is not initialized: {wave_id}")
+    return wave
+
+
+def _supplemental_task(
+    manifest: SessionManifest,
+    task_id: str,
+) -> tuple[str, ReviewWaveCheckpoint, SupplementalTaskCheckpoint]:
+    _require_non_empty_string(task_id, "task_id")
+    matches = [
+        (wave_id, wave, wave.tasks[task_id])
+        for wave_id, wave in manifest.supplemental_waves.items()
+        if task_id in wave.tasks
+    ]
+    if not matches:
+        raise ValueError(f"supplemental task is not initialized: {task_id}")
+    if len(matches) != 1:
+        raise ValueError(f"supplemental task ID is ambiguous: {task_id}")
+    return matches[0]
+
+
+def _replace_supplemental_task(
+    manifest: SessionManifest,
+    wave_id: str,
+    task_id: str,
+    task: SupplementalTaskCheckpoint,
+    now: str,
+) -> SessionManifest:
+    if not isinstance(task, SupplementalTaskCheckpoint):
+        raise ValueError("task must be a SupplementalTaskCheckpoint")
+    wave = _supplemental_wave(manifest, wave_id)
+    if task_id not in wave.tasks or task.task_id != task_id:
+        raise ValueError("supplemental task identity does not match wave registry")
+    tasks = dict(wave.tasks)
+    tasks[task_id] = task
+    waves = dict(manifest.supplemental_waves)
+    waves[wave_id] = replace(wave, tasks=tasks)
+    return replace(
+        manifest,
+        supplemental_waves=waves,
+        updated_at=now,
+    )
+
+
+def _supplemental_budget_ceiling(
+    manifest: SessionManifest,
+) -> SupplementalBudget:
+    policy = next(
+        (
+            wave.effective_policy
+            for wave in sorted(
+                manifest.supplemental_waves.values(),
+                key=lambda item: item.wave_index,
+            )
+        ),
+        manifest.execution.supplemental_policy,
+    )
+    return SupplementalBudget(
+        tasks=policy.max_tasks,
+        tool_calls=policy.max_total_tool_calls,
+        tokens=policy.max_total_tokens,
+        elapsed_seconds=policy.max_elapsed_seconds,
+    )
+
+
+def _supplemental_consumption(
+    manifest: SessionManifest,
+) -> SupplementalBudget:
+    total = SupplementalBudget()
+    for wave in manifest.supplemental_waves.values():
+        for task in wave.tasks.values():
+            total = (
+                total
+                + task.charged
+                + task.unknown_consumed
+                + task.reservation
+            )
+    return total
+
+
+def _require_task_reservation_within_policy(
+    reservation: SupplementalBudget,
+    policy: SupplementalPolicy,
+) -> None:
+    if reservation.tasks != 1:
+        raise ValueError("supplemental task reservation must reserve exactly one task")
+    if reservation.tool_calls > policy.max_tool_calls_per_task:
+        raise ValueError(
+            "supplemental task reservation exceeds max_tool_calls_per_task"
+        )
+    if reservation.tokens > policy.max_tokens_per_task:
+        raise ValueError(
+            "supplemental task reservation exceeds max_tokens_per_task"
+        )
+    if reservation.elapsed_seconds > policy.max_elapsed_seconds:
+        raise ValueError(
+            "supplemental task reservation exceeds elapsed-time budget"
+        )
+
+
+def _require_task_charge(
+    charged: SupplementalBudget,
+    reservation: SupplementalBudget,
+) -> None:
+    if charged.tasks != 1:
+        raise ValueError("supplemental task charge must charge exactly one task")
+    if not charged.fits_within(reservation):
+        raise ValueError("supplemental task charge exceeds its reservation")
 
 
 def _require_session_phase(phase: RunPhase) -> RunPhase:

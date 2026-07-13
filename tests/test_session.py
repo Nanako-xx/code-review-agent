@@ -16,17 +16,24 @@ from review_agent.run_state import (
 from review_agent.session import (
     LEGACY_SESSION_PHASES,
     LEGACY_SESSION_SCHEMA_VERSION,
+    MODEL_STAGE_SESSION_SCHEMA_VERSION,
     PREVIOUS_SESSION_SCHEMA_VERSION,
+    PREVIOUS_SESSION_PHASES,
     SESSION_PHASES,
     SESSION_SCHEMA_VERSION,
     ArtifactDescriptor,
     ModelStageConfig,
     PhaseCheckpoint,
     PhaseStatus,
+    ReviewWaveCheckpoint,
     ReviewerTaskCheckpoint,
     ReviewExecutionConfig,
     RevisionChangeKind,
     SessionManifest,
+    SupplementalBudget,
+    SupplementalPolicy,
+    SupplementalTaskCheckpoint,
+    SupplementalTaskStatus,
     child_session_manifest,
     initial_session_manifest,
     session_manifest_from_dict,
@@ -35,6 +42,10 @@ from review_agent.session import (
 
 
 NOW = "2026-07-10T00:00:00Z"
+WAVE_ID = f"W-{'1' * 64}"
+TASK_ID = f"STASK-{'2' * 64}"
+ASSIGNMENT_DIGEST = "3" * 64
+TRIGGER_DIGEST = "4" * 64
 
 
 def execution_config() -> ReviewExecutionConfig:
@@ -64,6 +75,16 @@ def execution_config() -> ReviewExecutionConfig:
             max_provider_attempts=2,
             max_elapsed_seconds=60,
         ),
+        semantic_reconciler=ModelStageConfig(
+            mode="model",
+            provider="fake",
+            model="reconciler-model",
+            api_key_env="RECONCILER_API_KEY",
+            max_output_tokens=3584,
+            max_provider_attempts=4,
+            max_elapsed_seconds=75,
+        ),
+        supplemental_policy=SupplementalPolicy.for_risk("high"),
     )
 
 
@@ -132,6 +153,30 @@ def test_session_manifest_round_trips_with_pending_phases() -> None:
         "max_elapsed_seconds": 45.0,
     }
     assert payload["execution"]["portfolio_planner"]["provider"] == "fake"
+    assert payload["execution"]["semantic_reconciler"] == {
+        "mode": "model",
+        "provider": "fake",
+        "model": "reconciler-model",
+        "base_url": None,
+        "api_key_env": "RECONCILER_API_KEY",
+        "max_output_tokens": 3584,
+        "max_provider_attempts": 4,
+        "max_elapsed_seconds": 75.0,
+    }
+    assert payload["execution"]["supplemental_policy"] == {
+        "version": "supplemental_policy_v1",
+        "risk_level": "high",
+        "max_waves": 2,
+        "max_tasks": 3,
+        "max_tasks_per_wave": 2,
+        "max_concurrency": 2,
+        "max_turns_per_task": 8,
+        "max_tool_calls_per_task": 16,
+        "max_tokens_per_task": 49152,
+        "max_total_tokens": 147456,
+        "max_elapsed_seconds": 480.0,
+    }
+    assert payload["supplemental_waves"] == {}
     assert SESSION_PHASES == (
         RunPhase.PREFLIGHT,
         RunPhase.QUALITY_GATES,
@@ -140,6 +185,8 @@ def test_session_manifest_round_trips_with_pending_phases() -> None:
         RunPhase.INTENT_RESOLUTION,
         RunPhase.PLANNING,
         RunPhase.REVIEWERS,
+        RunPhase.RECONCILIATION_ANALYSIS,
+        RunPhase.SUPPLEMENTAL_INVESTIGATION,
         RunPhase.RECONCILIATION,
         RunPhase.COMPLETION,
         RunPhase.FINAL_RISK,
@@ -189,11 +236,216 @@ def test_session_manifest_round_trips_reviewer_task_checkpoints() -> None:
     assert payload["phases"]["reviewers"]["tasks"]["reviewer-1"]["attempts"] == 2
 
 
+def test_session_manifest_v4_round_trips_supplemental_wave_checkpoints() -> None:
+    budget = SupplementalBudget(
+        tasks=1,
+        tool_calls=8,
+        tokens=8192,
+        elapsed_seconds=30,
+    )
+    task = SupplementalTaskCheckpoint(
+        task_id=TASK_ID,
+        assignment_digest=ASSIGNMENT_DIGEST,
+        status=SupplementalTaskStatus.RUNNING,
+        attempts=1,
+        started_at=NOW,
+        reservation=budget,
+        unknown_consumed=SupplementalBudget(tokens=256, elapsed_seconds=1.5),
+        unknown_invocation_ids=(f"INV-{'5' * 64}",),
+    )
+    wave = ReviewWaveCheckpoint(
+        wave_id=WAVE_ID,
+        wave_index=1,
+        trigger_digest=TRIGGER_DIGEST,
+        effective_policy=SupplementalPolicy.for_risk("high"),
+        status=PhaseStatus.RUNNING,
+        attempts=1,
+        started_at=NOW,
+        tasks={TASK_ID: task},
+    )
+    original = replace(
+        manifest(),
+        status=RunStatus.RUNNING,
+        current_phase=RunPhase.SUPPLEMENTAL_INVESTIGATION,
+        supplemental_waves={WAVE_ID: wave},
+    )
+
+    payload = session_manifest_to_dict(original)
+    loaded = session_manifest_from_dict(payload)
+
+    assert loaded == original
+    assert loaded.supplemental_waves[WAVE_ID].tasks[TASK_ID] == task
+    assert payload["supplemental_waves"][WAVE_ID]["tasks"][TASK_ID][
+        "reservation"
+    ] == {
+        "tasks": 1,
+        "tool_calls": 8,
+        "tokens": 8192,
+        "elapsed_seconds": 30.0,
+    }
+    assert payload["supplemental_waves"][WAVE_ID]["effective_policy"][
+        "risk_level"
+    ] == "high"
+    with pytest.raises(TypeError):
+        loaded.supplemental_waves[WAVE_ID].tasks[TASK_ID] = task
+
+
+@pytest.mark.parametrize(
+    ("risk_level", "expected"),
+    [
+        ("low", (1, 1, 1, 1, 4, 8, 16384, 16384, 120.0)),
+        ("medium", (1, 2, 2, 2, 6, 12, 32768, 65536, 240.0)),
+        ("high", (2, 3, 2, 2, 8, 16, 49152, 147456, 480.0)),
+        ("critical", (2, 4, 2, 2, 10, 24, 65536, 262144, 600.0)),
+    ],
+)
+def test_supplemental_policy_carries_exact_risk_upper_bounds(
+    risk_level: str,
+    expected: tuple[int, int, int, int, int, int, int, int, float],
+) -> None:
+    policy = SupplementalPolicy.for_risk(risk_level)
+
+    assert (
+        policy.max_waves,
+        policy.max_tasks,
+        policy.max_tasks_per_wave,
+        policy.max_concurrency,
+        policy.max_turns_per_task,
+        policy.max_tool_calls_per_task,
+        policy.max_tokens_per_task,
+        policy.max_total_tokens,
+        policy.max_elapsed_seconds,
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"max_waves": 0}, "max_waves"),
+        ({"max_tasks": True}, "max_tasks"),
+        ({"max_tasks_per_wave": 5}, "max_tasks_per_wave"),
+        ({"max_concurrency": 3}, "max_concurrency"),
+        ({"max_total_tokens": 1}, "max_total_tokens"),
+        ({"max_elapsed_seconds": float("nan")}, "max_elapsed_seconds"),
+        ({"risk_level": "extreme"}, "risk_level"),
+    ],
+)
+def test_supplemental_policy_strictly_rejects_invalid_limits(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "risk_level": "critical",
+        "max_waves": 2,
+        "max_tasks": 4,
+        "max_tasks_per_wave": 2,
+        "max_concurrency": 2,
+        "max_turns_per_task": 10,
+        "max_tool_calls_per_task": 24,
+        "max_tokens_per_task": 65536,
+        "max_total_tokens": 262144,
+        "max_elapsed_seconds": 600,
+    }
+    values.update(changes)
+
+    with pytest.raises(ValueError, match=message):
+        SupplementalPolicy(**values)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"tasks": -1}, "tasks"),
+        ({"tool_calls": True}, "tool_calls"),
+        ({"tokens": 1.5}, "tokens"),
+        ({"elapsed_seconds": float("inf")}, "elapsed_seconds"),
+    ],
+)
+def test_supplemental_budget_requires_finite_non_negative_usage(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        SupplementalBudget(**changes)
+
+
+def test_supplemental_task_checkpoint_validates_state_and_budget_transitions() -> None:
+    reservation = SupplementalBudget(
+        tasks=1,
+        tool_calls=4,
+        tokens=4096,
+        elapsed_seconds=20,
+    )
+
+    with pytest.raises(ValueError, match="pending supplemental task"):
+        SupplementalTaskCheckpoint(
+            task_id=TASK_ID,
+            assignment_digest=ASSIGNMENT_DIGEST,
+            reservation=reservation,
+        )
+    with pytest.raises(ValueError, match="reserved supplemental task"):
+        SupplementalTaskCheckpoint(
+            task_id=TASK_ID,
+            assignment_digest=ASSIGNMENT_DIGEST,
+            status=SupplementalTaskStatus.RESERVED,
+        )
+    with pytest.raises(ValueError, match="running supplemental task"):
+        SupplementalTaskCheckpoint(
+            task_id=TASK_ID,
+            assignment_digest=ASSIGNMENT_DIGEST,
+            status=SupplementalTaskStatus.RUNNING,
+            attempts=1,
+            started_at=NOW,
+        )
+    with pytest.raises(ValueError, match="completed supplemental task"):
+        SupplementalTaskCheckpoint(
+            task_id=TASK_ID,
+            assignment_digest=ASSIGNMENT_DIGEST,
+            status=SupplementalTaskStatus.COMPLETED,
+            attempts=1,
+            started_at=NOW,
+            completed_at=NOW,
+            charged=SupplementalBudget(tasks=1),
+        )
+
+
+def test_review_wave_checkpoint_rejects_key_mismatch_and_nonterminal_completion() -> None:
+    task = SupplementalTaskCheckpoint(
+        task_id=TASK_ID,
+        assignment_digest=ASSIGNMENT_DIGEST,
+    )
+    with pytest.raises(ValueError, match="task registry key"):
+        ReviewWaveCheckpoint(
+            wave_id=WAVE_ID,
+            wave_index=1,
+            trigger_digest=TRIGGER_DIGEST,
+            effective_policy=SupplementalPolicy.for_risk("high"),
+            tasks={f"STASK-{'6' * 64}": task},
+        )
+    with pytest.raises(ValueError, match="nonterminal tasks"):
+        ReviewWaveCheckpoint(
+            wave_id=WAVE_ID,
+            wave_index=1,
+            trigger_digest=TRIGGER_DIGEST,
+            effective_policy=SupplementalPolicy.for_risk("high"),
+            status=PhaseStatus.COMPLETED,
+            attempts=1,
+            started_at=NOW,
+            completed_at=NOW,
+            artifacts=("wave_summary",),
+            stop_reason="no_requests",
+            tasks={TASK_ID: task},
+        )
+
+
 def test_session_manifest_loads_v1_layout_without_synthesizing_new_results() -> None:
     payload = session_manifest_to_dict(manifest())
     payload["schema_version"] = LEGACY_SESSION_SCHEMA_VERSION
     payload["execution"].pop("risk_assessor")
     payload["execution"].pop("portfolio_planner")
+    payload["execution"].pop("semantic_reconciler")
+    payload["execution"].pop("supplemental_policy")
+    payload.pop("supplemental_waves")
     payload["phases"] = {
         phase.value: payload["phases"][phase.value]
         for phase in LEGACY_SESSION_PHASES
@@ -214,6 +466,9 @@ def test_session_manifest_loads_v1_layout_without_synthesizing_new_results() -> 
     assert all(not checkpoint.user_decisions for checkpoint in loaded.phases.values())
     assert loaded.execution.risk_assessor == ModelStageConfig()
     assert loaded.execution.portfolio_planner == ModelStageConfig()
+    assert loaded.execution.semantic_reconciler == ModelStageConfig()
+    assert loaded.execution.supplemental_policy == SupplementalPolicy()
+    assert loaded.supplemental_waves == {}
     assert session_manifest_to_dict(loaded)["schema_version"] == 1
 
 
@@ -222,6 +477,13 @@ def test_session_manifest_loads_v2_model_stages_as_local_for_safe_resume() -> No
     payload["schema_version"] = PREVIOUS_SESSION_SCHEMA_VERSION
     payload["execution"].pop("risk_assessor")
     payload["execution"].pop("portfolio_planner")
+    payload["execution"].pop("semantic_reconciler")
+    payload["execution"].pop("supplemental_policy")
+    payload.pop("supplemental_waves")
+    payload["phases"] = {
+        phase.value: payload["phases"][phase.value]
+        for phase in PREVIOUS_SESSION_PHASES
+    }
 
     loaded = session_manifest_from_dict(payload)
     serialized = session_manifest_to_dict(loaded)
@@ -231,8 +493,40 @@ def test_session_manifest_loads_v2_model_stages_as_local_for_safe_resume() -> No
     assert loaded.execution.reviewer_mode == "multi"
     assert loaded.execution.risk_assessor == ModelStageConfig()
     assert loaded.execution.portfolio_planner == ModelStageConfig()
+    assert loaded.execution.semantic_reconciler == ModelStageConfig()
+    assert loaded.execution.supplemental_policy == SupplementalPolicy()
     assert "risk_assessor" not in serialized["execution"]
     assert "portfolio_planner" not in serialized["execution"]
+    assert "semantic_reconciler" not in serialized["execution"]
+    assert "supplemental_policy" not in serialized["execution"]
+    assert "supplemental_waves" not in serialized
+
+
+def test_session_manifest_loads_v3_with_original_layout_and_model_stages() -> None:
+    payload = session_manifest_to_dict(manifest())
+    payload["schema_version"] = MODEL_STAGE_SESSION_SCHEMA_VERSION
+    payload["execution"].pop("semantic_reconciler")
+    payload["execution"].pop("supplemental_policy")
+    payload.pop("supplemental_waves")
+    payload["phases"] = {
+        phase.value: payload["phases"][phase.value]
+        for phase in PREVIOUS_SESSION_PHASES
+    }
+
+    loaded = session_manifest_from_dict(payload)
+    serialized = session_manifest_to_dict(loaded)
+
+    assert loaded.schema_version == MODEL_STAGE_SESSION_SCHEMA_VERSION
+    assert list(loaded.phases) == [phase.value for phase in PREVIOUS_SESSION_PHASES]
+    assert loaded.execution.risk_assessor.mode == "model"
+    assert loaded.execution.portfolio_planner.mode == "model"
+    assert loaded.execution.semantic_reconciler == ModelStageConfig()
+    assert loaded.execution.supplemental_policy == SupplementalPolicy()
+    assert "reconciliation_analysis" not in loaded.phases
+    assert "supplemental_investigation" not in loaded.phases
+    assert "semantic_reconciler" not in serialized["execution"]
+    assert "supplemental_policy" not in serialized["execution"]
+    assert "supplemental_waves" not in serialized
 
 
 def test_awaiting_user_manifest_round_trips_with_committed_artifacts() -> None:
@@ -472,6 +766,29 @@ def test_session_manifest_never_serializes_api_key_values() -> None:
             "max_provider_attempts": 2,
             "max_elapsed_seconds": 60.0,
         },
+        "semantic_reconciler": {
+            "mode": "model",
+            "provider": "fake",
+            "model": "reconciler-model",
+            "base_url": None,
+            "api_key_env": "RECONCILER_API_KEY",
+            "max_output_tokens": 3584,
+            "max_provider_attempts": 4,
+            "max_elapsed_seconds": 75.0,
+        },
+        "supplemental_policy": {
+            "version": "supplemental_policy_v1",
+            "risk_level": "high",
+            "max_waves": 2,
+            "max_tasks": 3,
+            "max_tasks_per_wave": 2,
+            "max_concurrency": 2,
+            "max_turns_per_task": 8,
+            "max_tool_calls_per_task": 16,
+            "max_tokens_per_task": 49152,
+            "max_total_tokens": 147456,
+            "max_elapsed_seconds": 480.0,
+        },
     }
     assert "api_key" not in execution
     assert "authorization" not in str(payload).casefold()
@@ -486,7 +803,10 @@ def test_session_manifest_rejects_secret_execution_fields(secret_field: str) -> 
         session_manifest_from_dict(payload)
 
 
-@pytest.mark.parametrize("stage", ["risk_assessor", "portfolio_planner"])
+@pytest.mark.parametrize(
+    "stage",
+    ["risk_assessor", "portfolio_planner", "semantic_reconciler"],
+)
 def test_session_manifest_rejects_secret_model_stage_fields(stage: str) -> None:
     payload = session_manifest_to_dict(manifest())
     payload["execution"][stage]["api_key"] = "secret-value"
@@ -655,8 +975,12 @@ def test_child_session_manifest_starts_isolated_and_preserves_root_lineage(
     [
         ModelStageConfig,
         ReviewExecutionConfig,
+        SupplementalPolicy,
+        SupplementalBudget,
         ArtifactDescriptor,
         PhaseCheckpoint,
+        ReviewWaveCheckpoint,
+        SupplementalTaskCheckpoint,
         SessionManifest,
     ],
 )

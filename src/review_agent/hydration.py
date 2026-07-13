@@ -54,11 +54,23 @@ from review_agent.models import (
 )
 from review_agent.orchestrator import ReviewerExecution
 from review_agent.quality import QualityGateDefinition, QualityGatePlan
+from review_agent.reconciler import (
+    SemanticReconciliation,
+    semantic_reconciliation_from_dict as _semantic_reconciliation_from_dict,
+)
 from review_agent.reviewer_runtime import reviewer_runtime_to_dict
 from review_agent.repository_intelligence import (
     ChangedSymbol,
     RepositoryIntelligenceSnapshot,
 )
+
+
+def semantic_reconciliation_from_dict(
+    payload: Mapping[str, Any],
+) -> SemanticReconciliation:
+    """Hydrate the authoritative semantic reconciliation artifact strictly."""
+
+    return _semantic_reconciliation_from_dict(payload)
 
 
 def review_request_from_dict(payload: Mapping[str, Any]) -> ReviewRequest:
@@ -765,7 +777,7 @@ def review_brief_from_dict(payload: Mapping[str, Any]) -> ReviewBrief:
             "human_review_checklist_and_reading_order",
             "non_binding_recommendation",
         },
-        {"orchestration"},
+        {"orchestration", "semantic_reconciliation"},
         "review_brief",
     )
     findings = [
@@ -793,6 +805,15 @@ def review_brief_from_dict(payload: Mapping[str, Any]) -> ReviewBrief:
     verification_evidence = _review_brief_verification_evidence(
         item["verification_evidence"]
     )
+    semantic_reconciliation: dict[str, Any] = {}
+    if "semantic_reconciliation" in item:
+        semantic_payload = dict(
+            _object_field(item, "semantic_reconciliation", "review_brief")
+        )
+        if semantic_payload:
+            semantic_reconciliation = _semantic_reconciliation_from_dict(
+                semantic_payload
+            ).to_dict()
     return ReviewBrief(
         review_id=_string(item, "review_id", "review_brief"),
         base_revision=_string(item, "base_revision", "review_brief"),
@@ -827,6 +848,7 @@ def review_brief_from_dict(payload: Mapping[str, Any]) -> ReviewBrief:
             if "orchestration" in item
             else {}
         ),
+        semantic_reconciliation=semantic_reconciliation,
     )
 
 

@@ -418,3 +418,97 @@ def test_quality_discovery_issue_is_preserved_as_manual_review_uncertainty():
     assert result.status == "completed_with_uncertainties"
     assert result.recommendation == "manual_review"
     assert "Quality gate discovery issue: invalid explicit gate" in result.uncertainties
+
+
+def _completion_with_semantic(semantic, *, intent_status=IntentStatus.SUFFICIENT):
+    return check_completion(
+        intent=intent(intent_status),
+        quality_results=[],
+        executions=[
+            execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED)
+        ],
+        reconciliation=reconciliation_with_coverage(
+            coverage(0, "Core Reviewer")
+        ),
+        semantic_reconciliation=semantic,
+    )
+
+
+def test_semantic_fallback_and_remaining_disagreement_require_manual_review():
+    result = _completion_with_semantic(
+        {
+            "status": "fallback",
+            "model": {"status": "fallback"},
+            "remaining_disagreements": [{"issue": "behavior remains unknown"}],
+            "supplemental": {"status": "not_needed", "stop_reason": "no_requests"},
+        }
+    )
+
+    assert result.status == "completed_with_uncertainties"
+    assert result.recommendation == "manual_review"
+    assert "Semantic reconciliation used deterministic fallback" in result.uncertainties
+    assert "reviewer disagreements remain unresolved" in result.uncertainties
+
+
+def test_supplemental_unavailable_requires_manual_review():
+    result = _completion_with_semantic(
+        {
+            "status": "partial",
+            "model": {"status": "accepted"},
+            "remaining_disagreements": [],
+            "supplemental": {"status": "unavailable", "stop_reason": "unavailable"},
+        }
+    )
+
+    assert result.status == "completed_with_uncertainties"
+    assert result.recommendation == "manual_review"
+    assert "Supplemental investigation unavailable" in result.uncertainties
+
+
+def test_max_waves_maps_to_budget_exhausted_and_blockers_still_take_priority():
+    semantic = {
+        "status": "partial",
+        "model": {"status": "accepted"},
+        "remaining_disagreements": [{"issue": "still open"}],
+        "supplemental": {
+            "status": "budget_exhausted",
+            "stop_reason": "max_waves",
+        },
+    }
+    exhausted = _completion_with_semantic(semantic)
+    blocked = _completion_with_semantic(
+        semantic,
+        intent_status=IntentStatus.INSUFFICIENT,
+    )
+
+    assert exhausted.status == "budget_exhausted"
+    assert exhausted.recommendation == "manual_review"
+    assert blocked.status == "blocked"
+    assert blocked.recommendation == "manual_review"
+    assert "Intent Packet insufficient" in blocked.blockers
+
+
+def test_supplemental_execution_cannot_supply_initial_core_presence():
+    supplemental = execution(
+        0,
+        "Supplemental Core Reviewer",
+        ReviewerResultStatus.COMPLETED,
+    )
+    supplemental = replace(
+        supplemental,
+        assignment=replace(
+            supplemental.assignment,
+            role_kind="core",
+            planner_source="semantic_reconciler",
+        ),
+    )
+
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[supplemental],
+        reconciliation=reconciliation(),
+    )
+
+    assert result.status == "blocked"
+    assert "Core Reviewer did not run" in result.blockers

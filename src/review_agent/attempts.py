@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
 import shutil
 import stat
 import uuid
@@ -26,6 +27,7 @@ class AttemptWorkspace:
     phase: RunPhase
     attempt: int
     reviewer_index: int | None = None
+    task_id: str | None = None
 
     def __post_init__(self) -> None:
         run_dir = Path(self.run_dir)
@@ -33,15 +35,42 @@ class AttemptWorkspace:
             raise ValueError("phase must be one of the persisted SESSION_PHASES")
         if type(self.attempt) is not int or self.attempt < 1:
             raise ValueError("attempt must be a positive integer")
+        if self.reviewer_index is not None and self.task_id is not None:
+            raise ValueError(
+                "reviewer_index and task_id namespaces are mutually exclusive"
+            )
         if self.reviewer_index is not None:
             if self.phase is not RunPhase.REVIEWERS:
                 raise ValueError("reviewer_index is valid only for the reviewers phase")
             if type(self.reviewer_index) is not int or self.reviewer_index < 0:
                 raise ValueError("reviewer_index must be a non-negative integer")
+        if self.task_id is not None:
+            if self.phase is not RunPhase.SUPPLEMENTAL_INVESTIGATION:
+                raise ValueError(
+                    "task_id is valid only for the supplemental_investigation phase"
+                )
+            if not isinstance(self.task_id, str) or not re.fullmatch(
+                r"STASK-[0-9A-Fa-f]{64}",
+                self.task_id,
+            ):
+                raise ValueError(
+                    "task_id must use STASK- followed by a 64-character "
+                    "hexadecimal digest"
+                )
         object.__setattr__(self, "run_dir", run_dir)
 
     @property
     def path(self) -> Path:
+        if self.task_id is not None:
+            # Keep the full ID in Session/artifact names while using a compact
+            # 128-bit physical namespace for legacy Windows MAX_PATH.
+            return (
+                self.run_dir
+                / "attempts"
+                / "s"
+                / str(self.attempt)
+                / f"t-{self.task_id.removeprefix('STASK-')[:32]}"
+            )
         path = self.run_dir / "attempts" / self.phase.value / str(self.attempt)
         if self.reviewer_index is not None:
             path /= f"reviewer-{self.reviewer_index}"

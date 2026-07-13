@@ -8,13 +8,23 @@ import pytest
 from conftest import run_git
 
 import review_agent.pipeline as pipeline_module
+from review_agent.artifacts import artifact_schema
 from review_agent.checkpoint import CheckpointStore
 from review_agent.models import ReviewRequest
 from review_agent.pipeline import PipelineStageError, ReviewPipeline
 from review_agent.resume import ResumeAction, ResumeBlockedError, ReviewSessionResumer
 from review_agent.revision import RevisionResolver
 from review_agent.run_state import RunPhase, RunStatus
-from review_agent.session import PhaseStatus, ReviewExecutionConfig, initial_session_manifest
+from review_agent.session import (
+    MODEL_STAGE_SESSION_SCHEMA_VERSION,
+    PREVIOUS_SESSION_SCHEMA_VERSION,
+    PhaseStatus,
+    ReviewExecutionConfig,
+    SessionManifest,
+    SupplementalBudget,
+    initial_session_manifest,
+    session_phases_for_schema,
+)
 from review_agent.session_store import SessionStore
 
 
@@ -78,6 +88,53 @@ def _session_pipeline(
         **kwargs,
     )
     return pipeline, session_store, checkpoint_store
+
+
+def _observation_payloads(
+    run_dir: Path,
+    manifest: SessionManifest,
+) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    observation_paths = {
+        descriptor.path
+        for descriptor in manifest.artifacts.values()
+        if descriptor.schema == "observation_log_jsonl_v1"
+    }
+    for relative_path in sorted(observation_paths):
+        for line in (run_dir / relative_path).read_text(encoding="utf-8").splitlines():
+            payload = json.loads(line)
+            assert isinstance(payload, dict)
+            payloads.append(payload)
+    return payloads
+
+
+def _downgrade_session_schema(
+    session_store: SessionStore,
+    schema_version: int,
+) -> None:
+    payload = json.loads(session_store.session_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = schema_version
+    execution = payload["execution"]
+    execution.pop("semantic_reconciler")
+    execution.pop("supplemental_policy")
+    if schema_version < MODEL_STAGE_SESSION_SCHEMA_VERSION:
+        execution.pop("risk_assessor")
+        execution.pop("portfolio_planner")
+    payload.pop("supplemental_waves")
+    legacy_phases = {
+        phase.value for phase in session_phases_for_schema(schema_version)
+    }
+    payload["phases"] = {
+        phase_name: checkpoint
+        for phase_name, checkpoint in payload["phases"].items()
+        if phase_name in legacy_phases
+    }
+    payload["artifacts"] = {
+        artifact_name: descriptor
+        for artifact_name, descriptor in payload["artifacts"].items()
+        if descriptor["phase"] in legacy_phases
+    }
+    session_store.session_path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def test_resume_restarts_stale_running_phase_without_repeating_preflight(
@@ -243,6 +300,92 @@ def test_completed_resume_is_audit_only(
     assert result.starting_phase is None
 
 
+@pytest.mark.parametrize(
+    "schema_version",
+    [PREVIOUS_SESSION_SCHEMA_VERSION, MODEL_STAGE_SESSION_SCHEMA_VERSION],
+    ids=["session-v2", "session-v3"],
+)
+def test_legacy_resume_does_not_construct_or_call_semantic_reconciler(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schema_version: int,
+) -> None:
+    pipeline, session_store, checkpoint_store = _session_pipeline(
+        git_repo,
+        review_id=f"review-resume-v{schema_version}",
+    )
+    _downgrade_session_schema(
+        session_store,
+        schema_version,
+    )
+    with monkeypatch.context() as scoped:
+        def interrupt_legacy_reconciliation(*args, **kwargs):
+            raise KeyboardInterrupt("interrupt legacy reconciliation")
+
+        scoped.setattr(
+            pipeline,
+            "_run_reconciliation",
+            interrupt_legacy_reconciliation,
+        )
+        with pytest.raises(KeyboardInterrupt, match="legacy reconciliation"):
+            pipeline.execute()
+
+    interrupted = session_store.load()
+    assert (
+        interrupted.phases[RunPhase.RECONCILIATION.value].status
+        is PhaseStatus.RUNNING
+    )
+    assert interrupted.supplemental_waves == {}
+
+    class SemanticReconcilerSentinel:
+        def create(self, *args, **kwargs):
+            raise AssertionError(
+                "schema v2/v3 resume must not construct a Semantic Reconciler"
+            )
+
+        def __call__(self, *args, **kwargs):
+            raise AssertionError(
+                "schema v2/v3 resume must not call a Semantic Reconciler"
+            )
+
+    sentinel = SemanticReconcilerSentinel()
+    original_model_stage_adapter = ReviewPipeline._model_stage_adapter
+
+    def guarded_model_stage_adapter(self, stage, *, stage_label):
+        if stage_label == "semantic-reconciler":
+            return sentinel.create(stage)
+        return original_model_stage_adapter(
+            self,
+            stage,
+            stage_label=stage_label,
+        )
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            ReviewPipeline,
+            "_model_stage_adapter",
+            guarded_model_stage_adapter,
+        )
+        scoped.setattr(pipeline_module, "reconcile_semantically", sentinel)
+        result = ReviewSessionResumer(
+            repository=git_repo,
+            checkpoint_store=checkpoint_store,
+            session_store=session_store,
+        ).resume()
+
+    completed = session_store.load()
+    assert result.action is ResumeAction.CONTINUE_SESSION
+    assert result.starting_phase is RunPhase.RECONCILIATION
+    assert completed.status is RunStatus.COMPLETED
+    assert completed.schema_version == schema_version
+    assert list(completed.phases) == [
+        phase.value for phase in session_phases_for_schema(schema_version)
+    ]
+    assert completed.supplemental_waves == {}
+    assert "semantic_reconciliation" not in completed.artifacts
+    assert "supplemental_summary" not in completed.artifacts
+
+
 def test_head_drift_creates_idempotent_child_with_incremental_priority_map(
     git_repo: Path,
 ) -> None:
@@ -253,13 +396,90 @@ def test_head_drift_creates_idempotent_child_with_incremental_priority_map(
     )
     pipeline.execute()
     parent = session_store.load()
-    parent_session_bytes = session_store.session_path.read_bytes()
+    parent_observations = _observation_payloads(checkpoint_store.run_dir, parent)
     parent_observation_ids = {
-        json.loads(line)["observation_id"]
-        for line in (checkpoint_store.run_dir / "observations.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
+        str(observation["observation_id"])
+        for observation in parent_observations
     }
+    parent_supplemental_plan = json.loads(
+        (checkpoint_store.run_dir / "supplemental_initial_plan.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    parent_wave_id = str(parent_supplemental_plan["wave_id"])
+    parent_task_id = f"STASK-{'a' * 64}"
+    seeded_parent_budget = SupplementalBudget(
+        tasks=1,
+        tool_calls=2,
+        tokens=1024,
+        elapsed_seconds=5,
+    )
+    session_store.invalidate_from(
+        RunPhase.SUPPLEMENTAL_INVESTIGATION,
+        "seed resumable parent supplemental state",
+        "2026-07-12T00:01:00Z",
+    )
+    session_store.mark_phase_running(
+        RunPhase.SUPPLEMENTAL_INVESTIGATION,
+        "2026-07-12T00:02:00Z",
+    )
+    parent_budget_artifact = f"supplemental_wave_{parent_wave_id}_budget"
+    parent_budget_path = checkpoint_store.run_dir / "seeded_parent_budget.json"
+    parent_budget_path.write_text(
+        json.dumps(
+            {
+                "unknown_consumed": {
+                    "tasks": seeded_parent_budget.tasks,
+                    "tool_calls": seeded_parent_budget.tool_calls,
+                    "tokens": seeded_parent_budget.tokens,
+                    "elapsed_seconds": seeded_parent_budget.elapsed_seconds,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    session_store.register_existing_artifact(
+        name=parent_budget_artifact,
+        relative_path=parent_budget_path.name,
+        schema=artifact_schema(parent_budget_artifact),
+        phase=RunPhase.SUPPLEMENTAL_INVESTIGATION,
+        revision_binding=(
+            f"{parent.revisions.resolved_base_sha}.."
+            f"{parent.revisions.resolved_head_sha}"
+        ),
+        now="2026-07-12T00:03:00Z",
+    )
+    session_store.initialize_wave(
+        parent_wave_id,
+        {parent_task_id: "b" * 64},
+        "2026-07-12T00:04:00Z",
+        trigger_digest=str(parent_supplemental_plan["trigger_digest"]),
+    )
+    session_store.reserve_task_budget(
+        parent_task_id,
+        seeded_parent_budget,
+        "2026-07-12T00:05:00Z",
+    )
+    session_store.mark_task_running(
+        parent_task_id,
+        "2026-07-12T00:06:00Z",
+    )
+    session_store.mark_task_unknown(
+        parent_task_id,
+        f"INV-{'c' * 64}",
+        "provider returned before parent checkpoint commit",
+        "2026-07-12T00:07:00Z",
+    )
+    parent = session_store.load()
+    parent_wave = parent.supplemental_waves[parent_wave_id]
+    assert parent_wave.tasks[parent_task_id].unknown_consumed == seeded_parent_budget
+    parent_session_bytes = session_store.session_path.read_bytes()
+    parent_supplemental_artifacts = {
+        name
+        for name, descriptor in parent.artifacts.items()
+        if descriptor.phase is RunPhase.SUPPLEMENTAL_INVESTIGATION
+    }
+    assert parent_supplemental_artifacts == {parent_budget_artifact}
     (git_repo / "later.py").write_text("value = 1\n", encoding="utf-8")
     run_git(git_repo, "add", "later.py")
     run_git(git_repo, "commit", "-m", "move requested head")
@@ -313,13 +533,62 @@ def test_head_drift_creates_idempotent_child_with_incremental_priority_map(
     assert "Incremental priority map:" in (
         child_store.run_dir / "report.md"
     ).read_text(encoding="utf-8")
+    child_observations = _observation_payloads(child_store.run_dir, child)
     child_observation_ids = {
-        json.loads(line)["observation_id"]
-        for line in (child_store.run_dir / "observations.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
+        str(observation["observation_id"])
+        for observation in child_observations
     }
+    assert child_observations
+    assert all(
+        child.revisions.resolved_head_sha in str(observation["revision"])
+        for observation in child_observations
+    )
+    assert all(
+        parent.revisions.resolved_head_sha not in str(observation["revision"])
+        for observation in child_observations
+    )
     assert child_observation_ids.isdisjoint(parent_observation_ids)
+
+    child_supplemental_plan = json.loads(
+        (child_store.run_dir / "supplemental_initial_plan.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert child.supplemental_waves == {}
+    assert child_supplemental_plan["review_id"] == child.review_id
+    assert child_supplemental_plan["base_sha"] == child.revisions.resolved_base_sha
+    assert child_supplemental_plan["head_sha"] == child.revisions.resolved_head_sha
+    assert (
+        child_supplemental_plan["wave_id"]
+        != parent_supplemental_plan["wave_id"]
+    )
+    child_supplemental_artifacts = {
+        name
+        for name, descriptor in child.artifacts.items()
+        if descriptor.phase is RunPhase.SUPPLEMENTAL_INVESTIGATION
+    }
+    assert child_supplemental_artifacts.isdisjoint(
+        parent_supplemental_artifacts
+    )
+    assert (
+        f"supplemental_wave_{child_supplemental_plan['wave_id']}_summary"
+        in child_supplemental_artifacts
+    )
+    child_semantic = json.loads(
+        (child_store.run_dir / child.artifacts["semantic_reconciliation"].path)
+        .read_text(encoding="utf-8")
+    )
+    child_budget = child_semantic["supplemental"]["budget"]
+    empty_budget = {
+        "tasks": 0,
+        "tool_calls": 0,
+        "tokens": 0,
+        "elapsed_seconds": 0.0,
+    }
+    assert child_budget["charged"] == empty_budget
+    assert child_budget["unknown_consumed"] == empty_budget
+    assert child_budget["reserved"] == empty_budget
+    assert child_budget["remaining"] == child_budget["limits"]
     assert len(list((git_repo / ".review-agent" / "runs").iterdir())) == 2
 
 

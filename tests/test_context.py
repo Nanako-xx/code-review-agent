@@ -251,6 +251,47 @@ def test_reviewer_envelope_includes_repository_intelligence_tools():
     assert {"list_symbols", "inspect_symbol", "find_references"}.issubset(tool_names)
 
 
+def test_reviewer_envelope_exposes_only_runtime_allowed_tools():
+    envelope = build_reviewer_envelope(
+        assignment=_context_assignment(),
+        intent=_context_intent(),
+        code_snippets={},
+        observations={},
+        trace_id="trace-limited-tools",
+        allowed_tools=("read_range", "search_code"),
+    )
+
+    assert [tool["name"] for tool in envelope.tools] == [
+        "search_code",
+        "read_range",
+    ]
+    assert envelope.parameters["tool_choice"] == "auto"
+
+
+def test_reviewer_envelope_can_disable_tools_and_rejects_unknown_allowlist_items():
+    envelope = build_reviewer_envelope(
+        assignment=_context_assignment(),
+        intent=_context_intent(),
+        code_snippets={},
+        observations={},
+        trace_id="trace-no-tools",
+        allowed_tools=(),
+    )
+
+    assert envelope.tools == []
+    assert envelope.parameters["tool_choice"] == "none"
+
+    with pytest.raises(ValueError, match="unsupported reviewer tool"):
+        build_reviewer_envelope(
+            assignment=_context_assignment(),
+            intent=_context_intent(),
+            code_snippets={},
+            observations={},
+            trace_id="trace-invalid-tools",
+            allowed_tools=("write_file",),
+        )
+
+
 def test_context_payload_compacts_variable_sections_to_message_budget():
     huge_snippet = "\n".join(f"line {index}: return value_{index}" for index in range(300))
     huge_observation = "\n".join(f"observation {index}" for index in range(300)) + "\ntail-marker"

@@ -22,6 +22,8 @@ class RunPhase(str, Enum):
     INTENT_RESOLUTION = "intent_resolution"
     PLANNING = "planning"
     REVIEWERS = "reviewers"
+    RECONCILIATION_ANALYSIS = "reconciliation_analysis"
+    SUPPLEMENTAL_INVESTIGATION = "supplemental_investigation"
     RECONCILIATION = "reconciliation"
     COMPLETION = "completion"
     FINAL_RISK = "final_risk"

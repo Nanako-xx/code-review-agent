@@ -564,6 +564,7 @@ class Assignment:
             "local",
             "model",
             "runtime_injected",
+            "semantic_reconciler",
         }:
             raise ValueError("planner_source is unsupported")
         object.__setattr__(self, "assignment_reason", list(self.assignment_reason))

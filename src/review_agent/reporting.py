@@ -55,6 +55,16 @@ def render_review_brief_markdown(brief: ReviewBrief) -> str:
             "",
             _string_list(brief.reviewer_disagreements, "No reviewer disagreements recorded"),
             "",
+            *(
+                [
+                    "## Semantic Reconciliation And Supplemental Investigation",
+                    "",
+                    _semantic_reconciliation_section(brief),
+                    "",
+                ]
+                if brief.semantic_reconciliation
+                else []
+            ),
             "## Review Contract Coverage",
             "",
             _contract_coverage_section(brief),
@@ -93,6 +103,7 @@ def render_markdown_report(
     intent_packet: IntentPacket | None = None,
     quality_results: list[QualityGateResult] | None = None,
     planning_summary: dict[str, object] | None = None,
+    semantic_reconciliation_summary: dict[str, object] | None = None,
 ) -> str:
     brief = build_review_brief(
         review_id=review_id,
@@ -109,6 +120,7 @@ def render_markdown_report(
         reconciliation_payload=reconciliation_summary,
         completion_summary=completion_summary,
         planning_summary=planning_summary,
+        semantic_reconciliation_payload=semantic_reconciliation_summary,
     )
     return render_review_brief_markdown(brief)
 
@@ -382,6 +394,176 @@ def _rejected_hypotheses_section(brief: ReviewBrief) -> str:
         role = f" ({item.role})" if item.role else ""
         lines.append(f"-{role} {item.claim}: {item.reason}")
     return "\n".join(lines)
+
+
+def _semantic_reconciliation_section(brief: ReviewBrief) -> str:
+    semantic = brief.semantic_reconciliation
+    model = semantic.get("model", {})
+    model = model if isinstance(model, dict) else {}
+    supplemental = semantic.get("supplemental", {})
+    supplemental = supplemental if isinstance(supplemental, dict) else {}
+    budget = supplemental.get("budget", {})
+    budget = budget if isinstance(budget, dict) else {}
+    lines = [
+        f"Status: {semantic.get('status', 'unknown')}",
+        f"Evidence quality: {semantic.get('evidence_quality', 'unknown')}",
+        f"Model status: {model.get('status', 'unknown')}",
+        "",
+        "Resolved conflicts:",
+        _semantic_conflicts(
+            semantic.get("conflicts_resolved", []),
+            "No semantic conflicts were resolved",
+        ),
+        "",
+        "Remaining disagreements:",
+        _semantic_conflicts(
+            semantic.get("remaining_disagreements", []),
+            "No semantic disagreements remain",
+        ),
+        "",
+        "Rejected findings:",
+        _semantic_rejected_findings(semantic.get("rejected_findings", [])),
+        "",
+        "Supplemental investigation:",
+        (
+            "- "
+            f"status={supplemental.get('status', 'unknown')}, "
+            f"stop_reason={supplemental.get('stop_reason', 'unknown')}, "
+            f"waves={supplemental.get('waves', 0)}, "
+            f"tasks={supplemental.get('tasks', 0)}, "
+            f"completed={supplemental.get('completed', 0)}, "
+            f"partial={supplemental.get('partial', 0)}, "
+            f"failed={supplemental.get('failed', 0)}, "
+            f"unavailable={supplemental.get('unavailable', 0)}"
+        ),
+        "",
+        "Supplemental budget:",
+        _semantic_budget_section(budget),
+        "",
+        "Runtime policy actions:",
+        _string_list(
+            semantic.get("policy_actions", []),
+            "No Runtime policy actions recorded",
+        ),
+        "",
+        "Semantic uncertainties:",
+        _string_list(
+            semantic.get("uncertainties", []),
+            "No semantic uncertainties recorded",
+        ),
+        "",
+        "Semantic manual-review triggers:",
+        _string_list(
+            _semantic_manual_review_reasons(semantic, model, supplemental),
+            "No semantic manual-review trigger recorded",
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def _semantic_conflicts(value: object, fallback: str) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return f"- {fallback}"
+    lines: list[str] = []
+    for row in rows:
+        lines.append(
+            f"- [{row.get('status', 'unknown')}] "
+            f"{row.get('issue', 'No issue recorded')}"
+        )
+        resolution = str(row.get("resolution", "")).strip()
+        if resolution:
+            lines.append(f"  - Resolution: {resolution}")
+        lines.append(
+            "  - Decision: "
+            f"source={row.get('decision_source', 'unknown')}; "
+            f"refs={_inline_value(row.get('decision_refs', [])) or 'none'}"
+        )
+        lines.append(
+            "  - Candidates: "
+            f"{_inline_value(row.get('candidate_ids', [])) or 'none'}"
+        )
+    return "\n".join(lines)
+
+
+def _semantic_rejected_findings(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No findings were rejected by semantic reconciliation"
+    lines: list[str] = []
+    for row in rows:
+        source = (
+            f"reviewer={row.get('reviewer_index', 'unknown')}, "
+            f"role={row.get('role', 'unknown')}, "
+            f"candidate={row.get('candidate_id', 'unknown')}"
+        )
+        lines.append(
+            f"- {row.get('claim', 'No claim recorded')}: "
+            f"{row.get('reason', 'unknown')} ({source})"
+        )
+        lines.append(
+            f"  - Rationale: {row.get('rationale', 'Not recorded')}"
+        )
+        lines.append(
+            "  - Refs: "
+            f"evidence={_inline_value(row.get('evidence_refs', [])) or 'none'}; "
+            f"missing={_inline_value(row.get('missing_evidence_refs', [])) or 'none'}; "
+            f"decision={_inline_value(row.get('decision_refs', [])) or 'none'}; "
+            f"decision_source={row.get('decision_source', 'unknown')}"
+        )
+    return "\n".join(lines)
+
+
+def _semantic_budget_section(budget: dict[str, Any]) -> str:
+    if not budget:
+        return "- No supplemental budget accounting recorded"
+    rows: list[str] = []
+    for key in (
+        "limits",
+        "charged",
+        "unknown_consumed",
+        "reserved",
+        "remaining",
+    ):
+        if key in budget:
+            rows.append(f"- {key}: {_inline_value(budget[key])}")
+    for key in sorted(set(budget) - {"limits", "charged", "unknown_consumed", "reserved", "remaining"}):
+        rows.append(f"- {key}: {_inline_value(budget[key])}")
+    return "\n".join(rows) or "- No supplemental budget accounting recorded"
+
+
+def _semantic_manual_review_reasons(
+    semantic: dict[str, Any],
+    model: dict[str, Any],
+    supplemental: dict[str, Any],
+) -> list[str]:
+    reasons: list[str] = []
+    status = str(semantic.get("status", "")).casefold()
+    model_status = str(model.get("status", "")).casefold()
+    supplemental_status = str(supplemental.get("status", "")).casefold()
+    stop_reason = str(supplemental.get("stop_reason", "")).casefold()
+    if status in {"fallback", "partial"} or model_status == "fallback":
+        reasons.append("Semantic reconciliation used fallback or is partial")
+    if _mapping_rows(semantic.get("remaining_disagreements", [])):
+        reasons.append("Semantic disagreements remain unresolved")
+    if supplemental_status in {
+        "partial",
+        "failed",
+        "unavailable",
+        "budget_exhausted",
+    }:
+        reasons.append(
+            f"Supplemental investigation status is {supplemental_status}"
+        )
+    if stop_reason in {
+        "model_fallback",
+        "task_failure",
+        "budget_exhausted",
+        "max_waves",
+        "unavailable",
+    }:
+        reasons.append(f"Supplemental investigation stopped because {stop_reason}")
+    return list(dict.fromkeys(reasons))
 
 
 def _contract_coverage_section(brief: ReviewBrief) -> str:

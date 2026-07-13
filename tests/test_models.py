@@ -147,6 +147,25 @@ def test_assignment_persists_runtime_compiled_identity() -> None:
     assert assignment.command_permission == "safe_checks_only"
 
 
+def test_assignment_accepts_semantic_reconciler_planner_source() -> None:
+    assignment = Assignment(
+        role="Supplemental Concurrency Reviewer",
+        mission="Resolve one disagreement",
+        assignment_reason=["D-retry requires targeted evidence"],
+        assigned_contract=["supplemental_investigation:D-retry"],
+        required_checks=["inspect the retry path"],
+        initial_context=InitialContext(observation_refs=["O-retry"]),
+        max_turns=4,
+        max_tool_calls=8,
+        assignment_id="SASSIGN-retry",
+        role_kind="specialist",
+        perspective_key="supplemental:concurrency",
+        planner_source="semantic_reconciler",
+    )
+
+    assert assignment.planner_source == "semantic_reconciler"
+
+
 @pytest.mark.parametrize(
     ("field_name", "invalid_value", "message"),
     [

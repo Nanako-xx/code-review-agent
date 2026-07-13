@@ -34,6 +34,7 @@ from review_agent.session import (
     RevisionChangeKind,
     SessionManifest,
     child_session_manifest,
+    session_phases_for_schema,
 )
 from review_agent.session_store import SessionStore
 
@@ -119,7 +120,7 @@ class ReviewSessionResumer:
         reused: list[RunPhase] = []
         starting_phase: RunPhase | None = None
 
-        for phase in PHASE_MESSAGES:
+        for phase in session_phases_for_schema(manifest.schema_version):
             checkpoint = self.session_store.load().phases[phase.value]
             if checkpoint.status is not PhaseStatus.COMPLETED:
                 starting_phase = phase
@@ -134,6 +135,21 @@ class ReviewSessionResumer:
                         _utc_now(),
                     )
                     starting_phase = RunPhase.REVIEWERS
+                    break
+            if (
+                phase is RunPhase.SUPPLEMENTAL_INVESTIGATION
+                and self.session_store.load().supplemental_waves
+            ):
+                failures = pipeline.validate_completed_supplemental_state()
+                if failures:
+                    failure = failures[0]
+                    self.session_store.invalidate_wave_from(
+                        failure.wave_id,
+                        failure.reason,
+                        _utc_now(),
+                        task_id=failure.task_id,
+                    )
+                    starting_phase = RunPhase.SUPPLEMENTAL_INVESTIGATION
                     break
             try:
                 pipeline.load_phase(phase)

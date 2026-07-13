@@ -73,6 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument("--reviewer-api-key-env", default="REVIEW_AGENT_API_KEY")
     _add_model_stage_arguments(review, "risk-assessor")
     _add_model_stage_arguments(review, "portfolio-planner")
+    _add_model_stage_arguments(review, "semantic-reconciler")
 
     resume = subparsers.add_parser(
         "resume",
@@ -214,6 +215,11 @@ def _run_review(args: argparse.Namespace) -> int:
             portfolio_planner=_resolve_model_stage_config(
                 args,
                 "portfolio-planner",
+                execution_config,
+            ),
+            semantic_reconciler=_resolve_model_stage_config(
+                args,
+                "semantic-reconciler",
                 execution_config,
             ),
         )

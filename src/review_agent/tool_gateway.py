@@ -5,6 +5,7 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+from collections.abc import Iterable
 from typing import Any
 
 from review_agent.observations import ObservationStore
@@ -12,7 +13,16 @@ from review_agent.repository_intelligence import collect_python_symbols, search_
 
 
 class ToolGatewayError(ValueError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "tool_error",
+        tool_name: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.tool_name = tool_name
 
 
 @dataclass(frozen=True)
@@ -21,6 +31,17 @@ class ToolExecutionResult:
     observation_ids: list[str]
     context_view: str
     truncated: bool = False
+
+
+SUPPORTED_TOOL_NAMES = (
+    "read_range",
+    "compare_base_head",
+    "search_code",
+    "list_symbols",
+    "inspect_symbol",
+    "find_references",
+    "read_commit_messages",
+)
 
 
 class ToolGateway:
@@ -34,6 +55,7 @@ class ToolGateway:
         timeout_seconds: int = 10,
         max_commit_messages: int = 50,
         max_commit_body_chars: int = 4000,
+        allowed_tools: Iterable[str] | None = None,
     ) -> None:
         self.repository_path = repository_path
         self.base_revision = base_revision
@@ -47,8 +69,33 @@ class ToolGateway:
             raise ValueError("max_commit_body_chars must be a positive integer")
         self.max_commit_messages = max_commit_messages
         self.max_commit_body_chars = max_commit_body_chars
+        if isinstance(allowed_tools, (str, bytes)):
+            raise ValueError("allowed_tools must be an iterable of tool names")
+        requested_tools = (
+            tuple(SUPPORTED_TOOL_NAMES)
+            if allowed_tools is None
+            else tuple(allowed_tools)
+        )
+        if any(not isinstance(name, str) or not name for name in requested_tools):
+            raise ValueError("allowed_tools must contain non-empty strings")
+        unsupported = set(requested_tools) - set(SUPPORTED_TOOL_NAMES)
+        if unsupported:
+            raise ValueError(
+                "unsupported allowed tool(s): " + ", ".join(sorted(unsupported))
+            )
+        self.allowed_tools = frozenset(requested_tools)
+        self.attempted_tool_calls = 0
+        self.denied_tool_calls = 0
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolExecutionResult:
+        self.attempted_tool_calls += 1
+        if tool_name not in self.allowed_tools:
+            self.denied_tool_calls += 1
+            raise ToolGatewayError(
+                f"tool is not allowed for this reviewer task: {tool_name}",
+                code="tool_not_allowed",
+                tool_name=tool_name,
+            )
         if tool_name == "read_range":
             return self._read_range(arguments)
         if tool_name == "compare_base_head":
@@ -63,7 +110,12 @@ class ToolGateway:
             return self._find_references(arguments)
         if tool_name == "read_commit_messages":
             return self._read_commit_messages(arguments)
-        raise ToolGatewayError(f"unsupported tool: {tool_name}")
+        self.denied_tool_calls += 1
+        raise ToolGatewayError(
+            f"unsupported tool: {tool_name}",
+            code="unsupported_tool",
+            tool_name=tool_name,
+        )
 
     def _read_range(self, arguments: dict[str, Any]) -> ToolExecutionResult:
         path = _safe_repo_path(str(arguments["path"]))

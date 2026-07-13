@@ -134,7 +134,7 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypat
     assert brief["change_map_and_repository_impact"]["changed_files"] == ["auth.py"]
     assert brief["initial_and_final_risk_assessment"]["final"]["status"] == "reassessed"
     assert brief["non_binding_recommendation"] == "manual_review"
-    assert session["schema_version"] == 3
+    assert session["schema_version"] == 4
     assert session["status"] == "completed"
     assert session["current_phase"] == "completed"
     assert session["revisions"] == {
@@ -176,6 +176,29 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypat
             "max_output_tokens": 4096,
             "max_provider_attempts": 2,
             "max_elapsed_seconds": 60.0,
+        },
+        "semantic_reconciler": {
+            "mode": "local",
+            "provider": "none",
+            "model": None,
+            "base_url": None,
+            "api_key_env": "REVIEW_AGENT_API_KEY",
+            "max_output_tokens": 4096,
+            "max_provider_attempts": 2,
+            "max_elapsed_seconds": 60.0,
+        },
+        "supplemental_policy": {
+            "version": "supplemental_policy_v1",
+            "risk_level": "critical",
+            "max_waves": 2,
+            "max_tasks": 4,
+            "max_tasks_per_wave": 2,
+            "max_concurrency": 2,
+            "max_turns_per_task": 10,
+            "max_tool_calls_per_task": 24,
+            "max_tokens_per_task": 65536,
+            "max_total_tokens": 262144,
+            "max_elapsed_seconds": 600.0,
         },
     }
     assert secret not in session_text
@@ -253,6 +276,20 @@ def test_cli_model_stage_inherit_and_overrides_persist_concrete_config(
             "4",
             "--portfolio-planner-max-elapsed-seconds",
             "75",
+            "--semantic-reconciler-mode",
+            "model",
+            "--semantic-reconciler-provider",
+            "inherit",
+            "--semantic-reconciler-model",
+            "semantic-model",
+            "--semantic-reconciler-api-key-env",
+            "SEMANTIC_API_KEY",
+            "--semantic-reconciler-max-output-tokens",
+            "3584",
+            "--semantic-reconciler-max-provider-attempts",
+            "5",
+            "--semantic-reconciler-max-elapsed-seconds",
+            "90",
             "--non-interactive",
         ]
     )
@@ -282,8 +319,19 @@ def test_cli_model_stage_inherit_and_overrides_persist_concrete_config(
         "max_provider_attempts": 4,
         "max_elapsed_seconds": 75.0,
     }
+    assert execution["semantic_reconciler"] == {
+        "mode": "model",
+        "provider": "fake",
+        "model": "semantic-model",
+        "base_url": "https://reviewer.example/v1",
+        "api_key_env": "SEMANTIC_API_KEY",
+        "max_output_tokens": 3584,
+        "max_provider_attempts": 5,
+        "max_elapsed_seconds": 90.0,
+    }
     assert execution["risk_assessor"]["provider"] != "inherit"
     assert execution["portfolio_planner"]["provider"] != "inherit"
+    assert execution["semantic_reconciler"]["provider"] != "inherit"
 
 
 def test_cli_model_stage_rejects_inheriting_reviewer_provider_none(
@@ -313,6 +361,30 @@ def test_cli_model_stage_rejects_inheriting_reviewer_provider_none(
 
     assert exit_code == 2
     assert "risk-assessor: mode=model requires" in capsys.readouterr().out
+    assert not (git_repo / ".review-agent" / "runs").exists()
+
+
+def test_cli_semantic_reconciler_rejects_inheriting_reviewer_provider_none(
+    git_repo: Path,
+    capsys,
+) -> None:
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--semantic-reconciler-mode",
+            "model",
+            "--non-interactive",
+        ]
+    )
+
+    assert exit_code == 2
+    assert "semantic-reconciler: mode=model requires" in capsys.readouterr().out
     assert not (git_repo / ".review-agent" / "runs").exists()
 
 

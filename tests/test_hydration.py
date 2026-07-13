@@ -31,6 +31,7 @@ from review_agent.hydration import (
     reviewer_result_from_dict,
     risk_assessment_from_dict,
     risk_packet_from_dict,
+    semantic_reconciliation_from_dict,
 )
 from review_agent.model_protocol import ModelResponse
 from review_agent.models import (
@@ -70,6 +71,11 @@ from review_agent.quality import (
     quality_gate_plan_to_dict,
 )
 from review_agent.reviewer import reviewer_result_to_dict
+from review_agent.reconciler import (
+    deterministic_semantic_reconciliation,
+    semantic_reconciliation_to_dict,
+)
+from review_agent.evidence import ReconciliationPrepass
 
 
 def _json(value: object) -> object:
@@ -438,6 +444,28 @@ def test_downstream_artifacts_round_trip() -> None:
     assert review_brief_from_dict(_json(review_brief_to_dict(brief))) == brief
 
 
+def test_semantic_reconciliation_hydrates_through_the_shared_boundary() -> None:
+    prepass = ReconciliationPrepass(
+        review_id="review-semantic",
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        candidate_catalog={},
+        conflict_hints=[],
+        rejected_findings=[],
+        contract_coverage=[],
+        evidence_quality="verified",
+    )
+    semantic = deterministic_semantic_reconciliation(
+        prepass,
+        status="local_only",
+        model_status="disabled",
+    )
+
+    assert semantic_reconciliation_from_dict(
+        _json(semantic_reconciliation_to_dict(semantic))
+    ) == semantic
+
+
 def test_review_brief_hydration_defaults_missing_orchestration() -> None:
     payload = _json(review_brief_to_dict(_review_brief()))
     payload.pop("orchestration")
@@ -445,6 +473,39 @@ def test_review_brief_hydration_defaults_missing_orchestration() -> None:
     hydrated = review_brief_from_dict(payload)
 
     assert hydrated.orchestration == {}
+
+
+def test_review_brief_hydrates_optional_semantic_sidecar_strictly() -> None:
+    prepass = ReconciliationPrepass(
+        review_id="review-semantic-brief",
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        candidate_catalog={},
+        conflict_hints=[],
+        rejected_findings=[],
+        contract_coverage=[],
+        evidence_quality="verified",
+    )
+    semantic_payload = semantic_reconciliation_to_dict(
+        deterministic_semantic_reconciliation(
+            prepass,
+            status="local_only",
+            model_status="disabled",
+        )
+    )
+    payload = _json(review_brief_to_dict(_review_brief()))
+    assert isinstance(payload, dict)
+    assert "semantic_reconciliation" not in payload
+    payload["semantic_reconciliation"] = semantic_payload
+
+    hydrated = review_brief_from_dict(payload)
+
+    assert hydrated.semantic_reconciliation == semantic_payload
+    assert review_brief_to_dict(hydrated)["semantic_reconciliation"] == semantic_payload
+
+    payload["semantic_reconciliation"]["invented"] = True
+    with pytest.raises(ValueError, match="exact fields"):
+        review_brief_from_dict(payload)
 
 
 def test_review_brief_hydration_accepts_abbreviated_final_risk_payload() -> None:

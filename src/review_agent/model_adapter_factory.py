@@ -115,6 +115,8 @@ def _fake_response_for_request(request: ModelTurnRequest) -> ModelTurnResponse:
         return _fake_risk_proposal_response()
     if response_schema == "portfolio_proposal_v1":
         return _fake_portfolio_proposal_response()
+    if response_schema == "semantic_reconciliation_proposal_v1":
+        return _fake_semantic_reconciliation_response(request)
     if not request.tools or request.parameters.get("tool_choice") == "none":
         return _fake_single_shot_response()
 
@@ -224,6 +226,64 @@ def _fake_portfolio_proposal_response() -> ModelTurnResponse:
         provider_name="fake",
         model="fake-portfolio-planner",
         raw={"fake": True, "response_schema": "portfolio_proposal_v1"},
+    )
+
+
+def _fake_semantic_reconciliation_response(
+    request: ModelTurnRequest,
+) -> ModelTurnResponse:
+    packet: dict[str, object] = {}
+    for message in request.messages:
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            candidate = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and isinstance(
+            candidate.get("candidate_catalog"),
+            dict,
+        ):
+            packet = candidate
+            break
+    catalog = packet.get("candidate_catalog", {})
+    catalog = catalog if isinstance(catalog, dict) else {}
+    groups = []
+    for candidate_id in sorted(catalog):
+        row = catalog[candidate_id]
+        if not isinstance(row, dict):
+            continue
+        refs = row.get("evidence_refs", [])
+        refs = refs if isinstance(refs, list) else []
+        groups.append(
+            {
+                "member_ids": [candidate_id],
+                "representative_id": candidate_id,
+                "canonical_claim": str(row.get("claim", "Verified finding")),
+                "rationale": "Fake provider preserves each Runtime candidate independently.",
+                "supporting_refs": refs,
+                "proposed_confidence": str(row.get("confidence", "low")),
+            }
+        )
+    return ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "canonical_groups": groups,
+                "rejections": [],
+                "disagreements": [],
+                "supplemental_requests": [],
+                "uncertainties": [],
+                "summary": "Fake semantic reconciliation preserved Runtime candidates.",
+            }
+        ),
+        provider_name="fake",
+        model="fake-semantic-reconciler",
+        raw={
+            "fake": True,
+            "response_schema": "semantic_reconciliation_proposal_v1",
+        },
     )
 
 

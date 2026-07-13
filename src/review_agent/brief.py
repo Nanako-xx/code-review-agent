@@ -60,6 +60,7 @@ class ReviewBrief:
     human_review_checklist_and_reading_order: list[str]
     non_binding_recommendation: str
     orchestration: dict[str, Any] = field(default_factory=dict)
+    semantic_reconciliation: dict[str, Any] = field(default_factory=dict)
 
 
 def build_review_brief(
@@ -80,6 +81,7 @@ def build_review_brief(
     final_risk_assessment: dict[str, Any] | None = None,
     incremental_priority: dict[str, Any] | None = None,
     planning_summary: dict[str, Any] | None = None,
+    semantic_reconciliation_payload: dict[str, Any] | None = None,
 ) -> ReviewBrief:
     observations = observation_summaries or {}
     reconciliation = reconciliation_payload or {}
@@ -170,11 +172,15 @@ def build_review_brief(
         ),
         non_binding_recommendation=str(completion.get("recommendation", "manual_review")),
         orchestration=dict(planning_summary or {}),
+        semantic_reconciliation=dict(semantic_reconciliation_payload or {}),
     )
 
 
 def review_brief_to_dict(brief: ReviewBrief) -> dict[str, Any]:
-    return _json_ready(asdict(brief))
+    payload = _json_ready(asdict(brief))
+    if not brief.semantic_reconciliation:
+        payload.pop("semantic_reconciliation", None)
+    return payload
 
 
 def _verified_findings(reconciliation: dict[str, Any]) -> list[BriefFinding]:

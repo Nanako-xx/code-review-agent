@@ -16,6 +16,56 @@ def test_attempt_workspace_uses_phase_and_reviewer_isolation(tmp_path: Path) -> 
     )
 
 
+def test_attempt_workspace_uses_safe_supplemental_task_namespace(
+    tmp_path: Path,
+) -> None:
+    task_id = f"STASK-{'a' * 64}"
+    workspace = AttemptWorkspace(
+        tmp_path,
+        RunPhase.SUPPLEMENTAL_INVESTIGATION,
+        2,
+        task_id=task_id,
+    )
+
+    assert workspace.prepare() == (
+        tmp_path
+        / "attempts"
+        / "s"
+        / "2"
+        / f"t-{task_id.removeprefix('STASK-')[:32]}"
+    )
+
+
+@pytest.mark.parametrize(
+    "task_id",
+    ["", "../escape", "nested/task", "reviewer-0", "STASK with spaces"],
+)
+def test_attempt_workspace_rejects_unsafe_supplemental_task_ids(
+    tmp_path: Path,
+    task_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="task_id"):
+        AttemptWorkspace(
+            tmp_path,
+            RunPhase.SUPPLEMENTAL_INVESTIGATION,
+            1,
+            task_id=task_id,
+        )
+
+
+def test_attempt_workspace_rejects_mixed_reviewer_and_task_namespaces(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        AttemptWorkspace(
+            tmp_path,
+            RunPhase.SUPPLEMENTAL_INVESTIGATION,
+            1,
+            reviewer_index=0,
+            task_id=f"STASK-{'a' * 64}",
+        )
+
+
 def test_attempt_workspace_writes_then_atomically_promotes_file(tmp_path: Path) -> None:
     workspace = AttemptWorkspace(tmp_path, RunPhase.PREFLIGHT, 1)
     workspace.write_json("artifacts/intent.json", {"goal": "safe resume"})

@@ -329,3 +329,137 @@ def test_review_brief_discloses_intent_provenance_and_clarification_history() ->
     assert "Is auth.py the complete intended scope?" in markdown
     assert "Unconfirmed inferred claims:" in markdown
     assert "intended scope contains unconfirmed inferred values" in markdown
+
+
+def test_review_brief_discloses_semantic_and_supplemental_audit_details() -> None:
+    semantic_payload = {
+        "schema_version": "semantic_reconciliation_v1",
+        "status": "partial",
+        "canonical_findings": [],
+        "rejected_findings": [
+            {
+                "candidate_id": "F-1",
+                "reviewer_index": 1,
+                "role": "Adversarial Reviewer",
+                "claim": "Session storage changed",
+                "reason": "unsupported_claim",
+                "rationale": "No authorized Observation supports the claim.",
+                "evidence_refs": ["O-1"],
+                "missing_evidence_refs": ["O-missing"],
+                "decision_refs": ["O-2"],
+                "decision_source": "semantic_reconciler",
+            }
+        ],
+        "conflicts_resolved": [
+            {
+                "conflict_id": "C-resolved",
+                "candidate_ids": ["F-1"],
+                "status": "resolved",
+                "issue": "Two claims used different wording.",
+                "resolution": "They describe the same behavior.",
+                "decision_refs": ["O-1"],
+                "decision_source": "semantic_reconciler",
+            }
+        ],
+        "remaining_disagreements": [
+            {
+                "conflict_id": "C-open",
+                "candidate_ids": ["F-2"],
+                "status": "unresolved",
+                "issue": "Runtime behavior remains unverified.",
+                "resolution": "",
+                "decision_refs": [],
+                "decision_source": "runtime_policy",
+            }
+        ],
+        "contract_coverage": [],
+        "evidence_quality": "mixed",
+        "supplemental": {
+            "status": "budget_exhausted",
+            "waves": 2,
+            "tasks": 3,
+            "completed": 1,
+            "partial": 1,
+            "failed": 0,
+            "unavailable": 1,
+            "budget": {
+                "limits": {"tasks": 3, "tokens": 1000},
+                "charged": {"tasks": 2, "tokens": 600},
+                "unknown_consumed": {"tasks": 1, "tokens": 300},
+                "reserved": {"tasks": 0, "tokens": 0},
+                "remaining": {"tasks": 0, "tokens": 100},
+            },
+            "stop_reason": "max_waves",
+        },
+        "policy_actions": ["preserved_severe_finding:F-2"],
+        "uncertainties": ["A targeted runtime check did not complete."],
+        "model": {
+            "status": "fallback",
+            "invocation_ids": ["I-semantic"],
+            "input_digests": ["a" * 64],
+        },
+    }
+    brief = build_review_brief(
+        review_id="review-semantic-brief",
+        base_revision="base",
+        head_revision="head",
+        intent_packet=IntentPacket(
+            goal="Preserve behavior",
+            status=IntentStatus.SUFFICIENT,
+        ),
+        risk_assessment=RiskAssessment(
+            level=RiskLevel.HIGH,
+            dimensions={},
+            reasons=[],
+            signal_refs=[],
+            uncertainties=[],
+            suggested_focus=[],
+        ),
+        changed_files=["app.py"],
+        quality_results=[],
+        completion_summary={
+            "recommendation": "manual_review",
+            "uncertainties": ["Semantic reconciliation used deterministic fallback"],
+        },
+        semantic_reconciliation_payload=semantic_payload,
+    )
+
+    payload = review_brief_to_dict(brief)
+    markdown = render_review_brief_markdown(brief)
+
+    assert payload["semantic_reconciliation"] == semantic_payload
+    assert "## Semantic Reconciliation And Supplemental Investigation" in markdown
+    assert "Status: partial" in markdown
+    assert "They describe the same behavior." in markdown
+    assert "Runtime behavior remains unverified." in markdown
+    assert "No authorized Observation supports the claim." in markdown
+    assert "decision_source=semantic_reconciler" in markdown
+    assert "status=budget_exhausted, stop_reason=max_waves" in markdown
+    assert "unknown_consumed: tasks=1, tokens=300" in markdown
+    assert "preserved_severe_finding:F-2" in markdown
+    assert "Semantic reconciliation used fallback or is partial" in markdown
+
+
+def test_legacy_review_brief_omits_empty_semantic_sidecar_and_section() -> None:
+    brief = build_review_brief(
+        review_id="review-legacy-brief",
+        base_revision="base",
+        head_revision="head",
+        intent_packet=IntentPacket(goal="Preserve behavior"),
+        risk_assessment=RiskAssessment(
+            level=RiskLevel.LOW,
+            dimensions={},
+            reasons=[],
+            signal_refs=[],
+            uncertainties=[],
+            suggested_focus=[],
+        ),
+        changed_files=[],
+        quality_results=[],
+    )
+
+    assert "semantic_reconciliation" not in review_brief_to_dict(brief)
+    assert (
+        "## Semantic Reconciliation And Supplemental Investigation"
+        not in render_review_brief_markdown(brief)
+    )
