@@ -12,10 +12,24 @@ from review_agent.revision import RepositoryIdentity, ResolvedRevisions
 from review_agent.run_state import RunPhase, RunStatus
 
 
-SESSION_SCHEMA_VERSION = 1
-SESSION_PHASES = (
+LEGACY_SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
+LEGACY_SESSION_PHASES = (
     RunPhase.PREFLIGHT,
     RunPhase.REPOSITORY_INTELLIGENCE,
+    RunPhase.REVIEWERS,
+    RunPhase.RECONCILIATION,
+    RunPhase.COMPLETION,
+    RunPhase.FINAL_RISK,
+    RunPhase.REPORTING,
+)
+SESSION_PHASES = (
+    RunPhase.PREFLIGHT,
+    RunPhase.QUALITY_GATES,
+    RunPhase.REPOSITORY_INTELLIGENCE,
+    RunPhase.INTENT_DISCOVERY,
+    RunPhase.INTENT_RESOLUTION,
+    RunPhase.PLANNING,
     RunPhase.REVIEWERS,
     RunPhase.RECONCILIATION,
     RunPhase.COMPLETION,
@@ -31,6 +45,7 @@ _SHA256_PATTERN = re.compile(r"^[0-9A-Fa-f]{64}$")
 class PhaseStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    AWAITING_USER = "awaiting_user"
     COMPLETED = "completed"
     FAILED = "failed"
     INVALIDATED = "invalidated"
@@ -110,6 +125,8 @@ class ReviewerTaskCheckpoint:
     def __post_init__(self) -> None:
         if not isinstance(self.status, PhaseStatus):
             raise ValueError("status must be a PhaseStatus")
+        if self.status is PhaseStatus.AWAITING_USER:
+            raise ValueError("reviewer task cannot be awaiting_user")
         if type(self.attempts) is not int or self.attempts < 0:
             raise ValueError("attempts must be a non-negative integer")
         artifacts = _immutable_string_tuple(self.artifacts, "artifacts")
@@ -167,6 +184,7 @@ class PhaseCheckpoint:
     artifacts: tuple[str, ...] = field(default_factory=tuple)
     error: str | None = None
     tasks: Mapping[str, ReviewerTaskCheckpoint] = field(default_factory=dict)
+    user_decisions: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, PhaseStatus):
@@ -174,6 +192,10 @@ class PhaseCheckpoint:
         if type(self.attempts) is not int or self.attempts < 0:
             raise ValueError("attempts must be a non-negative integer")
         artifacts = _immutable_string_tuple(self.artifacts, "artifacts")
+        for field_name in ("started_at", "completed_at", "error"):
+            value = getattr(self, field_name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{field_name} must be a non-empty string or null")
         if not isinstance(self.tasks, Mapping):
             raise ValueError("tasks must be a mapping")
         tasks = dict(self.tasks)
@@ -187,8 +209,38 @@ class PhaseCheckpoint:
                 raise ValueError(
                     "reviewer task values must be ReviewerTaskCheckpoint instances"
                 )
+        if not isinstance(self.user_decisions, Mapping):
+            raise ValueError("user_decisions must be a mapping")
+        user_decisions = dict(self.user_decisions)
+        for event_id, artifact_name in user_decisions.items():
+            _require_non_empty_string(event_id, "user decision event id")
+            _require_non_empty_string(artifact_name, "user decision artifact name")
+        if not set(user_decisions.values()).issubset(artifacts):
+            raise ValueError(
+                "user decision artifacts must be retained by the phase checkpoint"
+            )
+        if self.status is PhaseStatus.AWAITING_USER:
+            if (
+                self.attempts < 1
+                or self.started_at is None
+                or self.completed_at is not None
+                or not artifacts
+                or self.error is not None
+                or tasks
+            ):
+                raise ValueError(
+                    "awaiting_user phase must have a started attempt and committed "
+                    "artifacts, no completion, error, or reviewer tasks"
+                )
+        if self.status is PhaseStatus.PENDING and user_decisions:
+            raise ValueError("pending phase cannot contain user decisions")
         object.__setattr__(self, "artifacts", artifacts)
         object.__setattr__(self, "tasks", MappingProxyType(tasks))
+        object.__setattr__(
+            self,
+            "user_decisions",
+            MappingProxyType(user_decisions),
+        )
 
 
 @dataclass(frozen=True)
@@ -213,10 +265,13 @@ class SessionManifest:
     updated_at: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != SESSION_SCHEMA_VERSION:
+        if self.schema_version not in {
+            LEGACY_SESSION_SCHEMA_VERSION,
+            SESSION_SCHEMA_VERSION,
+        }:
             raise ValueError(
-                "schema_version must equal the supported Session schema version "
-                f"{SESSION_SCHEMA_VERSION}"
+                "schema_version must be a supported Session schema version: "
+                f"{LEGACY_SESSION_SCHEMA_VERSION} or {SESSION_SCHEMA_VERSION}"
             )
         _require_non_empty_string(self.review_id, "review_id")
         _require_non_empty_string(self.root_review_id, "root_review_id")
@@ -240,9 +295,35 @@ class SessionManifest:
         if not isinstance(self.phases, Mapping):
             raise ValueError("phases must be a mapping")
         phases = dict(self.phases)
-        expected_phase_names = {phase.value for phase in SESSION_PHASES}
+        layout_phases = (
+            LEGACY_SESSION_PHASES
+            if self.schema_version == LEGACY_SESSION_SCHEMA_VERSION
+            else SESSION_PHASES
+        )
+        expected_phase_names = {phase.value for phase in layout_phases}
+        allowed_current_phases = {
+            RunPhase.CREATED,
+            RunPhase.COMPLETED,
+            RunPhase.FAILED,
+            *layout_phases,
+        }
+        if self.current_phase not in allowed_current_phases:
+            raise ValueError(
+                "current_phase must belong to the Session schema layout or be "
+                "a lifecycle phase"
+            )
+        if (
+            self.last_successful_phase is not None
+            and self.last_successful_phase not in layout_phases
+        ):
+            raise ValueError(
+                "last_successful_phase must belong to the Session schema layout"
+            )
         if set(phases) != expected_phase_names:
-            raise ValueError("phases must contain exactly the persisted SESSION_PHASES")
+            raise ValueError(
+                "phases must contain exactly the persisted phases for its "
+                "Session schema version"
+            )
         if any(
             not isinstance(checkpoint, PhaseCheckpoint)
             for checkpoint in phases.values()
@@ -252,6 +333,20 @@ class SessionManifest:
             if phase_name != RunPhase.REVIEWERS.value and checkpoint.tasks:
                 raise ValueError(
                     "reviewer task checkpoints are allowed only on the reviewers phase"
+                )
+            if (
+                phase_name != RunPhase.INTENT_RESOLUTION.value
+                and checkpoint.user_decisions
+            ):
+                raise ValueError(
+                    "user decisions are allowed only on the intent_resolution phase"
+                )
+            if (
+                checkpoint.status is PhaseStatus.AWAITING_USER
+                and phase_name != RunPhase.INTENT_RESOLUTION.value
+            ):
+                raise ValueError(
+                    "awaiting_user checkpoint is allowed only on intent_resolution"
                 )
         reviewer_checkpoint = phases[RunPhase.REVIEWERS.value]
         if reviewer_checkpoint.status is PhaseStatus.COMPLETED:
@@ -290,6 +385,46 @@ class SessionManifest:
                     f"artifact registry key {registry_name!r} must match "
                     f"descriptor.name {descriptor.name!r}"
                 )
+            if descriptor.phase not in layout_phases:
+                raise ValueError(
+                    "artifact phase must belong to the Session schema layout"
+                )
+
+        awaiting_phases = [
+            phase_name
+            for phase_name, checkpoint in phases.items()
+            if checkpoint.status is PhaseStatus.AWAITING_USER
+        ]
+        if self.status is RunStatus.AWAITING_USER:
+            if (
+                self.schema_version != SESSION_SCHEMA_VERSION
+                or self.current_phase is not RunPhase.INTENT_RESOLUTION
+                or awaiting_phases != [RunPhase.INTENT_RESOLUTION.value]
+            ):
+                raise ValueError(
+                    "awaiting_user Session must be schema v2 and have only the "
+                    "intent_resolution checkpoint awaiting_user"
+                )
+        elif awaiting_phases:
+            raise ValueError(
+                "an awaiting_user phase requires the Session status awaiting_user"
+            )
+
+        if RunPhase.INTENT_RESOLUTION.value in phases:
+            intent_resolution = phases[RunPhase.INTENT_RESOLUTION.value]
+            if intent_resolution.status is PhaseStatus.AWAITING_USER:
+                for artifact_name in intent_resolution.artifacts:
+                    descriptor = artifacts.get(artifact_name)
+                    if descriptor is None:
+                        raise ValueError(
+                            "awaiting_user intent_resolution artifacts must be "
+                            f"registered: {artifact_name}"
+                        )
+                    if descriptor.phase is not RunPhase.INTENT_RESOLUTION:
+                        raise ValueError(
+                            "awaiting_user intent_resolution artifacts must belong "
+                            "to intent_resolution"
+                        )
 
         errors = _immutable_string_tuple(self.errors, "errors")
         object.__setattr__(self, "phases", MappingProxyType(phases))
@@ -465,6 +600,30 @@ def child_session_manifest(
 
 
 def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
+    def phase_payload(checkpoint: PhaseCheckpoint) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "status": checkpoint.status.value,
+            "attempts": checkpoint.attempts,
+            "started_at": checkpoint.started_at,
+            "completed_at": checkpoint.completed_at,
+            "artifacts": list(checkpoint.artifacts),
+            "error": checkpoint.error,
+            "tasks": {
+                task_name: {
+                    "status": task.status.value,
+                    "attempts": task.attempts,
+                    "started_at": task.started_at,
+                    "completed_at": task.completed_at,
+                    "artifacts": list(task.artifacts),
+                    "error": task.error,
+                }
+                for task_name, task in checkpoint.tasks.items()
+            },
+        }
+        if manifest.schema_version >= SESSION_SCHEMA_VERSION:
+            payload["user_decisions"] = dict(checkpoint.user_decisions)
+        return payload
+
     return {
         "schema_version": manifest.schema_version,
         "review_id": manifest.review_id,
@@ -501,25 +660,7 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
             else None
         ),
         "phases": {
-            name: {
-                "status": checkpoint.status.value,
-                "attempts": checkpoint.attempts,
-                "started_at": checkpoint.started_at,
-                "completed_at": checkpoint.completed_at,
-                "artifacts": list(checkpoint.artifacts),
-                "error": checkpoint.error,
-                "tasks": {
-                    task_name: {
-                        "status": task.status.value,
-                        "attempts": task.attempts,
-                        "started_at": task.started_at,
-                        "completed_at": task.completed_at,
-                        "artifacts": list(task.artifacts),
-                        "error": task.error,
-                    }
-                    for task_name, task in checkpoint.tasks.items()
-                },
-            }
+            name: phase_payload(checkpoint)
             for name, checkpoint in manifest.phases.items()
         },
         "artifacts": {
@@ -564,10 +705,14 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
     )
 
     schema_version = _integer(root, "schema_version", "session")
-    if schema_version != SESSION_SCHEMA_VERSION:
+    if schema_version not in {
+        LEGACY_SESSION_SCHEMA_VERSION,
+        SESSION_SCHEMA_VERSION,
+    }:
         raise ValueError(
             "unsupported session schema_version: "
-            f"{schema_version}; expected {SESSION_SCHEMA_VERSION}"
+            f"{schema_version}; expected {LEGACY_SESSION_SCHEMA_VERSION} "
+            f"or {SESSION_SCHEMA_VERSION}"
         )
 
     repository_payload = _object_field(root, "repository", "session")
@@ -664,14 +809,20 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
     )
 
     phases_payload = _object_field(root, "phases", "session")
-    expected_phase_names = {phase.value for phase in SESSION_PHASES}
+    layout_phases = (
+        LEGACY_SESSION_PHASES
+        if schema_version == LEGACY_SESSION_SCHEMA_VERSION
+        else SESSION_PHASES
+    )
+    expected_phase_names = {phase.value for phase in layout_phases}
     _exact_fields(phases_payload, expected_phase_names, "session.phases")
     phases = {
         phase.value: _phase_checkpoint_from_dict(
             _object_field(phases_payload, phase.value, "session.phases"),
             f"session.phases.{phase.value}",
+            schema_version=schema_version,
         )
-        for phase in SESSION_PHASES
+        for phase in layout_phases
     }
 
     artifacts_payload = _object_field(root, "artifacts", "session")
@@ -738,14 +889,20 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
 def _phase_checkpoint_from_dict(
     payload: Mapping[str, Any],
     context: str,
+    *,
+    schema_version: int,
 ) -> PhaseCheckpoint:
     required = {"status", "attempts", "started_at", "completed_at", "artifacts", "error"}
+    optional = {"tasks"}
+    if schema_version == SESSION_SCHEMA_VERSION:
+        required |= {"tasks", "user_decisions"}
+        optional = set()
     missing = required - set(payload)
     if missing:
         raise ValueError(
             f"{context} is missing required field(s): {', '.join(sorted(missing))}"
         )
-    unexpected = set(payload) - required - {"tasks"}
+    unexpected = set(payload) - required - optional
     if unexpected:
         names = ", ".join(sorted(str(name).casefold() for name in unexpected))
         raise ValueError(f"{context} contains unsupported field(s): {names}")
@@ -761,6 +918,16 @@ def _phase_checkpoint_from_dict(
         )
         for task_name, task_payload in tasks_object.items()
     }
+    decisions_payload = payload.get("user_decisions", {})
+    decisions_object = _object(decisions_payload, f"{context}.user_decisions")
+    user_decisions = {
+        _require_non_empty_string(event_id, f"{context}.user_decisions event id"):
+        _require_non_empty_string(
+            artifact_name,
+            f"{context}.user_decisions.{event_id}",
+        )
+        for event_id, artifact_name in decisions_object.items()
+    }
     return PhaseCheckpoint(
         status=_enum_field(PhaseStatus, payload, "status", context),
         attempts=attempts,
@@ -769,6 +936,7 @@ def _phase_checkpoint_from_dict(
         artifacts=_string_list(payload, "artifacts", context),
         error=_optional_string(payload, "error", context),
         tasks=tasks,
+        user_decisions=user_decisions,
     )
 
 

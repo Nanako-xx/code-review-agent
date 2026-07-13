@@ -8,6 +8,7 @@ from typing import Any
 class RunStatus(str, Enum):
     CREATED = "created"
     RUNNING = "running"
+    AWAITING_USER = "awaiting_user"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -17,6 +18,9 @@ class RunPhase(str, Enum):
     PREFLIGHT = "preflight"
     QUALITY_GATES = "quality_gates"
     REPOSITORY_INTELLIGENCE = "repository_intelligence"
+    INTENT_DISCOVERY = "intent_discovery"
+    INTENT_RESOLUTION = "intent_resolution"
+    PLANNING = "planning"
     REVIEWERS = "reviewers"
     RECONCILIATION = "reconciliation"
     COMPLETION = "completion"
@@ -39,6 +43,13 @@ class RunState:
     resolved_head_revision: str | None = None
     artifacts: dict[str, str] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.status is RunStatus.AWAITING_USER:
+            if self.phase is not RunPhase.INTENT_RESOLUTION:
+                raise ValueError(
+                    "awaiting_user RunState is allowed only during intent_resolution"
+                )
 
 
 def initial_run_state(
@@ -78,6 +89,30 @@ def advance_run_state(
         review_id=state.review_id,
         status=status,
         phase=phase,
+        repository_path=state.repository_path,
+        base_revision=state.base_revision,
+        head_revision=state.head_revision,
+        message=message,
+        resolved_base_revision=state.resolved_base_revision,
+        resolved_head_revision=state.resolved_head_revision,
+        artifacts=next_artifacts,
+        errors=list(state.errors),
+    )
+
+
+def await_user_run_state(
+    state: RunState,
+    *,
+    message: str,
+    artifacts: dict[str, str] | None = None,
+) -> RunState:
+    next_artifacts = dict(state.artifacts)
+    if artifacts:
+        next_artifacts.update(artifacts)
+    return RunState(
+        review_id=state.review_id,
+        status=RunStatus.AWAITING_USER,
+        phase=RunPhase.INTENT_RESOLUTION,
         repository_path=state.repository_path,
         base_revision=state.base_revision,
         head_revision=state.head_revision,

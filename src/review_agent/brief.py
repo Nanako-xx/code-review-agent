@@ -4,7 +4,17 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from typing import Any
 
-from review_agent.models import IntentPacket, QualityGateResult, ReviewerResult, RiskAssessment
+from review_agent.models import (
+    ClarificationQuestion,
+    ClarificationStatus,
+    IntentClaim,
+    IntentClaimState,
+    IntentPacket,
+    IntentSource,
+    QualityGateResult,
+    ReviewerResult,
+    RiskAssessment,
+)
 
 
 @dataclass(frozen=True)
@@ -95,11 +105,30 @@ def build_review_brief(
             "scope": list(intent_packet.scope),
             "constraints": list(intent_packet.constraints),
             "sources": {key: value.value for key, value in intent_packet.sources.items()},
+            "provenance": [
+                _intent_claim_to_dict(claim) for claim in intent_packet.provenance
+            ],
         },
         intent_assessment={
             "status": intent_packet.status.value,
             "uncertainties": list(intent_packet.uncertainties),
             "source_counts": _source_counts(intent_packet),
+            "clarification_history": [
+                _clarification_to_dict(question)
+                for question in intent_packet.clarifications
+            ],
+            "unresolved_questions": [
+                _clarification_to_dict(question)
+                for question in intent_packet.clarifications
+                if question.status
+                in {ClarificationStatus.PENDING, ClarificationStatus.OPEN}
+            ],
+            "unconfirmed_inferred_claims": [
+                _intent_claim_to_dict(claim)
+                for claim in intent_packet.provenance
+                if claim.source is IntentSource.INFERRED
+                and claim.claim_state is IntentClaimState.ACTIVE
+            ],
         },
         initial_and_final_risk_assessment={
             "initial": _risk_to_dict(risk_assessment),
@@ -277,6 +306,37 @@ def _source_counts(intent_packet: IntentPacket) -> dict[str, int]:
     for source in intent_packet.sources.values():
         counts[source.value] = counts.get(source.value, 0) + 1
     return counts
+
+
+def _intent_claim_to_dict(claim: IntentClaim) -> dict[str, Any]:
+    return {
+        "claim_id": claim.claim_id,
+        "field": claim.field.value,
+        "value": claim.value,
+        "source": claim.source.value,
+        "origin": claim.origin.value,
+        "confidence": claim.confidence.value,
+        "source_refs": list(claim.source_refs),
+        "evidence_refs": list(claim.evidence_refs),
+        "claim_state": claim.claim_state.value,
+        "conclusion_impact": claim.conclusion_impact.value,
+    }
+
+
+def _clarification_to_dict(question: ClarificationQuestion) -> dict[str, Any]:
+    return {
+        "question_id": question.question_id,
+        "field": question.field.value,
+        "question": question.question,
+        "rationale": question.rationale,
+        "proposed_values": list(question.proposed_values),
+        "claim_ids": list(question.claim_ids),
+        "status": question.status.value,
+        "user_response": question.user_response,
+        "continuation_basis": question.continuation_basis,
+        "resolved_values": list(question.resolved_values),
+        "decision_id": question.decision_id,
+    }
 
 
 def _risk_to_dict(risk_assessment: RiskAssessment) -> dict[str, Any]:

@@ -140,7 +140,8 @@ def test_resume_reuses_completed_reviewer_and_retries_only_failed_task(
 
         def create(self):
             self.created += 1
-            if self.created == 2:
+            # Intent inference creates the first adapter; fail the second reviewer.
+            if self.created == 3:
                 raise RuntimeError("provider timeout")
             return FakeModelAdapterFactory().create()
 
@@ -380,7 +381,7 @@ def test_head_child_missing_incremental_map_rebuilds_preflight(
     )
     payload = json.loads(child_store.session_path.read_text(encoding="utf-8"))
     payload["artifacts"].pop("incremental_priority")
-    payload["phases"]["preflight"]["artifacts"].remove(
+    payload["phases"]["planning"]["artifacts"].remove(
         "incremental_priority"
     )
     child_store.session_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -392,8 +393,8 @@ def test_head_child_missing_incremental_map_rebuilds_preflight(
     ).resume()
 
     repaired = child_store.load()
-    assert result.starting_phase is RunPhase.PREFLIGHT
-    assert repaired.phases["preflight"].attempts == 2
+    assert result.starting_phase is RunPhase.PLANNING
+    assert repaired.phases["planning"].attempts == 2
     assert "incremental_priority" in repaired.artifacts
 
 
@@ -456,9 +457,10 @@ def test_running_child_without_request_restarts_preflight_attempt(
     assert len(child_dirs) == 1
     child_store = SessionStore(child_dirs[0])
     interrupted = child_store.load()
-    assert interrupted.phases["preflight"].status is PhaseStatus.RUNNING
-    assert interrupted.phases["preflight"].attempts == 1
-    assert "request" not in interrupted.artifacts
+    assert interrupted.phases["preflight"].status is PhaseStatus.COMPLETED
+    assert interrupted.phases["quality_gates"].status is PhaseStatus.RUNNING
+    assert interrupted.phases["quality_gates"].attempts == 1
+    assert "request" in interrupted.artifacts
 
     result = ReviewSessionResumer(
         repository=git_repo,
@@ -471,7 +473,8 @@ def test_running_child_without_request_restarts_preflight_attempt(
     assert result.child_created is False
     assert result.new_review_id == child_dirs[0].name
     assert completed.status is RunStatus.COMPLETED
-    assert completed.phases["preflight"].attempts == 2
+    assert completed.phases["preflight"].attempts == 1
+    assert completed.phases["quality_gates"].attempts == 2
 
 
 def test_failed_child_without_request_retries_preflight_attempt(
@@ -511,9 +514,10 @@ def test_failed_child_without_request_retries_preflight_attempt(
     )
     child_store = SessionStore(child_dir)
     failed = child_store.load()
-    assert failed.phases["preflight"].status is PhaseStatus.FAILED
-    assert failed.phases["preflight"].attempts == 1
-    assert "request" not in failed.artifacts
+    assert failed.phases["preflight"].status is PhaseStatus.COMPLETED
+    assert failed.phases["quality_gates"].status is PhaseStatus.FAILED
+    assert failed.phases["quality_gates"].attempts == 1
+    assert "request" in failed.artifacts
 
     result = ReviewSessionResumer(
         repository=git_repo,
@@ -522,7 +526,8 @@ def test_failed_child_without_request_retries_preflight_attempt(
     ).resume()
 
     assert result.child_created is False
-    assert child_store.load().phases["preflight"].attempts == 2
+    assert child_store.load().phases["preflight"].attempts == 1
+    assert child_store.load().phases["quality_gates"].attempts == 2
     assert child_store.load().status is RunStatus.COMPLETED
 
 

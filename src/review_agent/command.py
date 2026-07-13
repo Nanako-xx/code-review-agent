@@ -8,6 +8,7 @@ import uuid
 
 from review_agent.checkpoint import CheckpointStore
 from review_agent.git_repo import ChangeSummary, collect_change_summary
+from review_agent.intent_clarification import ConsoleIntentClarifier
 from review_agent.model_adapter_factory import build_model_adapter_factory_from_config
 from review_agent.models import IntentPacket, QualityGateResult, ReviewRequest, RiskAssessment
 from review_agent.pipeline import (
@@ -43,6 +44,10 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument("--head", required=True)
     review.add_argument("--intent")
     review.add_argument("--focus")
+    review.add_argument("--title")
+    review.add_argument("--description")
+    review.add_argument("--requirement", action="append", default=[])
+    review.add_argument("--project-rule", action="append", default=[])
     review.add_argument("--non-interactive", action="store_true")
     review.add_argument(
         "--reviewer-provider",
@@ -118,8 +123,12 @@ def _run_review(args: argparse.Namespace) -> int:
         repository_path=str(repo),
         base_revision=revisions.requested_base,
         head_revision=revisions.requested_head,
+        title=args.title,
+        description=args.description,
+        linked_requirements=tuple(args.requirement),
         user_intent=args.intent,
         review_focus=args.focus,
+        project_rules=tuple(args.project_rule),
     )
     pipeline = ReviewPipeline(
         repository=repo,
@@ -128,6 +137,7 @@ def _run_review(args: argparse.Namespace) -> int:
         request=request,
         collect_change_summary_fn=collect_change_summary,
         adapter_factory_builder=build_model_adapter_factory_from_config,
+        intent_clarifier=ConsoleIntentClarifier(),
     )
     try:
         result = pipeline.execute()
@@ -146,6 +156,15 @@ def _run_review(args: argparse.Namespace) -> int:
         suffix = "; Session remains retryable" if retryable else ""
         print(f"Review failed: {error}{suffix}", file=sys.stderr)
         return 1
+
+    if result.awaiting_user:
+        print(f"Review awaiting intent clarification: {store.run_dir}")
+        print(f"Review id: {review_id}")
+        for question in result.open_questions:
+            print(f"  [{question.field.value}] {question.question}")
+            print(f"    Why: {question.rationale}")
+        print(f"Resume with: review-agent resume {review_id} --repo {repo}")
+        return 0
 
     context = result.context
     for warning in context.compatibility_warnings:
@@ -200,6 +219,7 @@ def _run_resume(args: argparse.Namespace) -> int:
                 repository=repo,
                 checkpoint_store=store,
                 session_store=session_store,
+                intent_clarifier=ConsoleIntentClarifier(),
             ).resume()
         except ResumeBlockedError as error:
             print(f"Resume blocked: {error}", file=sys.stderr)
@@ -245,6 +265,8 @@ def _run_resume(args: argparse.Namespace) -> int:
         if result.action is ResumeAction.AUDIT_COMPLETED:
             print("  No model or tool execution performed")
             print("  Audit: valid")
+        if result.action is ResumeAction.AWAITING_USER:
+            print("  Intent clarification is still awaiting user input")
         return 0
 
     return _run_legacy_resume(store)

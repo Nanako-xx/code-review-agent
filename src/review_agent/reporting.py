@@ -121,6 +121,9 @@ def _change_intent_section(brief: ReviewBrief) -> str:
             "",
             "Constraints:",
             _string_list(intent.get("constraints", []), "No constraints recorded"),
+            "",
+            "Claim-level provenance:",
+            _intent_provenance_section(intent.get("provenance", [])),
         ]
     )
 
@@ -136,9 +139,120 @@ def _intent_assessment_section(brief: ReviewBrief) -> str:
             "Source counts:",
             _string_list(source_lines, "No intent sources recorded"),
             "",
+            "Clarification and decision history:",
+            _clarification_history_section(
+                assessment.get("clarification_history", [])
+            ),
+            "",
+            "Unresolved clarification questions:",
+            _unresolved_questions_section(
+                assessment.get("unresolved_questions", [])
+            ),
+            "",
+            "Unconfirmed inferred claims:",
+            _unconfirmed_claims_section(
+                assessment.get("unconfirmed_inferred_claims", [])
+            ),
+            "",
             "Intent uncertainties:",
             _string_list(assessment.get("uncertainties", []), "No intent uncertainties recorded"),
         ]
+    )
+
+
+def _intent_provenance_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No claim-level provenance recorded"
+
+    lines: list[str] = []
+    for row in rows:
+        field = row.get("field", "unknown")
+        claim_value = row.get("value", "No value recorded")
+        lines.append(f"- `{field}`: {claim_value}")
+        lines.append(
+            "  - Provenance: "
+            f"{row.get('source', 'unknown')} via {row.get('origin', 'unknown')}; "
+            f"confidence {row.get('confidence', 'unknown')}; "
+            f"state {row.get('claim_state', 'unknown')}; "
+            f"conclusion impact {row.get('conclusion_impact', 'unknown')}"
+        )
+        lines.append(f"  - Claim ID: {row.get('claim_id', 'unknown')}")
+        source_refs = row.get("source_refs", [])
+        if source_refs:
+            lines.append(f"  - Source refs: {_inline_value(source_refs)}")
+        evidence_refs = row.get("evidence_refs", [])
+        if evidence_refs:
+            lines.append(f"  - Evidence refs: {_inline_value(evidence_refs)}")
+    return "\n".join(lines)
+
+
+def _clarification_history_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No clarification decisions recorded"
+
+    lines: list[str] = []
+    for row in rows:
+        lines.append(
+            f"- [{row.get('status', 'unknown')}] "
+            f"`{row.get('field', 'unknown')}`: {row.get('question', '')}"
+        )
+        lines.append(f"  - Question ID: {row.get('question_id', 'unknown')}")
+        lines.append(f"  - Rationale: {row.get('rationale', 'Not recorded')}")
+        claim_ids = row.get("claim_ids", [])
+        if claim_ids:
+            lines.append(f"  - Related claim IDs: {_inline_value(claim_ids)}")
+        proposed_values = row.get("proposed_values", [])
+        if proposed_values:
+            lines.append(f"  - Proposed values: {_inline_value(proposed_values)}")
+        resolved_values = row.get("resolved_values", [])
+        if resolved_values:
+            lines.append(f"  - Resolved values: {_inline_value(resolved_values)}")
+        user_response = row.get("user_response")
+        if user_response:
+            lines.append(f"  - User response: {user_response}")
+        continuation_basis = row.get("continuation_basis")
+        if continuation_basis:
+            lines.append(f"  - Continuation basis: {continuation_basis}")
+        decision_id = row.get("decision_id")
+        if decision_id:
+            lines.append(f"  - Decision ID: {decision_id}")
+    return "\n".join(lines)
+
+
+def _unresolved_questions_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No unresolved clarification questions"
+
+    lines: list[str] = []
+    for row in rows:
+        lines.append(
+            f"- `{row.get('field', 'unknown')}`: {row.get('question', '')} "
+            f"(status: {row.get('status', 'unknown')}; "
+            f"question ID: {row.get('question_id', 'unknown')})"
+        )
+        lines.append(f"  - Rationale: {row.get('rationale', 'Not recorded')}")
+        claim_ids = row.get("claim_ids", [])
+        if claim_ids:
+            lines.append(f"  - Related claim IDs: {_inline_value(claim_ids)}")
+        proposed_values = row.get("proposed_values", [])
+        if proposed_values:
+            lines.append(f"  - Proposed values: {_inline_value(proposed_values)}")
+    return "\n".join(lines)
+
+
+def _unconfirmed_claims_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No unconfirmed inferred claims"
+    return "\n".join(
+        f"- `{row.get('field', 'unknown')}`: {row.get('value', '')} "
+        f"(confidence: {row.get('confidence', 'unknown')}; "
+        f"origin: {row.get('origin', 'unknown')}; "
+        f"claim ID: {row.get('claim_id', 'unknown')})"
+        for row in rows
     )
 
 
@@ -280,6 +394,12 @@ def _string_list(items: object, fallback: str) -> str:
     if not items:
         return f"- {fallback}"
     return "\n".join(f"- {item}" for item in items)
+
+
+def _mapping_rows(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(row) for row in value if isinstance(row, dict)]
 
 
 def _dict_lines(payload: dict[str, Any]) -> str:

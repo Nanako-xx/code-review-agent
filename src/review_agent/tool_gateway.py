@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path, PurePosixPath
+import re
 import subprocess
 from typing import Any
 
@@ -31,6 +32,8 @@ class ToolGateway:
         observation_store: ObservationStore,
         max_context_chars: int = 4000,
         timeout_seconds: int = 10,
+        max_commit_messages: int = 50,
+        max_commit_body_chars: int = 4000,
     ) -> None:
         self.repository_path = repository_path
         self.base_revision = base_revision
@@ -38,6 +41,12 @@ class ToolGateway:
         self.observation_store = observation_store
         self.max_context_chars = max_context_chars
         self.timeout_seconds = timeout_seconds
+        if type(max_commit_messages) is not int or max_commit_messages < 1:
+            raise ValueError("max_commit_messages must be a positive integer")
+        if type(max_commit_body_chars) is not int or max_commit_body_chars < 1:
+            raise ValueError("max_commit_body_chars must be a positive integer")
+        self.max_commit_messages = max_commit_messages
+        self.max_commit_body_chars = max_commit_body_chars
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolExecutionResult:
         if tool_name == "read_range":
@@ -52,6 +61,8 @@ class ToolGateway:
             return self._inspect_symbol(arguments)
         if tool_name == "find_references":
             return self._find_references(arguments)
+        if tool_name == "read_commit_messages":
+            return self._read_commit_messages(arguments)
         raise ToolGatewayError(f"unsupported tool: {tool_name}")
 
     def _read_range(self, arguments: dict[str, Any]) -> ToolExecutionResult:
@@ -195,6 +206,55 @@ class ToolGateway:
         )
         return ToolExecutionResult("find_references", [observation.observation_id], context_view, truncated)
 
+    def _read_commit_messages(self, arguments: dict[str, Any]) -> ToolExecutionResult:
+        _validate_commit_message_arguments(
+            arguments,
+            self.base_revision,
+            self.head_revision,
+        )
+        requested_max = arguments.get("max_commits", self.max_commit_messages)
+        if type(requested_max) is not int or requested_max < 1:
+            raise ToolGatewayError("max_commits must be a positive integer")
+        limit = min(requested_max, self.max_commit_messages)
+        revision_range = f"{self.base_revision}..{self.head_revision}"
+        raw_log = _run_git(
+            self.repository_path,
+            [
+                "log",
+                f"--max-count={limit + 1}",
+                "--format=%H%x00%s%x00%b%x00%x1e",
+                revision_range,
+            ],
+            self.timeout_seconds,
+            allow_exit_codes={0},
+        )
+        parsed = _parse_commit_messages(
+            raw_log,
+            max_body_chars=self.max_commit_body_chars,
+        )
+        commit_count_truncated = len(parsed) > limit
+        commits = parsed[:limit]
+        raw_content = json.dumps(commits, ensure_ascii=False, indent=2)
+        context_view, context_truncated = _context_view(
+            raw_content,
+            self.max_context_chars,
+        )
+        observation = self.observation_store.record(
+            source="git.read_commit_messages",
+            revision=revision_range,
+            path=None,
+            line_start=None,
+            line_end=None,
+            raw_content=raw_content,
+            context_view=context_view,
+        )
+        return ToolExecutionResult(
+            "read_commit_messages",
+            [observation.observation_id],
+            context_view,
+            commit_count_truncated or context_truncated,
+        )
+
     def _resolve_revision(self, revision_label: str) -> tuple[str, str]:
         if revision_label == "base":
             return "base", self.base_revision
@@ -227,6 +287,108 @@ def _run_git(repo: Path, args: list[str], timeout_seconds: int, allow_exit_codes
     if result.returncode not in allow_exit_codes:
         raise ToolGatewayError(result.stderr.strip() or f"git {' '.join(args)} failed")
     return result.stdout
+
+
+_COMMIT_MESSAGE_ARGUMENTS = {
+    "max_commits",
+    "base_revision",
+    "head_revision",
+    "base",
+    "head",
+    "revision",
+    "revision_range",
+}
+
+
+def _validate_commit_message_arguments(
+    arguments: dict[str, Any],
+    base_revision: str,
+    head_revision: str,
+) -> None:
+    unexpected = set(arguments) - _COMMIT_MESSAGE_ARGUMENTS
+    if unexpected:
+        raise ToolGatewayError(
+            "unsupported read_commit_messages argument(s): "
+            + ", ".join(sorted(str(item) for item in unexpected))
+        )
+    for key in ("base_revision", "base"):
+        if key in arguments and arguments[key] != base_revision:
+            raise ToolGatewayError(
+                f"unauthorized revision binding for {key}: {arguments[key]}"
+            )
+    for key in ("head_revision", "head"):
+        if key in arguments and arguments[key] != head_revision:
+            raise ToolGatewayError(
+                f"unauthorized revision binding for {key}: {arguments[key]}"
+            )
+    expected_range = f"{base_revision}..{head_revision}"
+    for key in ("revision", "revision_range"):
+        if key not in arguments:
+            continue
+        if arguments[key] not in {expected_range, "base..head"}:
+            raise ToolGatewayError(
+                f"unauthorized revision binding for {key}: {arguments[key]}"
+            )
+
+
+def _parse_commit_messages(
+    raw_log: str,
+    *,
+    max_body_chars: int,
+) -> list[dict[str, Any]]:
+    commits: list[dict[str, Any]] = []
+    for record in raw_log.split("\x1e"):
+        record = record.strip("\r\n")
+        if not record:
+            continue
+        parts = record.split("\x00", 3)
+        if len(parts) < 3:
+            raise ToolGatewayError("git log returned an invalid commit record")
+        commit_hash, subject, body = parts[:3]
+        message_body, trailers = _split_commit_trailers(body)
+        commits.append(
+            {
+                "hash": commit_hash.strip(),
+                "subject": _bounded_commit_text(subject.strip(), 500),
+                "body": _bounded_commit_text(message_body, max_body_chars),
+                "trailers": [
+                    {
+                        "key": _bounded_commit_text(key, 200),
+                        "value": _bounded_commit_text(value, 1000),
+                    }
+                    for key, value in trailers
+                ],
+            }
+        )
+    return commits
+
+
+_TRAILER_PATTERN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9-]*):[ \t]*(.+)$")
+
+
+def _split_commit_trailers(body: str) -> tuple[str, list[tuple[str, str]]]:
+    lines = body.rstrip().splitlines()
+    trailers_reversed: list[tuple[str, str]] = []
+    index = len(lines) - 1
+    while index >= 0:
+        match = _TRAILER_PATTERN.match(lines[index])
+        if match is None:
+            break
+        trailers_reversed.append((match.group(1), match.group(2).strip()))
+        index -= 1
+    if not trailers_reversed:
+        return body.strip(), []
+    remaining = lines[: index + 1]
+    while remaining and not remaining[-1].strip():
+        remaining.pop()
+    return "\n".join(remaining).strip(), list(reversed(trailers_reversed))
+
+
+def _bounded_commit_text(content: str, max_chars: int) -> str:
+    if len(content) <= max_chars:
+        return content
+    marker = "\n[truncated]"
+    return content[: max(0, max_chars - len(marker))] + marker
 
 
 def _context_view(content: str, max_chars: int) -> tuple[str, bool]:

@@ -19,9 +19,19 @@ from review_agent.incremental import (
 from review_agent.model_protocol import ModelResponse
 from review_agent.models import (
     Assignment,
+    ClarificationQuestion,
+    ClarificationStatus,
+    ConclusionImpact,
     ContractAssessment,
     ContractItemStatus,
     InitialContext,
+    IntentClaim,
+    IntentClaimState,
+    IntentConfidence,
+    IntentDecision,
+    IntentDecisionAction,
+    IntentField,
+    IntentOrigin,
     IntentPacket,
     IntentSource,
     IntentStatus,
@@ -80,7 +90,7 @@ def review_request_from_dict(payload: Mapping[str, Any]) -> ReviewRequest:
 
 def intent_from_dict(payload: Mapping[str, Any]) -> IntentPacket:
     item = _object(payload, "intent")
-    _exact(
+    _required_with_optional(
         item,
         {
             "goal",
@@ -91,6 +101,7 @@ def intent_from_dict(payload: Mapping[str, Any]) -> IntentPacket:
             "status",
             "uncertainties",
         },
+        {"provenance", "clarifications"},
         "intent",
     )
     sources_payload = _object_field(item, "sources", "intent")
@@ -107,6 +118,169 @@ def intent_from_dict(payload: Mapping[str, Any]) -> IntentPacket:
         sources=sources,
         status=_enum_field(IntentStatus, item, "status", "intent"),
         uncertainties=_string_list(item, "uncertainties", "intent"),
+        provenance=(
+            [_intent_claim(row, f"intent.provenance[{index}]") for index, row in enumerate(_list_field(item, "provenance", "intent"))]
+            if "provenance" in item
+            else []
+        ),
+        clarifications=(
+            [
+                _clarification_question(
+                    row,
+                    f"intent.clarifications[{index}]",
+                )
+                for index, row in enumerate(
+                    _list_field(item, "clarifications", "intent")
+                )
+            ]
+            if "clarifications" in item
+            else []
+        ),
+    )
+
+
+def intent_claims_from_dict(payload: Mapping[str, Any]) -> list[IntentClaim]:
+    item = _object(payload, "intent_candidates")
+    _required_with_optional(
+        item,
+        {"claims"},
+        {"uncertainties"},
+        "intent_candidates",
+    )
+    return [
+        _intent_claim(row, f"intent_candidates.claims[{index}]")
+        for index, row in enumerate(
+            _list_field(item, "claims", "intent_candidates")
+        )
+    ]
+
+
+def clarification_questions_from_dict(
+    payload: Mapping[str, Any],
+) -> list[ClarificationQuestion]:
+    item = _object(payload, "intent_questions")
+    _exact(item, {"questions"}, "intent_questions")
+    return [
+        _clarification_question(row, f"intent_questions.questions[{index}]")
+        for index, row in enumerate(
+            _list_field(item, "questions", "intent_questions")
+        )
+    ]
+
+
+def intent_decision_from_dict(payload: Mapping[str, Any]) -> IntentDecision:
+    item = _object(payload, "intent_decision")
+    _exact(
+        item,
+        {
+            "question_id",
+            "action",
+            "corrected_values",
+            "user_response",
+            "continuation_basis",
+            "decision_id",
+        },
+        "intent_decision",
+    )
+    return IntentDecision(
+        question_id=_string(item, "question_id", "intent_decision"),
+        action=_enum_field(
+            IntentDecisionAction,
+            item,
+            "action",
+            "intent_decision",
+        ),
+        corrected_values=_string_list(
+            item,
+            "corrected_values",
+            "intent_decision",
+        ),
+        user_response=_optional_string(
+            item,
+            "user_response",
+            "intent_decision",
+        ),
+        continuation_basis=_optional_string(
+            item,
+            "continuation_basis",
+            "intent_decision",
+        ),
+        decision_id=_string(item, "decision_id", "intent_decision"),
+    )
+
+
+def _intent_claim(value: Any, context: str) -> IntentClaim:
+    item = _object(value, context)
+    _exact(
+        item,
+        {
+            "field",
+            "value",
+            "source",
+            "origin",
+            "confidence",
+            "source_refs",
+            "evidence_refs",
+            "claim_state",
+            "conclusion_impact",
+            "claim_id",
+        },
+        context,
+    )
+    return IntentClaim(
+        field=_enum_field(IntentField, item, "field", context),
+        value=_string(item, "value", context),
+        source=_enum_field(IntentSource, item, "source", context),
+        origin=_enum_field(IntentOrigin, item, "origin", context),
+        confidence=_enum_field(IntentConfidence, item, "confidence", context),
+        source_refs=_string_list(item, "source_refs", context),
+        evidence_refs=_string_list(item, "evidence_refs", context),
+        claim_state=_enum_field(IntentClaimState, item, "claim_state", context),
+        conclusion_impact=_enum_field(
+            ConclusionImpact,
+            item,
+            "conclusion_impact",
+            context,
+        ),
+        claim_id=_string(item, "claim_id", context),
+    )
+
+
+def _clarification_question(value: Any, context: str) -> ClarificationQuestion:
+    item = _object(value, context)
+    _exact(
+        item,
+        {
+            "field",
+            "question",
+            "rationale",
+            "proposed_values",
+            "claim_ids",
+            "status",
+            "user_response",
+            "continuation_basis",
+            "resolved_values",
+            "decision_id",
+            "question_id",
+        },
+        context,
+    )
+    return ClarificationQuestion(
+        field=_enum_field(IntentField, item, "field", context),
+        question=_string(item, "question", context),
+        rationale=_string(item, "rationale", context),
+        proposed_values=_string_list(item, "proposed_values", context),
+        claim_ids=_string_list(item, "claim_ids", context),
+        status=_enum_field(ClarificationStatus, item, "status", context),
+        user_response=_optional_string(item, "user_response", context),
+        continuation_basis=_optional_string(
+            item,
+            "continuation_basis",
+            context,
+        ),
+        resolved_values=_string_list(item, "resolved_values", context),
+        decision_id=_optional_string(item, "decision_id", context),
+        question_id=_string(item, "question_id", context),
     )
 
 
@@ -520,9 +694,10 @@ def review_brief_from_dict(payload: Mapping[str, Any]) -> ReviewBrief:
 def _review_brief_change_intent(value: Any) -> dict[str, Any]:
     context = "review_brief.change_intent"
     item = _object(value, context)
-    _exact(
+    _required_with_optional(
         item,
         {"goal", "acceptance_criteria", "scope", "constraints", "sources"},
+        {"provenance"},
         context,
     )
     sources_payload = _object_field(item, "sources", context)
@@ -531,20 +706,38 @@ def _review_brief_change_intent(value: Any) -> dict[str, Any]:
         if not isinstance(key, str) or not key:
             raise ValueError(f"{context}.sources keys must be non-empty strings")
         sources[key] = _enum(IntentSource, source, f"{context}.sources.{key}").value
-    return {
+    result: dict[str, Any] = {
         "goal": _optional_string(item, "goal", context),
         "acceptance_criteria": _string_list(item, "acceptance_criteria", context),
         "scope": _string_list(item, "scope", context),
         "constraints": _string_list(item, "constraints", context),
         "sources": sources,
     }
+    if "provenance" in item:
+        result["provenance"] = [
+            _review_brief_intent_claim(
+                row,
+                f"{context}.provenance[{index}]",
+            )
+            for index, row in enumerate(_list_field(item, "provenance", context))
+        ]
+    return result
 
 
 def _review_brief_intent_assessment(value: Any) -> dict[str, Any]:
     context = "review_brief.intent_assessment"
     item = _object(value, context)
-    _exact(item, {"status", "uncertainties", "source_counts"}, context)
-    return {
+    _required_with_optional(
+        item,
+        {"status", "uncertainties", "source_counts"},
+        {
+            "clarification_history",
+            "unresolved_questions",
+            "unconfirmed_inferred_claims",
+        },
+        context,
+    )
+    result: dict[str, Any] = {
         "status": _enum_field(IntentStatus, item, "status", context).value,
         "uncertainties": _string_list(item, "uncertainties", context),
         "source_counts": _non_negative_integer_mapping(
@@ -552,6 +745,88 @@ def _review_brief_intent_assessment(value: Any) -> dict[str, Any]:
             "source_counts",
             context,
         ),
+    }
+    if "clarification_history" in item:
+        result["clarification_history"] = [
+            _review_brief_clarification(
+                row,
+                f"{context}.clarification_history[{index}]",
+            )
+            for index, row in enumerate(
+                _list_field(item, "clarification_history", context)
+            )
+        ]
+    if "unresolved_questions" in item:
+        unresolved_questions = [
+            _review_brief_clarification(
+                row,
+                f"{context}.unresolved_questions[{index}]",
+            )
+            for index, row in enumerate(
+                _list_field(item, "unresolved_questions", context)
+            )
+        ]
+        if any(
+            row["status"]
+            not in {ClarificationStatus.PENDING.value, ClarificationStatus.OPEN.value}
+            for row in unresolved_questions
+        ):
+            raise ValueError(
+                f"{context}.unresolved_questions must contain only pending or open questions"
+            )
+        result["unresolved_questions"] = unresolved_questions
+    if "unconfirmed_inferred_claims" in item:
+        unconfirmed_claims = [
+            _review_brief_intent_claim(
+                row,
+                f"{context}.unconfirmed_inferred_claims[{index}]",
+            )
+            for index, row in enumerate(
+                _list_field(item, "unconfirmed_inferred_claims", context)
+            )
+        ]
+        if any(
+            row["source"] != IntentSource.INFERRED.value
+            or row["claim_state"] != IntentClaimState.ACTIVE.value
+            for row in unconfirmed_claims
+        ):
+            raise ValueError(
+                f"{context}.unconfirmed_inferred_claims must contain only active inferred claims"
+            )
+        result["unconfirmed_inferred_claims"] = unconfirmed_claims
+    return result
+
+
+def _review_brief_intent_claim(value: Any, context: str) -> dict[str, Any]:
+    claim = _intent_claim(value, context)
+    return {
+        "claim_id": claim.claim_id,
+        "field": claim.field.value,
+        "value": claim.value,
+        "source": claim.source.value,
+        "origin": claim.origin.value,
+        "confidence": claim.confidence.value,
+        "source_refs": list(claim.source_refs),
+        "evidence_refs": list(claim.evidence_refs),
+        "claim_state": claim.claim_state.value,
+        "conclusion_impact": claim.conclusion_impact.value,
+    }
+
+
+def _review_brief_clarification(value: Any, context: str) -> dict[str, Any]:
+    question = _clarification_question(value, context)
+    return {
+        "question_id": question.question_id,
+        "field": question.field.value,
+        "question": question.question,
+        "rationale": question.rationale,
+        "proposed_values": list(question.proposed_values),
+        "claim_ids": list(question.claim_ids),
+        "status": question.status.value,
+        "user_response": question.user_response,
+        "continuation_basis": question.continuation_basis,
+        "resolved_values": list(question.resolved_values),
+        "decision_id": question.decision_id,
     }
 
 

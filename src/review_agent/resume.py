@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
 import json
@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 from review_agent.artifacts import artifact_schema
 from review_agent.checkpoint import CheckpointStore
 from review_agent.hydration import review_request_from_dict
+from review_agent.intent_clarification import IntentClarifier
 from review_agent.incremental import (
     classify_revision_change,
     deterministic_child_review_id,
@@ -28,6 +29,7 @@ from review_agent.revision import (
 )
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
+    LEGACY_SESSION_SCHEMA_VERSION,
     PhaseStatus,
     RevisionChangeKind,
     SessionManifest,
@@ -40,6 +42,7 @@ class ResumeAction(str, Enum):
     AUDIT_COMPLETED = "audit_completed"
     CONTINUE_SESSION = "continue_session"
     CREATE_INCREMENTAL_SESSION = "create_incremental_session"
+    AWAITING_USER = "awaiting_user"
     BLOCKED = "blocked"
 
 
@@ -70,11 +73,13 @@ class ReviewSessionResumer:
         checkpoint_store: CheckpointStore,
         session_store: SessionStore,
         resolver: RevisionResolver | None = None,
+        intent_clarifier: IntentClarifier | None = None,
     ) -> None:
         self.repository = Path(repository).resolve()
         self.checkpoint_store = checkpoint_store
         self.session_store = session_store
         self.resolver = resolver or RevisionResolver()
+        self.intent_clarifier = intent_clarifier
 
     def resume(self) -> ResumeResult:
         manifest = self.session_store.load()
@@ -82,6 +87,19 @@ class ReviewSessionResumer:
             manifest
         )
         request = self._load_request(manifest)
+        if manifest.schema_version == LEGACY_SESSION_SCHEMA_VERSION:
+            if manifest.status is not RunStatus.COMPLETED:
+                raise ResumeBlockedError(
+                    "schema v1 Session is read-only; start a new schema v2 review"
+                )
+            return ResumeResult(
+                action=ResumeAction.AUDIT_COMPLETED,
+                manifest=manifest,
+                starting_phase=None,
+                reused_phases=tuple(
+                    RunPhase(phase) for phase in manifest.phases
+                ),
+            )
         change_kind = classify_revision_change(manifest, current_revisions)
         if change_kind is not RevisionChangeKind.INITIAL:
             return self._resume_incremental_child(
@@ -96,6 +114,7 @@ class ReviewSessionResumer:
             checkpoint_store=self.checkpoint_store,
             session_store=self.session_store,
             request=request,
+            intent_clarifier=self.intent_clarifier,
         )
         reused: list[RunPhase] = []
         starting_phase: RunPhase | None = None
@@ -133,6 +152,51 @@ class ReviewSessionResumer:
                 starting_phase = phase
                 break
             reused.append(phase)
+
+        if starting_phase is RunPhase.INTENT_RESOLUTION:
+            checkpoint = self.session_store.load().phases[
+                RunPhase.INTENT_RESOLUTION.value
+            ]
+            if checkpoint.status is PhaseStatus.AWAITING_USER:
+                if self.intent_clarifier is None:
+                    return ResumeResult(
+                        action=ResumeAction.AWAITING_USER,
+                        manifest=self.session_store.load(),
+                        starting_phase=starting_phase,
+                        reused_phases=tuple(reused),
+                    )
+                pipeline.apply_submitted_intent_decisions()
+                open_questions = [
+                    question
+                    for question in pipeline.context.intent_questions
+                    if question.status.value in {"pending", "open"}
+                ]
+                for question in open_questions:
+                    decision = self.intent_clarifier.decide(question)
+                    if decision is None:
+                        return ResumeResult(
+                            action=ResumeAction.AWAITING_USER,
+                            manifest=self.session_store.load(),
+                            starting_phase=starting_phase,
+                            reused_phases=tuple(reused),
+                        )
+                    artifact_name = f"intent_decision_{decision.decision_id}"
+                    filename = f"intent_decision_{decision.decision_id}.json"
+                    self.checkpoint_store.write_json(filename, asdict(decision))
+                    self.session_store.register_existing_artifact(
+                        name=artifact_name,
+                        relative_path=filename,
+                        schema=artifact_schema(artifact_name),
+                        phase=RunPhase.INTENT_RESOLUTION,
+                        revision_binding=pipeline.context.revision_binding,
+                        now=_utc_now(),
+                    )
+                    self.session_store.submit_user_decision(
+                        decision.decision_id,
+                        artifact_name,
+                        _utc_now(),
+                    )
+                self.session_store.resume_awaiting_user(_utc_now())
 
         if starting_phase is None:
             latest = self.session_store.load()
@@ -236,6 +300,7 @@ class ReviewSessionResumer:
                 checkpoint_store=child_checkpoint,
                 session_store=child_store,
                 request=request,
+                intent_clarifier=self.intent_clarifier,
             ).execute(
                 starting_phase=RunPhase.PREFLIGHT,
                 resuming=preflight.status is not PhaseStatus.PENDING,
@@ -248,6 +313,7 @@ class ReviewSessionResumer:
                 checkpoint_store=child_checkpoint,
                 session_store=child_store,
                 resolver=self.resolver,
+                intent_clarifier=self.intent_clarifier,
             ).resume()
             pipeline_result = nested_result.pipeline_result
             starting_phase = nested_result.starting_phase

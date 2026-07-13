@@ -86,6 +86,8 @@ def _factory_fake_adapter() -> FakeToolCallingAdapter:
 
 
 def _fake_response_for_request(request: ModelTurnRequest) -> ModelTurnResponse:
+    if request.parameters.get("response_schema") == "intent_inference_result_v1":
+        return _fake_intent_inference_response()
     if not request.tools or request.parameters.get("tool_choice") == "none":
         return _fake_single_shot_response()
 
@@ -103,6 +105,35 @@ def _fake_response_for_request(request: ModelTurnRequest) -> ModelTurnResponse:
         )
 
     return _fake_completed_agent_loop_response("", request)
+
+
+def _fake_intent_inference_response() -> ModelTurnResponse:
+    return ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "candidates": [
+                    {
+                        "field": "goal",
+                        "value": "Review the behavior changed between the resolved base and head revisions.",
+                        "origin": "llm_inference",
+                        "confidence": "low",
+                        "source_refs": [],
+                        "evidence_refs": [],
+                        "rationale": "The fake provider exercises intent inference without claiming repository evidence.",
+                        "conclusion_impact": "material",
+                    }
+                ],
+                "uncertainties": [
+                    "Fake provider does not perform semantic intent analysis."
+                ],
+                "summary": "Fake intent inference executed.",
+            }
+        ),
+        provider_name="fake",
+        model="fake-intent-analyst",
+        raw={"fake": True, "response_schema": "intent_inference_result_v1"},
+    )
 
 
 def _fake_single_shot_response() -> ModelTurnResponse:

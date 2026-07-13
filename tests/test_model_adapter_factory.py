@@ -144,6 +144,43 @@ def test_factory_fake_agent_loop_after_tool_result_completes_citing_latest_obser
     assert payload["contract_assessments"][0]["evidence_refs"] == ["obs-123"]
 
 
+def test_factory_fake_adapter_dispatches_intent_inference_schema_without_changing_reviewer_behavior():
+    factory = build_model_adapter_factory_from_config(
+        ModelAdapterConfig(
+            provider_name="fake",
+            model=None,
+            base_url=None,
+            api_key_env="REVIEW_AGENT_API_KEY",
+        )
+    )
+    adapter = factory.create()
+
+    intent_response = adapter.complete_turn(
+        ModelTurnRequest(
+            system="You are the Intent Analyst.",
+            tools=[ModelToolSpec(name="read_commit_messages", description="Read commits")],
+            messages=[{"role": "user", "content": "Infer intent"}],
+            tool_results=[],
+            parameters={
+                "tool_choice": "auto",
+                "response_schema": "intent_inference_result_v1",
+            },
+        )
+    )
+    reviewer_response = adapter.complete_turn(_agent_loop_request(""))
+    intent_payload = json.loads(intent_response.final_text)
+    reviewer_payload = json.loads(reviewer_response.final_text)
+
+    assert intent_response.kind is ModelResponseKind.FINAL
+    assert intent_response.model == "fake-intent-analyst"
+    assert intent_payload["summary"] == "Fake intent inference executed."
+    assert intent_payload["candidates"][0]["origin"] == "llm_inference"
+    assert set(intent_payload) == {"candidates", "uncertainties", "summary"}
+    assert reviewer_response.kind is ModelResponseKind.FINAL
+    assert reviewer_response.model == "fake-reviewer"
+    assert reviewer_payload["status"] == "completed"
+
+
 def test_factory_creates_openai_compatible_adapter(monkeypatch):
     monkeypatch.setenv("REVIEW_AGENT_API_KEY", "secret-key")
 

@@ -5,8 +5,17 @@ from dataclasses import replace
 import pytest
 
 from review_agent.revision import RepositoryIdentity, ResolvedRevisions
-from review_agent.run_state import RunPhase, RunStatus
+from review_agent.run_state import (
+    RunPhase,
+    RunStatus,
+    await_user_run_state,
+    initial_run_state,
+    run_state_from_dict,
+    run_state_to_dict,
+)
 from review_agent.session import (
+    LEGACY_SESSION_PHASES,
+    LEGACY_SESSION_SCHEMA_VERSION,
     SESSION_PHASES,
     SESSION_SCHEMA_VERSION,
     ArtifactDescriptor,
@@ -91,6 +100,20 @@ def test_session_manifest_round_trips_with_pending_phases() -> None:
     assert list(payload["phases"]) == [phase.value for phase in SESSION_PHASES]
     assert payload["phases"]["preflight"]["status"] == "pending"
     assert payload["phases"]["reviewers"]["tasks"] == {}
+    assert payload["phases"]["intent_resolution"]["user_decisions"] == {}
+    assert SESSION_PHASES == (
+        RunPhase.PREFLIGHT,
+        RunPhase.QUALITY_GATES,
+        RunPhase.REPOSITORY_INTELLIGENCE,
+        RunPhase.INTENT_DISCOVERY,
+        RunPhase.INTENT_RESOLUTION,
+        RunPhase.PLANNING,
+        RunPhase.REVIEWERS,
+        RunPhase.RECONCILIATION,
+        RunPhase.COMPLETION,
+        RunPhase.FINAL_RISK,
+        RunPhase.REPORTING,
+    )
 
 
 def test_session_manifest_round_trips_reviewer_task_checkpoints() -> None:
@@ -135,14 +158,157 @@ def test_session_manifest_round_trips_reviewer_task_checkpoints() -> None:
     assert payload["phases"]["reviewers"]["tasks"]["reviewer-1"]["attempts"] == 2
 
 
-def test_session_manifest_loads_batch_a_v1_without_task_fields() -> None:
+def test_session_manifest_loads_v1_layout_without_synthesizing_new_results() -> None:
     payload = session_manifest_to_dict(manifest())
+    payload["schema_version"] = LEGACY_SESSION_SCHEMA_VERSION
+    payload["phases"] = {
+        phase.value: payload["phases"][phase.value]
+        for phase in LEGACY_SESSION_PHASES
+    }
     for checkpoint in payload["phases"].values():
         checkpoint.pop("tasks")
+        checkpoint.pop("user_decisions")
 
     loaded = session_manifest_from_dict(payload)
 
+    assert loaded.schema_version == LEGACY_SESSION_SCHEMA_VERSION
+    assert list(loaded.phases) == [phase.value for phase in LEGACY_SESSION_PHASES]
+    assert "quality_gates" not in loaded.phases
+    assert "intent_discovery" not in loaded.phases
+    assert "intent_resolution" not in loaded.phases
+    assert "planning" not in loaded.phases
     assert all(not checkpoint.tasks for checkpoint in loaded.phases.values())
+    assert all(not checkpoint.user_decisions for checkpoint in loaded.phases.values())
+    assert session_manifest_to_dict(loaded)["schema_version"] == 1
+
+
+def test_awaiting_user_manifest_round_trips_with_committed_artifacts() -> None:
+    original = manifest()
+    descriptors = {
+        name: artifact_descriptor(
+            name=name,
+            path=f"{name}.json",
+            schema=f"{name}_v1",
+            phase=RunPhase.INTENT_RESOLUTION,
+            revision_binding=f"{'a' * 40}..{'b' * 40}",
+        )
+        for name in ("intent_candidates", "intent_questions")
+    }
+    awaiting = PhaseCheckpoint(
+        status=PhaseStatus.AWAITING_USER,
+        attempts=1,
+        started_at=NOW,
+        artifacts=tuple(descriptors),
+    )
+    original = replace(
+        original,
+        status=RunStatus.AWAITING_USER,
+        current_phase=RunPhase.INTENT_RESOLUTION,
+        phases={
+            **original.phases,
+            RunPhase.INTENT_RESOLUTION.value: awaiting,
+        },
+        artifacts=descriptors,
+    )
+
+    loaded = session_manifest_from_dict(session_manifest_to_dict(original))
+
+    assert loaded == original
+    assert loaded.status is RunStatus.AWAITING_USER
+    assert loaded.phases["intent_resolution"].completed_at is None
+    assert loaded.phases["intent_resolution"].artifacts == (
+        "intent_candidates",
+        "intent_questions",
+    )
+
+
+def test_awaiting_user_invariants_reject_wrong_phase_or_session_status() -> None:
+    original = manifest()
+    descriptor = artifact_descriptor(
+        name="intent_questions",
+        path="intent_questions.json",
+        schema="intent_questions_v1",
+        phase=RunPhase.INTENT_RESOLUTION,
+        revision_binding=f"{'a' * 40}..{'b' * 40}",
+    )
+    awaiting = PhaseCheckpoint(
+        status=PhaseStatus.AWAITING_USER,
+        attempts=1,
+        started_at=NOW,
+        artifacts=("intent_questions",),
+    )
+
+    with pytest.raises(ValueError, match="only on intent_resolution"):
+        replace(
+            original,
+            status=RunStatus.AWAITING_USER,
+            current_phase=RunPhase.INTENT_RESOLUTION,
+            phases={**original.phases, "planning": awaiting},
+            artifacts={"intent_questions": descriptor},
+        )
+    with pytest.raises(ValueError, match="requires the Session status"):
+        replace(
+            original,
+            status=RunStatus.RUNNING,
+            current_phase=RunPhase.INTENT_RESOLUTION,
+            phases={**original.phases, "intent_resolution": awaiting},
+            artifacts={"intent_questions": descriptor},
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"attempts": 0},
+        {"started_at": None},
+        {"completed_at": "2026-07-10T00:01:00Z"},
+        {"artifacts": ()},
+        {"error": "not a wait"},
+    ],
+)
+def test_awaiting_user_checkpoint_requires_nonterminal_committed_state(
+    changes: dict[str, object],
+) -> None:
+    values = {
+        "status": PhaseStatus.AWAITING_USER,
+        "attempts": 1,
+        "started_at": NOW,
+        "completed_at": None,
+        "artifacts": ("intent_questions",),
+        "error": None,
+    }
+    values.update(changes)
+
+    with pytest.raises(ValueError, match="awaiting_user phase"):
+        PhaseCheckpoint(**values)
+
+
+def test_reviewer_task_explicitly_rejects_awaiting_user() -> None:
+    with pytest.raises(ValueError, match="reviewer task cannot"):
+        ReviewerTaskCheckpoint(status=PhaseStatus.AWAITING_USER)
+
+
+def test_run_state_round_trips_awaiting_user_and_new_phases() -> None:
+    state = initial_run_state(
+        review_id="review-1",
+        repository_path="C:/repo",
+        base_revision="main",
+        head_revision="HEAD",
+    )
+    waiting = await_user_run_state(
+        state,
+        message="Clarification required",
+        artifacts={"intent_questions": "intent_questions.json"},
+    )
+
+    assert run_state_from_dict(run_state_to_dict(waiting)) == waiting
+    assert waiting.status is RunStatus.AWAITING_USER
+    assert waiting.phase is RunPhase.INTENT_RESOLUTION
+
+    payload = run_state_to_dict(waiting)
+    payload["phase"] = RunPhase.PLANNING.value
+    with pytest.raises(ValueError, match="only during intent_resolution"):
+        run_state_from_dict(payload)
 
 
 def test_session_manifest_rejects_reviewer_tasks_on_other_phases() -> None:

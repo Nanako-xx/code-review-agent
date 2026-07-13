@@ -179,7 +179,11 @@ LLM 可以从 `head_revision` 的实现形态推断“这次修改似乎想达�
 如果 `inferred` 意图与 `base_revision` 的既有行为、明确文档、测试或用户声明冲突，该冲突本身就是审查线索；
 系统应把它记录为 `uncertainty`、风险理由或候选 finding，而不是把错误实现直接当作真实需求。
 
+Commit message 中的字面需求声明可以作为 `explicit` 来源；模型基于提交历史模式作出的解释仍是 `inferred`。测试中的明确说明可以作为 `explicit` 来源，但普通测试实现、当前断言或 Head 中新增测试的行为不能仅因存在于测试文件就自动成为真实需求。
+
 Intent Packet 的主要作用是让系统判断“当前意图理解是否足够支持可靠审查”。只有当缺失信息可能改变审查结论时，系统才向用户提出具体问题。
+
+Intent 来源和确认状态按具体 claim 记录，而不是只靠字段级标签。同一个列表字段可以同时包含 `explicit`、`inferred`、已否定和已替换的条目；字段级 `sources` 只是最终有效值的兼容摘要。`scope` 表示预期修改边界，不能直接把 `changed_files` 当作已经确认的 scope；changed files 只能提供 inferred 候选和调查起点。
 
 最小核心内容：
 
@@ -244,6 +248,8 @@ Agent 只提出可能改变审查结论的具体问题，例如：
 用户可以回答，也可以选择 `continue with uncertainty`。未知答案本身是有效信息，必须进入报告。
 
 `Uncertainties` 只记录经过 `explicit` 收集、`inferred` 推断和必要用户确认之后，仍然没有可用结论的意图项或运行条件。已经形成可用推断的项标记为 `inferred`；被用户确认后升级为 `explicit`；被用户否定、跳过、无法确认，且系统也无法形成稳定推断的项，进入 `Uncertainties`。
+
+用户“否定”和“跳过”具有不同语义：否定会使对应 inferred claim 失效，不能继续作为有效意图；跳过或无法确认时，稳定推断可以保留为 `inferred`，但必须记录 continuation basis 并使 IntentStatus 保持 `partial` 或 `insufficient`。交互问题等待用户时，Session 进入可恢复的 `awaiting_user`，而不是失败或长期保持普通 `running`；已提交的候选、问题和用户决策在恢复时不得重复生成或重复询问。
 
 ## 7. Deterministic Quality Gates
 
@@ -1300,11 +1306,13 @@ M1 完成时，应能在一个本地 Python Git 仓库中：
 11. 生成人类可审计的 Markdown/JSON Review Brief。
 12. 不修改代码、不自动发布评论、不自动合并。
 
-### 23.1 实现状态（2026-07-12）
+### 23.1 实现状态（2026-07-13）
 
 Runtime Review Contract Enforcement 已落地：合法 Observation revision allowlist、严格新 Finding 输出、assigned Contract completion validator、Agent Loop completion 拒绝/重试、single/multi/no-provider 统一 reconciliation/completion，以及无 Core Reviewer 时 `blocked` 均已进入主路径。`Session.status=completed` 仅表示执行生命周期结束，审查结论以 `completion.json` 为准。
 
-仍待后续本地批次实现：Intent Manager 与用户澄清、完整 Quality Gates、模型辅助 Risk/Portfolio、Reviewer 并行与失败隔离、语义 Reconciler 和有界补充调查。Eval 与 GitHub/PR 集成继续独立延期。
+Intent Clarification 与 LLM Intent Inference 已落地：claim 级 provenance、受控 Tool Gateway 推断、Runtime 来源与 Observation authority 校验、material question 生成、confirm/correct/reject/skip、非交互降级、`awaiting_user` Session、幂等 decision artifact 与 resume、revision drift child Session 重新推断，以及 JSON/Markdown Brief 和 Reviewer Context 传播均已进入主路径。
+
+仍待后续本地批次实现：完整 Quality Gates、模型辅助 Risk/Portfolio、Reviewer 并行与失败隔离、语义 Reconciler 和有界补充调查。Eval 与 GitHub/PR 集成继续独立延期。
 
 ## 24. 实现同步原则
 

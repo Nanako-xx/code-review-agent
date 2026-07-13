@@ -1,5 +1,12 @@
 from review_agent.brief import build_review_brief, review_brief_to_dict
 from review_agent.models import (
+    ClarificationQuestion,
+    ClarificationStatus,
+    IntentClaim,
+    IntentClaimState,
+    IntentConfidence,
+    IntentField,
+    IntentOrigin,
     IntentPacket,
     IntentSource,
     IntentStatus,
@@ -180,3 +187,115 @@ def test_render_review_brief_markdown_uses_spec_section_order() -> None:
     assert positions == sorted(positions)
     assert "Risk level: medium" in markdown
     assert "Manual review required before merge." in markdown
+
+
+def test_review_brief_discloses_intent_provenance_and_clarification_history() -> None:
+    superseded_goal = IntentClaim(
+        field=IntentField.GOAL,
+        value="Infer the auth behavior",
+        source=IntentSource.INFERRED,
+        origin=IntentOrigin.LLM_INFERENCE,
+        confidence=IntentConfidence.MEDIUM,
+        source_refs=["request:description"],
+        evidence_refs=["O-intent-1"],
+        claim_state=IntentClaimState.SUPERSEDED,
+    )
+    corrected_goal = IntentClaim(
+        field=IntentField.GOAL,
+        value="Reject expired auth tokens",
+        source=IntentSource.EXPLICIT,
+        origin=IntentOrigin.USER_CORRECTION,
+        confidence=IntentConfidence.HIGH,
+        source_refs=["clarification:goal"],
+    )
+    inferred_scope = IntentClaim(
+        field=IntentField.SCOPE,
+        value="auth.py",
+        source=IntentSource.INFERRED,
+        origin=IntentOrigin.CHANGED_FILES,
+        confidence=IntentConfidence.LOW,
+        source_refs=["changed_file:auth.py"],
+    )
+    corrected_question = ClarificationQuestion(
+        field=IntentField.GOAL,
+        question="Is the inferred goal correct?",
+        rationale="The goal changes the behavioral correctness conclusion.",
+        proposed_values=[superseded_goal.value],
+        claim_ids=[superseded_goal.claim_id],
+        status=ClarificationStatus.CORRECTED,
+        user_response="The review should cover expired tokens.",
+        resolved_values=[corrected_goal.value],
+        decision_id="decision-goal-correction",
+    )
+    open_question = ClarificationQuestion(
+        field=IntentField.SCOPE,
+        question="Is auth.py the complete intended scope?",
+        rationale="The changed file is the only available scope signal.",
+        proposed_values=[inferred_scope.value],
+        claim_ids=[inferred_scope.claim_id],
+        status=ClarificationStatus.OPEN,
+    )
+    intent = IntentPacket(
+        goal=corrected_goal.value,
+        scope=[inferred_scope.value],
+        sources={
+            IntentField.GOAL.value: IntentSource.EXPLICIT,
+            IntentField.SCOPE.value: IntentSource.INFERRED,
+        },
+        status=IntentStatus.PARTIAL,
+        uncertainties=["intended scope contains unconfirmed inferred values"],
+        provenance=[superseded_goal, corrected_goal, inferred_scope],
+        clarifications=[corrected_question, open_question],
+    )
+    brief = build_review_brief(
+        review_id="review-intent-history",
+        base_revision="base",
+        head_revision="head",
+        intent_packet=intent,
+        risk_assessment=RiskAssessment(
+            level=RiskLevel.MEDIUM,
+            dimensions={},
+            reasons=[],
+            signal_refs=[],
+            uncertainties=[],
+            suggested_focus=[],
+        ),
+        changed_files=["auth.py"],
+        quality_results=[],
+    )
+
+    payload = review_brief_to_dict(brief)
+
+    provenance = payload["change_intent"]["provenance"]
+    assert provenance[0] == {
+        "claim_id": superseded_goal.claim_id,
+        "field": "goal",
+        "value": "Infer the auth behavior",
+        "source": "inferred",
+        "origin": "llm_inference",
+        "confidence": "medium",
+        "source_refs": ["request:description"],
+        "evidence_refs": ["O-intent-1"],
+        "claim_state": "superseded",
+        "conclusion_impact": "material",
+    }
+    assessment = payload["intent_assessment"]
+    assert assessment["clarification_history"][0]["status"] == "corrected"
+    assert (
+        assessment["clarification_history"][0]["decision_id"]
+        == "decision-goal-correction"
+    )
+    assert assessment["unresolved_questions"] == [
+        assessment["clarification_history"][1]
+    ]
+    assert assessment["unconfirmed_inferred_claims"] == [provenance[2]]
+
+    markdown = render_review_brief_markdown(brief)
+    assert "Claim-level provenance:" in markdown
+    assert "inferred via changed_files" in markdown
+    assert "Clarification and decision history:" in markdown
+    assert "Decision ID: decision-goal-correction" in markdown
+    assert "Unresolved clarification questions:" in markdown
+    assert "Is auth.py the complete intended scope?" in markdown
+    assert "Unconfirmed inferred claims:" in markdown
+    assert "intended scope contains unconfirmed inferred values" in markdown

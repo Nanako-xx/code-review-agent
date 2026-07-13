@@ -15,6 +15,7 @@ from review_agent.checkpoint import _atomic_write_text, _fsync_parent_directory
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
     SESSION_PHASES,
+    SESSION_SCHEMA_VERSION,
     ArtifactDescriptor,
     PhaseCheckpoint,
     PhaseStatus,
@@ -38,6 +39,10 @@ class SessionStore:
         self.session_path = self.run_dir / "session.json"
 
     def create(self, manifest: SessionManifest) -> Path:
+        if manifest.schema_version != SESSION_SCHEMA_VERSION:
+            raise ValueError(
+                "new Sessions must use the current Session schema version"
+            )
         self.run_dir.mkdir(parents=True, exist_ok=True)
         content = self._serialize(manifest)
         staging = self.session_path.with_name(
@@ -69,6 +74,7 @@ class SessionStore:
 
     def write(self, manifest: SessionManifest) -> Path:
         current = self.load()
+        self._require_current_layout(current)
         self._require_immutable_metadata(current, manifest)
         if current.status is RunStatus.COMPLETED:
             if manifest == current:
@@ -76,6 +82,14 @@ class SessionStore:
             raise ValueError("completed Session is immutable and cannot be reopened")
         _atomic_write_text(self.session_path, self._serialize(manifest))
         return self.session_path
+
+    @staticmethod
+    def _require_current_layout(manifest: SessionManifest) -> None:
+        if manifest.schema_version != SESSION_SCHEMA_VERSION:
+            raise ValueError(
+                "schema v1 Session is available for read-only audit; start a new "
+                "schema v2 Session to use state transitions"
+            )
 
     @staticmethod
     def _require_immutable_metadata(
@@ -113,6 +127,7 @@ class SessionStore:
     ) -> SessionManifest:
         phase = _require_session_phase(phase)
         current = self.load()
+        self._require_current_layout(current)
         existing = current.artifacts.get(name)
         if current.status is RunStatus.COMPLETED and existing is None:
             raise ValueError("cannot register a new artifact on a completed Session")
@@ -222,6 +237,7 @@ class SessionStore:
     def mark_phase_running(self, phase: RunPhase, now: str) -> SessionManifest:
         phase = _require_session_phase(phase)
         current = self.load()
+        self._require_current_layout(current)
         if current.status is RunStatus.COMPLETED:
             raise ValueError("cannot run a phase on a completed Session")
         self._require_predecessors_completed(current, phase)
@@ -233,6 +249,10 @@ class SessionStore:
             raise ValueError(
                 f"completed phase {phase.value} is invalid: {validation.reason}"
             )
+        if checkpoint.status is PhaseStatus.AWAITING_USER:
+            raise ValueError(
+                "use resume_awaiting_user to resume an awaiting_user phase"
+            )
         if checkpoint.status is PhaseStatus.RUNNING:
             return current
 
@@ -243,7 +263,9 @@ class SessionStore:
             attempts=checkpoint.attempts + 1,
             started_at=now,
             completed_at=None,
-            artifacts=(),
+            artifacts=(
+                checkpoint.artifacts if checkpoint.user_decisions else ()
+            ),
             error=None,
         )
         updated = replace(
@@ -256,9 +278,178 @@ class SessionStore:
         self.write(updated)
         return updated
 
+    def mark_phase_awaiting_user(
+        self,
+        phase: RunPhase,
+        artifact_names: Iterable[str],
+        now: str,
+    ) -> SessionManifest:
+        phase = _require_session_phase(phase)
+        if phase is not RunPhase.INTENT_RESOLUTION:
+            raise ValueError(
+                "awaiting_user is allowed only for intent_resolution"
+            )
+        current = self.load()
+        self._require_current_layout(current)
+        if current.status is RunStatus.COMPLETED:
+            raise ValueError("cannot await user input on a completed Session")
+        self._require_predecessors_completed(current, phase)
+        checkpoint = current.phases[phase.value]
+        requested_artifacts = _unique_artifact_names(artifact_names)
+        if not requested_artifacts:
+            raise ValueError(
+                "awaiting_user intent_resolution must retain committed question "
+                "or candidate artifacts"
+            )
+        if checkpoint.status is PhaseStatus.AWAITING_USER:
+            if (
+                current.status is RunStatus.AWAITING_USER
+                and current.current_phase is RunPhase.INTENT_RESOLUTION
+                and set(requested_artifacts) == set(checkpoint.artifacts)
+            ):
+                self._require_complete_phase_artifact_set(
+                    current,
+                    phase,
+                    checkpoint.artifacts,
+                )
+                return current
+            raise ValueError(
+                "intent_resolution is already awaiting_user with a different "
+                "artifact set"
+            )
+        if checkpoint.status is not PhaseStatus.RUNNING:
+            raise ValueError(
+                "intent_resolution must be running before awaiting_user"
+            )
+        self._require_no_completed_successors(current, phase)
+        self._require_complete_phase_artifact_set(
+            current,
+            phase,
+            requested_artifacts,
+        )
+
+        phases = dict(current.phases)
+        phases[phase.value] = replace(
+            checkpoint,
+            status=PhaseStatus.AWAITING_USER,
+            completed_at=None,
+            artifacts=requested_artifacts,
+            error=None,
+        )
+        updated = replace(
+            current,
+            status=RunStatus.AWAITING_USER,
+            current_phase=RunPhase.INTENT_RESOLUTION,
+            phases=phases,
+            updated_at=now,
+        )
+        self.write(updated)
+        return updated
+
+    def submit_user_decision(
+        self,
+        event_id: str,
+        artifact_name: str,
+        now: str,
+    ) -> SessionManifest:
+        _require_non_empty_string(event_id, "event_id")
+        _require_non_empty_string(artifact_name, "artifact_name")
+        current = self.load()
+        self._require_current_layout(current)
+        checkpoint = current.phases[RunPhase.INTENT_RESOLUTION.value]
+        existing_artifact = checkpoint.user_decisions.get(event_id)
+        if existing_artifact is not None:
+            if existing_artifact != artifact_name:
+                raise ValueError(
+                    f"user decision {event_id!r} was already submitted with a "
+                    "different artifact"
+                )
+            self._require_valid_phase_artifact(
+                current,
+                RunPhase.INTENT_RESOLUTION,
+                artifact_name,
+            )
+            return current
+        if (
+            current.status is not RunStatus.AWAITING_USER
+            or current.current_phase is not RunPhase.INTENT_RESOLUTION
+            or checkpoint.status is not PhaseStatus.AWAITING_USER
+        ):
+            raise ValueError(
+                "new user decisions may be submitted only while "
+                "intent_resolution is awaiting_user"
+            )
+        self._require_valid_phase_artifact(
+            current,
+            RunPhase.INTENT_RESOLUTION,
+            artifact_name,
+        )
+
+        user_decisions = dict(checkpoint.user_decisions)
+        user_decisions[event_id] = artifact_name
+        checkpoint_artifacts = tuple(
+            dict.fromkeys((*checkpoint.artifacts, artifact_name))
+        )
+        phases = dict(current.phases)
+        phases[RunPhase.INTENT_RESOLUTION.value] = replace(
+            checkpoint,
+            artifacts=checkpoint_artifacts,
+            user_decisions=user_decisions,
+        )
+        updated = replace(current, phases=phases, updated_at=now)
+        self.write(updated)
+        return updated
+
+    def resume_awaiting_user(self, now: str) -> SessionManifest:
+        current = self.load()
+        self._require_current_layout(current)
+        checkpoint = current.phases[RunPhase.INTENT_RESOLUTION.value]
+        if (
+            current.status is RunStatus.RUNNING
+            and current.current_phase is RunPhase.INTENT_RESOLUTION
+            and checkpoint.status is PhaseStatus.RUNNING
+            and checkpoint.user_decisions
+        ):
+            return current
+        if (
+            current.status is not RunStatus.AWAITING_USER
+            or current.current_phase is not RunPhase.INTENT_RESOLUTION
+            or checkpoint.status is not PhaseStatus.AWAITING_USER
+        ):
+            raise ValueError(
+                "Session is not awaiting_user during intent_resolution"
+            )
+        if not checkpoint.user_decisions:
+            raise ValueError(
+                "cannot resume awaiting_user without a submitted user decision"
+            )
+        self._require_complete_phase_artifact_set(
+            current,
+            RunPhase.INTENT_RESOLUTION,
+            checkpoint.artifacts,
+        )
+
+        phases = dict(current.phases)
+        phases[RunPhase.INTENT_RESOLUTION.value] = replace(
+            checkpoint,
+            status=PhaseStatus.RUNNING,
+            completed_at=None,
+            error=None,
+        )
+        updated = replace(
+            current,
+            status=RunStatus.RUNNING,
+            current_phase=RunPhase.INTENT_RESOLUTION,
+            phases=phases,
+            updated_at=now,
+        )
+        self.write(updated)
+        return updated
+
     def restart_running_phase(self, phase: RunPhase, now: str) -> SessionManifest:
         phase = _require_session_phase(phase)
         current = self.load()
+        self._require_current_layout(current)
         checkpoint = current.phases[phase.value]
         if checkpoint.status is not PhaseStatus.RUNNING:
             raise ValueError(f"phase {phase.value} is not running")
@@ -269,7 +460,9 @@ class SessionStore:
             attempts=checkpoint.attempts + 1,
             started_at=now,
             completed_at=None,
-            artifacts=(),
+            artifacts=(
+                checkpoint.artifacts if checkpoint.user_decisions else ()
+            ),
             error=None,
         )
         updated = replace(
@@ -291,9 +484,14 @@ class SessionStore:
         phase = _require_session_phase(phase)
         preserve = set(_unique_artifact_names(preserve_names))
         current = self.load()
+        self._require_current_layout(current)
         checkpoint = current.phases[phase.value]
         if checkpoint.status is PhaseStatus.COMPLETED:
             raise ValueError("cannot discard artifacts from a completed phase")
+        if checkpoint.status is PhaseStatus.AWAITING_USER:
+            raise ValueError(
+                "cannot discard committed artifacts while awaiting_user"
+            )
         phase_registry = {
             name
             for name, descriptor in current.artifacts.items()
@@ -309,6 +507,9 @@ class SessionStore:
         }
         if not task_artifacts.issubset(preserve):
             raise ValueError("completed reviewer task artifacts must be preserved")
+        decision_artifacts = set(checkpoint.user_decisions.values())
+        if not decision_artifacts.issubset(preserve):
+            raise ValueError("submitted user decision artifacts must be preserved")
         artifacts = {
             name: descriptor
             for name, descriptor in current.artifacts.items()
@@ -343,6 +544,7 @@ class SessionStore:
     ) -> SessionManifest:
         names = _unique_reviewer_task_names(task_names)
         current = self.load()
+        self._require_current_layout(current)
         checkpoint = current.phases[RunPhase.REVIEWERS.value]
         if checkpoint.status is not PhaseStatus.RUNNING:
             raise ValueError("reviewers phase must be running before tasks are initialized")
@@ -365,6 +567,7 @@ class SessionStore:
         now: str,
     ) -> SessionManifest:
         current = self.load()
+        self._require_current_layout(current)
         checkpoint = current.phases[RunPhase.REVIEWERS.value]
         if checkpoint.status is not PhaseStatus.RUNNING:
             raise ValueError("reviewers phase must be running")
@@ -396,6 +599,7 @@ class SessionStore:
         now: str,
     ) -> SessionManifest:
         current = self.load()
+        self._require_current_layout(current)
         checkpoint = current.phases[RunPhase.REVIEWERS.value]
         if checkpoint.status is not PhaseStatus.RUNNING:
             raise ValueError("reviewers phase must be running")
@@ -424,6 +628,7 @@ class SessionStore:
         now: str,
     ) -> SessionManifest:
         current = self.load()
+        self._require_current_layout(current)
         checkpoint = current.phases[RunPhase.REVIEWERS.value]
         if checkpoint.status is not PhaseStatus.RUNNING:
             raise ValueError("reviewers phase must be running")
@@ -466,6 +671,7 @@ class SessionStore:
         if not isinstance(error, str) or not error.strip():
             raise ValueError("error must be a non-empty string")
         current = self.load()
+        self._require_current_layout(current)
         checkpoint = current.phases[RunPhase.REVIEWERS.value]
         if checkpoint.status is not PhaseStatus.RUNNING:
             raise ValueError("reviewers phase must be running")
@@ -513,6 +719,7 @@ class SessionStore:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("reason must be a non-empty string")
         current = self.load()
+        self._require_current_layout(current)
         phase_index = SESSION_PHASES.index(phase)
         invalidated_phases = set(SESSION_PHASES[phase_index:])
         checkpoint = current.phases[phase.value]
@@ -587,6 +794,7 @@ class SessionStore:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("reason must be a non-empty string")
         current = self.load()
+        self._require_current_layout(current)
         reviewer_checkpoint = current.phases[RunPhase.REVIEWERS.value]
         task = _reviewer_task(reviewer_checkpoint, task_name)
         if task.status is PhaseStatus.PENDING:
@@ -650,7 +858,7 @@ class SessionStore:
             current,
             status=RunStatus.RUNNING,
             current_phase=RunPhase.REVIEWERS,
-            last_successful_phase=RunPhase.REPOSITORY_INTELLIGENCE,
+            last_successful_phase=RunPhase.PLANNING,
             phases=phases,
             artifacts=artifacts,
             errors=(*current.errors, message),
@@ -668,6 +876,7 @@ class SessionStore:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("reason must be a non-empty string")
         current = self.load()
+        self._require_current_layout(current)
         checkpoint = current.phases[RunPhase.REVIEWERS.value]
         preserved = {
             artifact_name
@@ -711,7 +920,7 @@ class SessionStore:
             current,
             status=RunStatus.RUNNING,
             current_phase=RunPhase.REVIEWERS,
-            last_successful_phase=RunPhase.REPOSITORY_INTELLIGENCE,
+            last_successful_phase=RunPhase.PLANNING,
             phases=phases,
             artifacts=artifacts,
             errors=(*current.errors, message),
@@ -729,6 +938,7 @@ class SessionStore:
     ) -> SessionManifest:
         phase = _require_session_phase(phase)
         current = self.load()
+        self._require_current_layout(current)
         checkpoint = current.phases[phase.value]
         requested_artifacts = _unique_artifact_names(artifact_names)
         if checkpoint.status is PhaseStatus.COMPLETED:
@@ -745,6 +955,10 @@ class SessionStore:
             )
         if current.status is RunStatus.COMPLETED:
             raise ValueError("cannot reopen a completed Session")
+        if checkpoint.status is PhaseStatus.AWAITING_USER:
+            raise ValueError(
+                "resume intent_resolution before marking it completed"
+            )
         self._require_predecessors_completed(current, phase)
 
         if phase is RunPhase.REVIEWERS and checkpoint.tasks:
@@ -778,6 +992,7 @@ class SessionStore:
             artifacts=requested_artifacts,
             error=None,
             tasks=checkpoint.tasks,
+            user_decisions=checkpoint.user_decisions,
         )
         updated = replace(
             current,
@@ -792,6 +1007,7 @@ class SessionStore:
 
     def mark_session_completed(self, now: str) -> SessionManifest:
         current = self.load()
+        self._require_current_layout(current)
         self._validate_completion_candidate(current)
         if current.status is RunStatus.COMPLETED:
             return current
@@ -807,6 +1023,7 @@ class SessionStore:
         return updated
 
     def _validate_completion_candidate(self, current: SessionManifest) -> None:
+        self._require_current_layout(current)
         incomplete = [
             phase.value
             for phase in SESSION_PHASES
@@ -854,6 +1071,7 @@ class SessionStore:
         if not isinstance(error, str) or not error.strip():
             raise ValueError("error must be a non-empty string")
         current = self.load()
+        self._require_current_layout(current)
         checkpoint = current.phases[phase.value]
         if current.status is RunStatus.COMPLETED:
             raise ValueError("cannot fail a completed Session")
@@ -878,7 +1096,10 @@ class SessionStore:
             status=PhaseStatus.FAILED,
             attempts=(
                 checkpoint.attempts
-                if checkpoint.status is PhaseStatus.RUNNING
+                if checkpoint.status in {
+                    PhaseStatus.RUNNING,
+                    PhaseStatus.AWAITING_USER,
+                }
                 else checkpoint.attempts + 1
             ),
             started_at=checkpoint.started_at or now,
@@ -886,6 +1107,7 @@ class SessionStore:
             artifacts=checkpoint.artifacts,
             error=error,
             tasks=checkpoint.tasks,
+            user_decisions=checkpoint.user_decisions,
         )
         updated = replace(
             current,
@@ -911,6 +1133,23 @@ class SessionStore:
                     f"cannot run {phase.value} before {predecessor.value}; "
                     f"predecessor is {status.value}"
                 )
+
+    @staticmethod
+    def _require_no_completed_successors(
+        manifest: SessionManifest,
+        phase: RunPhase,
+    ) -> None:
+        phase_index = SESSION_PHASES.index(phase)
+        completed = [
+            successor.value
+            for successor in SESSION_PHASES[phase_index + 1 :]
+            if manifest.phases[successor.value].status is PhaseStatus.COMPLETED
+        ]
+        if completed:
+            raise ValueError(
+                f"cannot await user input in {phase.value} because completed "
+                f"successor phases exist: {', '.join(completed)}"
+            )
 
     def _require_reviewer_task_artifacts(
         self,
@@ -1081,6 +1320,12 @@ def _require_session_phase(phase: RunPhase) -> RunPhase:
     if not isinstance(phase, RunPhase) or phase not in SESSION_PHASES:
         raise ValueError("phase must be one of the persisted SESSION_PHASES")
     return phase
+
+
+def _require_non_empty_string(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
 
 
 def _canonical_relative_path(relative_path: str) -> str:

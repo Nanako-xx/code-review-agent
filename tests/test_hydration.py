@@ -34,9 +34,15 @@ from review_agent.hydration import (
 from review_agent.model_protocol import ModelResponse
 from review_agent.models import (
     Assignment,
+    ClarificationQuestion,
+    ClarificationStatus,
     ContractAssessment,
     ContractItemStatus,
     InitialContext,
+    IntentClaim,
+    IntentConfidence,
+    IntentField,
+    IntentOrigin,
     IntentPacket,
     IntentSource,
     IntentStatus,
@@ -96,6 +102,33 @@ def _reviewer_result() -> ReviewerResult:
 
 
 def _review_brief() -> ReviewBrief:
+    goal_claim = IntentClaim(
+        field=IntentField.GOAL,
+        value="ship",
+        source=IntentSource.EXPLICIT,
+        origin=IntentOrigin.REQUEST_METADATA,
+        confidence=IntentConfidence.HIGH,
+        source_refs=["request:user_intent"],
+    )
+    criteria_claim = IntentClaim(
+        field=IntentField.ACCEPTANCE_CRITERIA,
+        value="tests pass",
+        source=IntentSource.INFERRED,
+        origin=IntentOrigin.REPOSITORY_TEST,
+        confidence=IntentConfidence.MEDIUM,
+        source_refs=["test:a.py"],
+        evidence_refs=["O-1"],
+    )
+    clarification = ClarificationQuestion(
+        field=IntentField.ACCEPTANCE_CRITERIA,
+        question="Should all tests pass?",
+        rationale="The acceptance criterion was inferred from repository tests.",
+        proposed_values=[criteria_claim.value],
+        claim_ids=[criteria_claim.claim_id],
+        status=ClarificationStatus.SKIPPED_NON_INTERACTIVE,
+        continuation_basis="Non-interactive review; disclose the uncertainty.",
+        decision_id="decision-non-interactive",
+    )
     intent = IntentPacket(
         goal="ship",
         acceptance_criteria=["tests pass"],
@@ -104,6 +137,8 @@ def _review_brief() -> ReviewBrief:
         sources={"goal": IntentSource.EXPLICIT},
         status=IntentStatus.PARTIAL,
         uncertainties=["criteria incomplete"],
+        provenance=[goal_claim, criteria_claim],
+        clarifications=[clarification],
     )
     risk = RiskAssessment(
         RiskLevel.MEDIUM,
@@ -278,6 +313,22 @@ def test_review_brief_hydration_accepts_abbreviated_final_risk_payload() -> None
     assert review_brief_from_dict(payload) == brief
 
 
+def test_review_brief_hydration_accepts_legacy_intent_sections() -> None:
+    payload = _json(review_brief_to_dict(_review_brief()))
+    assert isinstance(payload, dict)
+    payload["change_intent"].pop("provenance")
+    payload["intent_assessment"].pop("clarification_history")
+    payload["intent_assessment"].pop("unresolved_questions")
+    payload["intent_assessment"].pop("unconfirmed_inferred_claims")
+
+    brief = review_brief_from_dict(payload)
+
+    assert brief.change_intent["goal"] == "ship"
+    assert "provenance" not in brief.change_intent
+    assert brief.intent_assessment["status"] == "partial"
+    assert "clarification_history" not in brief.intent_assessment
+
+
 def test_review_brief_hydration_rejects_malformed_nested_payloads() -> None:
     payload = _json(review_brief_to_dict(_review_brief()))
     assert isinstance(payload, dict)
@@ -295,6 +346,20 @@ def test_review_brief_hydration_rejects_malformed_nested_payloads() -> None:
     assert isinstance(payload, dict)
     payload["verification_evidence"][0]["kind"] = "unsupported"
     with pytest.raises(ValueError, match="unsupported value"):
+        review_brief_from_dict(payload)
+
+    payload = _json(review_brief_to_dict(_review_brief()))
+    assert isinstance(payload, dict)
+    payload["change_intent"]["provenance"][0]["origin"] = "fabricated"
+    with pytest.raises(ValueError, match="unsupported value"):
+        review_brief_from_dict(payload)
+
+    payload = _json(review_brief_to_dict(_review_brief()))
+    assert isinstance(payload, dict)
+    payload["intent_assessment"]["unresolved_questions"] = [
+        payload["intent_assessment"]["clarification_history"][0]
+    ]
+    with pytest.raises(ValueError, match="pending or open"):
         review_brief_from_dict(payload)
 
 

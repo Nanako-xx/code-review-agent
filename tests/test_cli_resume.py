@@ -96,7 +96,7 @@ def test_cli_resume_session_does_not_require_legacy_state(git_repo: Path, capsys
     run_git(git_repo, "add", "auth.py")
     run_git(git_repo, "commit", "-m", "add auth check")
     head = run_git(git_repo, "rev-parse", "HEAD")
-    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head]) == 0
+    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head, "--non-interactive"]) == 0
     capsys.readouterr()
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
     (run_dir / "state.json").unlink()
@@ -119,7 +119,7 @@ def test_cli_resume_session_ignores_stale_legacy_state(git_repo: Path, capsys) -
     run_git(git_repo, "add", "auth.py")
     run_git(git_repo, "commit", "-m", "add auth check")
     head = run_git(git_repo, "rev-parse", "HEAD")
-    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head]) == 0
+    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head, "--non-interactive"]) == 0
     capsys.readouterr()
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
     state_path = run_dir / "state.json"
@@ -151,7 +151,7 @@ def test_cli_resume_completed_session_rebuilds_tampered_reporting_phase(git_repo
     run_git(git_repo, "add", "auth.py")
     run_git(git_repo, "commit", "-m", "add auth check")
     head = run_git(git_repo, "rev-parse", "HEAD")
-    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head]) == 0
+    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head, "--non-interactive"]) == 0
     capsys.readouterr()
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
     (run_dir / "report.md").write_text("tampered report\n", encoding="utf-8")
@@ -171,7 +171,7 @@ def test_cli_resume_completed_session_rebuilds_missing_reporting_artifact(git_re
     run_git(git_repo, "add", "auth.py")
     run_git(git_repo, "commit", "-m", "add auth check")
     head = run_git(git_repo, "rev-parse", "HEAD")
-    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head]) == 0
+    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head, "--non-interactive"]) == 0
     capsys.readouterr()
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
     (run_dir / "report.md").unlink()

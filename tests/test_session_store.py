@@ -13,7 +13,10 @@ import review_agent.session_store as session_store_module
 from review_agent.revision import RepositoryIdentity, ResolvedRevisions
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
+    LEGACY_SESSION_PHASES,
+    LEGACY_SESSION_SCHEMA_VERSION,
     SESSION_PHASES,
+    SESSION_SCHEMA_VERSION,
     ArtifactDescriptor,
     PhaseCheckpoint,
     PhaseStatus,
@@ -21,6 +24,8 @@ from review_agent.session import (
     RevisionChangeKind,
     SessionManifest,
     initial_session_manifest,
+    session_manifest_from_dict,
+    session_manifest_to_dict,
 )
 from review_agent.session_store import PhaseValidation, SessionStore
 
@@ -115,11 +120,53 @@ def test_session_store_atomically_round_trips_explicit_manifest_schema(
     session_path = store.create(original)
 
     payload = json.loads(session_path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == SESSION_SCHEMA_VERSION
     assert payload["review_id"] == "review-1"
     assert payload["phases"]["preflight"]["status"] == "pending"
     assert store.load() == original
     assert [path for path in run_dir.iterdir() if path.name.endswith(".tmp")] == []
+
+
+def test_session_store_loads_v1_for_audit_without_synthesizing_results(
+    tmp_path: Path,
+) -> None:
+    payload = session_manifest_to_dict(manifest())
+    payload["schema_version"] = LEGACY_SESSION_SCHEMA_VERSION
+    payload["phases"] = {
+        phase.value: payload["phases"][phase.value]
+        for phase in LEGACY_SESSION_PHASES
+    }
+    for checkpoint in payload["phases"].values():
+        checkpoint.pop("user_decisions")
+    (tmp_path / "session.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    store = SessionStore(tmp_path)
+
+    loaded = store.load()
+
+    assert loaded == session_manifest_from_dict(payload)
+    assert loaded.schema_version == 1
+    assert list(loaded.phases) == [phase.value for phase in LEGACY_SESSION_PHASES]
+    assert "intent_resolution" not in loaded.phases
+    with pytest.raises(ValueError, match="read-only audit|schema v1"):
+        store.mark_phase_running(RunPhase.PREFLIGHT, "2026-07-10T00:01:00Z")
+
+
+def test_session_store_refuses_to_create_a_new_v1_session(tmp_path: Path) -> None:
+    payload = session_manifest_to_dict(manifest())
+    payload["schema_version"] = LEGACY_SESSION_SCHEMA_VERSION
+    payload["phases"] = {
+        phase.value: payload["phases"][phase.value]
+        for phase in LEGACY_SESSION_PHASES
+    }
+    for checkpoint in payload["phases"].values():
+        checkpoint.pop("user_decisions")
+    legacy = session_manifest_from_dict(payload)
+
+    with pytest.raises(ValueError, match="new Sessions.*current"):
+        SessionStore(tmp_path).create(legacy)
 
 
 def test_session_store_create_never_overwrites_existing_session(tmp_path: Path) -> None:
@@ -235,7 +282,7 @@ def test_session_store_write_rejects_immutable_lineage(
 def test_session_store_write_rejects_schema_version_mutation(tmp_path: Path) -> None:
     store = create_store(tmp_path)
     modified = manifest()
-    object.__setattr__(modified, "schema_version", 2)
+    object.__setattr__(modified, "schema_version", LEGACY_SESSION_SCHEMA_VERSION)
 
     with pytest.raises(ValueError, match="schema_version"):
         store.write(modified)
@@ -649,7 +696,7 @@ def test_mark_phase_completed_rejects_different_artifacts_after_completion(
 
 @pytest.mark.parametrize(
     "phase",
-    [RunPhase.CREATED, RunPhase.QUALITY_GATES, RunPhase.COMPLETED, RunPhase.FAILED],
+    [RunPhase.CREATED, RunPhase.COMPLETED, RunPhase.FAILED],
 )
 def test_mark_phase_completed_accepts_only_persisted_session_phases(
     tmp_path: Path,
@@ -951,6 +998,210 @@ def _complete_empty_predecessors(
         )
 
 
+def _prepare_awaiting_user(store: SessionStore) -> SessionManifest:
+    _complete_empty_predecessors(store, RunPhase.INTENT_RESOLUTION)
+    store.mark_phase_running(
+        RunPhase.INTENT_RESOLUTION,
+        "2026-07-10T02:00:00Z",
+    )
+    for index, name in enumerate(("intent_candidates", "intent_questions"), start=1):
+        relative_path = f"{name}.json"
+        (store.run_dir / relative_path).write_text("{}", encoding="utf-8")
+        register_artifact(
+            store,
+            name=name,
+            relative_path=relative_path,
+            phase=RunPhase.INTENT_RESOLUTION,
+            revision_binding=REVISION_BINDING,
+            now=f"2026-07-10T02:00:{index:02d}Z",
+        )
+    return store.mark_phase_awaiting_user(
+        RunPhase.INTENT_RESOLUTION,
+        ["intent_candidates", "intent_questions"],
+        "2026-07-10T02:01:00Z",
+    )
+
+
+def test_awaiting_user_transition_is_idempotent_and_not_a_failure(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+
+    awaiting = _prepare_awaiting_user(store)
+    session_bytes = (tmp_path / "session.json").read_bytes()
+    repeated = store.mark_phase_awaiting_user(
+        RunPhase.INTENT_RESOLUTION,
+        ["intent_candidates", "intent_questions"],
+        "2026-07-10T02:02:00Z",
+    )
+
+    checkpoint = awaiting.phases[RunPhase.INTENT_RESOLUTION.value]
+    assert repeated == awaiting
+    assert (tmp_path / "session.json").read_bytes() == session_bytes
+    assert awaiting.status is RunStatus.AWAITING_USER
+    assert awaiting.current_phase is RunPhase.INTENT_RESOLUTION
+    assert awaiting.errors == ()
+    assert checkpoint.status is PhaseStatus.AWAITING_USER
+    assert checkpoint.attempts == 1
+    assert checkpoint.started_at == "2026-07-10T02:00:00Z"
+    assert checkpoint.completed_at is None
+    assert checkpoint.artifacts == ("intent_candidates", "intent_questions")
+
+
+def test_submit_user_decision_and_resume_are_idempotent_and_preserve_artifacts(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    awaiting = _prepare_awaiting_user(store)
+    (tmp_path / "intent_event_1.json").write_text(
+        json.dumps({"event_id": "decision-1", "action": "confirmed"}),
+        encoding="utf-8",
+    )
+    register_artifact(
+        store,
+        name="intent_event_1",
+        relative_path="intent_event_1.json",
+        phase=RunPhase.INTENT_RESOLUTION,
+        revision_binding=REVISION_BINDING,
+        now="2026-07-10T02:02:00Z",
+    )
+
+    submitted = store.submit_user_decision(
+        "decision-1",
+        "intent_event_1",
+        "2026-07-10T02:03:00Z",
+    )
+    session_bytes = (tmp_path / "session.json").read_bytes()
+    repeated_submission = store.submit_user_decision(
+        "decision-1",
+        "intent_event_1",
+        "2026-07-10T02:04:00Z",
+    )
+    repeated_session_bytes = (tmp_path / "session.json").read_bytes()
+    resumed = store.resume_awaiting_user("2026-07-10T02:05:00Z")
+    repeated_resume = store.resume_awaiting_user("2026-07-10T02:06:00Z")
+
+    submitted_checkpoint = submitted.phases[RunPhase.INTENT_RESOLUTION.value]
+    resumed_checkpoint = resumed.phases[RunPhase.INTENT_RESOLUTION.value]
+    assert awaiting.status is RunStatus.AWAITING_USER
+    assert repeated_submission == submitted
+    assert repeated_session_bytes == session_bytes
+    assert submitted_checkpoint.user_decisions == {
+        "decision-1": "intent_event_1"
+    }
+    assert submitted_checkpoint.artifacts == (
+        "intent_candidates",
+        "intent_questions",
+        "intent_event_1",
+    )
+    assert resumed.status is RunStatus.RUNNING
+    assert resumed_checkpoint.status is PhaseStatus.RUNNING
+    assert resumed_checkpoint.started_at == "2026-07-10T02:00:00Z"
+    assert resumed_checkpoint.completed_at is None
+    assert resumed_checkpoint.artifacts == submitted_checkpoint.artifacts
+    assert resumed_checkpoint.user_decisions == submitted_checkpoint.user_decisions
+    assert repeated_resume == resumed
+
+
+def test_awaiting_user_rejects_illegal_phase_missing_decision_and_tampering(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    with pytest.raises(ValueError, match="only for intent_resolution"):
+        store.mark_phase_awaiting_user(
+            RunPhase.PLANNING,
+            ["intent_questions"],
+            "2026-07-10T02:00:00Z",
+        )
+
+    _prepare_awaiting_user(store)
+    with pytest.raises(ValueError, match="submitted user decision"):
+        store.resume_awaiting_user("2026-07-10T02:02:00Z")
+    with pytest.raises(ValueError, match="cannot discard.*awaiting_user"):
+        store.discard_uncommitted_phase_artifacts(
+            RunPhase.INTENT_RESOLUTION,
+            ["intent_candidates"],
+            "2026-07-10T02:02:30Z",
+        )
+
+    (tmp_path / "intent_questions.json").write_text(
+        '{"tampered":true}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="validation"):
+        store.mark_phase_awaiting_user(
+            RunPhase.INTENT_RESOLUTION,
+            ["intent_candidates", "intent_questions"],
+            "2026-07-10T02:03:00Z",
+        )
+
+
+def test_submit_user_decision_rejects_new_or_conflicting_event_outside_protocol(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path)
+    _complete_empty_predecessors(store, RunPhase.INTENT_RESOLUTION)
+    store.mark_phase_running(
+        RunPhase.INTENT_RESOLUTION,
+        "2026-07-10T02:00:00Z",
+    )
+    (tmp_path / "intent_event_1.json").write_text("{}", encoding="utf-8")
+    register_artifact(
+        store,
+        name="intent_event_1",
+        relative_path="intent_event_1.json",
+        phase=RunPhase.INTENT_RESOLUTION,
+        revision_binding=REVISION_BINDING,
+    )
+    with pytest.raises(ValueError, match="only while.*awaiting_user"):
+        store.submit_user_decision(
+            "decision-1",
+            "intent_event_1",
+            "2026-07-10T02:01:00Z",
+        )
+
+    store.discard_uncommitted_phase_artifacts(
+        RunPhase.INTENT_RESOLUTION,
+        [],
+        "2026-07-10T02:01:10Z",
+    )
+    for name in ("intent_candidates", "intent_questions"):
+        (tmp_path / f"{name}.json").write_text("{}", encoding="utf-8")
+        register_artifact(
+            store,
+            name=name,
+            relative_path=f"{name}.json",
+            phase=RunPhase.INTENT_RESOLUTION,
+            revision_binding=REVISION_BINDING,
+        )
+    store.mark_phase_awaiting_user(
+        RunPhase.INTENT_RESOLUTION,
+        ["intent_candidates", "intent_questions"],
+        "2026-07-10T02:02:00Z",
+    )
+    for name in ("intent_event_1", "intent_event_2"):
+        (tmp_path / f"{name}.json").write_text("{}", encoding="utf-8")
+        register_artifact(
+            store,
+            name=name,
+            relative_path=f"{name}.json",
+            phase=RunPhase.INTENT_RESOLUTION,
+            revision_binding=REVISION_BINDING,
+        )
+    store.submit_user_decision(
+        "decision-1",
+        "intent_event_1",
+        "2026-07-10T02:03:00Z",
+    )
+
+    with pytest.raises(ValueError, match="different artifact"):
+        store.submit_user_decision(
+            "decision-1",
+            "intent_event_2",
+            "2026-07-10T02:04:00Z",
+        )
+
+
 def _register_reviewer_result(
     store: SessionStore,
     index: int,
@@ -1034,7 +1285,8 @@ def test_invalidate_from_preserves_upstream_and_removes_downstream_registry(
 ) -> None:
     store = create_store(tmp_path)
     phase_artifacts: dict[RunPhase, str] = {}
-    for index, phase in enumerate(SESSION_PHASES[:4]):
+    through_reviewers = SESSION_PHASES[: SESSION_PHASES.index(RunPhase.REVIEWERS) + 1]
+    for index, phase in enumerate(through_reviewers):
         name = "request" if phase is RunPhase.PREFLIGHT else f"artifact_{index}"
         relative_path = f"{name}.json"
         (tmp_path / relative_path).write_text("{}", encoding="utf-8")
@@ -1065,10 +1317,15 @@ def test_invalidate_from_preserves_upstream_and_removes_downstream_registry(
     assert invalidated.phases["preflight"].artifacts == ("request",)
     assert all(
         invalidated.phases[phase.value].status is PhaseStatus.INVALIDATED
-        for phase in SESSION_PHASES[1:]
+        for phase in SESSION_PHASES[
+            SESSION_PHASES.index(RunPhase.REPOSITORY_INTELLIGENCE) :
+        ]
     )
-    assert set(invalidated.artifacts) == {"request"}
-    assert invalidated.last_successful_phase is RunPhase.PREFLIGHT
+    assert set(invalidated.artifacts) == {
+        phase_artifacts[RunPhase.PREFLIGHT],
+        phase_artifacts[RunPhase.QUALITY_GATES],
+    }
+    assert invalidated.last_successful_phase is RunPhase.QUALITY_GATES
     assert invalidated.current_phase is RunPhase.REPOSITORY_INTELLIGENCE
     assert (tmp_path / f"{phase_artifacts[RunPhase.REVIEWERS]}.json").exists()
 
@@ -1089,7 +1346,7 @@ def test_invalidate_from_can_reopen_completed_session_only_through_recovery_api(
     assert completed.status is RunStatus.COMPLETED
     assert recovered.status is RunStatus.RUNNING
     assert recovered.phases["preflight"].status is PhaseStatus.COMPLETED
-    assert recovered.phases["repository_intelligence"].status is PhaseStatus.COMPLETED
+    assert recovered.phases["planning"].status is PhaseStatus.COMPLETED
     assert recovered.phases["reviewers"].status is PhaseStatus.INVALIDATED
 
 
@@ -1232,11 +1489,7 @@ def test_mark_session_failed_preserves_last_successful_phase_and_appends_errors(
     tmp_path: Path,
 ) -> None:
     store = create_store(tmp_path)
-    store.mark_phase_completed(
-        RunPhase.PREFLIGHT,
-        [],
-        "2026-07-10T00:01:00Z",
-    )
+    _complete_empty_predecessors(store, RunPhase.REPOSITORY_INTELLIGENCE)
 
     failed = store.mark_session_failed(
         RunPhase.REPOSITORY_INTELLIGENCE,
@@ -1253,7 +1506,7 @@ def test_mark_session_failed_preserves_last_successful_phase_and_appends_errors(
     assert failed.status is RunStatus.FAILED
     assert failed_again.status is RunStatus.FAILED
     assert failed_again.current_phase is RunPhase.FAILED
-    assert failed_again.last_successful_phase is RunPhase.PREFLIGHT
+    assert failed_again.last_successful_phase is RunPhase.QUALITY_GATES
     assert checkpoint.status is PhaseStatus.FAILED
     assert checkpoint.attempts == 2
     assert checkpoint.started_at == "2026-07-10T00:02:00Z"
@@ -1341,7 +1594,7 @@ def test_mark_session_failed_accepts_only_persisted_session_phases(
 
     with pytest.raises(ValueError, match="SESSION_PHASES|persisted"):
         store.mark_session_failed(
-            RunPhase.QUALITY_GATES,
+            RunPhase.CREATED,
             "failed",
             "2026-07-10T00:02:00Z",
         )

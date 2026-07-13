@@ -3,7 +3,14 @@ from __future__ import annotations
 
 ARTIFACT_SCHEMAS = {
     "request": "review_request_v1",
-    "intent": "intent_packet_v1",
+    "change_summary": "change_summary_v1",
+    "intent_candidates": "intent_candidates_v1",
+    "intent_questions": "intent_questions_v1",
+    "intent_inference": "intent_inference_run_v1",
+    "intent_observations": "observation_log_jsonl_v1",
+    "intent_resolution_request": "intent_resolution_request_v1",
+    "intent_events": "intent_events_v1",
+    "intent": "intent_packet_v2",
     "risk_packet": "risk_packet_v1",
     "risk": "risk_assessment_v1",
     "assignments": "reviewer_assignments_v1",
@@ -42,4 +49,8 @@ def artifact_schema(name: str) -> str:
             reviewer_number = name[len("reviewer_") : -len(suffix)]
             if name.endswith(suffix) and reviewer_number.isdigit():
                 return reviewer_schema
+    if name.startswith("intent_decision_"):
+        event_id = name.removeprefix("intent_decision_")
+        if event_id:
+            return "intent_decision_v1"
     raise ValueError(f"No stable artifact schema is defined for: {name}")

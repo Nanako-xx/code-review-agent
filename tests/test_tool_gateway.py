@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import pytest
 
@@ -123,3 +124,83 @@ def test_tool_gateway_find_references_uses_revision_bound_text_search(git_repo: 
 
     assert "auth.py:1:def check_role" in result.context_view
     assert store.list_observations()[0].source == "repo_intelligence.find_references"
+
+
+def test_tool_gateway_read_commit_messages_is_bounded_to_fixed_revision_range(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "app.py").write_text(
+        "def add(a, b):\n    return int(a) + int(b)\n",
+        encoding="utf-8",
+    )
+    run_git(git_repo, "add", "app.py")
+    run_git(
+        git_repo,
+        "commit",
+        "-m",
+        "preserve integer addition",
+        "-m",
+        "Adds the documented acceptance behavior.",
+        "-m",
+        "Requirement: INT-42",
+    )
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    store = ObservationStore(tmp_path / "commit-observations")
+    gateway = ToolGateway(
+        git_repo,
+        base_revision=base,
+        head_revision=head,
+        observation_store=store,
+        max_commit_messages=1,
+    )
+
+    result = gateway.execute(
+        "read_commit_messages",
+        {
+            "base_revision": base,
+            "head_revision": head,
+            "revision_range": f"{base}..{head}",
+            "max_commits": 100,
+        },
+    )
+
+    messages = json.loads(result.context_view)
+    assert len(messages) == 1
+    assert messages[0]["hash"] == head
+    assert messages[0]["subject"] == "preserve integer addition"
+    assert messages[0]["body"] == "Adds the documented acceptance behavior."
+    assert messages[0]["trailers"] == [
+        {"key": "Requirement", "value": "INT-42"}
+    ]
+    observation = store.list_observations()[0]
+    assert observation.source == "git.read_commit_messages"
+    assert observation.revision == f"{base}..{head}"
+    assert observation.path is None
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"base_revision": "HEAD~9"},
+        {"head_revision": "main"},
+        {"revision": "HEAD~2..HEAD"},
+        {"revision_range": "main..HEAD"},
+    ],
+)
+def test_tool_gateway_read_commit_messages_rejects_revision_override(
+    git_repo: Path,
+    tmp_path: Path,
+    arguments,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    gateway = ToolGateway(
+        git_repo,
+        base_revision=head,
+        head_revision=head,
+        observation_store=ObservationStore(tmp_path / "commit-binding"),
+    )
+
+    with pytest.raises(ToolGatewayError, match="unauthorized revision binding"):
+        gateway.execute("read_commit_messages", arguments)

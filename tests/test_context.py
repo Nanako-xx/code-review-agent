@@ -1,7 +1,23 @@
 import pytest
 
-from review_agent.context import ContextBudget, build_reviewer_context_payload, build_reviewer_envelope
-from review_agent.models import Assignment, InitialContext, IntentPacket, IntentSource, IntentStatus
+from review_agent.context import (
+    ContextBudget,
+    build_reviewer_context_payload,
+    build_reviewer_envelope,
+)
+from review_agent.models import (
+    Assignment,
+    ClarificationQuestion,
+    ClarificationStatus,
+    InitialContext,
+    IntentClaim,
+    IntentConfidence,
+    IntentField,
+    IntentOrigin,
+    IntentPacket,
+    IntentSource,
+    IntentStatus,
+)
 
 
 def _context_assignment() -> Assignment:
@@ -75,6 +91,103 @@ def test_reviewer_envelope_uses_standard_four_inputs():
     assert "Evidence" not in envelope.messages[0]["content"]
     assert "explicit" not in envelope.messages[0]["content"]
     assert "inferred" in envelope.messages[0]["content"]
+
+
+def test_reviewer_context_injects_complete_intent_with_stable_compact_metadata():
+    goal_claim = IntentClaim(
+        field=IntentField.GOAL,
+        value="Prevent duplicate retry jobs",
+        source=IntentSource.EXPLICIT,
+        origin=IntentOrigin.USER_INPUT,
+        confidence=IntentConfidence.HIGH,
+        source_refs=["request:user_intent"],
+    )
+    acceptance_claim = IntentClaim(
+        field=IntentField.ACCEPTANCE_CRITERIA,
+        value="Reject duplicate job IDs",
+        source=IntentSource.INFERRED,
+        origin=IntentOrigin.REPOSITORY_TEST,
+        confidence=IntentConfidence.MEDIUM,
+        evidence_refs=["O-retry-tests"],
+    )
+    scope_claim = IntentClaim(
+        field=IntentField.SCOPE,
+        value="src/retry.py",
+        source=IntentSource.INFERRED,
+        origin=IntentOrigin.LLM_INFERENCE,
+        confidence=IntentConfidence.LOW,
+        evidence_refs=["O-retry-diff"],
+    )
+    constraint_claim = IntentClaim(
+        field=IntentField.CONSTRAINTS,
+        value="Keep storage schema compatible",
+        source=IntentSource.EXPLICIT,
+        origin=IntentOrigin.PROJECT_RULE,
+        confidence=IntentConfidence.HIGH,
+        source_refs=["AGENTS.md"],
+    )
+    open_question = ClarificationQuestion(
+        field=IntentField.SCOPE,
+        question="Should worker changes be included?",
+        rationale="Worker behavior can change retry correctness.",
+        proposed_values=["src/worker.py"],
+        claim_ids=[scope_claim.claim_id],
+        status=ClarificationStatus.OPEN,
+    )
+    resolved_question = ClarificationQuestion(
+        field=IntentField.CONSTRAINTS,
+        question="Must the storage schema remain compatible?",
+        rationale="A schema change would alter the compatibility conclusion.",
+        proposed_values=["Keep storage schema compatible"],
+        claim_ids=[constraint_claim.claim_id],
+        status=ClarificationStatus.CONFIRMED,
+        resolved_values=["Keep storage schema compatible"],
+        decision_id="decision-storage-compatibility",
+    )
+    intent = IntentPacket(
+        goal="Prevent duplicate retry jobs",
+        acceptance_criteria=["Reject duplicate job IDs", "Preserve successful retries"],
+        scope=["src/retry.py", "tests/test_retry.py"],
+        constraints=["Keep storage schema compatible"],
+        sources={
+            "constraints": IntentSource.EXPLICIT,
+            "scope": IntentSource.INFERRED,
+            "acceptance_criteria": IntentSource.INFERRED,
+            "goal": IntentSource.EXPLICIT,
+        },
+        status=IntentStatus.PARTIAL,
+        uncertainties=["Worker scope remains unconfirmed"],
+        provenance=[constraint_claim, scope_claim, acceptance_claim, goal_claim],
+        clarifications=[resolved_question, open_question],
+    )
+
+    result = build_reviewer_context_payload(
+        assignment=_context_assignment(),
+        intent=intent,
+        code_snippets={},
+        observations={},
+    )
+
+    intent_section = result.messages[0]["content"].split("\n\n")[1]
+    assert intent_section == "\n".join(
+        [
+            "Intent Packet",
+            "Goal: Prevent duplicate retry jobs",
+            "Acceptance Criteria: Reject duplicate job IDs; Preserve successful retries",
+            "Scope: src/retry.py; tests/test_retry.py",
+            "Constraints: Keep storage schema compatible",
+            "Status: partial",
+            "Sources: goal=explicit, acceptance_criteria=inferred, scope=inferred, constraints=explicit",
+            "Claim Provenance:",
+            "- goal | explicit/user_input | high | active | material | source=request:user_intent; evidence=none | Prevent duplicate retry jobs",
+            "- acceptance_criteria | inferred/repository_test | medium | active | material | source=none; evidence=O-retry-tests | Reject duplicate job IDs",
+            "- scope | inferred/llm_inference | low | active | material | source=none; evidence=O-retry-diff | src/retry.py",
+            "- constraints | explicit/project_rule | high | active | material | source=AGENTS.md; evidence=none | Keep storage schema compatible",
+            "Open Clarifications:",
+            "- scope | open | proposed=src/worker.py | question=Should worker changes be included? | rationale=Worker behavior can change retry correctness.",
+            "Uncertainties: Worker scope remains unconfirmed",
+        ]
+    )
 
 
 def test_reviewer_tools_describe_head_default_and_base_head_comparison():

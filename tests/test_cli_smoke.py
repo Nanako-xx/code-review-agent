@@ -126,7 +126,7 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypat
     assert brief["change_map_and_repository_impact"]["changed_files"] == ["auth.py"]
     assert brief["initial_and_final_risk_assessment"]["final"]["status"] == "reassessed"
     assert brief["non_binding_recommendation"] == "manual_review"
-    assert session["schema_version"] == 1
+    assert session["schema_version"] == 2
     assert session["status"] == "completed"
     assert session["current_phase"] == "completed"
     assert session["revisions"] == {
@@ -251,7 +251,7 @@ def test_cli_openai_compatible_adapter_requires_api_key(git_repo: Path, monkeypa
     assert session["status"] == "failed"
     assert session["phases"]["preflight"]["status"] == "completed"
     assert session["phases"]["repository_intelligence"]["status"] == "completed"
-    assert session["phases"]["reviewers"]["status"] == "failed"
+    assert session["phases"]["intent_discovery"]["status"] == "failed"
 
 
 def test_cli_review_records_failed_state_when_collection_fails(git_repo: Path, monkeypatch, capsys):
@@ -327,7 +327,7 @@ def test_cli_session_create_failure_returns_clear_error(git_repo: Path, monkeypa
     monkeypatch.setattr(SessionStore, "create", fail_create)
 
     exit_code = main(
-        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD"]
+        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD", "--non-interactive"]
     )
 
     assert exit_code == 1
@@ -343,7 +343,7 @@ def test_cli_legacy_state_write_failure_does_not_override_session(git_repo: Path
     monkeypatch.setattr(CheckpointStore, "write_state", fail_state_write)
 
     exit_code = main(
-        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD"]
+        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD", "--non-interactive"]
     )
 
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
@@ -369,7 +369,7 @@ def test_cli_request_write_failure_marks_session_and_state_failed(git_repo: Path
     monkeypatch.setattr(AttemptWorkspace, "write_json", fail_request_write)
 
     exit_code = main(
-        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD"]
+        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD", "--non-interactive"]
     )
 
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
@@ -393,7 +393,7 @@ def test_cli_finalization_failure_leaves_retryable_running_session(git_repo: Pat
     monkeypatch.setattr(SessionStore, "mark_session_completed", fail_finalization)
 
     exit_code = main(
-        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD"]
+        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD", "--non-interactive"]
     )
 
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
@@ -422,7 +422,7 @@ def test_cli_completed_state_write_is_best_effort(git_repo: Path, monkeypatch, c
     monkeypatch.setattr(CheckpointStore, "write_state", fail_completed_state)
 
     exit_code = main(
-        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD"]
+        ["review", "--repo", str(git_repo), "--base", "HEAD", "--head", "HEAD", "--non-interactive"]
     )
 
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
