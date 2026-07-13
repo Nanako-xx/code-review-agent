@@ -88,7 +88,8 @@ def build_reviewer_envelope(
     *,
     context_budget: ContextBudget | None = None,
     model: str = "configured-reviewer-model",
-    max_output_tokens: int = 4096,
+    max_output_tokens: int | None = None,
+    max_elapsed_seconds: float | None = None,
     reasoning_effort: str = "medium",
 ) -> ModelInvocationEnvelope:
     context_payload = build_reviewer_context_payload(
@@ -130,7 +131,16 @@ def build_reviewer_envelope(
         messages=context_payload.messages,
         parameters={
             "model": model,
-            "max_output_tokens": max_output_tokens,
+            "max_output_tokens": (
+                assignment.max_output_tokens
+                if max_output_tokens is None
+                else max_output_tokens
+            ),
+            "max_elapsed_seconds": (
+                assignment.max_elapsed_seconds
+                if max_elapsed_seconds is None
+                else max_elapsed_seconds
+            ),
             "reasoning_effort": reasoning_effort,
             "temperature": 0,
             "tool_choice": "auto",
@@ -264,7 +274,15 @@ def _assignment_block(assignment: Assignment) -> str:
             f"Reasons: {'; '.join(assignment.assignment_reason)}",
             f"Assigned Contract: {', '.join(assignment.assigned_contract)}",
             f"Required Checks: {'; '.join(assignment.required_checks)}",
-            f"Budget: {assignment.max_turns} turns, {assignment.max_tool_calls} tool calls",
+            (
+                "Budget: "
+                f"{assignment.max_turns} turns, "
+                f"{assignment.max_tool_calls} tool calls, "
+                f"{assignment.max_output_tokens} output tokens per model call, "
+                f"{assignment.max_total_tokens} total tokens, "
+                f"{assignment.max_elapsed_seconds:g} elapsed seconds, "
+                f"{assignment.max_provider_attempts} provider attempts per model turn"
+            ),
         ]
     )
 
@@ -384,6 +402,15 @@ def _completion_block(assignment: Assignment) -> str:
             "If a required check cannot be performed, record the reason as an uncertainty.",
             "Findings must cite observation IDs as evidence_refs in the final structured output.",
             "Every confirmed finding must include severity (blocker/high/medium/low), confidence (high/medium/low), path, positive line, impact, suggested_action, and a non-empty verification_performed list.",
+            (
+                "Runtime budget limits are concrete and cannot be changed: "
+                f"{assignment.max_turns} turns, "
+                f"{assignment.max_tool_calls} tool calls, "
+                f"{assignment.max_output_tokens} output tokens per model call, "
+                f"{assignment.max_total_tokens} total tokens, "
+                f"{assignment.max_elapsed_seconds:g} elapsed seconds, and "
+                f"{assignment.max_provider_attempts} provider attempts per model turn."
+            ),
             "Runtime validates the structured result and may reject an incomplete completion request.",
         ]
     )

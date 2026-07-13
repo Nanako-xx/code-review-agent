@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path, PurePosixPath
+from time import perf_counter
 from typing import Any, Callable, Mapping
 
 from review_agent.agent_loop import AgentLoopRun, agent_loop_run_to_dict, run_reviewer_agent_loop
@@ -67,6 +69,7 @@ from review_agent.model_adapter_factory import (
     ModelAdapterFactory,
     build_model_adapter_factory_from_config,
 )
+from review_agent.model_adapter import ModelAdapter
 from review_agent.models import (
     Assignment,
     ClarificationQuestion,
@@ -85,7 +88,12 @@ from review_agent.models import (
     RiskAssessmentPacket,
 )
 from review_agent.observations import ObservationStore
-from review_agent.orchestrator import MultiReviewerRun, ReviewerExecution, multi_reviewer_run_to_dict
+from review_agent.orchestrator import (
+    MultiReviewerRun,
+    ReviewerExecution,
+    failed_reviewer_execution,
+    multi_reviewer_run_to_dict,
+)
 from review_agent.quality import detect_quality_gates, run_python_compile_gate
 from review_agent.repository_intelligence import (
     RepositoryIntelligenceSnapshot,
@@ -96,6 +104,7 @@ from review_agent.repository_intelligence import (
 )
 from review_agent.reporting import render_review_brief_markdown
 from review_agent.reviewer import reviewer_result_to_dict, run_single_reviewer
+from review_agent.reviewer_runtime import reviewer_runtime_to_dict
 from review_agent.review_contract import validate_reviewer_completion
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
 from review_agent.run_state import RunPhase, RunState, RunStatus
@@ -997,7 +1006,11 @@ class ReviewPipeline:
             task_names,
             self._clock(),
         )
-        executions: list[ReviewerExecution] = []
+        initial_reviewer_observations = (
+            self._reviewer_authorized_observation_summaries()
+        )
+        executions_by_index: dict[int, ReviewerExecution] = {}
+        pending: list[_PendingReviewer] = []
         for index, assignment in enumerate(assignments):
             task_name = f"reviewer-{index}"
             task = self.context.manifest.phases[RunPhase.REVIEWERS.value].tasks[
@@ -1005,7 +1018,7 @@ class ReviewPipeline:
             ]
             if task.status is PhaseStatus.COMPLETED:
                 execution, observation_store = self._load_reviewer_task(index)
-                executions.append(execution)
+                executions_by_index[index] = execution
                 self.context.reviewer_observations[index] = observation_store
                 continue
             if task.status is PhaseStatus.RUNNING:
@@ -1018,26 +1031,74 @@ class ReviewPipeline:
                     task_name,
                     self._clock(),
                 )
+
             try:
-                execution, observation_store, artifact_names = self._execute_reviewer(
-                    index=index,
-                    assignment=assignment,
-                    adapter_factory=adapter_factory,
-                )
-                self.context.session_store.mark_reviewer_task_completed(
-                    task_name,
-                    artifact_names,
-                    self._clock(),
-                )
+                adapter = adapter_factory.create()
+                creation_error: Exception | None = None
             except Exception as error:
-                self.context.session_store.mark_reviewer_task_failed(
-                    task_name,
-                    f"{type(error).__name__}: {error}",
-                    self._clock(),
+                adapter = None
+                creation_error = error
+            pending.append(
+                _PendingReviewer(
+                    index=index,
+                    task_name=task_name,
+                    assignment=assignment,
+                    adapter=adapter,
+                    creation_error=creation_error,
+                    initial_observations=dict(initial_reviewer_observations),
                 )
-                raise
-            executions.append(execution)
-            self.context.reviewer_observations[index] = observation_store
+            )
+
+        futures: dict[int, Future[_ReviewerAttempt]] = {}
+        executor: ThreadPoolExecutor | None = None
+        try:
+            if len(pending) > 1:
+                executor = ThreadPoolExecutor(
+                    max_workers=min(len(pending), 32),
+                    thread_name_prefix="pipeline-reviewer",
+                )
+                futures = {
+                    item.index: executor.submit(
+                        self._investigate_reviewer,
+                        item,
+                    )
+                    for item in pending
+                }
+
+            # Stable index order is authoritative even when investigations finish
+            # in a different order. Only this thread promotes artifacts or writes
+            # session.json.
+            for item in pending:
+                try:
+                    attempt = (
+                        futures[item.index].result()
+                        if executor is not None
+                        else self._investigate_reviewer(item)
+                    )
+                    execution, observation_store, artifact_names = (
+                        self._commit_reviewer_attempt(attempt)
+                    )
+                    self.context.session_store.mark_reviewer_task_completed(
+                        item.task_name,
+                        artifact_names,
+                        self._clock(),
+                    )
+                except Exception as error:
+                    self.context.session_store.mark_reviewer_task_failed(
+                        item.task_name,
+                        f"{type(error).__name__}: {error}",
+                        self._clock(),
+                    )
+                    raise
+                executions_by_index[item.index] = execution
+                self.context.reviewer_observations[item.index] = observation_store
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
+
+        executions = [
+            executions_by_index[index] for index in range(len(assignments))
+        ]
 
         self.context.reviewer_executions = list(executions)
         if config.reviewer_mode == "multi":
@@ -1070,13 +1131,12 @@ class ReviewPipeline:
             if descriptor.phase is RunPhase.REVIEWERS
         }
 
-    def _execute_reviewer(
+    def _investigate_reviewer(
         self,
-        *,
-        index: int,
-        assignment: Assignment,
-        adapter_factory: ModelAdapterFactory,
-    ) -> tuple[ReviewerExecution, ObservationStore, tuple[str, ...]]:
+        pending: _PendingReviewer,
+    ) -> _ReviewerAttempt:
+        index = pending.index
+        assignment = pending.assignment
         manifest = self.context.manifest
         phase_attempt = manifest.phases[RunPhase.REVIEWERS.value].attempts
         workspace = AttemptWorkspace(
@@ -1087,65 +1147,109 @@ class ReviewPipeline:
         )
         workspace.prepare()
         observations = ObservationStore(workspace.path)
-        gateway = ToolGateway(
-            repository_path=self.context.repository,
-            base_revision=manifest.revisions.resolved_base_sha,
-            head_revision=manifest.revisions.resolved_head_sha,
-            observation_store=observations,
-        )
         summary = _required(self.context.change_summary, "change summary")
-        for changed_file in summary.changed_files:
-            gateway.execute("compare_base_head", {"path": changed_file})
-        reviewer_observations = self._authorized_observation_summaries(observations)
         intent = _required(self.context.intent, "intent")
         trace_id = f"{manifest.review_id}-reviewer-{index}"
         model = _reviewer_invocation_model(manifest.execution)
+        started_at = perf_counter()
         loop_run: AgentLoopRun | None = None
-        if manifest.execution.reviewer_loop == "agent-loop":
-            loop_run = run_reviewer_agent_loop(
-                adapter=adapter_factory.create(),
-                gateway=gateway,
+        reviewer_observations = dict(pending.initial_observations)
+        try:
+            gateway = ToolGateway(
+                repository_path=self.context.repository,
+                base_revision=manifest.revisions.resolved_base_sha,
+                head_revision=manifest.revisions.resolved_head_sha,
+                observation_store=observations,
+            )
+            for changed_file in summary.changed_files:
+                gateway.execute("compare_base_head", {"path": changed_file})
+            reviewer_observations.update(observations.summaries_by_id())
+            if pending.creation_error is not None:
+                raise pending.creation_error
+            if pending.adapter is None:
+                raise RuntimeError("reviewer adapter creation returned no adapter")
+
+            if manifest.execution.reviewer_loop == "agent-loop":
+                loop_run = run_reviewer_agent_loop(
+                    adapter=pending.adapter,
+                    gateway=gateway,
+                    assignment=assignment,
+                    intent=intent,
+                    diff_excerpt=self._review_diff_excerpt(summary),
+                    observations=reviewer_observations,
+                    trace_id=trace_id,
+                    model=model,
+                )
+                execution = ReviewerExecution(
+                    reviewer_index=index,
+                    trace_id=trace_id,
+                    assignment=assignment,
+                    envelope=loop_run.envelope,
+                    response=loop_run.response,
+                    result=loop_run.result,
+                    runtime=loop_run.runtime,
+                )
+            else:
+                run = run_single_reviewer(
+                    adapter=pending.adapter,
+                    assignment=assignment,
+                    intent=intent,
+                    diff_excerpt=self._review_diff_excerpt(summary),
+                    observations=reviewer_observations,
+                    trace_id=trace_id,
+                    model=model,
+                )
+                execution = ReviewerExecution(
+                    reviewer_index=index,
+                    trace_id=trace_id,
+                    assignment=assignment,
+                    envelope=run.envelope,
+                    response=run.response,
+                    result=run.result,
+                    runtime=run.runtime,
+                )
+        except Exception as error:
+            reviewer_observations = dict(pending.initial_observations)
+            reviewer_observations.update(observations.summaries_by_id())
+            execution = failed_reviewer_execution(
+                index=index,
+                trace_id=trace_id,
                 assignment=assignment,
                 intent=intent,
                 diff_excerpt=self._review_diff_excerpt(summary),
                 observations=reviewer_observations,
-                trace_id=trace_id,
+                error=error,
                 model=model,
+                elapsed_seconds=perf_counter() - started_at,
+                retained_observation_refs=tuple(
+                    sorted(reviewer_observations)
+                ),
             )
-            envelope = loop_run.envelope
-            response = loop_run.response
-            result = loop_run.result
-        else:
-            run = run_single_reviewer(
-                adapter=adapter_factory.create(),
-                assignment=assignment,
-                intent=intent,
-                diff_excerpt=self._review_diff_excerpt(summary),
-                observations=reviewer_observations,
-                trace_id=trace_id,
-                model=model,
-            )
-            envelope = run.envelope
-            response = run.response
-            result = run.result
 
         names = _reviewer_artifact_names(
             index,
             single=manifest.execution.reviewer_mode == "single",
-            include_trace=loop_run is not None,
+            include_trace=manifest.execution.reviewer_loop == "agent-loop",
         )
-        workspace.write_json(f"{names.envelope}.json", asdict(envelope))
+        workspace.write_json(
+            f"{names.envelope}.json",
+            asdict(execution.envelope),
+        )
         workspace.write_json(
             f"{names.raw_response}.json",
             {
-                "provider_name": response.provider_name,
-                "model": response.model,
-                "content": response.content,
-                "raw": response.raw,
+                "provider_name": execution.response.provider_name,
+                "model": execution.response.model,
+                "content": execution.response.content,
+                "raw": execution.response.raw,
+                "runtime": reviewer_runtime_to_dict(execution.runtime),
             },
         )
         result_filename = _reviewer_artifact_filename(names.result)
-        workspace.write_json(result_filename, reviewer_result_to_dict(result))
+        workspace.write_json(
+            result_filename,
+            reviewer_result_to_dict(execution.result),
+        )
         file_specs: dict[str, tuple[str, str]] = {
             names.envelope: (f"{names.envelope}.json", f"{names.envelope}.json"),
             names.raw_response: (
@@ -1154,32 +1258,54 @@ class ReviewPipeline:
             ),
             names.result: (result_filename, result_filename),
         }
-        if loop_run is not None and names.trace is not None:
+        if names.trace is not None:
+            trace_payload = (
+                agent_loop_run_to_dict(loop_run)["trace"]
+                if loop_run is not None
+                else {
+                    "trace_id": trace_id,
+                    "tool_call_count": execution.runtime.tool_calls,
+                    "provider_attempt_count": execution.runtime.provider_attempts,
+                    "final_status": execution.result.status.value,
+                    "turns": [],
+                }
+            )
             workspace.write_json(
                 f"{names.trace}.json",
-                agent_loop_run_to_dict(loop_run)["trace"],
+                trace_payload,
             )
             file_specs[names.trace] = (f"{names.trace}.json", f"{names.trace}.json")
-        committed = self._commit_files(RunPhase.REVIEWERS, workspace, file_specs)
-        observation_name = f"reviewer_{index}_observations"
+
+        return _ReviewerAttempt(
+            index=index,
+            workspace=workspace,
+            observations=observations,
+            execution=execution,
+            file_specs=file_specs,
+            observation_name=f"reviewer_{index}_observations",
+        )
+
+    def _commit_reviewer_attempt(
+        self,
+        attempt: _ReviewerAttempt,
+    ) -> tuple[ReviewerExecution, ObservationStore, tuple[str, ...]]:
+        committed = self._commit_files(
+            RunPhase.REVIEWERS,
+            attempt.workspace,
+            attempt.file_specs,
+        )
         observation_path = self._commit_observation_store(
             phase=RunPhase.REVIEWERS,
-            workspace=workspace,
-            source=observations,
-            destination_root=f"observation_stores/reviewer-{index}",
-            artifact_name=observation_name,
+            workspace=attempt.workspace,
+            source=attempt.observations,
+            destination_root=f"observation_stores/reviewer-{attempt.index}",
+            artifact_name=attempt.observation_name,
         )
-        committed[observation_name] = observation_path
-        authoritative_store = self._load_observation_artifact(observation_name)
-        execution = ReviewerExecution(
-            reviewer_index=index,
-            trace_id=trace_id,
-            assignment=assignment,
-            envelope=envelope,
-            response=response,
-            result=result,
+        committed[attempt.observation_name] = observation_path
+        authoritative_store = self._load_observation_artifact(
+            attempt.observation_name
         )
-        return execution, authoritative_store, tuple(committed)
+        return attempt.execution, authoritative_store, tuple(committed)
 
     def _load_reviewers(self) -> None:
         manifest = self.context.manifest
@@ -1251,7 +1377,11 @@ class ReviewPipeline:
         validation = validate_reviewer_completion(
             execution.assignment,
             execution.result,
-            set(self._authorized_observation_summaries(observations)),
+            set(
+                self._reviewer_authorized_observation_summaries(
+                    observations
+                )
+            ),
         )
         if not validation.accepted:
             raise ValueError(
@@ -1400,13 +1530,34 @@ class ReviewPipeline:
             _required(self.context.final_risk, "final risk")
         )
         multi_summary: dict[str, object] | None = None
-        if self.context.multi_run is not None:
-            payload = multi_reviewer_run_to_dict(self.context.multi_run)
+        if self.context.reviewer_executions:
+            payload = multi_reviewer_run_to_dict(
+                MultiReviewerRun(executions=self.context.reviewer_executions)
+            )
+            termination_counts: dict[str, int] = {}
+            for item in payload["executions"]:
+                runtime = item["runtime"]
+                reason = str(runtime["termination_reason"])
+                termination_counts[reason] = termination_counts.get(reason, 0) + 1
             multi_summary = {
                 "reviewer_count": payload["reviewer_count"],
                 "status_counts": payload["status_counts"],
                 "roles": [item["role"] for item in payload["executions"]],
+                "termination_counts": termination_counts,
+                "executions": [
+                    {
+                        "reviewer_index": item["reviewer_index"],
+                        "role": item["role"],
+                        "status": item["result"]["status"],
+                        "runtime": item["runtime"],
+                    }
+                    for item in payload["executions"]
+                ],
             }
+            if len(payload["executions"]) == 1:
+                multi_summary["single_reviewer_summary"] = payload[
+                    "executions"
+                ][0]["result"]["investigation_summary"]
 
         workspace = self._phase_workspace(RunPhase.REPORTING)
         aggregate_root = workspace.path / "agg"
@@ -1590,6 +1741,28 @@ class ReviewPipeline:
             summaries.update(current.summaries_by_id())
         return summaries
 
+    def _reviewer_authorized_observation_summaries(
+        self,
+        current: ObservationStore | None = None,
+    ) -> dict[str, str]:
+        """Return only the observations authorized for one Reviewer.
+
+        Reviewer attempts share repository and intent observations, but never
+        another Reviewer's investigation store. Reconciliation uses the broader
+        aggregate returned by _authorized_observation_summaries().
+        """
+
+        summaries: dict[str, str] = {}
+        for store in (
+            self.context.repository_observations,
+            self.context.intent_observations,
+        ):
+            if store is not None:
+                summaries.update(store.summaries_by_id())
+        if current is not None:
+            summaries.update(current.summaries_by_id())
+        return summaries
+
     def _review_diff_excerpt(self, full_summary: ChangeSummary) -> list[str]:
         priority = self.context.incremental_priority
         if priority is None:
@@ -1648,6 +1821,26 @@ class ReviewPipeline:
                 self._write_compatibility_state("Review failed")
             except Exception:
                 pass
+
+
+@dataclass(frozen=True)
+class _PendingReviewer:
+    index: int
+    task_name: str
+    assignment: Assignment
+    adapter: ModelAdapter | None
+    creation_error: Exception | None = None
+    initial_observations: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _ReviewerAttempt:
+    index: int
+    workspace: AttemptWorkspace
+    observations: ObservationStore
+    execution: ReviewerExecution
+    file_specs: dict[str, tuple[str, str]]
+    observation_name: str
 
 
 @dataclass(frozen=True)

@@ -25,6 +25,10 @@ def build_assignments(risk_assessment: RiskAssessment) -> list[Assignment]:
                 ),
                 max_turns=profile.max_turns_per_reviewer,
                 max_tool_calls=profile.max_tool_calls_per_reviewer,
+                max_output_tokens=profile.max_output_tokens,
+                max_total_tokens=profile.max_total_tokens,
+                max_elapsed_seconds=profile.max_elapsed_seconds,
+                max_provider_attempts=profile.max_provider_attempts,
             )
         )
 

@@ -1312,7 +1312,9 @@ Runtime Review Contract Enforcement 已落地：合法 Observation revision allo
 
 Intent Clarification 与 LLM Intent Inference 已落地：claim 级 provenance、受控 Tool Gateway 推断、Runtime 来源与 Observation authority 校验、material question 生成、confirm/correct/reject/skip、非交互降级、`awaiting_user` Session、幂等 decision artifact 与 resume、revision drift child Session 重新推断，以及 JSON/Markdown Brief 和 Reviewer Context 传播均已进入主路径。
 
-仍待后续本地批次实现：完整 Quality Gates、模型辅助 Risk/Portfolio、Reviewer 并行与失败隔离、语义 Reconciler 和有界补充调查。Eval 与 GitHub/PR 集成继续独立延期。
+Reviewer Execution Hardening 已落地：风险等级在本地展开为 turn、tool、单次输出 token、累计 token、wall-clock 和 Provider attempt 预算；single-shot 与 Agent Loop 对 Provider exception/INVALID 做同一逻辑 turn 内的有限重试；OpenAI-compatible HTTP timeout 受剩余时间约束；预算耗尽返回保留已授权 Observation 的 `partial`。多个 Reviewer 的调查和模型调用在独立 AttemptWorkspace/ObservationStore 中并行，authoritative artifact 提升与 Session task 更新由主线程按 reviewer index 串行完成。Provider、解析和 Reviewer Runtime 失败形成结构化 `failed` artifact，不再中断其他 Reviewer；控制层提交、hash 和 Session 失败仍阻断 phase。runtime/termination metadata 已进入 raw response、Agent Loop trace、multi reviewer summary 和 JSON/Markdown Brief，旧 artifact 缺少新字段时继续按 legacy defaults hydrate。
+
+仍待后续本地批次实现：完整 Quality Gates、模型辅助 Risk/Portfolio、语义 Reconciler 和有界补充调查。Eval 与 GitHub/PR 集成继续独立延期。
 
 ## 24. 实现同步原则
 

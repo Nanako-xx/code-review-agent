@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 from typing import Any, TypeVar
 
 from review_agent.brief import BriefFinding, RejectedHypothesis, ReviewBrief
@@ -24,6 +25,10 @@ from review_agent.models import (
     ConclusionImpact,
     ContractAssessment,
     ContractItemStatus,
+    DEFAULT_REVIEWER_MAX_ELAPSED_SECONDS,
+    DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS,
+    DEFAULT_REVIEWER_MAX_PROVIDER_ATTEMPTS,
+    DEFAULT_REVIEWER_MAX_TOTAL_TOKENS,
     InitialContext,
     IntentClaim,
     IntentClaimState,
@@ -41,11 +46,14 @@ from review_agent.models import (
     ReviewerFinding,
     ReviewerResult,
     ReviewerResultStatus,
+    ReviewerRuntimeMetadata,
+    ReviewerTerminationReason,
     RiskAssessment,
     RiskAssessmentPacket,
     RiskLevel,
 )
 from review_agent.orchestrator import ReviewerExecution
+from review_agent.reviewer_runtime import reviewer_runtime_to_dict
 from review_agent.repository_intelligence import (
     ChangedSymbol,
     RepositoryIntelligenceSnapshot,
@@ -512,6 +520,7 @@ def reviewer_execution_from_artifacts(
         raise ValueError("trace_id must be a non-empty string")
     envelope = _model_envelope_from_dict(envelope_payload)
     response = _model_response_from_dict(response_payload)
+    runtime = _reviewer_runtime_from_response(response_payload)
     return ReviewerExecution(
         reviewer_index=reviewer_index,
         trace_id=trace_id,
@@ -519,6 +528,7 @@ def reviewer_execution_from_artifacts(
         envelope=envelope,
         response=response,
         result=reviewer_result_from_dict(result_payload),
+        runtime=runtime,
     )
 
 
@@ -988,27 +998,18 @@ def _review_brief_reviewer_summary(value: Any) -> dict[str, Any]:
     item = _object(value, context)
     if not item:
         return {}
-    if "roles" in item:
-        _exact(item, {"reviewer_count", "status_counts", "roles"}, context)
-        common = {
-            "reviewer_count": _non_negative_integer(
-                item,
-                "reviewer_count",
-                context,
-            ),
-            "status_counts": _non_negative_integer_mapping(
-                item,
-                "status_counts",
-                context,
-            ),
-        }
-        return {**common, "roles": _string_list(item, "roles", context)}
-    _exact(
+    _required_with_optional(
         item,
-        {"reviewer_count", "status_counts", "single_reviewer_summary"},
+        {"reviewer_count", "status_counts"},
+        {
+            "roles",
+            "single_reviewer_summary",
+            "termination_counts",
+            "executions",
+        },
         context,
     )
-    common = {
+    result: dict[str, Any] = {
         "reviewer_count": _non_negative_integer(item, "reviewer_count", context),
         "status_counts": _non_negative_integer_mapping(
             item,
@@ -1016,12 +1017,55 @@ def _review_brief_reviewer_summary(value: Any) -> dict[str, Any]:
             context,
         ),
     }
-    return {
-        **common,
-        "single_reviewer_summary": _string(
+    if "roles" in item:
+        result["roles"] = _string_list(item, "roles", context)
+    if "single_reviewer_summary" in item:
+        result["single_reviewer_summary"] = _string(
             item,
             "single_reviewer_summary",
             context,
+        )
+    if "termination_counts" in item:
+        result["termination_counts"] = _non_negative_integer_mapping(
+            item,
+            "termination_counts",
+            context,
+        )
+    if "executions" in item:
+        executions = item["executions"]
+        if not isinstance(executions, list):
+            raise ValueError(f"{context}.executions must be a list")
+        result["executions"] = [
+            _review_brief_reviewer_execution(
+                execution,
+                f"{context}.executions[{index}]",
+            )
+            for index, execution in enumerate(executions)
+        ]
+    return result
+
+
+def _review_brief_reviewer_execution(value: Any, context: str) -> dict[str, Any]:
+    item = _object(value, context)
+    _exact(item, {"reviewer_index", "role", "status", "runtime"}, context)
+    return {
+        "reviewer_index": _non_negative_integer(
+            item,
+            "reviewer_index",
+            context,
+        ),
+        "role": _string(item, "role", context),
+        "status": _enum_field(
+            ReviewerResultStatus,
+            item,
+            "status",
+            context,
+        ).value,
+        "runtime": reviewer_runtime_to_dict(
+            _reviewer_runtime_from_dict(
+                item["runtime"],
+                f"{context}.runtime",
+            )
         ),
     }
 
@@ -1136,7 +1180,7 @@ def _review_brief_verification_evidence(value: Any) -> list[dict[str, Any]]:
 
 def _assignment_from_dict(value: Any, context: str) -> Assignment:
     item = _object(value, context)
-    _exact(
+    _required_with_optional(
         item,
         {
             "role",
@@ -1149,6 +1193,12 @@ def _assignment_from_dict(value: Any, context: str) -> Assignment:
             "max_tool_calls",
             "repository_permission",
             "command_permission",
+        },
+        {
+            "max_output_tokens",
+            "max_total_tokens",
+            "max_elapsed_seconds",
+            "max_provider_attempts",
         },
         context,
     )
@@ -1188,6 +1238,26 @@ def _assignment_from_dict(value: Any, context: str) -> Assignment:
         ),
         max_turns=_integer(item, "max_turns", context),
         max_tool_calls=_integer(item, "max_tool_calls", context),
+        max_output_tokens=(
+            _positive_integer(item, "max_output_tokens", context)
+            if "max_output_tokens" in item
+            else DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS
+        ),
+        max_total_tokens=(
+            _positive_integer(item, "max_total_tokens", context)
+            if "max_total_tokens" in item
+            else DEFAULT_REVIEWER_MAX_TOTAL_TOKENS
+        ),
+        max_elapsed_seconds=(
+            _positive_number(item, "max_elapsed_seconds", context)
+            if "max_elapsed_seconds" in item
+            else DEFAULT_REVIEWER_MAX_ELAPSED_SECONDS
+        ),
+        max_provider_attempts=(
+            _positive_integer(item, "max_provider_attempts", context)
+            if "max_provider_attempts" in item
+            else DEFAULT_REVIEWER_MAX_PROVIDER_ATTEMPTS
+        ),
         repository_permission=_string(item, "repository_permission", context),
         command_permission=_string(item, "command_permission", context),
     )
@@ -1206,12 +1276,68 @@ def _model_envelope_from_dict(payload: Mapping[str, Any]) -> ModelInvocationEnve
 
 def _model_response_from_dict(payload: Mapping[str, Any]) -> ModelResponse:
     item = _object(payload, "reviewer_response")
-    _exact(item, {"content", "provider_name", "model", "raw"}, "reviewer_response")
+    _required_with_optional(
+        item,
+        {"content", "provider_name", "model", "raw"},
+        {"runtime"},
+        "reviewer_response",
+    )
     return ModelResponse(
         content=_string(item, "content", "reviewer_response"),
         provider_name=_string(item, "provider_name", "reviewer_response"),
         model=_string(item, "model", "reviewer_response"),
         raw=dict(_object_field(item, "raw", "reviewer_response")),
+    )
+
+
+def _reviewer_runtime_from_response(
+    payload: Mapping[str, Any],
+) -> ReviewerRuntimeMetadata:
+    item = _object(payload, "reviewer_response")
+    if "runtime" not in item:
+        return ReviewerRuntimeMetadata()
+
+    return _reviewer_runtime_from_dict(
+        item["runtime"],
+        "reviewer_response.runtime",
+    )
+
+
+def _reviewer_runtime_from_dict(
+    value: Any,
+    context: str,
+) -> ReviewerRuntimeMetadata:
+    runtime = _object(value, context)
+    _exact(
+        runtime,
+        {
+            "provider_attempts",
+            "model_turns",
+            "tool_calls",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "usage_available",
+            "elapsed_seconds",
+            "termination_reason",
+        },
+        context,
+    )
+    return ReviewerRuntimeMetadata(
+        provider_attempts=_non_negative_integer(runtime, "provider_attempts", context),
+        model_turns=_non_negative_integer(runtime, "model_turns", context),
+        tool_calls=_non_negative_integer(runtime, "tool_calls", context),
+        input_tokens=_non_negative_integer(runtime, "input_tokens", context),
+        output_tokens=_non_negative_integer(runtime, "output_tokens", context),
+        total_tokens=_non_negative_integer(runtime, "total_tokens", context),
+        usage_available=_boolean(runtime, "usage_available", context),
+        elapsed_seconds=_non_negative_number(runtime, "elapsed_seconds", context),
+        termination_reason=_enum_field(
+            ReviewerTerminationReason,
+            runtime,
+            "termination_reason",
+            context,
+        ),
     )
 
 
@@ -1416,6 +1542,13 @@ def _integer(payload: Mapping[str, Any], field: str, context: str) -> int:
     return value
 
 
+def _positive_integer(payload: Mapping[str, Any], field: str, context: str) -> int:
+    value = _integer(payload, field, context)
+    if value <= 0:
+        raise ValueError(f"{context}.{field} must be a positive integer")
+    return value
+
+
 def _non_negative_integer(
     payload: Mapping[str, Any],
     field: str,
@@ -1424,6 +1557,41 @@ def _non_negative_integer(
     value = _integer(payload, field, context)
     if value < 0:
         raise ValueError(f"{context}.{field} must be a non-negative integer")
+    return value
+
+
+def _positive_number(payload: Mapping[str, Any], field: str, context: str) -> float:
+    value = payload[field]
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{context}.{field} must be a positive number")
+    return float(value)
+
+
+def _non_negative_number(
+    payload: Mapping[str, Any],
+    field: str,
+    context: str,
+) -> float:
+    value = payload[field]
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(f"{context}.{field} must be a non-negative number")
+    return float(value)
+
+
+def _boolean(payload: Mapping[str, Any], field: str, context: str) -> bool:
+    value = payload[field]
+    if type(value) is not bool:
+        raise ValueError(f"{context}.{field} must be a boolean")
     return value
 
 

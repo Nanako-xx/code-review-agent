@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Protocol, Union
@@ -62,15 +63,24 @@ class OpenAICompatibleConfig:
     model: str
     timeout_seconds: int = 60
 
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or not math.isfinite(self.timeout_seconds)
+            or self.timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be a positive finite number")
 
-Transport = Callable[[str, dict[str, str], dict[str, Any], int], dict[str, Any]]
+
+Transport = Callable[[str, dict[str, str], dict[str, Any], float], dict[str, Any]]
 
 
 def _urllib_transport(
     url: str,
     headers: dict[str, str],
     payload: dict[str, Any],
-    timeout_seconds: int,
+    timeout_seconds: float,
 ) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url=url, data=data, headers=headers, method="POST")
@@ -97,8 +107,9 @@ class OpenAICompatibleToolAdapter:
             "Content-Type": "application/json",
         }
         url = f"{self._config.base_url.rstrip('/')}/chat/completions"
+        timeout_seconds = _transport_timeout_seconds(request, self._config.timeout_seconds)
         try:
-            raw = self._transport(url, headers, payload, self._config.timeout_seconds)
+            raw = self._transport(url, headers, payload, timeout_seconds)
         except json.JSONDecodeError as error:
             return ModelTurnResponse(
                 kind=ModelResponseKind.INVALID,
@@ -117,6 +128,21 @@ class OpenAICompatibleToolAdapter:
         if response.kind is ModelResponseKind.TOOL_CALLS:
             self._assistant_tool_call_messages.append(_assistant_tool_call_message(response.tool_calls))
         return response
+
+
+def _transport_timeout_seconds(
+    request: ModelTurnRequest,
+    configured_timeout_seconds: int,
+) -> float:
+    requested = request.parameters.get("timeout_seconds")
+    if (
+        isinstance(requested, bool)
+        or not isinstance(requested, (int, float))
+        or not math.isfinite(requested)
+        or requested <= 0
+    ):
+        return float(configured_timeout_seconds)
+    return float(min(configured_timeout_seconds, requested))
 
 
 def _build_openai_tool_payload(

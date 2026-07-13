@@ -1,8 +1,20 @@
+from dataclasses import replace
+import json
+import time
+
 import pytest
 
 from review_agent.model_adapter import FakeToolCallingAdapter
 from review_agent.model_protocol import ModelResponseKind, ModelToolCall, ModelTurnResponse
-from review_agent.models import Assignment, InitialContext, IntentPacket, IntentSource, IntentStatus, ReviewerResultStatus
+from review_agent.models import (
+    Assignment,
+    InitialContext,
+    IntentPacket,
+    IntentSource,
+    IntentStatus,
+    ReviewerResultStatus,
+    ReviewerTerminationReason,
+)
 from review_agent.reviewer import ReviewerResultParseError, parse_reviewer_result, run_single_reviewer
 
 
@@ -290,8 +302,11 @@ def test_run_single_reviewer_handles_invalid_adapter_response():
     )
 
     assert run.result.status is ReviewerResultStatus.FAILED
-    assert run.result.uncertainties == ["bad response shape"]
-    assert run.response.content == "bad response shape"
+    assert run.runtime.provider_attempts == 2
+    assert run.runtime.termination_reason is ReviewerTerminationReason.PROVIDER_RETRY_EXHAUSTED
+    assert "bad response shape" in run.result.uncertainties[0]
+    assert "provider retry exhausted" in run.result.uncertainties
+    assert "fake adapter script exhausted" in run.response.content
 
 
 def test_run_single_reviewer_handles_malformed_final_list_field():
@@ -364,3 +379,100 @@ def test_run_single_reviewer_uses_diff_excerpt_as_code_snippet():
 
     assert "Diff Excerpt" in run.envelope.messages[0]["content"]
     assert "+changed" in run.envelope.messages[0]["content"]
+
+
+def _partial_final_response(*, raw=None):
+    return ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "contract_assessments": [],
+                "confirmed_findings": [],
+                "rejected_hypotheses": [],
+                "uncertainties": ["bounded single-shot review"],
+                "observation_refs": ["O-diff-auth"],
+                "investigation_summary": "Completed bounded review.",
+                "status": "partial",
+            }
+        ),
+        raw=raw or {},
+    )
+
+
+def test_single_reviewer_retries_provider_exception_on_same_logical_request():
+    def raise_once(_request):
+        raise TimeoutError("temporary provider timeout")
+
+    adapter = FakeToolCallingAdapter(
+        script=[raise_once, _partial_final_response()]
+    )
+
+    run = run_single_reviewer(
+        adapter=adapter,
+        assignment=make_assignment(),
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={"O-diff-auth": "authorized diff"},
+        trace_id="trace-reviewer-provider-retry",
+    )
+
+    assert run.result.status is ReviewerResultStatus.PARTIAL
+    assert len(adapter.requests) == 2
+    assert adapter.requests[0].messages == adapter.requests[1].messages
+    assert run.runtime.provider_attempts == 2
+    assert run.runtime.model_turns == 1
+    assert run.runtime.usage_available is False
+
+
+def test_single_reviewer_stops_on_total_token_budget_and_retains_observations():
+    assignment = replace(make_assignment(), max_total_tokens=100)
+    adapter = FakeToolCallingAdapter(
+        script=[
+            _partial_final_response(
+                raw={
+                    "usage": {
+                        "prompt_tokens": 80,
+                        "completion_tokens": 30,
+                        "total_tokens": 110,
+                    }
+                }
+            )
+        ]
+    )
+
+    run = run_single_reviewer(
+        adapter=adapter,
+        assignment=assignment,
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={"O-diff-auth": "authorized diff"},
+        trace_id="trace-reviewer-token-budget",
+    )
+
+    assert run.result.status is ReviewerResultStatus.PARTIAL
+    assert run.result.observation_refs == ["O-diff-auth"]
+    assert run.runtime.total_tokens == 110
+    assert run.runtime.usage_available is True
+    assert run.runtime.termination_reason is ReviewerTerminationReason.TOKEN_BUDGET_EXHAUSTED
+    assert adapter.requests[0].parameters["max_output_tokens"] == 100
+
+
+def test_single_reviewer_stops_on_elapsed_time_budget():
+    assignment = replace(make_assignment(), max_elapsed_seconds=0.001)
+
+    def slow_response(_request):
+        time.sleep(0.01)
+        return _partial_final_response()
+
+    run = run_single_reviewer(
+        adapter=FakeToolCallingAdapter(script=[slow_response]),
+        assignment=assignment,
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={"O-diff-auth": "authorized diff"},
+        trace_id="trace-reviewer-time-budget",
+    )
+
+    assert run.result.status is ReviewerResultStatus.PARTIAL
+    assert run.runtime.elapsed_seconds >= assignment.max_elapsed_seconds
+    assert run.runtime.termination_reason is ReviewerTerminationReason.TIME_BUDGET_EXHAUSTED

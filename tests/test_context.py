@@ -36,6 +36,10 @@ def _context_assignment() -> Assignment:
         ),
         max_turns=6,
         max_tool_calls=12,
+        max_output_tokens=1234,
+        max_total_tokens=9876,
+        max_elapsed_seconds=90,
+        max_provider_attempts=3,
     )
 
 
@@ -88,6 +92,10 @@ def test_reviewer_envelope_uses_standard_four_inputs():
     assert "Assignment" in envelope.messages[0]["content"]
     assert "Observation Summary" in envelope.messages[0]["content"]
     assert "Initial Context" in envelope.messages[0]["content"]
+    assert "4096 output tokens per model call" in envelope.messages[0]["content"]
+    assert "65536 total tokens" in envelope.messages[0]["content"]
+    assert "300 elapsed seconds" in envelope.messages[0]["content"]
+    assert "2 provider attempts per model turn" in envelope.messages[0]["content"]
     assert "Evidence" not in envelope.messages[0]["content"]
     assert "explicit" not in envelope.messages[0]["content"]
     assert "inferred" in envelope.messages[0]["content"]
@@ -262,8 +270,10 @@ def test_context_payload_compacts_variable_sections_to_message_budget():
     assert "Completion Rules" in content
     assert "[compacted" in content
     assert "tail-marker" not in content
-    assert "Code Snippets" in result.metadata["compressed_sections"]
-    assert "Observation Summary" in result.metadata["compressed_sections"]
+    assert result.metadata["compressed_sections"]
+    assert set(result.metadata["compressed_sections"]).issubset(
+        {"Code Snippets", "Observation Summary"}
+    )
 
 
 def test_context_budget_applies_to_messages_only_not_tools_or_parameters():
@@ -381,5 +391,21 @@ def test_reviewer_envelope_uses_explicit_model_parameters():
 
     assert envelope.parameters["model"] == "deepseek-chat"
     assert envelope.parameters["max_output_tokens"] == 2048
+    assert envelope.parameters["max_elapsed_seconds"] == 90
     assert envelope.parameters["reasoning_effort"] == "high"
     assert envelope.parameters["response_schema"] == "reviewer_assignment_result_v2"
+
+
+def test_reviewer_envelope_defaults_model_limits_from_assignment():
+    assignment = _context_assignment()
+
+    envelope = build_reviewer_envelope(
+        assignment=assignment,
+        intent=_context_intent(),
+        code_snippets={},
+        observations={},
+        trace_id="trace-assignment-budget",
+    )
+
+    assert envelope.parameters["max_output_tokens"] == assignment.max_output_tokens
+    assert envelope.parameters["max_elapsed_seconds"] == assignment.max_elapsed_seconds

@@ -405,7 +405,32 @@ def _mapping_rows(value: object) -> list[dict[str, Any]]:
 def _dict_lines(payload: dict[str, Any]) -> str:
     if not payload:
         return "- No reviewer summary recorded"
-    return "\n".join(f"- {key}: {_inline_value(value)}" for key, value in payload.items())
+    lines: list[str] = []
+    for key, value in payload.items():
+        if key == "executions" and isinstance(value, list):
+            lines.append("- executions:")
+            for item in value:
+                if not isinstance(item, dict):
+                    lines.append(f"  - {_inline_value(item)}")
+                    continue
+                runtime = item.get("runtime", {})
+                runtime = runtime if isinstance(runtime, dict) else {}
+                lines.append(
+                    "  - "
+                    f"reviewer {item.get('reviewer_index', 'unknown')} "
+                    f"({item.get('role', 'unknown')}): "
+                    f"status={item.get('status', 'unknown')}, "
+                    f"termination={runtime.get('termination_reason', 'unknown')}, "
+                    f"provider_attempts={runtime.get('provider_attempts', 0)}, "
+                    f"model_turns={runtime.get('model_turns', 0)}, "
+                    f"tool_calls={runtime.get('tool_calls', 0)}, "
+                    f"total_tokens={runtime.get('total_tokens', 0)}, "
+                    f"usage_available={runtime.get('usage_available', False)}, "
+                    f"elapsed_seconds={runtime.get('elapsed_seconds', 0)}"
+                )
+            continue
+        lines.append(f"- {key}: {_inline_value(value)}")
+    return "\n".join(lines)
 
 
 def _inline_value(value: object) -> str:

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from review_agent.model_adapter import (
     FakeToolCallingAdapter,
     OpenAICompatibleConfig,
@@ -40,6 +42,17 @@ def test_model_response_lives_in_model_protocol():
 
 def test_openai_compatible_config_lives_in_model_adapter():
     assert OpenAICompatibleConfig.__module__ == "review_agent.model_adapter"
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan")])
+def test_openai_compatible_config_requires_finite_positive_timeout(timeout):
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+            timeout_seconds=timeout,
+        )
 
 
 def test_fake_adapter_returns_scripted_tool_call():
@@ -342,3 +355,27 @@ def test_openai_compatible_adapter_returns_invalid_when_tool_call_function_is_no
 
     assert response.kind is ModelResponseKind.INVALID
     assert "tool call function must be an object" in response.error
+
+
+def test_openai_compatible_adapter_caps_transport_timeout_to_runtime_budget():
+    captured = {}
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured["timeout_seconds"] = timeout_seconds
+        return {"choices": [{"message": {"content": '{"status": "partial"}'}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+            timeout_seconds=60,
+        ),
+        transport=transport,
+    )
+    request = make_request()
+    request.parameters["timeout_seconds"] = 2.5
+
+    adapter.complete_turn(request)
+
+    assert captured["timeout_seconds"] == 2.5

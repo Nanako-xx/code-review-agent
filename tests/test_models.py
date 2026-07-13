@@ -1,3 +1,5 @@
+import pytest
+
 from review_agent.models import (
     Assignment,
     ContractItemStatus,
@@ -8,6 +10,8 @@ from review_agent.models import (
     QualityGateResult,
     ReviewProfile,
     ReviewRequest,
+    ReviewerRuntimeMetadata,
+    ReviewerTerminationReason,
     RiskAssessment,
     RiskLevel,
 )
@@ -100,6 +104,63 @@ def test_review_profile_maps_risk_to_depth():
     assert profile.reviewer_count == 3
     assert profile.max_turns_per_reviewer == 16
     assert "dynamic_specialist" in profile.reviewer_roles
+
+
+def test_review_profiles_expand_every_runtime_budget_by_risk():
+    profiles = [ReviewProfile.for_risk(level) for level in RiskLevel]
+
+    assert [profile.max_total_tokens for profile in profiles] == sorted(
+        profile.max_total_tokens for profile in profiles
+    )
+    assert [profile.max_elapsed_seconds for profile in profiles] == sorted(
+        profile.max_elapsed_seconds for profile in profiles
+    )
+    for profile in profiles:
+        assert profile.max_output_tokens > 0
+        assert profile.max_total_tokens > 0
+        assert profile.max_elapsed_seconds > 0
+        assert profile.max_provider_attempts > 0
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "message"),
+    [
+        ("max_output_tokens", 0, "max_output_tokens"),
+        ("max_total_tokens", -1, "max_total_tokens"),
+        ("max_elapsed_seconds", 0.0, "max_elapsed_seconds"),
+        ("max_elapsed_seconds", float("nan"), "max_elapsed_seconds"),
+        ("max_provider_attempts", True, "max_provider_attempts"),
+    ],
+)
+def test_assignment_requires_strictly_positive_runtime_budgets(
+    field_name: str,
+    invalid_value: object,
+    message: str,
+):
+    values = {
+        "role": "core",
+        "mission": "review",
+        "assignment_reason": [],
+        "assigned_contract": [],
+        "required_checks": [],
+        "initial_context": InitialContext(),
+        "max_turns": 1,
+        "max_tool_calls": 1,
+        field_name: invalid_value,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        Assignment(**values)
+
+
+def test_reviewer_runtime_metadata_has_legacy_unknown_defaults():
+    runtime = ReviewerRuntimeMetadata()
+
+    assert runtime.provider_attempts == 0
+    assert runtime.total_tokens == 0
+    assert runtime.usage_available is False
+    assert runtime.elapsed_seconds == 0.0
+    assert runtime.termination_reason is ReviewerTerminationReason.LEGACY_UNKNOWN
 
 
 def test_contract_status_values_are_stable():

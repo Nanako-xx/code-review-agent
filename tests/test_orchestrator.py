@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 
 from review_agent.model_adapter import ModelAdapter
 from review_agent.model_adapter_factory import ModelAdapterFactory
@@ -46,14 +48,17 @@ class RecordingAdapter:
 
 
 class RecordingAdapterFactory:
-    def __init__(self, fail_on_call_number=None):
+    def __init__(self, fail_on_create_number=None):
         self.trace_ids = []
         self.roles = []
-        self.fail_on_call_number = fail_on_call_number
+        self.fail_on_call_number = None
+        self.fail_on_create_number = fail_on_create_number
         self.created_count = 0
 
     def create(self) -> ModelAdapter:
         self.created_count += 1
+        if self.fail_on_create_number == self.created_count:
+            raise RuntimeError("provider unavailable")
         return RecordingAdapter(self)
 
 
@@ -92,8 +97,8 @@ def test_run_multi_reviewer_runs_every_assignment_with_isolated_traces():
     )
 
     assert factory.created_count == 2
-    assert factory.trace_ids == ["review-123-reviewer-0", "review-123-reviewer-1"]
-    assert factory.roles == ["Core Reviewer", "Adversarial Reviewer"]
+    assert sorted(factory.trace_ids) == ["review-123-reviewer-0", "review-123-reviewer-1"]
+    assert sorted(factory.roles) == ["Adversarial Reviewer", "Core Reviewer"]
     assert [item.assignment.role for item in run.executions] == ["Core Reviewer", "Adversarial Reviewer"]
     assert [item.result.status.value for item in run.executions] == ["partial", "partial"]
     assert run.status_counts == {"partial": 2}
@@ -120,7 +125,7 @@ def test_multi_reviewer_run_to_dict_contains_artifact_summary():
 
 def test_run_multi_reviewer_records_failed_execution_without_aborting_remaining_artifacts():
     run = run_multi_reviewer(
-        adapter_factory=RecordingAdapterFactory(fail_on_call_number=2),
+        adapter_factory=RecordingAdapterFactory(fail_on_create_number=2),
         assignments=[make_assignment("Core Reviewer"), make_assignment("Adversarial Reviewer")],
         intent=make_intent(),
         diff_excerpt=[],
@@ -136,3 +141,83 @@ def test_run_multi_reviewer_records_failed_execution_without_aborting_remaining_
     assert payload["executions"][1]["trace_id"] == "review-789-reviewer-1"
     assert payload["executions"][1]["result"]["status"] == "failed"
     assert "provider unavailable" in payload["executions"][1]["result"]["investigation_summary"]
+    assert payload["executions"][1]["runtime"]["termination_reason"] == "runtime_failure"
+
+
+class OverlapState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.release = threading.Event()
+        self.active = 0
+        self.max_active = 0
+
+
+class OverlapAdapter:
+    provider_name = "overlap"
+
+    def __init__(self, state: OverlapState):
+        self.state = state
+
+    def complete_turn(self, request: ModelTurnRequest) -> ModelTurnResponse:
+        with self.state.lock:
+            self.state.active += 1
+            self.state.max_active = max(self.state.max_active, self.state.active)
+            if self.state.active >= 2:
+                self.state.release.set()
+        try:
+            self.state.release.wait(timeout=1)
+            time.sleep(0.02)
+            content = request.messages[0]["content"]
+            role_line = next(
+                line for line in content.splitlines() if line.startswith("Role: ")
+            )
+            role = role_line.removeprefix("Role: ")
+            return ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(
+                    {
+                        "contract_assessments": [],
+                        "confirmed_findings": [],
+                        "rejected_hypotheses": [],
+                        "uncertainties": [f"{role} bounded test"],
+                        "observation_refs": ["O-shared"],
+                        "investigation_summary": f"{role} finished.",
+                        "status": "partial",
+                    }
+                ),
+            )
+        finally:
+            with self.state.lock:
+                self.state.active -= 1
+
+
+class OverlapAdapterFactory:
+    def __init__(self):
+        self.state = OverlapState()
+
+    def create(self) -> ModelAdapter:
+        return OverlapAdapter(self.state)
+
+
+def test_run_multi_reviewer_overlaps_model_calls_but_preserves_output_order():
+    factory = OverlapAdapterFactory()
+    assignments = [
+        make_assignment("Core Reviewer"),
+        make_assignment("Adversarial Reviewer"),
+    ]
+
+    run = run_multi_reviewer(
+        adapter_factory=factory,
+        assignments=assignments,
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={"O-shared": "shared observation"},
+        trace_id_prefix="review-overlap",
+    )
+
+    assert factory.state.max_active >= 2
+    assert [execution.reviewer_index for execution in run.executions] == [0, 1]
+    assert [execution.assignment.role for execution in run.executions] == [
+        "Core Reviewer",
+        "Adversarial Reviewer",
+    ]

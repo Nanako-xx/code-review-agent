@@ -38,6 +38,10 @@ from review_agent.models import (
     ClarificationStatus,
     ContractAssessment,
     ContractItemStatus,
+    DEFAULT_REVIEWER_MAX_ELAPSED_SECONDS,
+    DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS,
+    DEFAULT_REVIEWER_MAX_PROVIDER_ATTEMPTS,
+    DEFAULT_REVIEWER_MAX_TOTAL_TOKENS,
     InitialContext,
     IntentClaim,
     IntentConfidence,
@@ -52,6 +56,8 @@ from review_agent.models import (
     ReviewerFinding,
     ReviewerResult,
     ReviewerResultStatus,
+    ReviewerRuntimeMetadata,
+    ReviewerTerminationReason,
     RiskAssessment,
     RiskAssessmentPacket,
     RiskLevel,
@@ -82,6 +88,10 @@ def _assignment() -> Assignment:
         ),
         max_turns=3,
         max_tool_calls=4,
+        max_output_tokens=2048,
+        max_total_tokens=24000,
+        max_elapsed_seconds=45,
+        max_provider_attempts=3,
     )
 
 
@@ -261,6 +271,96 @@ def test_repository_and_reviewer_artifacts_round_trip() -> None:
     assert execution.assignment == assignment
     assert execution.result == result
     assert execution.response == response
+
+
+def test_assignment_hydration_adds_runtime_defaults_to_legacy_artifact() -> None:
+    payload = _json({"assignments": [asdict(_assignment())]})
+    assert isinstance(payload, dict)
+    assignment_payload = payload["assignments"][0]
+    for field_name in (
+        "max_output_tokens",
+        "max_total_tokens",
+        "max_elapsed_seconds",
+        "max_provider_attempts",
+    ):
+        assignment_payload.pop(field_name)
+
+    assignment = assignments_from_dict(payload)[0]
+
+    assert assignment.max_output_tokens == DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS
+    assert assignment.max_total_tokens == DEFAULT_REVIEWER_MAX_TOTAL_TOKENS
+    assert assignment.max_elapsed_seconds == DEFAULT_REVIEWER_MAX_ELAPSED_SECONDS
+    assert assignment.max_provider_attempts == DEFAULT_REVIEWER_MAX_PROVIDER_ATTEMPTS
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("max_output_tokens", 0),
+        ("max_total_tokens", "many"),
+        ("max_elapsed_seconds", False),
+        ("max_elapsed_seconds", float("nan")),
+        ("max_provider_attempts", -1),
+    ],
+)
+def test_assignment_hydration_strictly_validates_new_budget_fields(
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    payload = _json({"assignments": [asdict(_assignment())]})
+    assert isinstance(payload, dict)
+    payload["assignments"][0][field_name] = invalid_value
+
+    with pytest.raises(ValueError, match=field_name):
+        assignments_from_dict(payload)
+
+
+def test_reviewer_execution_hydrates_runtime_metadata_from_raw_response() -> None:
+    result = _reviewer_result()
+    envelope = ModelInvocationEnvelope("system", [], [], {"trace_id": "t"})
+    response = ModelResponse("{}", "fake", "fake-reviewer", {"fake": True})
+    runtime = ReviewerRuntimeMetadata(
+        provider_attempts=2,
+        model_turns=1,
+        tool_calls=3,
+        input_tokens=100,
+        output_tokens=20,
+        total_tokens=120,
+        usage_available=True,
+        elapsed_seconds=1.5,
+        termination_reason=ReviewerTerminationReason.COMPLETED,
+    )
+    response_payload = _json(asdict(response))
+    assert isinstance(response_payload, dict)
+    response_payload["runtime"] = _json(asdict(runtime))
+
+    execution = reviewer_execution_from_artifacts(
+        reviewer_index=0,
+        trace_id="review-1-reviewer-0",
+        assignment=_assignment(),
+        envelope_payload=_json(asdict(envelope)),
+        response_payload=response_payload,
+        result_payload=_json(reviewer_result_to_dict(result)),
+    )
+
+    assert execution.runtime == runtime
+
+
+def test_reviewer_execution_uses_legacy_unknown_runtime_when_metadata_is_missing() -> None:
+    result = _reviewer_result()
+    envelope = ModelInvocationEnvelope("system", [], [], {"trace_id": "t"})
+    response = ModelResponse("{}", "fake", "fake-reviewer", {"fake": True})
+
+    execution = reviewer_execution_from_artifacts(
+        reviewer_index=0,
+        trace_id="review-1-reviewer-0",
+        assignment=_assignment(),
+        envelope_payload=_json(asdict(envelope)),
+        response_payload=_json(asdict(response)),
+        result_payload=_json(reviewer_result_to_dict(result)),
+    )
+
+    assert execution.runtime == ReviewerRuntimeMetadata()
 
 
 def test_downstream_artifacts_round_trip() -> None:

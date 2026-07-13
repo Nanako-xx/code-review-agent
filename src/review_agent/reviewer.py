@@ -16,11 +16,21 @@ from review_agent.models import (
     ReviewerFinding,
     ReviewerResult,
     ReviewerResultStatus,
+    ReviewerRuntimeMetadata,
+    ReviewerTerminationReason,
 )
 from review_agent.review_contract import (
     finding_path_error,
     result_with_validation_deficiencies,
     validate_reviewer_completion,
+)
+from review_agent.reviewer_runtime import (
+    RuntimeTracker,
+    budget_reason_after_call,
+    budget_reason_before_call,
+    request_parameters,
+    termination_reason_for_result,
+    termination_summary,
 )
 
 
@@ -33,6 +43,7 @@ class ReviewerRun:
     envelope: ModelInvocationEnvelope
     response: ModelResponse
     result: ReviewerResult
+    runtime: ReviewerRuntimeMetadata
 
 
 REQUIRED_RESULT_KEYS = (
@@ -99,6 +110,7 @@ def run_single_reviewer(
     *,
     model: str = "configured-reviewer-model",
 ) -> ReviewerRun:
+    runtime = RuntimeTracker.start()
     envelope = build_reviewer_envelope(
         assignment=assignment,
         intent=intent,
@@ -106,15 +118,97 @@ def run_single_reviewer(
         observations=observations,
         trace_id=trace_id,
         model=model,
+        max_output_tokens=assignment.max_output_tokens,
     )
-    request = ModelTurnRequest(
-        system=envelope.system,
-        tools=[],
-        messages=[dict(message) for message in envelope.messages],
-        tool_results=[],
-        parameters={**dict(envelope.parameters), "tool_choice": "none"},
-    )
-    turn_response = adapter.complete_turn(request)
+    runtime.model_turns = 1
+    turn_response = None
+    attempt_failures: list[str] = []
+
+    for attempt_index in range(1, assignment.max_provider_attempts + 1):
+        budget_reason = budget_reason_before_call(assignment, runtime)
+        if budget_reason is not None:
+            return _single_shot_budget_run(
+                envelope,
+                turn_response,
+                observations,
+                runtime,
+                budget_reason,
+                attempt_failures,
+            )
+
+        request = ModelTurnRequest(
+            system=envelope.system,
+            tools=[],
+            messages=[dict(message) for message in envelope.messages],
+            tool_results=[],
+            parameters={
+                **request_parameters(envelope.parameters, assignment, runtime),
+                "tool_choice": "none",
+            },
+        )
+        try:
+            candidate = adapter.complete_turn(request)
+        except Exception as error:  # Provider adapters are an isolation boundary.
+            runtime.record_attempt(None)
+            attempt_failures.append(
+                f"provider attempt {attempt_index} raised "
+                f"{type(error).__name__}: {error}"
+            )
+            budget_reason = budget_reason_after_call(assignment, runtime)
+            if budget_reason is not None:
+                return _single_shot_budget_run(
+                    envelope,
+                    turn_response,
+                    observations,
+                    runtime,
+                    budget_reason,
+                    attempt_failures,
+                )
+            continue
+
+        turn_response = candidate
+        runtime.record_attempt(candidate.raw)
+        budget_reason = budget_reason_after_call(assignment, runtime)
+        if budget_reason is not None:
+            return _single_shot_budget_run(
+                envelope,
+                turn_response,
+                observations,
+                runtime,
+                budget_reason,
+                attempt_failures,
+            )
+        if candidate.kind is not ModelResponseKind.INVALID:
+            break
+        attempt_failures.append(
+            f"provider attempt {attempt_index} returned INVALID: "
+            f"{candidate.error or 'unspecified invalid response'}"
+        )
+
+    if turn_response is None or turn_response.kind is ModelResponseKind.INVALID:
+        message = "provider retry exhausted"
+        failures = _dedupe([*attempt_failures, message])
+        result = _runtime_result(
+            status=ReviewerResultStatus.FAILED,
+            reason=message,
+            observation_refs=sorted(observations),
+            uncertainties=failures,
+        )
+        response = _model_response(
+            turn_response,
+            adapter,
+            model,
+            fallback_error="; ".join(failures),
+        )
+        return ReviewerRun(
+            envelope=envelope,
+            response=response,
+            result=result,
+            runtime=runtime.snapshot(
+                ReviewerTerminationReason.PROVIDER_RETRY_EXHAUSTED
+            ),
+        )
+
     response = ModelResponse(
         content=turn_response.final_text or turn_response.error or "",
         provider_name=turn_response.provider_name,
@@ -126,10 +220,11 @@ def run_single_reviewer(
             result = parse_reviewer_result(turn_response.final_text or "")
         except ReviewerResultParseError as error:
             message = f"single-shot final response parse failed: {error}"
-            result = ReviewerResult(
-                uncertainties=[message],
-                investigation_summary=message,
+            result = _runtime_result(
                 status=ReviewerResultStatus.FAILED,
+                reason=message,
+                observation_refs=sorted(observations),
+                uncertainties=[message],
             )
         validation = validate_reviewer_completion(
             assignment,
@@ -141,17 +236,103 @@ def run_single_reviewer(
                 result,
                 validation.deficiencies,
             )
-        return ReviewerRun(envelope=envelope, response=response, result=result)
+        return ReviewerRun(
+            envelope=envelope,
+            response=response,
+            result=result,
+            runtime=runtime.snapshot(termination_reason_for_result(result)),
+        )
     if turn_response.kind is ModelResponseKind.TOOL_CALLS:
         message = "single-shot reviewer received tool calls; use --reviewer-loop agent-loop to enable tools"
     else:
         message = turn_response.error or f"single-shot reviewer received invalid response kind: {turn_response.kind.value}"
-    result = ReviewerResult(
-        uncertainties=[message],
-        investigation_summary=message,
+    result = _runtime_result(
         status=ReviewerResultStatus.FAILED,
+        reason=message,
+        observation_refs=sorted(observations),
+        uncertainties=[message],
     )
-    return ReviewerRun(envelope=envelope, response=response, result=result)
+    return ReviewerRun(
+        envelope=envelope,
+        response=response,
+        result=result,
+        runtime=runtime.snapshot(ReviewerTerminationReason.RUNTIME_FAILURE),
+    )
+
+
+def _single_shot_budget_run(
+    envelope: ModelInvocationEnvelope,
+    turn_response: Any,
+    observations: dict[str, str],
+    runtime: RuntimeTracker,
+    reason: ReviewerTerminationReason | None,
+    failures: list[str],
+) -> ReviewerRun:
+    reason = reason or ReviewerTerminationReason.RUNTIME_FAILURE
+    reason_text = termination_summary(reason)
+    result = _runtime_result(
+        status=ReviewerResultStatus.PARTIAL,
+        reason=reason_text,
+        observation_refs=sorted(observations),
+        uncertainties=_dedupe([*failures, reason_text]),
+    )
+    response = _model_response(
+        turn_response,
+        None,
+        str(envelope.parameters.get("model", "unavailable")),
+        fallback_error=reason_text,
+    )
+    return ReviewerRun(
+        envelope=envelope,
+        response=response,
+        result=result,
+        runtime=runtime.snapshot(reason),
+    )
+
+
+def _model_response(
+    turn_response: Any,
+    adapter: ModelAdapter | None,
+    model: str,
+    *,
+    fallback_error: str,
+) -> ModelResponse:
+    if turn_response is not None:
+        return ModelResponse(
+            content=turn_response.final_text or turn_response.error or fallback_error,
+            provider_name=turn_response.provider_name,
+            model=turn_response.model,
+            raw=turn_response.raw,
+        )
+    return ModelResponse(
+        content=fallback_error,
+        provider_name=getattr(adapter, "provider_name", "review-agent"),
+        model=model,
+        raw={"error": fallback_error},
+    )
+
+
+def _runtime_result(
+    *,
+    status: ReviewerResultStatus,
+    reason: str,
+    observation_refs: list[str],
+    uncertainties: list[str],
+) -> ReviewerResult:
+    retained = ", ".join(observation_refs) if observation_refs else "none"
+    return ReviewerResult(
+        uncertainties=uncertainties,
+        observation_refs=observation_refs,
+        investigation_summary=(
+            f"Reviewer execution stopped because {reason}. "
+            f"Authorized observations retained: {retained}."
+        ),
+        status=status,
+    )
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
 
 
 def _strip_json_fence(raw_text: str) -> str:

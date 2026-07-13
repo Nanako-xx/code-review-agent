@@ -9,7 +9,6 @@ from conftest import run_git
 
 import review_agent.pipeline as pipeline_module
 from review_agent.checkpoint import CheckpointStore
-from review_agent.model_adapter_factory import FakeModelAdapterFactory
 from review_agent.models import ReviewRequest
 from review_agent.pipeline import PipelineStageError, ReviewPipeline
 from review_agent.resume import ResumeAction, ResumeBlockedError, ReviewSessionResumer
@@ -131,30 +130,26 @@ def test_resume_restarts_stale_running_phase_without_repeating_preflight(
     } == preflight_hashes
 
 
-def test_resume_reuses_completed_reviewer_and_retries_only_failed_task(
+def test_resume_reuses_completed_reviewer_and_retries_control_layer_failure(
     git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FailSecondFactory:
-        def __init__(self) -> None:
-            self.created = 0
-
-        def create(self):
-            self.created += 1
-            # Intent inference creates the first adapter; fail the second reviewer.
-            if self.created == 3:
-                raise RuntimeError("provider timeout")
-            return FakeModelAdapterFactory().create()
-
-    failing_factory = FailSecondFactory()
     pipeline, session_store, checkpoint_store = _session_pipeline(
         git_repo,
         review_id="review-partial-reviewers",
         reviewer_mode="multi",
-        adapter_factory_builder=lambda _config: failing_factory,
     )
 
-    with pytest.raises(PipelineStageError, match="provider timeout"):
-        pipeline.execute()
+    original_commit = pipeline._commit_reviewer_attempt
+    with monkeypatch.context() as scoped:
+        def fail_second_commit(attempt):
+            if attempt.index == 1:
+                raise RuntimeError("artifact promotion failed")
+            return original_commit(attempt)
+
+        scoped.setattr(pipeline, "_commit_reviewer_attempt", fail_second_commit)
+        with pytest.raises(PipelineStageError, match="artifact promotion failed"):
+            pipeline.execute()
 
     failed = session_store.load()
     tasks = failed.phases["reviewers"].tasks

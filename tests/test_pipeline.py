@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
+import time
 
 from conftest import run_git
 
 from review_agent.checkpoint import CheckpointStore
 from review_agent.model_adapter import FakeToolCallingAdapter
+from review_agent.model_adapter_factory import FakeModelAdapterFactory
 from review_agent.model_protocol import (
     ModelResponseKind,
     ModelToolCall,
@@ -27,13 +30,20 @@ def _pipeline(
     reviewer_mode: str = "single",
     reviewer_loop: str = "agent-loop",
     adapter_factory_builder=None,
+    changed_path: str = "app.py",
 ) -> tuple[ReviewPipeline, SessionStore, CheckpointStore]:
     base = run_git(git_repo, "rev-parse", "HEAD")
-    (git_repo / "app.py").write_text(
-        "def add(a, b):\n    return a - b\n",
+    changed_file = git_repo / changed_path
+    changed_file.parent.mkdir(parents=True, exist_ok=True)
+    changed_file.write_text(
+        (
+            "def add(a, b):\n    return a - b\n"
+            if changed_path == "app.py"
+            else "def check(token):\n    return token == 'ok'\n"
+        ),
         encoding="utf-8",
     )
-    run_git(git_repo, "add", "app.py")
+    run_git(git_repo, "add", changed_path)
     run_git(git_repo, "commit", "-m", "change implementation")
     head = run_git(git_repo, "rev-parse", "HEAD")
     resolver = RevisionResolver()
@@ -261,3 +271,116 @@ def test_single_reviewer_findings_flow_through_reconciliation_and_brief(
     assert finding.path == "app.py"
     assert finding.line == 2
     assert finding.impact == "Callers receive incorrect arithmetic results."
+
+
+def test_pipeline_overlaps_reviewer_calls_and_commits_in_stable_order(
+    git_repo: Path,
+) -> None:
+    class State:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.release = threading.Event()
+            self.active = 0
+            self.max_active = 0
+
+    state = State()
+
+    class OverlapAdapter:
+        provider_name = "overlap-fake"
+
+        def __init__(self) -> None:
+            self.delegate = FakeModelAdapterFactory().create()
+
+        def complete_turn(self, request):
+            is_reviewer = (
+                request.parameters.get("response_schema")
+                == "reviewer_assignment_result_v2"
+            )
+            if not is_reviewer:
+                return self.delegate.complete_turn(request)
+            with state.lock:
+                state.active += 1
+                state.max_active = max(state.max_active, state.active)
+                if state.active >= 2:
+                    state.release.set()
+            try:
+                state.release.wait(timeout=1)
+                time.sleep(0.02)
+                return self.delegate.complete_turn(request)
+            finally:
+                with state.lock:
+                    state.active -= 1
+
+    class OverlapFactory:
+        def create(self):
+            return OverlapAdapter()
+
+    pipeline, session_store, _ = _pipeline(
+        git_repo,
+        review_id="review-parallel-reviewers",
+        reviewer_mode="multi",
+        changed_path="auth.py",
+        adapter_factory_builder=lambda _config: OverlapFactory(),
+    )
+
+    result = pipeline.execute()
+
+    assert state.max_active >= 2
+    assert [
+        execution.reviewer_index
+        for execution in result.context.reviewer_executions
+    ] == [0, 1, 2]
+    tasks = session_store.load().phases["reviewers"].tasks
+    assert list(tasks) == ["reviewer-0", "reviewer-1", "reviewer-2"]
+    assert all(task.status is PhaseStatus.COMPLETED for task in tasks.values())
+
+
+def test_pipeline_persists_provider_failure_without_aborting_other_reviewers(
+    git_repo: Path,
+) -> None:
+    class FailSecondReviewerFactory:
+        def __init__(self) -> None:
+            self.created = 0
+
+        def create(self):
+            self.created += 1
+            # Intent inference owns adapter 1. Reviewer indices 0, 1, 2 own
+            # adapters 2, 3, 4 respectively.
+            if self.created == 3:
+                raise RuntimeError("reviewer provider creation failed")
+            return FakeModelAdapterFactory().create()
+
+    factory = FailSecondReviewerFactory()
+    pipeline, session_store, checkpoint_store = _pipeline(
+        git_repo,
+        review_id="review-isolated-provider-failure",
+        reviewer_mode="multi",
+        changed_path="auth.py",
+        adapter_factory_builder=lambda _config: factory,
+    )
+
+    result = pipeline.execute()
+
+    executions = result.context.reviewer_executions
+    assert [item.result.status.value for item in executions] == [
+        "completed",
+        "failed",
+        "completed",
+    ]
+    assert executions[1].runtime.termination_reason.value == "runtime_failure"
+    assert "reviewer provider creation failed" in executions[1].result.investigation_summary
+    tasks = session_store.load().phases["reviewers"].tasks
+    assert all(task.status is PhaseStatus.COMPLETED for task in tasks.values())
+
+    raw_response = json.loads(
+        (checkpoint_store.run_dir / "reviewer_1_raw_response.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert raw_response["runtime"]["termination_reason"] == "runtime_failure"
+    assert result.context.brief is not None
+    reviewer_summary = result.context.brief.change_map_and_repository_impact[
+        "reviewer_summary"
+    ]
+    assert reviewer_summary["termination_counts"]["runtime_failure"] == 1
+    assert reviewer_summary["executions"][1]["status"] == "failed"

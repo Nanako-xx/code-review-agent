@@ -1,6 +1,6 @@
 from review_agent.git_repo import ChangeSummary
 from review_agent.intent import build_intent_packet
-from review_agent.models import ReviewRequest, RiskAssessment, RiskLevel
+from review_agent.models import ReviewProfile, ReviewRequest, RiskAssessment, RiskLevel
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
 from review_agent.runtime import build_assignments
 
@@ -80,6 +80,13 @@ def test_runtime_assignments_use_initial_context():
 
     assert len(assignments) == 2
     assert assignments[0].initial_context.observation_refs == ["diff:src/app.py"]
+
+    profile = ReviewProfile.for_risk(RiskLevel.MEDIUM)
+    for assignment in assignments:
+        assert assignment.max_output_tokens == profile.max_output_tokens
+        assert assignment.max_total_tokens == profile.max_total_tokens
+        assert assignment.max_elapsed_seconds == profile.max_elapsed_seconds
+        assert assignment.max_provider_attempts == profile.max_provider_attempts
 
 
 def test_assignments_receive_initial_context_not_raw_evidence():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -285,6 +286,25 @@ class ReviewerResultStatus(str, Enum):
     FAILED = "failed"
 
 
+class ReviewerTerminationReason(str, Enum):
+    LEGACY_UNKNOWN = "legacy_unknown"
+    COMPLETED = "completed"
+    REVIEWER_PARTIAL = "reviewer_partial"
+    REVIEWER_BLOCKED = "reviewer_blocked"
+    PROVIDER_RETRY_EXHAUSTED = "provider_retry_exhausted"
+    TURN_BUDGET_EXHAUSTED = "turn_budget_exhausted"
+    TOOL_BUDGET_EXHAUSTED = "tool_budget_exhausted"
+    TOKEN_BUDGET_EXHAUSTED = "token_budget_exhausted"
+    TIME_BUDGET_EXHAUSTED = "time_budget_exhausted"
+    RUNTIME_FAILURE = "runtime_failure"
+
+
+DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_REVIEWER_MAX_TOTAL_TOKENS = 65536
+DEFAULT_REVIEWER_MAX_ELAPSED_SECONDS = 300.0
+DEFAULT_REVIEWER_MAX_PROVIDER_ATTEMPTS = 2
+
+
 @dataclass(frozen=True)
 class ReviewRequest:
     repository_path: str
@@ -355,14 +375,54 @@ class ReviewProfile:
     max_turns_per_reviewer: int
     max_tool_calls_per_reviewer: int
     reviewer_roles: list[str]
+    max_output_tokens: int = DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS
+    max_total_tokens: int = DEFAULT_REVIEWER_MAX_TOTAL_TOKENS
+    max_elapsed_seconds: float = DEFAULT_REVIEWER_MAX_ELAPSED_SECONDS
+    max_provider_attempts: int = DEFAULT_REVIEWER_MAX_PROVIDER_ATTEMPTS
 
     @classmethod
     def for_risk(cls, risk: RiskLevel) -> "ReviewProfile":
         profiles = {
-            RiskLevel.LOW: cls(1, 6, 12, ["core"]),
-            RiskLevel.MEDIUM: cls(2, 10, 24, ["core", "adversarial"]),
-            RiskLevel.HIGH: cls(3, 16, 40, ["core", "adversarial", "dynamic_specialist"]),
-            RiskLevel.CRITICAL: cls(4, 24, 64, ["core", "adversarial", "security_specialist", "domain_specialist"]),
+            RiskLevel.LOW: cls(
+                1,
+                6,
+                12,
+                ["core"],
+                max_output_tokens=4096,
+                max_total_tokens=32768,
+                max_elapsed_seconds=120.0,
+                max_provider_attempts=2,
+            ),
+            RiskLevel.MEDIUM: cls(
+                2,
+                10,
+                24,
+                ["core", "adversarial"],
+                max_output_tokens=4096,
+                max_total_tokens=65536,
+                max_elapsed_seconds=300.0,
+                max_provider_attempts=2,
+            ),
+            RiskLevel.HIGH: cls(
+                3,
+                16,
+                40,
+                ["core", "adversarial", "dynamic_specialist"],
+                max_output_tokens=8192,
+                max_total_tokens=131072,
+                max_elapsed_seconds=600.0,
+                max_provider_attempts=3,
+            ),
+            RiskLevel.CRITICAL: cls(
+                4,
+                24,
+                64,
+                ["core", "adversarial", "security_specialist", "domain_specialist"],
+                max_output_tokens=8192,
+                max_total_tokens=262144,
+                max_elapsed_seconds=900.0,
+                max_provider_attempts=3,
+            ),
         }
         return profiles[risk]
 
@@ -377,8 +437,66 @@ class Assignment:
     initial_context: InitialContext
     max_turns: int
     max_tool_calls: int
+    max_output_tokens: int = DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS
+    max_total_tokens: int = DEFAULT_REVIEWER_MAX_TOTAL_TOKENS
+    max_elapsed_seconds: float = DEFAULT_REVIEWER_MAX_ELAPSED_SECONDS
+    max_provider_attempts: int = DEFAULT_REVIEWER_MAX_PROVIDER_ATTEMPTS
     repository_permission: str = "read_only"
     command_permission: str = "safe_checks_only"
+
+    def __post_init__(self) -> None:
+        integer_budgets = {
+            "max_output_tokens": self.max_output_tokens,
+            "max_total_tokens": self.max_total_tokens,
+            "max_provider_attempts": self.max_provider_attempts,
+        }
+        for name, value in integer_budgets.items():
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            isinstance(self.max_elapsed_seconds, bool)
+            or not isinstance(self.max_elapsed_seconds, (int, float))
+            or not math.isfinite(self.max_elapsed_seconds)
+            or self.max_elapsed_seconds <= 0
+        ):
+            raise ValueError("max_elapsed_seconds must be a positive number")
+
+
+@dataclass(frozen=True)
+class ReviewerRuntimeMetadata:
+    provider_attempts: int = 0
+    model_turns: int = 0
+    tool_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    usage_available: bool = False
+    elapsed_seconds: float = 0.0
+    termination_reason: ReviewerTerminationReason = ReviewerTerminationReason.LEGACY_UNKNOWN
+
+    def __post_init__(self) -> None:
+        counters = {
+            "provider_attempts": self.provider_attempts,
+            "model_turns": self.model_turns,
+            "tool_calls": self.tool_calls,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+        }
+        for name, value in counters.items():
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if type(self.usage_available) is not bool:
+            raise ValueError("usage_available must be a boolean")
+        if (
+            isinstance(self.elapsed_seconds, bool)
+            or not isinstance(self.elapsed_seconds, (int, float))
+            or not math.isfinite(self.elapsed_seconds)
+            or self.elapsed_seconds < 0
+        ):
+            raise ValueError("elapsed_seconds must be a non-negative number")
+        if not isinstance(self.termination_reason, ReviewerTerminationReason):
+            raise ValueError("termination_reason must be a ReviewerTerminationReason")
 
 
 @dataclass(frozen=True)

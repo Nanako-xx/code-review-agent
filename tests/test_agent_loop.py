@@ -4,7 +4,12 @@ from dataclasses import replace
 from review_agent.agent_loop import agent_loop_run_to_dict, run_reviewer_agent_loop
 from review_agent.model_adapter import FakeToolCallingAdapter
 from review_agent.model_protocol import ModelResponseKind, ModelToolCall, ModelTurnResponse
-from review_agent.models import IntentPacket, IntentSource, IntentStatus
+from review_agent.models import (
+    IntentPacket,
+    IntentSource,
+    IntentStatus,
+    ReviewerTerminationReason,
+)
 from review_agent.observations import ObservationStore
 from review_agent.tool_gateway import ToolGateway
 from tests.conftest import run_git
@@ -230,7 +235,12 @@ def test_agent_loop_downgrades_invalid_completion_when_budget_ends(git_repo):
     )
 
     assert run.result.status.value == "partial"
-    assert "Runtime rejected reviewer completion" in run.result.uncertainties[-1]
+    assert any(
+        "Runtime rejected reviewer completion" in item
+        for item in run.result.uncertainties
+    )
+    assert run.result.uncertainties[-1] == "turn budget exhausted"
+    assert run.runtime.termination_reason is ReviewerTerminationReason.TURN_BUDGET_EXHAUSTED
     assert run.trace.final_status == "partial"
 
 
@@ -361,3 +371,124 @@ def test_agent_loop_run_to_dict_serializes_trace_response_and_result(git_repo):
     assert payload["trace"]["turns"][0]["tool_calls"][0]["call_id"] == "call-serialize"
     assert payload["trace"]["turns"][0]["tool_results"][0]["tool_name"] == "compare_base_head"
     assert payload["trace"]["turns"][0]["tool_results"][0]["observation_ids"]
+    assert payload["trace"]["provider_attempt_count"] == 2
+    assert payload["trace"]["turns"][0]["provider_attempts"][0]["provider_attempt"] == 1
+    assert payload["runtime"]["termination_reason"] == "completed"
+
+
+def test_agent_loop_retries_provider_exception_without_consuming_an_extra_turn(
+    git_repo,
+):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(
+        git_repo / ".review-agent" / "runs" / "review-provider-retry"
+    )
+    gateway = ToolGateway(git_repo, base, base, observation_store)
+
+    def raise_once(_request):
+        raise TimeoutError("temporary outage")
+
+    adapter = FakeToolCallingAdapter(
+        script=[
+            raise_once,
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(
+                    {
+                        "contract_assessments": [],
+                        "confirmed_findings": [],
+                        "rejected_hypotheses": [],
+                        "uncertainties": ["bounded retry test"],
+                        "observation_refs": [],
+                        "investigation_summary": "Recovered after provider retry.",
+                        "status": "partial",
+                    }
+                ),
+            ),
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=make_assignment("Core Reviewer"),
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-provider-retry-reviewer-0",
+    )
+
+    assert run.result.status.value == "partial"
+    assert run.runtime.provider_attempts == 2
+    assert run.runtime.model_turns == 1
+    assert len(run.trace.turns) == 1
+    assert [
+        attempt.response_kind for attempt in run.trace.turns[0].provider_attempts
+    ] == ["exception", "final"]
+
+
+def test_agent_loop_token_budget_retains_tool_observation(git_repo):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "app.py").write_text(
+        "def add(a, b):\n    return a - b\n",
+        encoding="utf-8",
+    )
+    run_git(git_repo, "add", "app.py")
+    run_git(git_repo, "commit", "-m", "change for token budget")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(
+        git_repo / ".review-agent" / "runs" / "review-token-budget"
+    )
+    gateway = ToolGateway(git_repo, base, head, observation_store)
+    assignment = replace(
+        make_assignment("Core Reviewer"),
+        max_total_tokens=10,
+    )
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.TOOL_CALLS,
+                tool_calls=[
+                    ModelToolCall(
+                        "call-token",
+                        "compare_base_head",
+                        {"path": "app.py"},
+                    )
+                ],
+                raw={
+                    "usage": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 2,
+                        "total_tokens": 5,
+                    }
+                },
+            ),
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="{}",
+                raw={
+                    "usage": {
+                        "prompt_tokens": 4,
+                        "completion_tokens": 2,
+                        "total_tokens": 6,
+                    }
+                },
+            ),
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=assignment,
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-token-budget-reviewer-0",
+    )
+
+    observation_ids = list(observation_store.summaries_by_id())
+    assert run.result.status.value == "partial"
+    assert run.result.observation_refs == observation_ids
+    assert run.runtime.total_tokens == 11
+    assert run.runtime.termination_reason is ReviewerTerminationReason.TOKEN_BUDGET_EXHAUSTED
