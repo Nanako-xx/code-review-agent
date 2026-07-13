@@ -23,8 +23,12 @@ def test_parse_reviewer_result_accepts_valid_json():
               "claim": "The admin check now always returns true.",
               "severity": "high",
               "confidence": "high",
+              "path": "auth.py",
+              "line": 12,
               "evidence_refs": ["O-diff-auth"],
-              "suggested_action": "Restore the role check."
+              "impact": "Unauthorized users can pass the admin check.",
+              "suggested_action": "Restore the role check.",
+              "verification_performed": ["Compared the base and head implementation."]
             }
           ],
           "rejected_hypotheses": ["No caller compatibility issue found in the provided context."],
@@ -38,6 +42,11 @@ def test_parse_reviewer_result_accepts_valid_json():
 
     assert result.status is ReviewerResultStatus.COMPLETED
     assert result.confirmed_findings[0].claim == "The admin check now always returns true."
+    assert result.confirmed_findings[0].path == "auth.py"
+    assert result.confirmed_findings[0].line == 12
+    assert result.confirmed_findings[0].verification_performed == [
+        "Compared the base and head implementation."
+    ]
     assert result.contract_assessments[0].evidence_refs == ["O-diff-auth"]
     assert result.observation_refs == ["O-diff-auth"]
 
@@ -62,7 +71,7 @@ def test_parse_reviewer_result_strips_markdown_json_fence():
 
 
 def test_parse_reviewer_result_rejects_missing_required_keys():
-    with pytest.raises(ReviewerResultParseError, match="missing required key: status"):
+    with pytest.raises(ReviewerResultParseError, match=r"missing required key\(s\): status"):
         parse_reviewer_result(
             """
             {
@@ -130,6 +139,38 @@ def test_parse_reviewer_result_rejects_non_list_evidence_refs():
               "observation_refs": [],
               "investigation_summary": "Malformed nested list field.",
               "status": "failed"
+            }
+            """
+        )
+
+
+def test_parse_reviewer_result_rejects_null_finding_suggested_action():
+    with pytest.raises(
+        ReviewerResultParseError,
+        match="finding suggested_action must be a non-empty string",
+    ):
+        parse_reviewer_result(
+            """
+            {
+              "contract_assessments": [],
+              "confirmed_findings": [
+                {
+                  "claim": "The behavior is incorrect.",
+                  "severity": "high",
+                  "confidence": "high",
+                  "path": "app.py",
+                  "line": 1,
+                  "evidence_refs": ["O-1"],
+                  "impact": "Callers receive an incorrect result.",
+                  "suggested_action": null,
+                  "verification_performed": ["Compared base and head."]
+                }
+              ],
+              "rejected_hypotheses": [],
+              "uncertainties": [],
+              "observation_refs": ["O-1"],
+              "investigation_summary": "Reviewed the change.",
+              "status": "partial"
             }
             """
         )

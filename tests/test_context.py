@@ -269,3 +269,4 @@ def test_reviewer_envelope_uses_explicit_model_parameters():
     assert envelope.parameters["model"] == "deepseek-chat"
     assert envelope.parameters["max_output_tokens"] == 2048
     assert envelope.parameters["reasoning_effort"] == "high"
+    assert envelope.parameters["response_schema"] == "reviewer_assignment_result_v2"

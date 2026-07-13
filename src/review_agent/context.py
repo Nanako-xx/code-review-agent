@@ -118,7 +118,7 @@ def build_reviewer_envelope(
             "reasoning_effort": reasoning_effort,
             "temperature": 0,
             "tool_choice": "auto",
-            "response_schema": "reviewer_assignment_result_v1",
+            "response_schema": "reviewer_assignment_result_v2",
             "trace_id": trace_id,
             "context": context_payload.metadata,
         },
@@ -301,5 +301,7 @@ def _completion_block(assignment: Assignment) -> str:
             "You may request completion only after addressing every assigned contract item.",
             "If a required check cannot be performed, record the reason as an uncertainty.",
             "Findings must cite observation IDs as evidence_refs in the final structured output.",
+            "Every confirmed finding must include severity (blocker/high/medium/low), confidence (high/medium/low), path, positive line, impact, suggested_action, and a non-empty verification_performed list.",
+            "Runtime validates the structured result and may reject an incomplete completion request.",
         ]
     )

@@ -63,6 +63,7 @@ from review_agent.repository_intelligence import (
 )
 from review_agent.reporting import render_review_brief_markdown
 from review_agent.reviewer import reviewer_result_to_dict, run_single_reviewer
+from review_agent.review_contract import validate_reviewer_completion
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
 from review_agent.run_state import RunPhase, RunState, RunStatus
 from review_agent.runtime import build_assignments
@@ -119,6 +120,7 @@ class PipelineContext:
     repository_intelligence: RepositoryIntelligenceSnapshot | None = None
     repository_observations: ObservationStore | None = None
     reviewer_observations: dict[int, ObservationStore] = field(default_factory=dict)
+    reviewer_executions: list[ReviewerExecution] = field(default_factory=list)
     reviewer_result: ReviewerResult | None = None
     multi_run: MultiReviewerRun | None = None
     reconciliation: EvidenceReconciliation | None = None
@@ -135,6 +137,15 @@ class PipelineContext:
     def revision_binding(self) -> str:
         revisions = self.manifest.revisions
         return f"{revisions.resolved_base_sha}..{revisions.resolved_head_sha}"
+
+    @property
+    def observation_revision_bindings(self) -> set[str]:
+        revisions = self.manifest.revisions
+        return {
+            self.revision_binding,
+            f"base@{revisions.resolved_base_sha}",
+            f"head@{revisions.resolved_head_sha}",
+        }
 
 
 @dataclass(frozen=True)
@@ -525,6 +536,7 @@ class ReviewPipeline:
                 "fake or openai-compatible"
             )
         if adapter_factory is None or not self.context.assignments:
+            self.context.reviewer_executions = []
             self.context.reviewer_result = None
             self.context.multi_run = None
             return {}
@@ -581,6 +593,7 @@ class ReviewPipeline:
             executions.append(execution)
             self.context.reviewer_observations[index] = observation_store
 
+        self.context.reviewer_executions = list(executions)
         if config.reviewer_mode == "multi":
             multi_run = MultiReviewerRun(executions=executions)
             workspace = self._phase_workspace(RunPhase.REVIEWERS)
@@ -725,6 +738,7 @@ class ReviewPipeline:
     def _load_reviewers(self) -> None:
         manifest = self.context.manifest
         if manifest.execution.reviewer_provider == "none" or not self.context.assignments:
+            self.context.reviewer_executions = []
             self.context.reviewer_result = None
             self.context.multi_run = None
             return
@@ -759,6 +773,7 @@ class ReviewPipeline:
         else:
             self.context.multi_run = None
             self.context.reviewer_result = executions[0].result
+        self.context.reviewer_executions = list(executions)
 
     def _load_reviewer_task(
         self,
@@ -783,10 +798,20 @@ class ReviewPipeline:
             single=manifest.execution.reviewer_mode == "single",
             include_trace=manifest.execution.reviewer_loop == "agent-loop",
         )
-        execution = self._load_reviewer_execution(index)
         observations = self._load_observation_artifact(
             f"reviewer_{index}_observations"
         )
+        execution = self._load_reviewer_execution(index)
+        validation = validate_reviewer_completion(
+            execution.assignment,
+            execution.result,
+            set(self._authorized_observation_summaries(observations)),
+        )
+        if not validation.accepted:
+            raise ValueError(
+                f"reviewer task completion is invalid: {task_name}: "
+                + "; ".join(validation.deficiencies)
+            )
         return execution, observations
 
     def _load_reviewer_execution(self, index: int) -> ReviewerExecution:
@@ -814,11 +839,8 @@ class ReviewPipeline:
         )
 
     def _run_reconciliation(self) -> dict[str, str]:
-        if self.context.multi_run is None:
-            self.context.reconciliation = None
-            return {}
         reconciliation = reconcile_evidence(
-            executions=self.context.multi_run.executions,
+            executions=self.context.reviewer_executions,
             authorized_observation_ids=set(self._authorized_observation_summaries()),
         )
         workspace = self._phase_workspace(RunPhase.RECONCILIATION)
@@ -849,14 +871,14 @@ class ReviewPipeline:
         )
 
     def _run_completion(self) -> dict[str, str]:
-        if self.context.multi_run is None or self.context.reconciliation is None:
-            self.context.completion = None
-            return {}
         completion = check_completion(
             intent=_required(self.context.intent, "intent"),
             quality_results=self.context.quality_results,
-            executions=self.context.multi_run.executions,
-            reconciliation=self.context.reconciliation,
+            executions=self.context.reviewer_executions,
+            reconciliation=_required(
+                self.context.reconciliation,
+                "evidence reconciliation",
+            ),
         )
         workspace = self._phase_workspace(RunPhase.COMPLETION)
         workspace.write_json("completion.json", completion_to_dict(completion))
@@ -1094,7 +1116,10 @@ class ReviewPipeline:
         root = self.context.checkpoint_store.run_dir.joinpath(
             *PurePosixPath(descriptor.path).parent.parts
         )
-        return ObservationStore.load(root, {self.context.revision_binding})
+        return ObservationStore.load(
+            root,
+            self.context.observation_revision_bindings,
+        )
 
     def _observation_stores(self) -> list[ObservationStore]:
         stores: list[ObservationStore] = []

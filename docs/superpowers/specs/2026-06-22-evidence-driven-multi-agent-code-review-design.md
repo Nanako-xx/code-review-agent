@@ -1300,6 +1300,12 @@ M1 完成时，应能在一个本地 Python Git 仓库中：
 11. 生成人类可审计的 Markdown/JSON Review Brief。
 12. 不修改代码、不自动发布评论、不自动合并。
 
+### 23.1 实现状态（2026-07-12）
+
+Runtime Review Contract Enforcement 已落地：合法 Observation revision allowlist、严格新 Finding 输出、assigned Contract completion validator、Agent Loop completion 拒绝/重试、single/multi/no-provider 统一 reconciliation/completion，以及无 Core Reviewer 时 `blocked` 均已进入主路径。`Session.status=completed` 仅表示执行生命周期结束，审查结论以 `completion.json` 为准。
+
+仍待后续本地批次实现：Intent Manager 与用户澄清、完整 Quality Gates、模型辅助 Risk/Portfolio、Reviewer 并行与失败隔离、语义 Reconciler 和有界补充调查。Eval 与 GitHub/PR 集成继续独立延期。
+
 ## 24. 实现同步原则
 
 本文档是后续代码生成和实现迁移的最新设计来源。已有 M1 Foundation 代码中的旧 schema 命名需要在下一轮实现中按本文迁移，例如：

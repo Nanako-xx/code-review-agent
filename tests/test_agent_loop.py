@@ -132,6 +132,108 @@ def test_agent_loop_returns_partial_when_tool_budget_is_exhausted(git_repo):
     assert run.trace.final_status == "partial"
 
 
+def test_agent_loop_rejects_incomplete_completion_and_accepts_correction(
+    git_repo,
+):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(
+        git_repo / ".review-agent" / "runs" / "review-contract-retry"
+    )
+    gateway = ToolGateway(git_repo, base, base, observation_store)
+    incomplete = ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "contract_assessments": [],
+                "confirmed_findings": [],
+                "rejected_hypotheses": [],
+                "uncertainties": [],
+                "observation_refs": [],
+                "investigation_summary": "Requested completion too early.",
+                "status": "completed",
+            }
+        ),
+    )
+    corrected = ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "contract_assessments": [
+                    {
+                        "contract": "regression_safety",
+                        "status": "not_applicable",
+                        "summary": "No changed behavior exists in this range.",
+                        "evidence_refs": [],
+                    }
+                ],
+                "confirmed_findings": [],
+                "rejected_hypotheses": [],
+                "uncertainties": [],
+                "observation_refs": [],
+                "investigation_summary": "Closed the assigned contract.",
+                "status": "completed",
+            }
+        ),
+    )
+    adapter = FakeToolCallingAdapter(script=[incomplete, corrected])
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=make_assignment("Core Reviewer"),
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-contract-retry-reviewer-0",
+    )
+
+    assert run.result.status.value == "completed"
+    assert len(adapter.requests) == 2
+    assert "Runtime rejected completion" in adapter.requests[1].messages[-1]["content"]
+    assert "missing contract assessment" in run.trace.turns[0].error
+
+
+def test_agent_loop_downgrades_invalid_completion_when_budget_ends(git_repo):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(
+        git_repo / ".review-agent" / "runs" / "review-contract-budget"
+    )
+    gateway = ToolGateway(git_repo, base, base, observation_store)
+    assignment = replace(make_assignment("Core Reviewer"), max_turns=1)
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(
+                    {
+                        "contract_assessments": [],
+                        "confirmed_findings": [],
+                        "rejected_hypotheses": [],
+                        "uncertainties": [],
+                        "observation_refs": [],
+                        "investigation_summary": "Requested completion too early.",
+                        "status": "completed",
+                    }
+                ),
+            )
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=assignment,
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-contract-budget-reviewer-0",
+    )
+
+    assert run.result.status.value == "partial"
+    assert "Runtime rejected reviewer completion" in run.result.uncertainties[-1]
+    assert run.trace.final_status == "partial"
+
+
 def test_agent_loop_converts_gateway_argument_error_to_error_tool_result(git_repo):
     base = run_git(git_repo, "rev-parse", "HEAD")
     observation_store = ObservationStore(git_repo / ".review-agent" / "runs" / "review-tool-error")
@@ -215,7 +317,14 @@ def test_agent_loop_run_to_dict_serializes_trace_response_and_result(git_repo):
                 kind=ModelResponseKind.FINAL,
                 final_text=json.dumps(
                     {
-                        "contract_assessments": [],
+                        "contract_assessments": [
+                            {
+                                "contract": "regression_safety",
+                                "status": "covered",
+                                "summary": "Compared the changed implementation.",
+                                "evidence_refs": [],
+                            }
+                        ],
                         "confirmed_findings": [],
                         "rejected_hypotheses": [],
                         "uncertainties": [],

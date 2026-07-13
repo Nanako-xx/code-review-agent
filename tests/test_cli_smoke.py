@@ -42,11 +42,14 @@ def test_cli_review_writes_current_schema_artifacts(git_repo: Path):
     assert (run_dirs[0] / "intent.json").exists()
     assert (run_dirs[0] / "risk.json").exists()
     assert (run_dirs[0] / "assignments.json").exists()
+    assert (run_dirs[0] / "reconciliation.json").exists()
+    assert (run_dirs[0] / "completion.json").exists()
     assert (run_dirs[0] / "report.md").exists()
 
     intent = json.loads((run_dirs[0] / "intent.json").read_text(encoding="utf-8"))
     risk = json.loads((run_dirs[0] / "risk.json").read_text(encoding="utf-8"))
     assignments = json.loads((run_dirs[0] / "assignments.json").read_text(encoding="utf-8"))
+    completion = json.loads((run_dirs[0] / "completion.json").read_text(encoding="utf-8"))
 
     assert "uncertainties" in intent
     assert "unknowns" not in intent
@@ -54,6 +57,8 @@ def test_cli_review_writes_current_schema_artifacts(git_repo: Path):
     assert "evidence_refs" not in risk
     assert "initial_context" in assignments["assignments"][0]
     assert "provided_evidence_refs" not in assignments["assignments"][0]
+    assert completion["status"] == "blocked"
+    assert completion["blockers"] == ["Core Reviewer did not run"]
 
 
 def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypatch, capsys):
@@ -504,11 +509,17 @@ def test_cli_agent_loop_openai_compatible_uses_adapter_factory(git_repo: Path, m
                         {
                             "contract_assessments": [
                                 {
-                                    "contract": "regression_safety",
+                                    "contract": contract,
                                     "status": "covered",
                                     "summary": "OpenAI-compatible adapter path used tools.",
                                     "evidence_refs": [observation_id],
                                 }
+                                for contract in (
+                                    "intent_alignment",
+                                    "behavioral_correctness",
+                                    "regression_safety",
+                                    "test_adequacy",
+                                )
                             ],
                             "confirmed_findings": [],
                             "rejected_hypotheses": [],

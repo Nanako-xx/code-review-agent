@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from review_agent.models import ContractAssessment, ReviewerFinding
@@ -16,6 +16,10 @@ class CanonicalFinding:
     reviewer_indices: list[int]
     roles: list[str]
     suggested_action: str | None = None
+    path: str | None = None
+    line: int | None = None
+    impact: str = ""
+    verification_performed: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -118,6 +122,10 @@ def _merge_canonical_finding(
             reviewer_indices=[execution.reviewer_index],
             roles=[execution.assignment.role],
             suggested_action=finding.suggested_action,
+            path=finding.path,
+            line=finding.line,
+            impact=finding.impact,
+            verification_performed=list(finding.verification_performed),
         )
     return CanonicalFinding(
         claim=existing.claim,
@@ -127,6 +135,10 @@ def _merge_canonical_finding(
         reviewer_indices=[*existing.reviewer_indices, execution.reviewer_index],
         roles=[*existing.roles, execution.assignment.role],
         suggested_action=existing.suggested_action,
+        path=existing.path,
+        line=existing.line,
+        impact=existing.impact,
+        verification_performed=list(existing.verification_performed or []),
     )
 
 

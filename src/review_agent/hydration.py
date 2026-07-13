@@ -278,11 +278,15 @@ def reviewer_result_from_dict(payload: Mapping[str, Any]) -> ReviewerResult:
     ):
         context = f"reviewer_result.confirmed_findings[{index}]"
         value = _object(row, context)
-        _exact(
+        _required_with_optional(
             value,
             {"claim", "severity", "confidence", "evidence_refs", "suggested_action"},
+            {"path", "line", "impact", "verification_performed"},
             context,
         )
+        line = value.get("line")
+        if line is not None and (type(line) is not int or line < 1):
+            raise ValueError(f"{context}.line must be a positive integer or null")
         findings.append(
             ReviewerFinding(
                 claim=_string(value, "claim", context),
@@ -290,6 +294,22 @@ def reviewer_result_from_dict(payload: Mapping[str, Any]) -> ReviewerResult:
                 confidence=_string(value, "confidence", context),
                 evidence_refs=_string_list(value, "evidence_refs", context),
                 suggested_action=_optional_string(value, "suggested_action", context),
+                path=(
+                    _optional_string(value, "path", context)
+                    if "path" in value
+                    else None
+                ),
+                line=line,
+                impact=(
+                    _string(value, "impact", context)
+                    if "impact" in value
+                    else ""
+                ),
+                verification_performed=(
+                    _string_list(value, "verification_performed", context)
+                    if "verification_performed" in value
+                    else []
+                ),
             )
         )
     return ReviewerResult(
@@ -922,11 +942,15 @@ def _model_response_from_dict(payload: Mapping[str, Any]) -> ModelResponse:
 
 def _canonical_finding(value: Any, context: str) -> CanonicalFinding:
     item = _object(value, context)
-    _exact(
+    _required_with_optional(
         item,
         {"claim", "severity", "confidence", "evidence_refs", "reviewer_indices", "roles", "suggested_action"},
+        {"path", "line", "impact", "verification_performed"},
         context,
     )
+    line = item.get("line")
+    if line is not None and (type(line) is not int or line < 1):
+        raise ValueError(f"{context}.line must be a positive integer or null")
     return CanonicalFinding(
         claim=_string(item, "claim", context),
         severity=_string(item, "severity", context),
@@ -935,6 +959,18 @@ def _canonical_finding(value: Any, context: str) -> CanonicalFinding:
         reviewer_indices=_integer_list(item, "reviewer_indices", context),
         roles=_string_list(item, "roles", context),
         suggested_action=_optional_string(item, "suggested_action", context),
+        path=(
+            _optional_string(item, "path", context)
+            if "path" in item
+            else None
+        ),
+        line=line,
+        impact=_string(item, "impact", context) if "impact" in item else "",
+        verification_performed=(
+            _string_list(item, "verification_performed", context)
+            if "verification_performed" in item
+            else []
+        ),
     )
 
 
@@ -979,11 +1015,15 @@ def _contract_coverage(value: Any, context: str) -> ContractCoverage:
 
 def _brief_finding(value: Any, context: str) -> BriefFinding:
     item = _object(value, context)
-    _exact(
+    _required_with_optional(
         item,
         {"claim", "severity", "confidence", "evidence_refs", "reviewer_indices", "roles", "suggested_action"},
+        {"path", "line", "impact", "verification_performed"},
         context,
     )
+    line = item.get("line")
+    if line is not None and (type(line) is not int or line < 1):
+        raise ValueError(f"{context}.line must be a positive integer or null")
     return BriefFinding(
         claim=_string(item, "claim", context),
         severity=_string(item, "severity", context),
@@ -992,6 +1032,18 @@ def _brief_finding(value: Any, context: str) -> BriefFinding:
         reviewer_indices=_integer_list(item, "reviewer_indices", context),
         roles=_string_list(item, "roles", context),
         suggested_action=_optional_string(item, "suggested_action", context),
+        path=(
+            _optional_string(item, "path", context)
+            if "path" in item
+            else None
+        ),
+        line=line,
+        impact=_string(item, "impact", context) if "impact" in item else "",
+        verification_performed=(
+            _string_list(item, "verification_performed", context)
+            if "verification_performed" in item
+            else []
+        ),
     )
 
 
@@ -1047,6 +1099,25 @@ def _exact(payload: Mapping[str, Any], expected: set[str], context: str) -> None
     unexpected = set(payload) - expected
     if unexpected:
         raise ValueError(f"{context} contains unsupported field(s): {', '.join(sorted(str(key) for key in unexpected))}")
+
+
+def _required_with_optional(
+    payload: Mapping[str, Any],
+    required: set[str],
+    optional: set[str],
+    context: str,
+) -> None:
+    missing = required - set(payload)
+    if missing:
+        raise ValueError(
+            f"{context} is missing required field(s): {', '.join(sorted(missing))}"
+        )
+    unexpected = set(payload) - required - optional
+    if unexpected:
+        raise ValueError(
+            f"{context} contains unsupported field(s): "
+            f"{', '.join(sorted(str(key) for key in unexpected))}"
+        )
 
 
 def _string(payload: Mapping[str, Any], field: str, context: str) -> str:

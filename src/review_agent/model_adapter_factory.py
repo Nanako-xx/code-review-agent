@@ -91,7 +91,7 @@ def _fake_response_for_request(request: ModelTurnRequest) -> ModelTurnResponse:
 
     observation_id = _latest_observation_id(request)
     if observation_id:
-        return _fake_completed_agent_loop_response(observation_id)
+        return _fake_completed_agent_loop_response(observation_id, request)
 
     changed_file = _first_changed_file(request)
     if changed_file:
@@ -102,7 +102,7 @@ def _fake_response_for_request(request: ModelTurnRequest) -> ModelTurnResponse:
             model="fake-reviewer",
         )
 
-    return _fake_completed_agent_loop_response("")
+    return _fake_completed_agent_loop_response("", request)
 
 
 def _fake_single_shot_response() -> ModelTurnResponse:
@@ -125,20 +125,20 @@ def _fake_single_shot_response() -> ModelTurnResponse:
     )
 
 
-def _fake_completed_agent_loop_response(observation_id: str) -> ModelTurnResponse:
+def _fake_completed_agent_loop_response(
+    observation_id: str,
+    request: ModelTurnRequest,
+) -> ModelTurnResponse:
     evidence_refs = [observation_id] if observation_id else []
-    contract_assessments = (
-        [
-            {
-                "contract": "regression_safety",
-                "status": "covered",
-                "summary": "Fake agent loop used a tool observation.",
-                "evidence_refs": evidence_refs,
-            }
-        ]
-        if evidence_refs
-        else []
-    )
+    contract_assessments = [
+        {
+            "contract": contract,
+            "status": "covered",
+            "summary": "Fake agent loop exercised the configured Runtime path.",
+            "evidence_refs": evidence_refs,
+        }
+        for contract in _assigned_contracts(request)
+    ]
     return ModelTurnResponse(
         kind=ModelResponseKind.FINAL,
         final_text=json.dumps(
@@ -156,6 +156,22 @@ def _fake_completed_agent_loop_response(observation_id: str) -> ModelTurnRespons
         model="fake-reviewer",
         raw={"fake": True},
     )
+
+
+def _assigned_contracts(request: ModelTurnRequest) -> list[str]:
+    prefix = "Assigned Contract:"
+    for message in request.messages:
+        content = message.get("content", "")
+        if not isinstance(content, str):
+            continue
+        for line in content.splitlines():
+            if line.startswith(prefix):
+                return [
+                    item.strip()
+                    for item in line.removeprefix(prefix).split(",")
+                    if item.strip()
+                ]
+    return ["regression_safety"]
 
 
 def _latest_observation_id(request: ModelTurnRequest) -> str:

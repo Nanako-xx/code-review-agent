@@ -22,6 +22,10 @@ from review_agent.models import (
     ReviewerResultStatus,
 )
 from review_agent.reviewer import ReviewerResultParseError, parse_reviewer_result, reviewer_result_to_dict
+from review_agent.review_contract import (
+    result_with_validation_deficiencies,
+    validate_reviewer_completion,
+)
 from review_agent.tool_gateway import ToolGateway, ToolGatewayError
 
 
@@ -70,16 +74,18 @@ def run_reviewer_agent_loop(
         model=model,
     )
     tools = [_tool_spec_from_envelope_tool(tool) for tool in envelope.tools]
+    runtime_messages = list(envelope.messages)
     turns: list[AgentLoopTurn] = []
     tool_results: list[ModelToolResult] = []
     tool_call_count = 0
     last_response: ModelTurnResponse | None = None
+    runtime_failures: list[str] = []
 
     for turn_index in range(assignment.max_turns):
         request = ModelTurnRequest(
             system=envelope.system,
             tools=tools,
-            messages=list(envelope.messages),
+            messages=list(runtime_messages),
             tool_results=list(tool_results),
             parameters=dict(envelope.parameters),
         )
@@ -118,6 +124,7 @@ def run_reviewer_agent_loop(
                 result = parse_reviewer_result(response.final_text or "")
             except ReviewerResultParseError as error:
                 error_message = f"final response parse failed: {error}"
+                runtime_failures.append(error_message)
                 turns.append(
                     AgentLoopTurn(
                         turn_index=turn_index,
@@ -125,12 +132,51 @@ def run_reviewer_agent_loop(
                         error=error_message,
                     )
                 )
+                if turn_index + 1 < assignment.max_turns:
+                    runtime_messages.append(_runtime_rejection_message(error_message))
+                    continue
                 result = ReviewerResult(
                     uncertainties=[error_message],
                     investigation_summary=error_message,
                     status=ReviewerResultStatus.FAILED,
                 )
                 return _run_from_parts(envelope, response, result, trace_id, turns, tool_call_count)
+
+            validation = validate_reviewer_completion(
+                assignment,
+                result,
+                _authorized_observation_ids(gateway, observations),
+            )
+            if not validation.accepted:
+                error_message = (
+                    "Runtime rejected completion: "
+                    + "; ".join(validation.deficiencies)
+                )
+                runtime_failures.append(error_message)
+                turns.append(
+                    AgentLoopTurn(
+                        turn_index=turn_index,
+                        response_kind=response.kind.value,
+                        error=error_message,
+                    )
+                )
+                if turn_index + 1 < assignment.max_turns:
+                    runtime_messages.append(
+                        _runtime_rejection_message(error_message)
+                    )
+                    continue
+                result = result_with_validation_deficiencies(
+                    result,
+                    validation.deficiencies,
+                )
+                return _run_from_parts(
+                    envelope,
+                    response,
+                    result,
+                    trace_id,
+                    turns,
+                    tool_call_count,
+                )
 
             turns.append(AgentLoopTurn(turn_index=turn_index, response_kind=response.kind.value))
             return _run_from_parts(envelope, response, result, trace_id, turns, tool_call_count)
@@ -143,14 +189,20 @@ def run_reviewer_agent_loop(
                 error=error_message,
             )
         )
+        failures = _dedupe([*runtime_failures, error_message])
         result = ReviewerResult(
-            uncertainties=[error_message],
-            investigation_summary=error_message,
+            uncertainties=failures,
+            investigation_summary="; ".join(failures),
             status=ReviewerResultStatus.FAILED,
         )
         return _run_from_parts(envelope, response, result, trace_id, turns, tool_call_count)
 
-    result = _partial_result("turn budget exhausted")
+    failures = _dedupe([*runtime_failures, "turn budget exhausted"])
+    result = ReviewerResult(
+        uncertainties=failures,
+        investigation_summary="; ".join(failures),
+        status=ReviewerResultStatus.PARTIAL,
+    )
     response = last_response or ModelTurnResponse(
         kind=ModelResponseKind.INVALID,
         error="turn budget exhausted",
@@ -217,6 +269,30 @@ def _partial_result(uncertainty: str) -> ReviewerResult:
         investigation_summary=uncertainty,
         status=ReviewerResultStatus.PARTIAL,
     )
+
+
+def _authorized_observation_ids(
+    gateway: ToolGateway,
+    initial_observations: dict[str, str],
+) -> set[str]:
+    return {
+        *initial_observations,
+        *gateway.observation_store.summaries_by_id(),
+    }
+
+
+def _runtime_rejection_message(reason: str) -> dict[str, str]:
+    return {
+        "role": "user",
+        "content": (
+            f"{reason}. Continue the assigned investigation and submit a corrected "
+            "structured result that satisfies every Runtime requirement."
+        ),
+    }
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
 
 
 def _run_from_parts(

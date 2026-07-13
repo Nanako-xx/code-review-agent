@@ -16,6 +16,10 @@ class BriefFinding:
     reviewer_indices: list[int] = field(default_factory=list)
     roles: list[str] = field(default_factory=list)
     suggested_action: str | None = None
+    path: str | None = None
+    line: int | None = None
+    impact: str = ""
+    verification_performed: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -141,6 +145,12 @@ def _verified_findings(reconciliation: dict[str, Any]) -> list[BriefFinding]:
                 reviewer_indices=[int(index) for index in row.get("reviewer_indices", [])],
                 roles=[str(role) for role in row.get("roles", [])],
                 suggested_action=str(row["suggested_action"]) if row.get("suggested_action") is not None else None,
+                path=str(row["path"]) if row.get("path") is not None else None,
+                line=int(row["line"]) if row.get("line") is not None else None,
+                impact=str(row.get("impact", "")),
+                verification_performed=[
+                    str(item) for item in row.get("verification_performed", [])
+                ],
             )
         )
     return findings

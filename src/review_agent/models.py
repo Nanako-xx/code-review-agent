@@ -153,6 +153,10 @@ class ReviewerFinding:
     confidence: str
     evidence_refs: list[str] = field(default_factory=list)
     suggested_action: str | None = None
+    path: str | None = None
+    line: int | None = None
+    impact: str = ""
+    verification_performed: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

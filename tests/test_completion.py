@@ -69,6 +69,19 @@ def test_completion_blocks_when_core_reviewer_failed():
     assert "Core Reviewer failed" in result.blockers
 
 
+def test_completion_blocks_when_core_reviewer_did_not_run():
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[],
+        reconciliation=reconciliation(),
+    )
+
+    assert result.status == "blocked"
+    assert result.recommendation == "manual_review"
+    assert result.blockers == ["Core Reviewer did not run"]
+
+
 def test_completion_with_uncertainties_when_specialist_failed():
     result = check_completion(
         intent=intent(),

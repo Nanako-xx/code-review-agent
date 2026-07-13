@@ -36,6 +36,9 @@ def check_completion(
         uncertainties.append("Intent Packet partial")
     uncertainties.extend(intent.uncertainties)
 
+    if not any(_is_core_reviewer(execution.assignment.role) for execution in executions):
+        blockers.append("Core Reviewer did not run")
+
     for result in quality_results:
         if result.status == "failed":
             uncertainties.append(f"Quality gate failed: {result.name}")

@@ -209,8 +209,20 @@ def _verified_findings_section(brief: ReviewBrief) -> str:
     lines = []
     for finding in brief.verified_findings:
         line = f"- [{finding.severity}/{finding.confidence}] {finding.claim}"
+        if finding.path:
+            location = finding.path
+            if finding.line is not None:
+                location += f":{finding.line}"
+            line += f" Location: {location}"
         if finding.evidence_refs:
             line += f" Evidence: {', '.join(finding.evidence_refs)}"
+        if finding.impact:
+            line += f" Impact: {finding.impact}"
+        if finding.verification_performed:
+            line += (
+                " Verification: "
+                + "; ".join(finding.verification_performed)
+            )
         if finding.suggested_action:
             line += f" Suggested action: {finding.suggested_action}"
         lines.append(line)
