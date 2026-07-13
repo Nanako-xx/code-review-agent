@@ -15,8 +15,9 @@ from review_agent.model_protocol import (
     ModelToolCall,
     ModelTurnResponse,
 )
-from review_agent.models import ReviewRequest
+from review_agent.models import QualityGateResult, ReviewRequest
 from review_agent.pipeline import PHASE_MESSAGES, ReviewPipeline
+from review_agent.quality import QualityGateExecution
 from review_agent.revision import RevisionResolver
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import PhaseStatus, ReviewExecutionConfig, initial_session_manifest
@@ -106,6 +107,10 @@ def test_review_pipeline_runs_all_phases_through_atomic_attempts(git_repo: Path)
     assert reviewer.status is PhaseStatus.COMPLETED
     assert reviewer.attempts == 1
     assert "reviewer_0_observations" in reviewer.artifacts
+    assert manifest.artifacts["quality_gate_plan"].phase is RunPhase.QUALITY_GATES
+    assert manifest.artifacts["quality_gate_observations"].phase is RunPhase.QUALITY_GATES
+    assert manifest.artifacts["deep_quality_gates"].phase is RunPhase.PLANNING
+    assert manifest.artifacts["deep_quality_gate_observations"].phase is RunPhase.PLANNING
     assert manifest.artifacts["repository_observations"].phase is RunPhase.REPOSITORY_INTELLIGENCE
     assert manifest.artifacts["observations"].phase is RunPhase.REPORTING
     assert (checkpoint_store.run_dir / "report.md").exists()
@@ -113,6 +118,170 @@ def test_review_pipeline_runs_all_phases_through_atomic_attempts(git_repo: Path)
     assert (checkpoint_store.run_dir / "attempts" / "preflight" / "1").is_dir()
     assert result.context.brief is not None
     assert result.context.final_risk is not None
+
+
+def test_risk_triggered_gate_reaches_observations_and_reviewer_context(
+    git_repo: Path,
+    monkeypatch,
+) -> None:
+    (git_repo / "tests").mkdir()
+    (git_repo / "tests" / "test_app.py").write_text(
+        "def test_ok():\n    assert True\n",
+        encoding="utf-8",
+    )
+    (git_repo / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\n",
+        encoding="utf-8",
+    )
+    run_git(git_repo, "add", "pyproject.toml", "tests/test_app.py")
+    run_git(git_repo, "commit", "-m", "configure pytest")
+
+    calls: list[str] = []
+
+    def fake_execute(_repo, _revision, gate):
+        calls.append(gate.name)
+        return QualityGateExecution(
+            result=QualityGateResult(
+                name=gate.name,
+                status="passed",
+                command=list(gate.command),
+                summary="pytest passed in isolated snapshot",
+                category=gate.category,
+                cost=gate.cost,
+                source=gate.source,
+                blocking=gate.blocking,
+                duration_seconds=0.01,
+                sandbox="test-sandbox",
+            ),
+            raw_output="1 passed",
+        )
+
+    monkeypatch.setattr("review_agent.pipeline.execute_quality_gate", fake_execute)
+    pipeline, session_store, _ = _pipeline(
+        git_repo,
+        review_id="review-deep-quality",
+        changed_path="auth.py",
+    )
+
+    result = pipeline.execute()
+
+    assert calls == ["pytest"]
+    assert [gate.name for gate in result.context.quality_results] == [
+        "python_compile",
+        "pytest",
+    ]
+    pytest_result = result.context.quality_results[1]
+    assert pytest_result.observation_ref is not None
+    assert result.context.assignments[0].initial_context.quality_gate_summary == {
+        "python_compile": "passed",
+        "pytest": "passed",
+    }
+    assert pytest_result.observation_ref in (
+        result.context.assignments[0].initial_context.observation_refs
+    )
+    assert session_store.load().status is RunStatus.COMPLETED
+
+
+def test_quality_discovery_observation_reaches_reviewer_context(
+    git_repo: Path,
+) -> None:
+    (git_repo / "pyproject.toml").write_text(
+        """
+[[tool.review-agent.quality-gates]]
+name = "unsafe_gate"
+category = "security"
+command = ["bash", "-c", "echo unsafe"]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    run_git(git_repo, "add", "pyproject.toml")
+    run_git(git_repo, "commit", "-m", "add invalid quality gate")
+    pipeline, _session_store, _checkpoint_store = _pipeline(
+        git_repo,
+        review_id="review-quality-discovery",
+    )
+
+    result = pipeline.execute()
+
+    assert result.context.quality_gate_plan is not None
+    assert result.context.quality_gate_plan.discovery_issues
+    assert result.context.quality_gate_observations is not None
+    discovery = next(
+        observation
+        for observation in result.context.quality_gate_observations.list_observations()
+        if observation.source == "quality_gate.discovery"
+    )
+    assert all(
+        discovery.observation_id in assignment.initial_context.observation_refs
+        for assignment in result.context.assignments
+    )
+    assert result.context.completion is not None
+    assert any(
+        "Quality gate discovery issue" in uncertainty
+        for uncertainty in result.context.completion.uncertainties
+    )
+
+
+def test_blocking_gate_unavailable_does_not_abort_reviewers_but_blocks_completion(
+    git_repo: Path,
+    monkeypatch,
+) -> None:
+    (git_repo / "pyproject.toml").write_text(
+        """
+[[tool.review-agent.quality-gates]]
+name = "required_security"
+category = "security"
+cost = "expensive"
+command = ["python", "-m", "bandit"]
+blocking = true
+trigger_risks = ["high", "critical"]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    run_git(git_repo, "add", "pyproject.toml")
+    run_git(git_repo, "commit", "-m", "require security gate")
+
+    def unavailable(_repo, _revision, gate):
+        return QualityGateExecution(
+            result=QualityGateResult(
+                name=gate.name,
+                status="unavailable",
+                command=list(gate.command),
+                summary="bandit is unavailable",
+                category=gate.category,
+                cost=gate.cost,
+                source=gate.source,
+                blocking=gate.blocking,
+                reason="bandit is not installed",
+                sandbox="test-sandbox",
+            ),
+            raw_output="bandit is not installed",
+        )
+
+    monkeypatch.setattr("review_agent.pipeline.execute_quality_gate", unavailable)
+    pipeline, session_store, _ = _pipeline(
+        git_repo,
+        review_id="review-blocking-quality",
+        changed_path="auth.py",
+    )
+
+    result = pipeline.execute()
+
+    gate = next(
+        item
+        for item in result.context.quality_results
+        if item.name == "required_security"
+    )
+    assert gate.status == "unavailable"
+    assert result.context.reviewer_result is not None
+    assert result.context.completion is not None
+    assert result.context.completion.status == "blocked"
+    assert any("required_security" in item for item in result.context.completion.blockers)
+    manifest = session_store.load()
+    assert manifest.status is RunStatus.COMPLETED
+    assert manifest.phases["reviewers"].tasks["reviewer-0"].status is PhaseStatus.COMPLETED
 
 
 def test_completed_pipeline_hydrates_every_phase_without_provider_execution(

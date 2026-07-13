@@ -39,6 +39,59 @@ def test_failed_quality_gate_produces_signal_ref():
     assert assessment.uncertainties == intent.uncertainties
 
 
+def test_unavailable_quality_gate_lowers_verification_strength_signal():
+    request = ReviewRequest(
+        repository_path="C:/repo",
+        base_revision="main",
+        head_revision="HEAD",
+    )
+    summary = ChangeSummary(
+        "C:/repo",
+        "main",
+        "HEAD",
+        ["app.py"],
+        "",
+        ["+def changed():"],
+    )
+    intent = build_intent_packet(request, summary)
+    packet = build_risk_packet(
+        summary,
+        intent,
+        {"quality_gate_discovery": "error"},
+    )
+
+    assessment = LocalRiskAssessor().assess(packet)
+
+    assert assessment.level is RiskLevel.MEDIUM
+    assert "quality_gate:quality_gate_discovery" in assessment.signal_refs
+    assert "verification gap" in assessment.suggested_focus
+
+
+def test_unavailable_gate_does_not_lower_sensitive_path_risk():
+    request = ReviewRequest(
+        repository_path="C:/repo",
+        base_revision="main",
+        head_revision="HEAD",
+    )
+    summary = ChangeSummary(
+        "C:/repo",
+        "main",
+        "HEAD",
+        ["auth/session.py"],
+        "",
+        ["+def changed():"],
+    )
+    intent = build_intent_packet(request, summary)
+    packet = build_risk_packet(summary, intent, {"mypy": "unavailable"})
+
+    assessment = LocalRiskAssessor().assess(packet)
+
+    assert assessment.level is RiskLevel.HIGH
+    assert "changed_file:auth/session.py" in assessment.signal_refs
+    assert "quality_gate:mypy" in assessment.signal_refs
+    assert "verification gap" in assessment.suggested_focus
+
+
 def test_many_doc_files_do_not_become_medium_risk_by_count_only():
     request = ReviewRequest(repository_path="C:/repo", base_revision="main", head_revision="HEAD")
     changed_files = [f"docs/note-{index}.md" for index in range(10)]

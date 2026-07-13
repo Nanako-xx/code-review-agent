@@ -30,6 +30,7 @@ from review_agent.hydration import (
     intent_claims_from_dict,
     intent_decision_from_dict,
     intent_from_dict,
+    quality_gate_plan_from_dict,
     quality_results_from_dict,
     reconciliation_from_dict,
     repository_intelligence_from_dict,
@@ -94,7 +95,19 @@ from review_agent.orchestrator import (
     failed_reviewer_execution,
     multi_reviewer_run_to_dict,
 )
-from review_agent.quality import detect_quality_gates, run_python_compile_gate
+from review_agent.quality import (
+    QualityGateDefinition,
+    QualityGateExecution,
+    QualityGatePlan,
+    discover_quality_gate_plan,
+    quality_gate_plan_to_dict,
+    quality_gate_policy_decision,
+    run_python_compile_gate,
+)
+from review_agent.quality_runner import (
+    execute_quality_gate,
+    skipped_quality_gate_execution,
+)
 from review_agent.repository_intelligence import (
     RepositoryIntelligenceSnapshot,
     build_repository_intelligence,
@@ -181,7 +194,10 @@ class PipelineContext:
     risk_assessment: RiskAssessment | None = None
     incremental_priority: IncrementalPriorityMap | None = None
     assignments: list[Assignment] = field(default_factory=list)
+    quality_gate_plan: QualityGatePlan | None = None
     quality_results: list[QualityGateResult] = field(default_factory=list)
+    quality_gate_observations: ObservationStore | None = None
+    deep_quality_gate_observations: ObservationStore | None = None
     repository_intelligence: RepositoryIntelligenceSnapshot | None = None
     repository_observations: ObservationStore | None = None
     reviewer_observations: dict[int, ObservationStore] = field(default_factory=dict)
@@ -455,19 +471,37 @@ class ReviewPipeline:
 
     def _run_quality_gates(self) -> dict[str, str]:
         revisions = self.context.manifest.revisions
-        gates = detect_quality_gates(
+        plan = discover_quality_gate_plan(
             self.context.repository,
-            revision=revisions.resolved_head_sha,
+            revisions.resolved_head_sha,
         )
-        quality_results: list[QualityGateResult] = []
-        if "python_compile" in gates:
-            quality_results.append(
-                run_python_compile_gate(
-                    self.context.repository,
-                    revision=revisions.resolved_head_sha,
-                )
-            )
         workspace = self._phase_workspace(RunPhase.QUALITY_GATES)
+        observations = ObservationStore(workspace.path / "obs")
+        quality_results = [
+            self._record_quality_gate_execution(
+                self._execute_quality_gate(gate),
+                observations,
+            )
+            for gate in plan.gates
+            if gate.cost == "cheap"
+        ]
+        if plan.discovery_issues:
+            observations.record(
+                source="quality_gate.discovery",
+                revision=f"head@{revisions.resolved_head_sha}",
+                path="pyproject.toml",
+                line_start=None,
+                line_end=None,
+                raw_content="\n".join(plan.discovery_issues),
+                context_view=(
+                    "Quality Gate discovery issues: "
+                    + "; ".join(plan.discovery_issues)
+                ),
+            )
+        workspace.write_json(
+            "quality_gate_plan.json",
+            quality_gate_plan_to_dict(plan),
+        )
         workspace.write_json(
             "quality_gates.json",
             {"results": [asdict(item) for item in quality_results]},
@@ -476,19 +510,91 @@ class ReviewPipeline:
             RunPhase.QUALITY_GATES,
             workspace,
             {
+                "quality_gate_plan": (
+                    "quality_gate_plan.json",
+                    "quality_gate_plan.json",
+                ),
                 "quality_gates": (
                     "quality_gates.json",
                     "quality_gates.json",
                 )
             },
         )
+        artifacts["quality_gate_observations"] = self._commit_observation_store(
+            phase=RunPhase.QUALITY_GATES,
+            workspace=workspace,
+            source=observations,
+            destination_root="quality-gates/pre-risk",
+            artifact_name="quality_gate_observations",
+        )
+        self.context.quality_gate_plan = plan
         self.context.quality_results = quality_results
+        self.context.quality_gate_observations = observations
         return artifacts
 
     def _load_quality_gates(self) -> None:
+        manifest = self.context.manifest
+        self.context.quality_gate_plan = (
+            quality_gate_plan_from_dict(
+                self._read_json_artifact("quality_gate_plan")
+            )
+            if "quality_gate_plan" in manifest.artifacts
+            else None
+        )
+        if self.context.quality_gate_plan is not None and (
+            self.context.quality_gate_plan.revision.casefold()
+            != manifest.revisions.resolved_head_sha.casefold()
+        ):
+            raise ValueError("Quality Gate plan revision does not match Session Head")
         self.context.quality_results = quality_results_from_dict(
             self._read_json_artifact("quality_gates")
         )
+        self.context.quality_gate_observations = (
+            self._load_observation_artifact("quality_gate_observations")
+            if "quality_gate_observations" in manifest.artifacts
+            else None
+        )
+
+    def _execute_quality_gate(
+        self,
+        gate: QualityGateDefinition,
+    ) -> QualityGateExecution:
+        revision = self.context.manifest.revisions.resolved_head_sha
+        if gate.name == "python_compile":
+            result = run_python_compile_gate(
+                self.context.repository,
+                revision=revision,
+            )
+            return QualityGateExecution(result=result, raw_output=result.summary)
+        return execute_quality_gate(
+            self.context.repository,
+            revision,
+            gate,
+        )
+
+    def _record_quality_gate_execution(
+        self,
+        execution: QualityGateExecution,
+        observations: ObservationStore,
+    ) -> QualityGateResult:
+        result = execution.result
+        observation = observations.record(
+            source=f"quality_gate.{result.name}",
+            revision=(
+                "head@"
+                f"{self.context.manifest.revisions.resolved_head_sha}"
+            ),
+            path=None,
+            line_start=None,
+            line_end=None,
+            raw_content=execution.raw_output,
+            context_view=(
+                f"Quality Gate {result.name} "
+                f"[{result.category}/{result.cost}] {result.status}: "
+                f"{result.summary}"
+            ),
+        )
+        return replace(result, observation_ref=observation.observation_id)
 
     def _run_repository_intelligence(self) -> dict[str, str]:
         summary = _required(self.context.change_summary, "change summary")
@@ -796,10 +902,18 @@ class ReviewPipeline:
         intent = _required(self.context.intent, "intent")
         manifest = self.context.manifest
         revisions = manifest.revisions
+        pre_risk_quality_status = {
+            result.name: result.status for result in self.context.quality_results
+        }
+        if (
+            self.context.quality_gate_plan is not None
+            and self.context.quality_gate_plan.discovery_issues
+        ):
+            pre_risk_quality_status["quality_gate_discovery"] = "error"
         risk_packet = build_risk_packet(
             summary,
             intent,
-            {result.name: result.status for result in self.context.quality_results},
+            pre_risk_quality_status,
         )
         risk = LocalRiskAssessor().assess(risk_packet)
         incremental_priority: IncrementalPriorityMap | None = None
@@ -834,16 +948,84 @@ class ReviewPipeline:
             for assignment in build_assignments(risk)
         ]
         workspace = self._phase_workspace(RunPhase.PLANNING)
+        deep_observations = ObservationStore(workspace.path / "quality-obs")
+        deep_results: list[QualityGateResult] = []
+        if self.context.quality_gate_plan is not None:
+            for gate in self.context.quality_gate_plan.gates:
+                if gate.cost != "expensive":
+                    continue
+                should_run, reason = quality_gate_policy_decision(
+                    gate,
+                    risk,
+                    assignments,
+                )
+                execution = (
+                    self._execute_quality_gate(gate)
+                    if should_run
+                    else skipped_quality_gate_execution(gate, reason)
+                )
+                deep_results.append(
+                    self._record_quality_gate_execution(
+                        execution,
+                        deep_observations,
+                    )
+                )
+        all_quality_results = _merge_quality_results(
+            self.context.quality_results,
+            deep_results,
+        )
+        quality_summary = {
+            result.name: result.status for result in all_quality_results
+        }
+        quality_observation_refs = _dedupe(
+            [
+                *(
+                    result.observation_ref
+                    for result in all_quality_results
+                    if result.observation_ref is not None
+                ),
+                *(
+                    self.context.quality_gate_observations.summaries_by_id()
+                    if self.context.quality_gate_observations is not None
+                    else {}
+                ),
+                *deep_observations.summaries_by_id(),
+            ]
+        )
+        assignments = [
+            replace(
+                assignment,
+                initial_context=replace(
+                    assignment.initial_context,
+                    quality_gate_summary=dict(quality_summary),
+                    observation_refs=_dedupe(
+                        [
+                            *assignment.initial_context.observation_refs,
+                            *quality_observation_refs,
+                        ]
+                    ),
+                ),
+            )
+            for assignment in assignments
+        ]
         workspace.write_json("risk_packet.json", asdict(risk_packet))
         workspace.write_json("risk.json", asdict(risk))
         workspace.write_json(
             "assignments.json",
             {"assignments": [asdict(item) for item in assignments]},
         )
+        workspace.write_json(
+            "deep_quality_gates.json",
+            {"results": [asdict(item) for item in deep_results]},
+        )
         files: dict[str, tuple[str, str]] = {
             "risk_packet": ("risk_packet.json", "risk_packet.json"),
             "risk": ("risk.json", "risk.json"),
             "assignments": ("assignments.json", "assignments.json"),
+            "deep_quality_gates": (
+                "deep_quality_gates.json",
+                "deep_quality_gates.json",
+            ),
         }
         if incremental_priority is not None:
             workspace.write_json(
@@ -855,10 +1037,21 @@ class ReviewPipeline:
                 "incremental_priority.json",
             )
         artifacts = self._commit_files(RunPhase.PLANNING, workspace, files)
+        artifacts["deep_quality_gate_observations"] = (
+            self._commit_observation_store(
+                phase=RunPhase.PLANNING,
+                workspace=workspace,
+                source=deep_observations,
+                destination_root="quality-gates/deep",
+                artifact_name="deep_quality_gate_observations",
+            )
+        )
         self.context.risk_packet = risk_packet
         self.context.risk_assessment = risk
         self.context.incremental_priority = incremental_priority
         self.context.assignments = assignments
+        self.context.quality_results = all_quality_results
+        self.context.deep_quality_gate_observations = deep_observations
         return artifacts
 
     def _load_planning(self) -> None:
@@ -871,6 +1064,19 @@ class ReviewPipeline:
         )
         self.context.assignments = assignments_from_dict(
             self._read_json_artifact("assignments")
+        )
+        if "deep_quality_gates" in manifest.artifacts:
+            deep_results = quality_results_from_dict(
+                self._read_json_artifact("deep_quality_gates")
+            )
+            self.context.quality_results = _merge_quality_results(
+                self.context.quality_results,
+                deep_results,
+            )
+        self.context.deep_quality_gate_observations = (
+            self._load_observation_artifact("deep_quality_gate_observations")
+            if "deep_quality_gate_observations" in manifest.artifacts
+            else None
         )
         has_incremental_priority = "incremental_priority" in manifest.artifacts
         if manifest.incremental_from_sha is not None and not has_incremental_priority:
@@ -1455,6 +1661,16 @@ class ReviewPipeline:
                 self.context.reconciliation,
                 "evidence reconciliation",
             ),
+            quality_plan=self.context.quality_gate_plan,
+            quality_observation_refs={
+                observation_id
+                for store in (
+                    self.context.quality_gate_observations,
+                    self.context.deep_quality_gate_observations,
+                )
+                if store is not None
+                for observation_id in store.summaries_by_id()
+            },
         )
         workspace = self._phase_workspace(RunPhase.COMPLETION)
         workspace.write_json("completion.json", completion_to_dict(completion))
@@ -1720,6 +1936,10 @@ class ReviewPipeline:
 
     def _observation_stores(self) -> list[ObservationStore]:
         stores: list[ObservationStore] = []
+        if self.context.quality_gate_observations is not None:
+            stores.append(self.context.quality_gate_observations)
+        if self.context.deep_quality_gate_observations is not None:
+            stores.append(self.context.deep_quality_gate_observations)
         if self.context.repository_observations is not None:
             stores.append(self.context.repository_observations)
         if self.context.intent_observations is not None:
@@ -1754,6 +1974,8 @@ class ReviewPipeline:
 
         summaries: dict[str, str] = {}
         for store in (
+            self.context.quality_gate_observations,
+            self.context.deep_quality_gate_observations,
             self.context.repository_observations,
             self.context.intent_observations,
         ):
@@ -1931,6 +2153,28 @@ def _intent_claim_from_inference(
 
 def _dedupe(items: list[str]) -> list[str]:
     return list(dict.fromkeys(items))
+
+
+def _merge_quality_results(
+    first: list[QualityGateResult],
+    second: list[QualityGateResult],
+) -> list[QualityGateResult]:
+    merged = list(first)
+    by_name = {result.name: result for result in merged}
+    if len(by_name) != len(merged):
+        raise ValueError("Quality Gate results contain duplicate names")
+    for result in second:
+        existing = by_name.get(result.name)
+        if existing is not None:
+            if existing != result:
+                raise ValueError(
+                    "Quality Gate result name points to conflicting results: "
+                    f"{result.name}"
+                )
+            continue
+        by_name[result.name] = result
+        merged.append(result)
+    return merged
 
 
 def _reviewer_artifact_names(

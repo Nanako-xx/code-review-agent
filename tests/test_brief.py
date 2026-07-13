@@ -99,9 +99,17 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
         quality_results=[
             QualityGateResult(
                 name="python_compile",
-                status="passed",
+                status="failed",
                 command=["python", "-m", "compileall"],
-                summary="Compiled 1 Python file",
+                summary="Syntax error in auth.py",
+                observation_ref="O-QG",
+                category="compile",
+                source="builtin",
+                reason="invalid syntax",
+                exit_code=1,
+                duration_seconds=0.25,
+                output_truncated=True,
+                sandbox="git_blob_compile",
             )
         ],
         observation_summaries={"O-1": "auth.py changed between base and head"},
@@ -143,6 +151,11 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
     markdown = render_review_brief_markdown(brief)
     assert "Incremental priority map:" in markdown
     assert f"{'b' * 40}..{'c' * 40}" in markdown
+    assert "[compile/cheap; builtin; non-blocking]: failed (0.25s)" in markdown
+    assert "  - Reason: invalid syntax" in markdown
+    assert "  - Output truncated: True" in markdown
+    assert "  - Sandbox: git_blob_compile" in markdown
+    assert "  - Observation: O-QG" in markdown
 
 
 def test_render_review_brief_markdown_uses_spec_section_order() -> None:

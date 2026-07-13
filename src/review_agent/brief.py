@@ -257,6 +257,12 @@ def _verification_evidence(
             "summary": result.summary,
             "command": list(result.command),
             "observation_ref": result.observation_ref,
+            "category": result.category,
+            "cost": result.cost,
+            "source": result.source,
+            "blocking": result.blocking,
+            "reason": result.reason,
+            "duration_seconds": result.duration_seconds,
         }
         for result in quality_results
     ]
@@ -357,6 +363,15 @@ def _quality_result_to_dict(result: QualityGateResult) -> dict[str, Any]:
         "command": list(result.command),
         "summary": result.summary,
         "observation_ref": result.observation_ref,
+        "category": result.category,
+        "cost": result.cost,
+        "source": result.source,
+        "blocking": result.blocking,
+        "reason": result.reason,
+        "exit_code": result.exit_code,
+        "duration_seconds": result.duration_seconds,
+        "output_truncated": result.output_truncated,
+        "sandbox": result.sandbox,
     }
 
 

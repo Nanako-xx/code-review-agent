@@ -1,8 +1,16 @@
 from review_agent.completion import check_completion, completion_to_dict
 from review_agent.evidence import ContractCoverage, EvidenceReconciliation
 from review_agent.model_protocol import ModelResponse
-from review_agent.models import IntentPacket, IntentSource, IntentStatus, ReviewerResult, ReviewerResultStatus
+from review_agent.models import (
+    IntentPacket,
+    IntentSource,
+    IntentStatus,
+    QualityGateResult,
+    ReviewerResult,
+    ReviewerResultStatus,
+)
 from review_agent.orchestrator import ReviewerExecution
+from review_agent.quality import QualityGateDefinition, QualityGatePlan
 from tests.test_orchestrator import make_assignment
 
 
@@ -255,3 +263,109 @@ def test_completion_requires_manual_review_when_final_risk_is_high():
     assert result.status == "completed_with_uncertainties"
     assert result.recommendation == "manual_review"
     assert "Final risk is high" in result.uncertainties
+
+
+def planned_gate(*, blocking=False):
+    return QualityGateDefinition(
+        name="pytest",
+        category="test",
+        cost="expensive",
+        source="builtin",
+        command=["python", "-m", "pytest", "-q"],
+        blocking=blocking,
+        trigger_risks=["medium", "high", "critical"],
+    )
+
+
+def gate_result(gate, status, *, reason=None):
+    return QualityGateResult(
+        name=gate.name,
+        status=status,
+        command=list(gate.command),
+        summary=f"pytest {status}",
+        observation_ref="O-quality-pytest",
+        category=gate.category,
+        cost=gate.cost,
+        source=gate.source,
+        blocking=gate.blocking,
+        reason=reason,
+        sandbox="test-sandbox",
+    )
+
+
+def completion_with_gate(gate, results, *, issues=None, known_observations=None):
+    return check_completion(
+        intent=intent(),
+        quality_results=results,
+        executions=[execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED)],
+        reconciliation=reconciliation_with_coverage(coverage(0, "Core Reviewer")),
+        quality_plan=QualityGatePlan(
+            revision="a" * 40,
+            gates=[gate],
+            discovery_issues=list(issues or []),
+        ),
+        quality_observation_refs=known_observations,
+    )
+
+
+def test_completion_requires_every_planned_quality_gate_result():
+    result = completion_with_gate(planned_gate(), [])
+
+    assert result.status == "blocked"
+    assert "Quality gate result missing: pytest" in result.blockers
+
+
+def test_completion_rejects_unknown_quality_gate_observation_ref():
+    gate = planned_gate()
+    result = completion_with_gate(
+        gate,
+        [gate_result(gate, "passed")],
+        known_observations=set(),
+    )
+
+    assert result.status == "blocked"
+    assert "Quality gate observation unknown: pytest" in result.blockers
+
+
+def test_non_blocking_quality_failure_is_an_uncertainty_not_a_hard_gate():
+    gate = planned_gate()
+    result = completion_with_gate(gate, [gate_result(gate, "failed")])
+
+    assert result.status == "completed_with_uncertainties"
+    assert result.blockers == []
+    assert any("Quality gate failed: pytest" in item for item in result.uncertainties)
+
+
+def test_policy_skipped_non_blocking_gate_satisfies_planned_depth():
+    gate = planned_gate()
+    result = completion_with_gate(
+        gate,
+        [gate_result(gate, "skipped", reason="low risk policy")],
+    )
+
+    assert result.status == "completed"
+    assert result.recommendation == "approve"
+
+
+def test_repository_blocking_quality_gate_blocks_completion():
+    gate = planned_gate(blocking=True)
+    result = completion_with_gate(
+        gate,
+        [gate_result(gate, "unavailable", reason="pytest is not installed")],
+    )
+
+    assert result.status == "blocked"
+    assert any("Quality gate unavailable: pytest" in item for item in result.blockers)
+
+
+def test_quality_discovery_issue_is_preserved_as_manual_review_uncertainty():
+    gate = planned_gate()
+    result = completion_with_gate(
+        gate,
+        [gate_result(gate, "passed")],
+        issues=["invalid explicit gate"],
+    )
+
+    assert result.status == "completed_with_uncertainties"
+    assert result.recommendation == "manual_review"
+    assert "Quality gate discovery issue: invalid explicit gate" in result.uncertainties

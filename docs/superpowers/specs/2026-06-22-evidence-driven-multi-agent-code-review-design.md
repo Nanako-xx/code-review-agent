@@ -1,7 +1,7 @@
 # Evidence-Driven Multi-Agent Code Review Agent 设计
 
 - 日期：2026-06-22
-- 状态：已确认，待实施计划
+- 状态：已确认，M1 本地核心实现进行中（Eval 与 GitHub/PR 集成延期）
 - 项目根目录：`D:\Agent\code review agent`
 - M1 形态：面向 Python Git 仓库的本地交互式 CLI
 
@@ -285,6 +285,10 @@ M1 默认只读，不自动修改被审查代码。后续可以增加显式 `fix
 对确定性小错误生成修复补丁、记录修复 diff，再基于修复后的状态继续审查。该模式不属于默认 Review 流程。
 
 Quality Gates 的完整输出进入 Observation Store；模型先看到结构化摘要，需要时再按范围读取原始日志。
+
+M1 的已实现运行协议如下：Runtime 在固定 `resolved_head_sha` 上生成 `QualityGatePlan`，从 Python 文件与仓库配置发现 compile、ruff、mypy/pyright、pytest，并解析 `pyproject.toml` 中显式声明的 `[[tool.review-agent.quality-gates]]`。仓库命令必须是通过 category/module 白名单验证的 `python -m ...` argv，禁止 shell、变更型参数、绝对路径和父目录穿越。
+
+廉价门禁在 `QUALITY_GATES` checkpoint 运行并进入初始风险信号；昂贵门禁在本地 Risk 与 Reviewer portfolio 形成后，于 `PLANNING` checkpoint 按策略执行或以带原因的 `skipped` 终态记录。外部门禁只在安全物化的 Head snapshot 中运行，使用最小环境、Python 网络 guard、wall-clock timeout、输出上限、进程树终止和日志脱敏。`passed | failed | skipped | unavailable | timed_out | error` 均形成结构化 Result 与 Observation；Completion 核对 plan coverage，普通失败作为 uncertainty，仓库显式声明的 blocking gate 非通过时成为 blocker。旧 Session 没有 plan 或新增字段时按 legacy 语义 hydrate。
 
 ## 8. Review Contract
 
@@ -1314,7 +1318,9 @@ Intent Clarification 与 LLM Intent Inference 已落地：claim 级 provenance�
 
 Reviewer Execution Hardening 已落地：风险等级在本地展开为 turn、tool、单次输出 token、累计 token、wall-clock 和 Provider attempt 预算；single-shot 与 Agent Loop 对 Provider exception/INVALID 做同一逻辑 turn 内的有限重试；OpenAI-compatible HTTP timeout 受剩余时间约束；预算耗尽返回保留已授权 Observation 的 `partial`。多个 Reviewer 的调查和模型调用在独立 AttemptWorkspace/ObservationStore 中并行，authoritative artifact 提升与 Session task 更新由主线程按 reviewer index 串行完成。Provider、解析和 Reviewer Runtime 失败形成结构化 `failed` artifact，不再中断其他 Reviewer；控制层提交、hash 和 Session 失败仍阻断 phase。runtime/termination metadata 已进入 raw response、Agent Loop trace、multi reviewer summary 和 JSON/Markdown Brief，旧 artifact 缺少新字段时继续按 legacy defaults hydrate。
 
-仍待后续本地批次实现：完整 Quality Gates、模型辅助 Risk/Portfolio、语义 Reconciler 和有界补充调查。Eval 与 GitHub/PR 集成继续独立延期。
+Deterministic Quality Gates 已落地：固定 Head 的 Gate Plan 与安全发现、cheap/deep 两阶段策略、隔离 snapshot runner、完整终态 Observation、Risk/Assignment/Completion/Final Risk/Brief 传播、checkpoint resume 和 legacy hydration 均进入主路径。普通门禁失败继续 Reviewer 并形成 uncertainty，显式 blocking 门禁由 Completion 硬约束。
+
+仍待后续本地批次实现：模型辅助 Risk/Portfolio、语义 Reconciler 和有界补充调查。Eval 与 GitHub/PR 集成继续独立延期。
 
 ## 24. 实现同步原则
 

@@ -21,6 +21,7 @@ from review_agent.hydration import (
     completion_from_dict,
     final_risk_from_dict,
     intent_from_dict,
+    quality_gate_plan_from_dict,
     quality_results_from_dict,
     reconciliation_from_dict,
     repository_intelligence_from_dict,
@@ -63,6 +64,11 @@ from review_agent.models import (
     RiskLevel,
 )
 from review_agent.repository_intelligence import ChangedSymbol, RepositoryIntelligenceSnapshot
+from review_agent.quality import (
+    QualityGateDefinition,
+    QualityGatePlan,
+    quality_gate_plan_to_dict,
+)
 from review_agent.reviewer import reviewer_result_to_dict
 
 
@@ -411,6 +417,60 @@ def test_review_brief_hydration_accepts_abbreviated_final_risk_payload() -> None
     payload = _json(review_brief_to_dict(brief))
 
     assert review_brief_from_dict(payload) == brief
+
+
+def test_quality_gate_plan_and_additive_result_metadata_round_trip() -> None:
+    gate = QualityGateDefinition(
+        name="pytest",
+        category="test",
+        cost="expensive",
+        source="builtin",
+        command=["python", "-m", "pytest", "-q"],
+        timeout_seconds=120,
+        trigger_risks=["medium", "high", "critical"],
+    )
+    plan = QualityGatePlan(
+        revision="a" * 40,
+        gates=[gate],
+        discovery_issues=[],
+    )
+    result = QualityGateResult(
+        name="pytest",
+        status="timed_out",
+        command=list(gate.command),
+        summary="pytest timed out",
+        observation_ref="O-pytest",
+        category="test",
+        cost="expensive",
+        source="builtin",
+        reason="timeout",
+        duration_seconds=120.0,
+        output_truncated=True,
+        sandbox="test-sandbox",
+    )
+
+    assert quality_gate_plan_from_dict(_json(quality_gate_plan_to_dict(plan))) == plan
+    assert quality_results_from_dict(_json({"results": [asdict(result)]})) == [result]
+
+
+def test_quality_result_hydration_defaults_legacy_metadata() -> None:
+    [result] = quality_results_from_dict(
+        {
+            "results": [
+                {
+                    "name": "compile",
+                    "status": "passed",
+                    "command": ["python", "-m", "compileall"],
+                    "summary": "ok",
+                    "observation_ref": None,
+                }
+            ]
+        }
+    )
+
+    assert result.category == "unknown"
+    assert result.source == "legacy"
+    assert result.duration_seconds == 0.0
 
 
 def test_review_brief_hydration_accepts_legacy_intent_sections() -> None:

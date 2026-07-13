@@ -62,6 +62,25 @@ def test_quality_gate_uses_observation_ref_name():
     assert result.observation_ref == "O-quality-python-compile"
 
 
+def test_quality_gate_rejects_unknown_status_and_non_finite_duration():
+    with pytest.raises(ValueError, match="status"):
+        QualityGateResult(
+            name="compile",
+            status="running",
+            command=["python", "-m", "compileall"],
+            summary="not terminal",
+        )
+
+    with pytest.raises(ValueError, match="duration_seconds"):
+        QualityGateResult(
+            name="compile",
+            status="passed",
+            command=["python", "-m", "compileall"],
+            summary="ok",
+            duration_seconds=float("nan"),
+        )
+
+
 def test_risk_assessment_uses_signal_refs_and_uncertainties():
     assessment = RiskAssessment(
         level=RiskLevel.HIGH,

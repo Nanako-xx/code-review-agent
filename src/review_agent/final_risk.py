@@ -68,6 +68,24 @@ def reassess_final_risk(
             escalations.append(message)
             reasons.append(message)
             signal_refs.append(f"quality_gate:{result.name}")
+        elif result.status in {"unavailable", "timed_out", "error"}:
+            target = RiskLevel.HIGH if result.blocking else RiskLevel.MEDIUM
+            level = _raise_to(level, target)
+            message = (
+                f"quality gate {result.status} after review: {result.name}"
+            )
+            escalations.append(message)
+            reasons.append(message)
+            uncertainties.append(result.reason or result.summary)
+            signal_refs.append(f"quality_gate:{result.name}")
+        elif result.status == "skipped":
+            if result.blocking:
+                level = _raise_to(level, RiskLevel.HIGH)
+                message = f"blocking quality gate skipped: {result.name}"
+                escalations.append(message)
+                reasons.append(message)
+                uncertainties.append(result.reason or result.summary)
+                signal_refs.append(f"quality_gate:{result.name}")
 
     canonical_findings = list(reconciliation.get("canonical_findings", []))
     for item in canonical_findings:

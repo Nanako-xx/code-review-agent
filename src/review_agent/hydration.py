@@ -53,6 +53,7 @@ from review_agent.models import (
     RiskLevel,
 )
 from review_agent.orchestrator import ReviewerExecution
+from review_agent.quality import QualityGateDefinition, QualityGatePlan
 from review_agent.reviewer_runtime import reviewer_runtime_to_dict
 from review_agent.repository_intelligence import (
     ChangedSymbol,
@@ -364,17 +365,126 @@ def quality_results_from_dict(payload: Mapping[str, Any]) -> list[QualityGateRes
     for index, row in enumerate(rows):
         context = f"quality_results.results[{index}]"
         value = _object(row, context)
-        _exact(value, {"name", "status", "command", "summary", "observation_ref"}, context)
-        results.append(
-            QualityGateResult(
+        results.append(_quality_gate_result_from_mapping(value, context))
+    return results
+
+
+def quality_gate_plan_from_dict(payload: Mapping[str, Any]) -> QualityGatePlan:
+    item = _object(payload, "quality_gate_plan")
+    _exact(
+        item,
+        {"revision", "gates", "discovery_issues"},
+        "quality_gate_plan",
+    )
+    gates: list[QualityGateDefinition] = []
+    for index, row in enumerate(_list_field(item, "gates", "quality_gate_plan")):
+        context = f"quality_gate_plan.gates[{index}]"
+        value = _object(row, context)
+        _exact(
+            value,
+            {
+                "name",
+                "category",
+                "cost",
+                "source",
+                "command",
+                "blocking",
+                "timeout_seconds",
+                "trigger_risks",
+            },
+            context,
+        )
+        gates.append(
+            QualityGateDefinition(
                 name=_string(value, "name", context),
-                status=_string(value, "status", context),
+                category=_string(value, "category", context),
+                cost=_string(value, "cost", context),
+                source=_string(value, "source", context),
                 command=_string_list(value, "command", context),
-                summary=_string(value, "summary", context),
-                observation_ref=_optional_string(value, "observation_ref", context),
+                blocking=_boolean(value, "blocking", context),
+                timeout_seconds=_positive_number(
+                    value,
+                    "timeout_seconds",
+                    context,
+                ),
+                trigger_risks=_string_list(value, "trigger_risks", context),
             )
         )
-    return results
+    return QualityGatePlan(
+        revision=_string(item, "revision", "quality_gate_plan"),
+        gates=gates,
+        discovery_issues=_string_list(
+            item,
+            "discovery_issues",
+            "quality_gate_plan",
+        ),
+    )
+
+
+def _quality_gate_result_from_mapping(
+    value: Mapping[str, Any],
+    context: str,
+) -> QualityGateResult:
+    required = {"name", "status", "command", "summary", "observation_ref"}
+    optional = {
+        "category",
+        "cost",
+        "source",
+        "blocking",
+        "reason",
+        "exit_code",
+        "duration_seconds",
+        "output_truncated",
+        "sandbox",
+    }
+    _required_with_optional(value, required, optional, context)
+    exit_code_value = value.get("exit_code")
+    if exit_code_value is not None and type(exit_code_value) is not int:
+        raise ValueError(f"{context}.exit_code must be an integer or null")
+    return QualityGateResult(
+        name=_string(value, "name", context),
+        status=_string(value, "status", context),
+        command=_string_list(value, "command", context),
+        summary=_string(value, "summary", context),
+        observation_ref=_optional_string(value, "observation_ref", context),
+        category=(
+            _string(value, "category", context)
+            if "category" in value
+            else "unknown"
+        ),
+        cost=_string(value, "cost", context) if "cost" in value else "cheap",
+        source=(
+            _string(value, "source", context)
+            if "source" in value
+            else "legacy"
+        ),
+        blocking=(
+            _boolean(value, "blocking", context)
+            if "blocking" in value
+            else False
+        ),
+        reason=(
+            _optional_string(value, "reason", context)
+            if "reason" in value
+            else None
+        ),
+        exit_code=exit_code_value,
+        duration_seconds=(
+            _non_negative_number(value, "duration_seconds", context)
+            if "duration_seconds" in value
+            else 0.0
+        ),
+        output_truncated=(
+            _boolean(value, "output_truncated", context)
+            if "output_truncated" in value
+            else False
+        ),
+        sandbox=(
+            _string(value, "sandbox", context)
+            if "sandbox" in value
+            else "legacy"
+        ),
+    )
 
 
 def repository_intelligence_from_dict(
@@ -924,22 +1034,39 @@ def _review_brief_quality_gates(value: Any) -> list[dict[str, Any]]:
     for index, row in enumerate(value):
         row_context = f"{context}[{index}]"
         item = _object(row, row_context)
-        _exact(
+        _required_with_optional(
             item,
             {"name", "status", "command", "summary", "observation_ref"},
+            {
+                "category",
+                "cost",
+                "source",
+                "blocking",
+                "reason",
+                "exit_code",
+                "duration_seconds",
+                "output_truncated",
+                "sandbox",
+            },
             row_context,
         )
+        result = _quality_gate_result_from_mapping(item, row_context)
         rows.append(
             {
-                "name": _string(item, "name", row_context),
-                "status": _string(item, "status", row_context),
-                "command": _string_list(item, "command", row_context),
-                "summary": _string(item, "summary", row_context),
-                "observation_ref": _optional_string(
-                    item,
-                    "observation_ref",
-                    row_context,
-                ),
+                "name": result.name,
+                "status": result.status,
+                "command": list(result.command),
+                "summary": result.summary,
+                "observation_ref": result.observation_ref,
+                "category": result.category,
+                "cost": result.cost,
+                "source": result.source,
+                "blocking": result.blocking,
+                "reason": result.reason,
+                "exit_code": result.exit_code,
+                "duration_seconds": result.duration_seconds,
+                "output_truncated": result.output_truncated,
+                "sandbox": result.sandbox,
             }
         )
     return rows
@@ -1137,7 +1264,7 @@ def _review_brief_verification_evidence(value: Any) -> list[dict[str, Any]]:
             raise ValueError(f"{row_context} is missing required field(s): kind")
         kind = _string(item, "kind", row_context)
         if kind == "quality_gate":
-            _exact(
+            _required_with_optional(
                 item,
                 {
                     "kind",
@@ -1147,20 +1274,34 @@ def _review_brief_verification_evidence(value: Any) -> list[dict[str, Any]]:
                     "command",
                     "observation_ref",
                 },
+                {
+                    "category",
+                    "cost",
+                    "source",
+                    "blocking",
+                    "reason",
+                    "duration_seconds",
+                },
+                row_context,
+            )
+            gate = _quality_gate_result_from_mapping(
+                {key: value for key, value in item.items() if key != "kind"},
                 row_context,
             )
             rows.append(
                 {
                     "kind": kind,
-                    "name": _string(item, "name", row_context),
-                    "status": _string(item, "status", row_context),
-                    "summary": _string(item, "summary", row_context),
-                    "command": _string_list(item, "command", row_context),
-                    "observation_ref": _optional_string(
-                        item,
-                        "observation_ref",
-                        row_context,
-                    ),
+                    "name": gate.name,
+                    "status": gate.status,
+                    "summary": gate.summary,
+                    "command": list(gate.command),
+                    "observation_ref": gate.observation_ref,
+                    "category": gate.category,
+                    "cost": gate.cost,
+                    "source": gate.source,
+                    "blocking": gate.blocking,
+                    "reason": gate.reason,
+                    "duration_seconds": gate.duration_seconds,
                 }
             )
             continue

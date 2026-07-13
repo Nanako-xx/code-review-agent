@@ -281,10 +281,29 @@ def _risk_section(brief: ReviewBrief) -> str:
 def _quality_gates_section(brief: ReviewBrief) -> str:
     if not brief.quality_gates:
         return "- No quality gates recorded"
-    return "\n".join(
-        f"- {gate.get('name', 'unknown')}: {gate.get('status', 'unknown')} - {gate.get('summary', '')}".rstrip()
-        for gate in brief.quality_gates
-    )
+    rows: list[str] = []
+    for gate in brief.quality_gates:
+        rows.extend(
+            [
+                (
+                    f"- {gate.get('name', 'unknown')} "
+                    f"[{gate.get('category', 'unknown')}/"
+                    f"{gate.get('cost', 'unknown')}; "
+                    f"{gate.get('source', 'unknown')}; "
+                    f"{'blocking' if gate.get('blocking') else 'non-blocking'}]: "
+                    f"{gate.get('status', 'unknown')} "
+                    f"({float(gate.get('duration_seconds', 0.0)):.2f}s) - "
+                    f"{gate.get('summary', '')}"
+                ).rstrip(),
+                f"  - Command: {gate.get('command', [])}",
+                f"  - Reason: {gate.get('reason') or 'none'}",
+                f"  - Exit code: {gate.get('exit_code')}",
+                f"  - Output truncated: {bool(gate.get('output_truncated', False))}",
+                f"  - Sandbox: {gate.get('sandbox', 'unknown')}",
+                f"  - Observation: {gate.get('observation_ref') or 'none'}",
+            ]
+        )
+    return "\n".join(rows)
 
 
 def _change_map_section(brief: ReviewBrief) -> str:

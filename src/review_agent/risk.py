@@ -52,15 +52,17 @@ class LocalRiskAssessor:
             if any(marker in path.lower() for marker in SENSITIVE_PATH_MARKERS)
         ]
         quality_gates = packet.deterministic_signals.get("quality_gates", {})
-        failed_gates = [name for name, status in quality_gates.items() if status == "failed"]
+        failed_gates = [
+            name for name, status in quality_gates.items() if status == "failed"
+        ]
+        unavailable_gates = [
+            name
+            for name, status in quality_gates.items()
+            if status in {"unavailable", "timed_out", "error"}
+        ]
         signal_refs: list[str] = []
 
-        if failed_gates:
-            level = RiskLevel.HIGH
-            reasons = [f"quality gate failed: {name}" for name in failed_gates]
-            signal_refs.extend(f"quality_gate:{name}" for name in failed_gates)
-            focus = ["failed quality gate", "regression safety"]
-        elif sensitive_files:
+        if sensitive_files:
             level = RiskLevel.HIGH
             reasons = [f"sensitive path changed: {path}" for path in sensitive_files]
             signal_refs.extend(f"changed_file:{path}" for path in sensitive_files)
@@ -74,6 +76,29 @@ class LocalRiskAssessor:
             level = RiskLevel.LOW
             reasons = ["small or documentation-only non-sensitive change set"]
             focus = ["intent alignment", "changed file sanity"]
+
+        quality_reasons = [
+            *(f"quality gate failed: {name}" for name in failed_gates),
+            *(
+                f"quality gate verification unavailable: {name}"
+                for name in unavailable_gates
+            ),
+        ]
+        if failed_gates:
+            level = RiskLevel.HIGH
+            focus = list(
+                dict.fromkeys(["failed quality gate", "regression safety", *focus])
+            )
+        elif unavailable_gates and level is RiskLevel.LOW:
+            level = RiskLevel.MEDIUM
+        if unavailable_gates:
+            focus = list(dict.fromkeys(["verification gap", "test adequacy", *focus]))
+        if quality_reasons:
+            reasons = [*quality_reasons, *reasons]
+            signal_refs.extend(
+                f"quality_gate:{name}"
+                for name in [*failed_gates, *unavailable_gates]
+            )
 
         return RiskAssessment(
             level=level,

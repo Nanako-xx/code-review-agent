@@ -339,6 +339,78 @@ class QualityGateResult:
     command: list[str]
     summary: str
     observation_ref: str | None = None
+    category: str = "unknown"
+    cost: str = "cheap"
+    source: str = "legacy"
+    blocking: bool = False
+    reason: str | None = None
+    exit_code: int | None = None
+    duration_seconds: float = 0.0
+    output_truncated: bool = False
+    sandbox: str = "legacy"
+
+    def __post_init__(self) -> None:
+        _validate_non_empty_text(self.name, "quality gate name")
+        if self.status not in {
+            "passed",
+            "failed",
+            "skipped",
+            "unavailable",
+            "timed_out",
+            "error",
+        }:
+            raise ValueError("quality gate status is unsupported")
+        if not isinstance(self.command, list) or not self.command:
+            raise ValueError("quality gate command must be a non-empty list")
+        for argument in self.command:
+            _validate_non_empty_text(argument, "quality gate command argument")
+        _validate_non_empty_text(self.summary, "quality gate summary")
+        if self.observation_ref is not None:
+            _validate_non_empty_text(
+                self.observation_ref,
+                "quality gate observation_ref",
+            )
+        if self.category not in {
+            "compile",
+            "format",
+            "type",
+            "lint",
+            "build",
+            "test",
+            "security",
+            "unknown",
+        }:
+            raise ValueError("quality gate category is unsupported")
+        if self.cost not in {"cheap", "expensive"}:
+            raise ValueError("quality gate cost is unsupported")
+        if self.source not in {"builtin", "repository_config", "legacy"}:
+            raise ValueError("quality gate source is unsupported")
+        if type(self.blocking) is not bool:
+            raise ValueError("quality gate blocking must be a boolean")
+        if self.reason is not None:
+            _validate_non_empty_text(self.reason, "quality gate reason")
+        if self.status in {"skipped", "unavailable", "timed_out", "error"} and (
+            self.reason is None
+        ):
+            raise ValueError(
+                f"quality gate status {self.status} must include a reason"
+            )
+        if self.exit_code is not None and type(self.exit_code) is not int:
+            raise ValueError("quality gate exit_code must be an integer or null")
+        if (
+            isinstance(self.duration_seconds, bool)
+            or not isinstance(self.duration_seconds, (int, float))
+            or not math.isfinite(self.duration_seconds)
+            or self.duration_seconds < 0
+        ):
+            raise ValueError(
+                "quality gate duration_seconds must be a finite non-negative number"
+            )
+        if type(self.output_truncated) is not bool:
+            raise ValueError("quality gate output_truncated must be a boolean")
+        _validate_non_empty_text(self.sandbox, "quality gate sandbox")
+        object.__setattr__(self, "command", list(self.command))
+        object.__setattr__(self, "duration_seconds", float(self.duration_seconds))
 
 
 @dataclass(frozen=True)

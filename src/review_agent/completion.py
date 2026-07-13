@@ -6,6 +6,7 @@ from typing import Any
 from review_agent.evidence import EvidenceReconciliation
 from review_agent.models import IntentPacket, IntentStatus, QualityGateResult, ReviewerResultStatus
 from review_agent.orchestrator import ReviewerExecution
+from review_agent.quality import QualityGatePlan
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,8 @@ def check_completion(
     executions: list[ReviewerExecution],
     reconciliation: EvidenceReconciliation,
     *,
+    quality_plan: QualityGatePlan | None = None,
+    quality_observation_refs: set[str] | None = None,
     require_final_risk: bool = False,
     final_risk_level: str | None = None,
 ) -> CompletionResult:
@@ -39,9 +42,18 @@ def check_completion(
     if not any(_is_core_reviewer(execution.assignment.role) for execution in executions):
         blockers.append("Core Reviewer did not run")
 
-    for result in quality_results:
-        if result.status == "failed":
-            uncertainties.append(f"Quality gate failed: {result.name}")
+    if quality_plan is None:
+        for result in quality_results:
+            if result.status == "failed":
+                uncertainties.append(f"Quality gate failed: {result.name}")
+    else:
+        _check_quality_gates(
+            quality_plan,
+            quality_results,
+            blockers,
+            uncertainties,
+            quality_observation_refs,
+        )
 
     contract_coverage = _contract_coverage(reconciliation)
     for execution in executions:
@@ -110,6 +122,65 @@ def completion_to_dict(result: CompletionResult) -> dict[str, Any]:
 
 def _is_core_reviewer(role: str) -> bool:
     return "core" in role.casefold()
+
+
+def _check_quality_gates(
+    plan: QualityGatePlan,
+    results: list[QualityGateResult],
+    blockers: list[str],
+    uncertainties: list[str],
+    known_observation_refs: set[str] | None,
+) -> None:
+    for issue in plan.discovery_issues:
+        uncertainties.append(f"Quality gate discovery issue: {issue}")
+
+    by_name: dict[str, QualityGateResult] = {}
+    duplicate_names: set[str] = set()
+    for result in results:
+        if result.name in by_name:
+            duplicate_names.add(result.name)
+            continue
+        by_name[result.name] = result
+    for name in sorted(duplicate_names):
+        blockers.append(f"Quality gate result duplicated: {name}")
+
+    planned_names = {gate.name for gate in plan.gates}
+    for gate in plan.gates:
+        result = by_name.get(gate.name)
+        if result is None:
+            blockers.append(f"Quality gate result missing: {gate.name}")
+            continue
+        if (
+            result.category != gate.category
+            or result.cost != gate.cost
+            or result.source != gate.source
+            or result.blocking != gate.blocking
+            or result.command != gate.command
+        ):
+            blockers.append(f"Quality gate result metadata mismatch: {gate.name}")
+            continue
+        if result.observation_ref is None:
+            blockers.append(f"Quality gate observation missing: {gate.name}")
+            continue
+        if (
+            known_observation_refs is not None
+            and result.observation_ref not in known_observation_refs
+        ):
+            blockers.append(f"Quality gate observation unknown: {gate.name}")
+            continue
+        if result.status == "passed":
+            continue
+        if result.status == "skipped" and not gate.blocking:
+            continue
+        detail = result.reason or result.summary
+        message = f"Quality gate {result.status}: {gate.name} ({detail})"
+        if gate.blocking:
+            blockers.append(message)
+        else:
+            uncertainties.append(message)
+
+    for name in sorted(set(by_name) - planned_names):
+        uncertainties.append(f"Unplanned Quality gate result: {name}")
 
 
 def _contract_coverage(reconciliation: EvidenceReconciliation) -> dict[tuple[int, str], str]:
