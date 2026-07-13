@@ -10,6 +10,14 @@ from review_agent.cli import main
 from review_agent.session_store import SessionStore
 
 
+def _first_reviewer_artifact(run_dir: Path, kind: str) -> Path:
+    for name in (f"reviewer_{kind}.json", f"reviewer_0_{kind}.json"):
+        path = run_dir / name
+        if path.exists():
+            return path
+    raise AssertionError(f"reviewer {kind} artifact was not written")
+
+
 def test_cli_review_writes_current_schema_artifacts(git_repo: Path):
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "auth.py").write_text("def check(token):\n    return token == 'ok'\n", encoding="utf-8")
@@ -126,7 +134,7 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypat
     assert brief["change_map_and_repository_impact"]["changed_files"] == ["auth.py"]
     assert brief["initial_and_final_risk_assessment"]["final"]["status"] == "reassessed"
     assert brief["non_binding_recommendation"] == "manual_review"
-    assert session["schema_version"] == 2
+    assert session["schema_version"] == 3
     assert session["status"] == "completed"
     assert session["current_phase"] == "completed"
     assert session["revisions"] == {
@@ -149,6 +157,26 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypat
         "reviewer_mode": "single",
         "reviewer_loop": "single-shot",
         "non_interactive": True,
+        "risk_assessor": {
+            "mode": "local",
+            "provider": "none",
+            "model": None,
+            "base_url": None,
+            "api_key_env": "REVIEW_AGENT_API_KEY",
+            "max_output_tokens": 4096,
+            "max_provider_attempts": 2,
+            "max_elapsed_seconds": 60.0,
+        },
+        "portfolio_planner": {
+            "mode": "local",
+            "provider": "none",
+            "model": None,
+            "base_url": None,
+            "api_key_env": "REVIEW_AGENT_API_KEY",
+            "max_output_tokens": 4096,
+            "max_provider_attempts": 2,
+            "max_elapsed_seconds": 60.0,
+        },
     }
     assert secret not in session_text
     assert "state" not in session["artifacts"]
@@ -169,6 +197,123 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypat
         assert descriptor["phase"] == phase
         assert descriptor["revision_binding"] == revision_binding
         assert descriptor["sha256"] == hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+
+
+def test_cli_model_stage_inherit_and_overrides_persist_concrete_config(
+    git_repo: Path,
+) -> None:
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "app.py").write_text("value = 2\n", encoding="utf-8")
+    run_git(git_repo, "add", "app.py")
+    run_git(git_repo, "commit", "-m", "change app")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--intent",
+            "Review the app change",
+            "--reviewer-provider",
+            "fake",
+            "--reviewer-model",
+            "review-model",
+            "--reviewer-base-url",
+            "https://reviewer.example/v1",
+            "--reviewer-api-key-env",
+            "REVIEWER_API_KEY",
+            "--risk-assessor-mode",
+            "model",
+            "--risk-assessor-provider",
+            "inherit",
+            "--risk-assessor-max-output-tokens",
+            "2048",
+            "--risk-assessor-max-provider-attempts",
+            "3",
+            "--risk-assessor-max-elapsed-seconds",
+            "45",
+            "--portfolio-planner-mode",
+            "model",
+            "--portfolio-planner-provider",
+            "fake",
+            "--portfolio-planner-model",
+            "planner-model",
+            "--portfolio-planner-base-url",
+            "https://planner.example/v1",
+            "--portfolio-planner-api-key-env",
+            "PLANNER_API_KEY",
+            "--portfolio-planner-max-output-tokens",
+            "3072",
+            "--portfolio-planner-max-provider-attempts",
+            "4",
+            "--portfolio-planner-max-elapsed-seconds",
+            "75",
+            "--non-interactive",
+        ]
+    )
+
+    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
+    session_text = (run_dir / "session.json").read_text(encoding="utf-8")
+    execution = json.loads(session_text)["execution"]
+
+    assert exit_code == 0
+    assert execution["risk_assessor"] == {
+        "mode": "model",
+        "provider": "fake",
+        "model": "review-model",
+        "base_url": "https://reviewer.example/v1",
+        "api_key_env": "REVIEWER_API_KEY",
+        "max_output_tokens": 2048,
+        "max_provider_attempts": 3,
+        "max_elapsed_seconds": 45.0,
+    }
+    assert execution["portfolio_planner"] == {
+        "mode": "model",
+        "provider": "fake",
+        "model": "planner-model",
+        "base_url": "https://planner.example/v1",
+        "api_key_env": "PLANNER_API_KEY",
+        "max_output_tokens": 3072,
+        "max_provider_attempts": 4,
+        "max_elapsed_seconds": 75.0,
+    }
+    assert execution["risk_assessor"]["provider"] != "inherit"
+    assert execution["portfolio_planner"]["provider"] != "inherit"
+
+
+def test_cli_model_stage_rejects_inheriting_reviewer_provider_none(
+    git_repo: Path,
+    capsys,
+) -> None:
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "app.py").write_text("value = 2\n", encoding="utf-8")
+    run_git(git_repo, "add", "app.py")
+    run_git(git_repo, "commit", "-m", "change app")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    exit_code = main(
+        [
+            "review",
+            "--repo",
+            str(git_repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--risk-assessor-mode",
+            "model",
+            "--non-interactive",
+        ]
+    )
+
+    assert exit_code == 2
+    assert "risk-assessor: mode=model requires" in capsys.readouterr().out
+    assert not (git_repo / ".review-agent" / "runs").exists()
 
 
 def test_cli_review_with_fake_reviewer_writes_reviewer_artifacts(git_repo: Path):
@@ -200,13 +345,17 @@ def test_cli_review_with_fake_reviewer_writes_reviewer_artifacts(git_repo: Path)
     run_dirs = sorted(run_root.iterdir())
     run_dir = run_dirs[-1]
 
-    assert (run_dir / "reviewer_envelope.json").exists()
-    assert (run_dir / "reviewer_raw_response.json").exists()
-    assert (run_dir / "reviewer_result.json").exists()
-
-    result = json.loads((run_dir / "reviewer_result.json").read_text(encoding="utf-8"))
-    raw = json.loads((run_dir / "reviewer_raw_response.json").read_text(encoding="utf-8"))
-    envelope = json.loads((run_dir / "reviewer_envelope.json").read_text(encoding="utf-8"))
+    result = json.loads(
+        _first_reviewer_artifact(run_dir, "result").read_text(encoding="utf-8")
+    )
+    raw = json.loads(
+        _first_reviewer_artifact(run_dir, "raw_response").read_text(
+            encoding="utf-8"
+        )
+    )
+    envelope = json.loads(
+        _first_reviewer_artifact(run_dir, "envelope").read_text(encoding="utf-8")
+    )
     report = (run_dir / "report.md").read_text(encoding="utf-8")
 
     assert result["status"] == "partial"
@@ -214,7 +363,7 @@ def test_cli_review_with_fake_reviewer_writes_reviewer_artifacts(git_repo: Path)
     assert envelope["parameters"]["model"] == "fake-reviewer"
     assert envelope["parameters"]["context"]["budget_scope"] == "messages_only"
     assert "## Uncertainties" in report
-    assert "Fake reviewer executed." in report
+    assert result["investigation_summary"] == "Fake reviewer executed."
 
 
 def test_cli_openai_compatible_adapter_requires_api_key(git_repo: Path, monkeypatch, capsys):
@@ -519,6 +668,7 @@ def test_cli_agent_loop_openai_compatible_uses_adapter_factory(git_repo: Path, m
                                     "behavioral_correctness",
                                     "regression_safety",
                                     "test_adequacy",
+                                    "unresolved_uncertainties",
                                 )
                             ],
                             "confirmed_findings": [],
@@ -579,10 +729,22 @@ def test_cli_agent_loop_openai_compatible_uses_adapter_factory(git_repo: Path, m
 
     assert exit_code == 0
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
-    trace = json.loads((run_dir / "reviewer_agent_trace.json").read_text(encoding="utf-8"))
-    result = json.loads((run_dir / "reviewer_result.json").read_text(encoding="utf-8"))
-    raw = json.loads((run_dir / "reviewer_raw_response.json").read_text(encoding="utf-8"))
-    envelope = json.loads((run_dir / "reviewer_envelope.json").read_text(encoding="utf-8"))
+    trace = json.loads(
+        _first_reviewer_artifact(run_dir, "agent_trace").read_text(
+            encoding="utf-8"
+        )
+    )
+    result = json.loads(
+        _first_reviewer_artifact(run_dir, "result").read_text(encoding="utf-8")
+    )
+    raw = json.loads(
+        _first_reviewer_artifact(run_dir, "raw_response").read_text(
+            encoding="utf-8"
+        )
+    )
+    envelope = json.loads(
+        _first_reviewer_artifact(run_dir, "envelope").read_text(encoding="utf-8")
+    )
 
     assert trace["tool_call_count"] == 1
     assert result["status"] == "completed"
@@ -659,7 +821,9 @@ def test_cli_fake_reviewer_writes_observation_store_artifacts(git_repo: Path):
     assert compare_record["path"] == "auth.py"
     assert (run_dir / compare_record["raw_artifact_ref"]).exists()
 
-    envelope = json.loads((run_dir / "reviewer_envelope.json").read_text(encoding="utf-8"))
+    envelope = json.loads(
+        _first_reviewer_artifact(run_dir, "envelope").read_text(encoding="utf-8")
+    )
     assert compare_record["observation_id"] in envelope["messages"][0]["content"]
     assert "## Verification Evidence" in (run_dir / "report.md").read_text(encoding="utf-8")
 
@@ -693,7 +857,9 @@ def test_cli_writes_repository_intelligence_artifacts(git_repo: Path):
         json.loads(line) for line in (run_dir / "observations.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     report = (run_dir / "report.md").read_text(encoding="utf-8")
-    envelope = json.loads((run_dir / "reviewer_envelope.json").read_text(encoding="utf-8"))
+    envelope = json.loads(
+        _first_reviewer_artifact(run_dir, "envelope").read_text(encoding="utf-8")
+    )
 
     assert payload["changed_symbols"][0]["qualified_name"] == "add"
     assert any(record["source"] == "repo_intelligence.snapshot" for record in observation_records)
@@ -784,8 +950,14 @@ def test_cli_agent_loop_fake_reviewer_writes_trace_artifact(git_repo: Path):
 
     assert exit_code == 0
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
-    trace = json.loads((run_dir / "reviewer_agent_trace.json").read_text(encoding="utf-8"))
-    result = json.loads((run_dir / "reviewer_result.json").read_text(encoding="utf-8"))
+    trace = json.loads(
+        _first_reviewer_artifact(run_dir, "agent_trace").read_text(
+            encoding="utf-8"
+        )
+    )
+    result = json.loads(
+        _first_reviewer_artifact(run_dir, "result").read_text(encoding="utf-8")
+    )
 
     assert trace["tool_call_count"] == 1
     assert trace["turns"][0]["tool_calls"][0]["tool_name"] == "compare_base_head"
@@ -816,8 +988,14 @@ def test_cli_agent_loop_fake_reviewer_handles_no_changed_files(git_repo: Path):
 
     assert exit_code == 0
     run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
-    trace = json.loads((run_dir / "reviewer_agent_trace.json").read_text(encoding="utf-8"))
-    result = json.loads((run_dir / "reviewer_result.json").read_text(encoding="utf-8"))
+    trace = json.loads(
+        _first_reviewer_artifact(run_dir, "agent_trace").read_text(
+            encoding="utf-8"
+        )
+    )
+    result = json.loads(
+        _first_reviewer_artifact(run_dir, "result").read_text(encoding="utf-8")
+    )
 
     assert trace["tool_call_count"] == 0
     assert result["status"] == "completed"

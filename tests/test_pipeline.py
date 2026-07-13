@@ -20,7 +20,12 @@ from review_agent.pipeline import PHASE_MESSAGES, ReviewPipeline
 from review_agent.quality import QualityGateExecution
 from review_agent.revision import RevisionResolver
 from review_agent.run_state import RunPhase, RunStatus
-from review_agent.session import PhaseStatus, ReviewExecutionConfig, initial_session_manifest
+from review_agent.session import (
+    ModelStageConfig,
+    PhaseStatus,
+    ReviewExecutionConfig,
+    initial_session_manifest,
+)
 from review_agent.session_store import SessionStore
 
 
@@ -32,6 +37,8 @@ def _pipeline(
     reviewer_loop: str = "agent-loop",
     adapter_factory_builder=None,
     changed_path: str = "app.py",
+    risk_assessor: ModelStageConfig | None = None,
+    portfolio_planner: ModelStageConfig | None = None,
 ) -> tuple[ReviewPipeline, SessionStore, CheckpointStore]:
     base = run_git(git_repo, "rev-parse", "HEAD")
     changed_file = git_repo / changed_path
@@ -65,6 +72,8 @@ def _pipeline(
                 reviewer_mode=reviewer_mode,
                 reviewer_loop=reviewer_loop,
                 non_interactive=True,
+                risk_assessor=risk_assessor or ModelStageConfig(),
+                portfolio_planner=portfolio_planner or ModelStageConfig(),
             ),
             now="2026-07-12T00:00:00Z",
         )
@@ -118,6 +127,141 @@ def test_review_pipeline_runs_all_phases_through_atomic_attempts(git_repo: Path)
     assert (checkpoint_store.run_dir / "attempts" / "preflight" / "1").is_dir()
     assert result.context.brief is not None
     assert result.context.final_risk is not None
+
+
+def test_model_assisted_risk_and_portfolio_are_runtime_compiled_and_audited(
+    git_repo: Path,
+) -> None:
+    model_stage = ModelStageConfig(mode="model", provider="fake")
+    pipeline, session_store, checkpoint_store = _pipeline(
+        git_repo,
+        review_id="review-model-planning",
+        risk_assessor=model_stage,
+        portfolio_planner=model_stage,
+    )
+
+    result = pipeline.execute()
+
+    assert result.context.risk_assessment is not None
+    assert result.context.risk_assessment.level.value == "medium"
+    assert len(result.context.assignments) == 2
+    assert [item.role_kind for item in result.context.assignments] == [
+        "core",
+        "adversarial",
+    ]
+    assert set(result.context.assignments[0].assigned_contract) == {
+        "intent_alignment",
+        "behavioral_correctness",
+        "regression_safety",
+        "test_adequacy",
+        "unresolved_uncertainties",
+    }
+    assert all(
+        item.repository_permission == "read_only"
+        and item.command_permission == "safe_checks_only"
+        for item in result.context.assignments
+    )
+    assert len(result.context.reviewer_executions) == 2
+    assert result.context.multi_run is not None
+
+    manifest = session_store.load()
+    planning_artifacts = {
+        name
+        for name, descriptor in manifest.artifacts.items()
+        if descriptor.phase is RunPhase.PLANNING
+    }
+    assert {
+        "risk_model_envelope",
+        "risk_model_raw_response",
+        "risk_model_decision",
+        "portfolio_packet",
+        "portfolio_model_envelope",
+        "portfolio_model_raw_response",
+        "portfolio_model_decision",
+        "portfolio_plan",
+        "planning_summary",
+    }.issubset(planning_artifacts)
+    risk_decision = json.loads(
+        (checkpoint_store.run_dir / "risk_model_decision.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    portfolio_decision = json.loads(
+        (checkpoint_store.run_dir / "portfolio_model_decision.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert risk_decision["status"] == "accepted"
+    assert risk_decision["local_floor"] == "low"
+    assert risk_decision["model_proposed_level"] == "medium"
+    assert portfolio_decision["status"] == "accepted"
+    assert portfolio_decision["final_reviewer_count"] == 2
+    assert any(
+        action.startswith("injected_required_role:adversarial")
+        for action in portfolio_decision["policy_actions"]
+    )
+    assert result.context.brief is not None
+    assert result.context.brief.orchestration["risk"]["status"] == "accepted"
+
+
+def test_model_planning_failures_fall_back_without_hiding_uncertainty(
+    git_repo: Path,
+) -> None:
+    class InvalidFactory:
+        def create(self):
+            return FakeToolCallingAdapter(
+                script=[
+                    ModelTurnResponse(
+                        kind=ModelResponseKind.INVALID,
+                        error="synthetic planning failure",
+                    ),
+                    ModelTurnResponse(
+                        kind=ModelResponseKind.INVALID,
+                        error="synthetic planning failure",
+                    ),
+                ]
+            )
+
+    def stage_aware_builder(config):
+        if config.stage_label in {"risk-assessor", "portfolio-planner"}:
+            return InvalidFactory()
+        return FakeModelAdapterFactory()
+
+    model_stage = ModelStageConfig(mode="model", provider="fake")
+    pipeline, _, checkpoint_store = _pipeline(
+        git_repo,
+        review_id="review-model-planning-fallback",
+        risk_assessor=model_stage,
+        portfolio_planner=model_stage,
+        adapter_factory_builder=stage_aware_builder,
+    )
+
+    result = pipeline.execute()
+
+    risk_decision = json.loads(
+        (checkpoint_store.run_dir / "risk_model_decision.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    portfolio_decision = json.loads(
+        (checkpoint_store.run_dir / "portfolio_model_decision.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert risk_decision["status"] == "fallback"
+    assert risk_decision["final_level"] == risk_decision["local_floor"]
+    assert portfolio_decision["status"] == "fallback"
+    assert len(result.context.assignments) == 1
+    assert result.context.assignments[0].role_kind == "core"
+    assert result.context.brief is not None
+    assert any(
+        "Model Risk Assessor fallback" in uncertainty
+        for uncertainty in result.context.brief.uncertainties
+    )
+    assert any(
+        "Portfolio planner fallback" in uncertainty
+        for uncertainty in result.context.brief.uncertainties
+    )
 
 
 def test_risk_triggered_gate_reaches_observations_and_reviewer_context(
@@ -275,7 +419,8 @@ trigger_risks = ["high", "critical"]
         if item.name == "required_security"
     )
     assert gate.status == "unavailable"
-    assert result.context.reviewer_result is not None
+    assert len(result.context.reviewer_executions) == 3
+    assert result.context.multi_run is not None
     assert result.context.completion is not None
     assert result.context.completion.status == "blocked"
     assert any("required_security" in item for item in result.context.completion.blockers)

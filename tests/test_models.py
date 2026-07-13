@@ -125,6 +125,59 @@ def test_review_profile_maps_risk_to_depth():
     assert "dynamic_specialist" in profile.reviewer_roles
 
 
+def test_assignment_persists_runtime_compiled_identity() -> None:
+    assignment = Assignment(
+        role="Async Lifecycle Reviewer",
+        mission="Inspect cancellation and retry lifecycle",
+        assignment_reason=["risk_reason:0"],
+        assigned_contract=["regression_safety", "unresolved_uncertainties"],
+        required_checks=["inspect cancellation paths"],
+        initial_context=InitialContext(),
+        max_turns=16,
+        max_tool_calls=40,
+        assignment_id="assignment-2",
+        role_kind="specialist",
+        perspective_key="async_lifecycle",
+        planner_source="model",
+    )
+
+    assert assignment.assignment_id == "assignment-2"
+    assert assignment.role_kind == "specialist"
+    assert assignment.repository_permission == "read_only"
+    assert assignment.command_permission == "safe_checks_only"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "message"),
+    [
+        ("max_turns", 0, "max_turns"),
+        ("max_tool_calls", -1, "max_tool_calls"),
+        ("role_kind", "judge", "role_kind"),
+        ("repository_permission", "write", "repository_permission"),
+        ("command_permission", "shell", "command_permission"),
+    ],
+)
+def test_assignment_rejects_runtime_authority_escalation(
+    field_name: str,
+    invalid_value: object,
+    message: str,
+) -> None:
+    values = {
+        "role": "Core Reviewer",
+        "mission": "Review the change",
+        "assignment_reason": [],
+        "assigned_contract": [],
+        "required_checks": [],
+        "initial_context": InitialContext(),
+        "max_turns": 1,
+        "max_tool_calls": 1,
+        field_name: invalid_value,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        Assignment(**values)
+
+
 def test_review_profiles_expand_every_runtime_budget_by_risk():
     profiles = [ReviewProfile.for_risk(level) for level in RiskLevel]
 

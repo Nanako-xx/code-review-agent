@@ -33,6 +33,7 @@ def _context_assignment() -> Assignment:
             code_ranges=["app.py:1-200"],
             quality_gate_summary={"python_compile": "passed"},
             observation_refs=["O-diff-app"],
+            signal_refs=["changed_file:app.py"],
         ),
         max_turns=6,
         max_tool_calls=12,
@@ -176,6 +177,7 @@ def test_reviewer_context_injects_complete_intent_with_stable_compact_metadata()
         observations={},
     )
 
+    assert "Risk Signal Refs: changed_file:app.py" in result.messages[0]["content"]
     intent_section = result.messages[0]["content"].split("\n\n")[1]
     assert intent_section == "\n".join(
         [

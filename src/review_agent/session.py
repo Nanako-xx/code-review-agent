@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from pathlib import PurePosixPath, PureWindowsPath
 import re
 from types import MappingProxyType
@@ -13,7 +14,21 @@ from review_agent.run_state import RunPhase, RunStatus
 
 
 LEGACY_SESSION_SCHEMA_VERSION = 1
-SESSION_SCHEMA_VERSION = 2
+PREVIOUS_SESSION_SCHEMA_VERSION = 2
+SESSION_SCHEMA_VERSION = 3
+SUPPORTED_SESSION_SCHEMA_VERSIONS = (
+    LEGACY_SESSION_SCHEMA_VERSION,
+    PREVIOUS_SESSION_SCHEMA_VERSION,
+    SESSION_SCHEMA_VERSION,
+)
+RESUMABLE_SESSION_SCHEMA_VERSIONS = (
+    PREVIOUS_SESSION_SCHEMA_VERSION,
+    SESSION_SCHEMA_VERSION,
+)
+DEFAULT_MODEL_STAGE_API_KEY_ENV = "REVIEW_AGENT_API_KEY"
+DEFAULT_MODEL_STAGE_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_MODEL_STAGE_MAX_PROVIDER_ATTEMPTS = 2
+DEFAULT_MODEL_STAGE_MAX_ELAPSED_SECONDS = 60.0
 LEGACY_SESSION_PHASES = (
     RunPhase.PREFLIGHT,
     RunPhase.REPOSITORY_INTELLIGENCE,
@@ -59,6 +74,72 @@ class RevisionChangeKind(str, Enum):
 
 
 @dataclass(frozen=True)
+class ModelStageConfig:
+    mode: str = "local"
+    provider: str = "none"
+    model: str | None = None
+    base_url: str | None = None
+    api_key_env: str = DEFAULT_MODEL_STAGE_API_KEY_ENV
+    max_output_tokens: int = DEFAULT_MODEL_STAGE_MAX_OUTPUT_TOKENS
+    max_provider_attempts: int = DEFAULT_MODEL_STAGE_MAX_PROVIDER_ATTEMPTS
+    max_elapsed_seconds: float = DEFAULT_MODEL_STAGE_MAX_ELAPSED_SECONDS
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, str) or self.mode not in {"local", "model"}:
+            raise ValueError("mode must be local or model")
+        if not isinstance(self.provider, str) or self.provider not in {
+            "none",
+            "fake",
+            "openai-compatible",
+        }:
+            raise ValueError(
+                "provider must be none, fake, or openai-compatible"
+            )
+        _validate_optional_non_empty_string(self.model, "model")
+        _validate_base_url(self.base_url, "base_url")
+        if not isinstance(self.api_key_env, str) or not (
+            _ENVIRONMENT_VARIABLE_PATTERN.fullmatch(self.api_key_env)
+        ):
+            raise ValueError(
+                "api_key_env must be an environment variable name, not an API key value"
+            )
+        if type(self.max_output_tokens) is not int or self.max_output_tokens <= 0:
+            raise ValueError("max_output_tokens must be a positive integer")
+        if (
+            type(self.max_provider_attempts) is not int
+            or self.max_provider_attempts <= 0
+        ):
+            raise ValueError("max_provider_attempts must be a positive integer")
+        if (
+            isinstance(self.max_elapsed_seconds, bool)
+            or not isinstance(self.max_elapsed_seconds, (int, float))
+            or not math.isfinite(self.max_elapsed_seconds)
+            or self.max_elapsed_seconds <= 0
+        ):
+            raise ValueError("max_elapsed_seconds must be a positive finite number")
+
+        if self.mode == "local":
+            if self.provider != "none":
+                raise ValueError("mode=local requires provider=none")
+            if self.model is not None or self.base_url is not None:
+                raise ValueError("mode=local requires model and base_url to be null")
+        elif self.provider == "none":
+            raise ValueError("mode=model requires a model-capable provider")
+
+        if self.provider == "openai-compatible":
+            if self.model is None:
+                raise ValueError(
+                    "model is required for openai-compatible provider"
+                )
+            if self.base_url is None:
+                raise ValueError(
+                    "base_url is required for openai-compatible provider"
+                )
+
+        object.__setattr__(self, "max_elapsed_seconds", float(self.max_elapsed_seconds))
+
+
+@dataclass(frozen=True)
 class ReviewExecutionConfig:
     reviewer_provider: str
     reviewer_model: str | None
@@ -67,6 +148,8 @@ class ReviewExecutionConfig:
     reviewer_mode: str
     reviewer_loop: str
     non_interactive: bool
+    risk_assessor: ModelStageConfig = field(default_factory=ModelStageConfig)
+    portfolio_planner: ModelStageConfig = field(default_factory=ModelStageConfig)
 
     def __post_init__(self) -> None:
         if not _ENVIRONMENT_VARIABLE_PATTERN.fullmatch(self.reviewer_api_key_env):
@@ -74,22 +157,13 @@ class ReviewExecutionConfig:
                 "reviewer_api_key_env must be an environment variable name, "
                 "not an API key value"
             )
-        if self.reviewer_base_url is not None:
-            parsed = urlsplit(self.reviewer_base_url)
-            if (
-                parsed.scheme not in {"http", "https"}
-                or not parsed.hostname
-                or parsed.username is not None
-                or parsed.password is not None
-                or parsed.query
-                or parsed.fragment
-            ):
-                raise ValueError(
-                    "reviewer_base_url must be an HTTP(S) base URL without "
-                    "credentials, query parameters, or fragments"
-                )
+        _validate_base_url(self.reviewer_base_url, "reviewer_base_url")
         if type(self.non_interactive) is not bool:
             raise ValueError("non_interactive must be a boolean")
+        if not isinstance(self.risk_assessor, ModelStageConfig):
+            raise ValueError("risk_assessor must be a ModelStageConfig")
+        if not isinstance(self.portfolio_planner, ModelStageConfig):
+            raise ValueError("portfolio_planner must be a ModelStageConfig")
 
 
 @dataclass(frozen=True)
@@ -265,13 +339,10 @@ class SessionManifest:
     updated_at: str
 
     def __post_init__(self) -> None:
-        if self.schema_version not in {
-            LEGACY_SESSION_SCHEMA_VERSION,
-            SESSION_SCHEMA_VERSION,
-        }:
+        if self.schema_version not in SUPPORTED_SESSION_SCHEMA_VERSIONS:
             raise ValueError(
                 "schema_version must be a supported Session schema version: "
-                f"{LEGACY_SESSION_SCHEMA_VERSION} or {SESSION_SCHEMA_VERSION}"
+                + ", ".join(str(version) for version in SUPPORTED_SESSION_SCHEMA_VERSIONS)
             )
         _require_non_empty_string(self.review_id, "review_id")
         _require_non_empty_string(self.root_review_id, "root_review_id")
@@ -288,6 +359,16 @@ class SessionManifest:
             RunPhase,
         ):
             raise ValueError("last_successful_phase must be a RunPhase or null")
+        if not isinstance(self.execution, ReviewExecutionConfig):
+            raise ValueError("execution must be a ReviewExecutionConfig")
+        if self.schema_version < SESSION_SCHEMA_VERSION and (
+            self.execution.risk_assessor.mode != "local"
+            or self.execution.portfolio_planner.mode != "local"
+        ):
+            raise ValueError(
+                "schema v1/v2 Sessions must use local risk_assessor and "
+                "portfolio_planner configurations"
+            )
 
         _validate_manifest_object_ids(self)
         _validate_manifest_lineage(self)
@@ -397,12 +478,12 @@ class SessionManifest:
         ]
         if self.status is RunStatus.AWAITING_USER:
             if (
-                self.schema_version != SESSION_SCHEMA_VERSION
+                self.schema_version < PREVIOUS_SESSION_SCHEMA_VERSION
                 or self.current_phase is not RunPhase.INTENT_RESOLUTION
                 or awaiting_phases != [RunPhase.INTENT_RESOLUTION.value]
             ):
                 raise ValueError(
-                    "awaiting_user Session must be schema v2 and have only the "
+                    "awaiting_user Session must be schema v2 or later and have only the "
                     "intent_resolution checkpoint awaiting_user"
                 )
         elif awaiting_phases:
@@ -496,6 +577,32 @@ def _require_non_empty_string(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
+
+
+def _validate_optional_non_empty_string(value: Any, field_name: str) -> None:
+    if value is not None and (
+        not isinstance(value, str) or not value or value != value.strip()
+    ):
+        raise ValueError(f"{field_name} must be a non-empty string or null")
+
+
+def _validate_base_url(value: Any, field_name: str) -> None:
+    if value is None:
+        return
+    _validate_optional_non_empty_string(value, field_name)
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            f"{field_name} must be an HTTP(S) base URL without credentials, "
+            "query parameters, or fragments"
+        )
 
 
 def _validate_artifact_path(path: Any) -> None:
@@ -600,6 +707,18 @@ def child_session_manifest(
 
 
 def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
+    def model_stage_payload(config: ModelStageConfig) -> dict[str, Any]:
+        return {
+            "mode": config.mode,
+            "provider": config.provider,
+            "model": config.model,
+            "base_url": config.base_url,
+            "api_key_env": config.api_key_env,
+            "max_output_tokens": config.max_output_tokens,
+            "max_provider_attempts": config.max_provider_attempts,
+            "max_elapsed_seconds": config.max_elapsed_seconds,
+        }
+
     def phase_payload(checkpoint: PhaseCheckpoint) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "status": checkpoint.status.value,
@@ -620,9 +739,30 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
                 for task_name, task in checkpoint.tasks.items()
             },
         }
-        if manifest.schema_version >= SESSION_SCHEMA_VERSION:
+        if manifest.schema_version >= PREVIOUS_SESSION_SCHEMA_VERSION:
             payload["user_decisions"] = dict(checkpoint.user_decisions)
         return payload
+
+    execution_payload = {
+        "reviewer_provider": manifest.execution.reviewer_provider,
+        "reviewer_model": manifest.execution.reviewer_model,
+        "reviewer_base_url": manifest.execution.reviewer_base_url,
+        "reviewer_api_key_env": manifest.execution.reviewer_api_key_env,
+        "reviewer_mode": manifest.execution.reviewer_mode,
+        "reviewer_loop": manifest.execution.reviewer_loop,
+        "non_interactive": manifest.execution.non_interactive,
+    }
+    if manifest.schema_version >= SESSION_SCHEMA_VERSION:
+        execution_payload.update(
+            {
+                "risk_assessor": model_stage_payload(
+                    manifest.execution.risk_assessor
+                ),
+                "portfolio_planner": model_stage_payload(
+                    manifest.execution.portfolio_planner
+                ),
+            }
+        )
 
     return {
         "schema_version": manifest.schema_version,
@@ -643,15 +783,7 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
             "incremental_from_sha": manifest.incremental_from_sha,
             "change_kind": manifest.revision_change_kind.value,
         },
-        "execution": {
-            "reviewer_provider": manifest.execution.reviewer_provider,
-            "reviewer_model": manifest.execution.reviewer_model,
-            "reviewer_base_url": manifest.execution.reviewer_base_url,
-            "reviewer_api_key_env": manifest.execution.reviewer_api_key_env,
-            "reviewer_mode": manifest.execution.reviewer_mode,
-            "reviewer_loop": manifest.execution.reviewer_loop,
-            "non_interactive": manifest.execution.non_interactive,
-        },
+        "execution": execution_payload,
         "status": manifest.status.value,
         "current_phase": manifest.current_phase.value,
         "last_successful_phase": (
@@ -705,14 +837,11 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
     )
 
     schema_version = _integer(root, "schema_version", "session")
-    if schema_version not in {
-        LEGACY_SESSION_SCHEMA_VERSION,
-        SESSION_SCHEMA_VERSION,
-    }:
+    if schema_version not in SUPPORTED_SESSION_SCHEMA_VERSIONS:
         raise ValueError(
             "unsupported session schema_version: "
-            f"{schema_version}; expected {LEGACY_SESSION_SCHEMA_VERSION} "
-            f"or {SESSION_SCHEMA_VERSION}"
+            f"{schema_version}; expected one of "
+            + ", ".join(str(version) for version in SUPPORTED_SESSION_SCHEMA_VERSIONS)
         )
 
     repository_payload = _object_field(root, "repository", "session")
@@ -757,19 +886,33 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
     )
 
     execution_payload = _object_field(root, "execution", "session")
+    execution_fields = {
+        "reviewer_provider",
+        "reviewer_model",
+        "reviewer_base_url",
+        "reviewer_api_key_env",
+        "reviewer_mode",
+        "reviewer_loop",
+        "non_interactive",
+    }
+    if schema_version >= SESSION_SCHEMA_VERSION:
+        execution_fields |= {"risk_assessor", "portfolio_planner"}
     _exact_fields(
         execution_payload,
-        {
-            "reviewer_provider",
-            "reviewer_model",
-            "reviewer_base_url",
-            "reviewer_api_key_env",
-            "reviewer_mode",
-            "reviewer_loop",
-            "non_interactive",
-        },
+        execution_fields,
         "session.execution",
     )
+    risk_assessor = ModelStageConfig()
+    portfolio_planner = ModelStageConfig()
+    if schema_version >= SESSION_SCHEMA_VERSION:
+        risk_assessor = _model_stage_config_from_dict(
+            _object_field(execution_payload, "risk_assessor", "session.execution"),
+            "session.execution.risk_assessor",
+        )
+        portfolio_planner = _model_stage_config_from_dict(
+            _object_field(execution_payload, "portfolio_planner", "session.execution"),
+            "session.execution.portfolio_planner",
+        )
     execution = ReviewExecutionConfig(
         reviewer_provider=_string(
             execution_payload,
@@ -806,6 +949,8 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
             "non_interactive",
             "session.execution",
         ),
+        risk_assessor=risk_assessor,
+        portfolio_planner=portfolio_planner,
     )
 
     phases_payload = _object_field(root, "phases", "session")
@@ -894,7 +1039,7 @@ def _phase_checkpoint_from_dict(
 ) -> PhaseCheckpoint:
     required = {"status", "attempts", "started_at", "completed_at", "artifacts", "error"}
     optional = {"tasks"}
-    if schema_version == SESSION_SCHEMA_VERSION:
+    if schema_version >= PREVIOUS_SESSION_SCHEMA_VERSION:
         required |= {"tasks", "user_decisions"}
         optional = set()
     missing = required - set(payload)
@@ -937,6 +1082,44 @@ def _phase_checkpoint_from_dict(
         error=_optional_string(payload, "error", context),
         tasks=tasks,
         user_decisions=user_decisions,
+    )
+
+
+def _model_stage_config_from_dict(
+    payload: Mapping[str, Any],
+    context: str,
+) -> ModelStageConfig:
+    _exact_fields(
+        payload,
+        {
+            "mode",
+            "provider",
+            "model",
+            "base_url",
+            "api_key_env",
+            "max_output_tokens",
+            "max_provider_attempts",
+            "max_elapsed_seconds",
+        },
+        context,
+    )
+    return ModelStageConfig(
+        mode=_string(payload, "mode", context),
+        provider=_string(payload, "provider", context),
+        model=_optional_string(payload, "model", context),
+        base_url=_optional_string(payload, "base_url", context),
+        api_key_env=_string(payload, "api_key_env", context),
+        max_output_tokens=_integer(payload, "max_output_tokens", context),
+        max_provider_attempts=_integer(
+            payload,
+            "max_provider_attempts",
+            context,
+        ),
+        max_elapsed_seconds=_number(
+            payload,
+            "max_elapsed_seconds",
+            context,
+        ),
     )
 
 
@@ -1036,6 +1219,13 @@ def _integer(payload: Mapping[str, Any], field_name: str, context: str) -> int:
     value = payload[field_name]
     if type(value) is not int:
         raise ValueError(f"{context}.{field_name} must be an integer")
+    return value
+
+
+def _number(payload: Mapping[str, Any], field_name: str, context: str) -> int | float:
+    value = payload[field_name]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{context}.{field_name} must be a number")
     return value
 
 

@@ -295,7 +295,7 @@ def _clarification_question(value: Any, context: str) -> ClarificationQuestion:
 
 def risk_packet_from_dict(payload: Mapping[str, Any]) -> RiskAssessmentPacket:
     item = _object(payload, "risk_packet")
-    _exact(
+    _required_with_optional(
         item,
         {
             "change_summary",
@@ -304,8 +304,15 @@ def risk_packet_from_dict(payload: Mapping[str, Any]) -> RiskAssessmentPacket:
             "intent_uncertainties",
             "diff_excerpt",
         },
+        {"changed_symbols", "signal_catalog"},
         "risk_packet",
     )
+    changed_symbols: list[dict[str, object]] = []
+    if "changed_symbols" in item:
+        changed_symbols = [
+            dict(row)
+            for row in _object_list(item, "changed_symbols", "risk_packet")
+        ]
     return RiskAssessmentPacket(
         change_summary=dict(_object_field(item, "change_summary", "risk_packet")),
         deterministic_signals=dict(
@@ -323,6 +330,12 @@ def risk_packet_from_dict(payload: Mapping[str, Any]) -> RiskAssessmentPacket:
             "risk_packet",
         ),
         diff_excerpt=_string_list(item, "diff_excerpt", "risk_packet"),
+        changed_symbols=changed_symbols,
+        signal_catalog=(
+            _string_mapping(item, "signal_catalog", "risk_packet")
+            if "signal_catalog" in item
+            else {}
+        ),
     )
 
 
@@ -732,7 +745,7 @@ def final_risk_from_dict(payload: Mapping[str, Any]) -> FinalRiskAssessment:
 
 def review_brief_from_dict(payload: Mapping[str, Any]) -> ReviewBrief:
     item = _object(payload, "review_brief")
-    _exact(
+    _required_with_optional(
         item,
         {
             "review_id",
@@ -752,6 +765,7 @@ def review_brief_from_dict(payload: Mapping[str, Any]) -> ReviewBrief:
             "human_review_checklist_and_reading_order",
             "non_binding_recommendation",
         },
+        {"orchestration"},
         "review_brief",
     )
     findings = [
@@ -807,6 +821,11 @@ def review_brief_from_dict(payload: Mapping[str, Any]) -> ReviewBrief:
             item,
             "non_binding_recommendation",
             "review_brief",
+        ),
+        orchestration=(
+            dict(_object_field(item, "orchestration", "review_brief"))
+            if "orchestration" in item
+            else {}
         ),
     )
 
@@ -1340,12 +1359,16 @@ def _assignment_from_dict(value: Any, context: str) -> Assignment:
             "max_total_tokens",
             "max_elapsed_seconds",
             "max_provider_attempts",
+            "assignment_id",
+            "role_kind",
+            "perspective_key",
+            "planner_source",
         },
         context,
     )
     initial_payload = _object_field(item, "initial_context", context)
     initial_context = f"{context}.initial_context"
-    _exact(
+    _required_with_optional(
         initial_payload,
         {
             "changed_files",
@@ -1354,6 +1377,7 @@ def _assignment_from_dict(value: Any, context: str) -> Assignment:
             "quality_gate_summary",
             "observation_refs",
         },
+        {"signal_refs"},
         initial_context,
     )
     return Assignment(
@@ -1375,6 +1399,11 @@ def _assignment_from_dict(value: Any, context: str) -> Assignment:
                 initial_payload,
                 "observation_refs",
                 initial_context,
+            ),
+            signal_refs=(
+                _string_list(initial_payload, "signal_refs", initial_context)
+                if "signal_refs" in initial_payload
+                else []
             ),
         ),
         max_turns=_integer(item, "max_turns", context),
@@ -1401,6 +1430,26 @@ def _assignment_from_dict(value: Any, context: str) -> Assignment:
         ),
         repository_permission=_string(item, "repository_permission", context),
         command_permission=_string(item, "command_permission", context),
+        assignment_id=(
+            _string(item, "assignment_id", context)
+            if "assignment_id" in item
+            else ""
+        ),
+        role_kind=(
+            _string(item, "role_kind", context)
+            if "role_kind" in item
+            else "legacy"
+        ),
+        perspective_key=(
+            _string(item, "perspective_key", context)
+            if "perspective_key" in item
+            else "legacy"
+        ),
+        planner_source=(
+            _string(item, "planner_source", context)
+            if "planner_source" in item
+            else "legacy"
+        ),
     )
 
 

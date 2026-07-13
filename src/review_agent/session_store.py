@@ -14,6 +14,7 @@ from typing import Iterable, Mapping
 from review_agent.checkpoint import _atomic_write_text, _fsync_parent_directory
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
+    RESUMABLE_SESSION_SCHEMA_VERSIONS,
     SESSION_PHASES,
     SESSION_SCHEMA_VERSION,
     ArtifactDescriptor,
@@ -85,10 +86,10 @@ class SessionStore:
 
     @staticmethod
     def _require_current_layout(manifest: SessionManifest) -> None:
-        if manifest.schema_version != SESSION_SCHEMA_VERSION:
+        if manifest.schema_version not in RESUMABLE_SESSION_SCHEMA_VERSIONS:
             raise ValueError(
                 "schema v1 Session is available for read-only audit; start a new "
-                "schema v2 Session to use state transitions"
+                "schema v3 Session to use state transitions"
             )
 
     @staticmethod

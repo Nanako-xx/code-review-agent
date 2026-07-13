@@ -25,6 +25,7 @@ class ModelAdapterConfig:
     model: str | None
     base_url: str | None
     api_key_env: str
+    stage_label: str = "reviewer"
 
 
 class ModelAdapterFactory(Protocol):
@@ -52,7 +53,11 @@ class _FactoryFakeToolCallingAdapter(FakeToolCallingAdapter):
 
 def build_model_adapter_factory_from_config(
     config: ModelAdapterConfig,
+    *,
+    stage_label: str | None = None,
 ) -> ModelAdapterFactory | None:
+    stage_label = config.stage_label if stage_label is None else stage_label
+    option_prefix = _option_prefix(stage_label)
     provider_name = config.provider_name or "none"
     if provider_name == "none":
         return None
@@ -61,11 +66,19 @@ def build_model_adapter_factory_from_config(
     if provider_name == "openai-compatible":
         api_key = os.environ.get(config.api_key_env)
         if not api_key:
-            raise AdapterConfigError(f"missing API key environment variable: {config.api_key_env}")
+            stage_prefix = "" if option_prefix == "reviewer" else f"{option_prefix} "
+            raise AdapterConfigError(
+                f"missing {stage_prefix}API key environment variable: "
+                f"{config.api_key_env}"
+            )
         if not config.model:
-            raise AdapterConfigError("--reviewer-model is required for openai-compatible provider")
+            raise AdapterConfigError(
+                f"--{option_prefix}-model is required for openai-compatible provider"
+            )
         if not config.base_url:
-            raise AdapterConfigError("--reviewer-base-url is required for openai-compatible provider")
+            raise AdapterConfigError(
+                f"--{option_prefix}-base-url is required for openai-compatible provider"
+            )
         return OpenAICompatibleModelAdapterFactory(
             OpenAICompatibleConfig(
                 base_url=config.base_url,
@@ -73,7 +86,16 @@ def build_model_adapter_factory_from_config(
                 model=config.model,
             )
         )
-    raise AdapterConfigError(f"unsupported reviewer provider: {provider_name}")
+    raise AdapterConfigError(f"unsupported {option_prefix} provider: {provider_name}")
+
+
+def _option_prefix(stage_label: str) -> str:
+    if not isinstance(stage_label, str) or not stage_label:
+        raise ValueError("stage_label must be a non-empty string")
+    option_prefix = stage_label.replace("_", "-")
+    if any(character.isspace() for character in option_prefix):
+        raise ValueError("stage_label must not contain whitespace")
+    return option_prefix
 
 
 def _factory_fake_adapter() -> FakeToolCallingAdapter:
@@ -86,8 +108,13 @@ def _factory_fake_adapter() -> FakeToolCallingAdapter:
 
 
 def _fake_response_for_request(request: ModelTurnRequest) -> ModelTurnResponse:
-    if request.parameters.get("response_schema") == "intent_inference_result_v1":
+    response_schema = request.parameters.get("response_schema")
+    if response_schema == "intent_inference_result_v1":
         return _fake_intent_inference_response()
+    if response_schema == "risk_proposal_v1":
+        return _fake_risk_proposal_response()
+    if response_schema == "portfolio_proposal_v1":
+        return _fake_portfolio_proposal_response()
     if not request.tools or request.parameters.get("tool_choice") == "none":
         return _fake_single_shot_response()
 
@@ -133,6 +160,70 @@ def _fake_intent_inference_response() -> ModelTurnResponse:
         provider_name="fake",
         model="fake-intent-analyst",
         raw={"fake": True, "response_schema": "intent_inference_result_v1"},
+    )
+
+
+def _fake_risk_proposal_response() -> ModelTurnResponse:
+    return ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "level": "medium",
+                "dimensions": {
+                    "impact": "Fake provider identified bounded behavioral impact.",
+                    "blast_radius": "Fake provider assumes a localized blast radius.",
+                    "reversibility": "The reviewed revision can be reverted.",
+                    "uncertainty": "Fake provider does not perform semantic risk analysis.",
+                    "verification_strength": "Runtime-owned checks remain authoritative.",
+                },
+                "reasons": [
+                    "Fake provider exercises the model-assisted risk path."
+                ],
+                "signal_refs": [],
+                "uncertainties": [
+                    "Fake provider does not perform semantic risk analysis."
+                ],
+                "suggested_focus": [
+                    "Verify changed behavior against the review contract."
+                ],
+            }
+        ),
+        provider_name="fake",
+        model="fake-risk-assessor",
+        raw={"fake": True, "response_schema": "risk_proposal_v1"},
+    )
+
+
+def _fake_portfolio_proposal_response() -> ModelTurnResponse:
+    return ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "candidates": [
+                    {
+                        "candidate_id": "fake-core",
+                        "role_kind": "core",
+                        "role_name": "Fake Core Reviewer",
+                        "perspective_key": "fake_core",
+                        "mission": "Exercise the model-assisted portfolio path.",
+                        "reason_refs": [],
+                        "context_refs": [],
+                        "extra_contract": [],
+                        "required_checks": [
+                            "Verify the Runtime-compiled review contract."
+                        ],
+                        "priority": 50,
+                    }
+                ],
+                "summary": "Fake portfolio proposal executed.",
+                "uncertainties": [
+                    "Fake provider does not select repository-specific specialists."
+                ],
+            }
+        ),
+        provider_name="fake",
+        model="fake-portfolio-planner",
+        raw={"fake": True, "response_schema": "portfolio_proposal_v1"},
     )
 
 

@@ -375,6 +375,7 @@ def _initial_context_block(assignment: Assignment) -> str:
             f"Diff Ranges: {', '.join(context.diff_ranges)}",
             f"Code Ranges: {', '.join(context.code_ranges)}",
             f"Quality Gates: {context.quality_gate_summary}",
+            f"Risk Signal Refs: {', '.join(context.signal_refs)}",
             f"Observation Refs: {', '.join(context.observation_refs)}",
         ]
     )

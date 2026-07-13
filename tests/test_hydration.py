@@ -91,6 +91,7 @@ def _assignment() -> Assignment:
             code_ranges=[],
             quality_gate_summary={"compile": "passed"},
             observation_refs=["O-1"],
+            signal_refs=["changed_file:a.py"],
         ),
         max_turns=3,
         max_tool_calls=4,
@@ -234,6 +235,17 @@ def test_foundation_artifacts_round_trip_to_typed_values() -> None:
         intent_status=IntentStatus.PARTIAL,
         intent_uncertainties=["criteria incomplete"],
         diff_excerpt=["+pass"],
+        changed_symbols=[
+            {
+                "path": "a.py",
+                "qualified_name": "f",
+                "kind": "function",
+                "change_type": "modified",
+                "line_start": 1,
+                "line_end": 2,
+            }
+        ],
+        signal_catalog={"changed_file:a.py": "Changed file a.py"},
     )
     risk = RiskAssessment(
         RiskLevel.MEDIUM,
@@ -251,6 +263,36 @@ def test_foundation_artifacts_round_trip_to_typed_values() -> None:
     assert risk_assessment_from_dict(_json(asdict(risk))) == risk
     assert assignments_from_dict(_json({"assignments": [asdict(_assignment())]})) == [_assignment()]
     assert quality_results_from_dict(_json({"results": [asdict(quality[0])]})) == quality
+
+
+def test_risk_packet_and_assignment_hydration_defaults_legacy_additive_fields() -> None:
+    packet_payload = {
+        "change_summary": {"changed_files": ["a.py"]},
+        "deterministic_signals": {"changed_file_count": 1},
+        "intent_status": "partial",
+        "intent_uncertainties": [],
+        "diff_excerpt": ["+pass"],
+    }
+    assignment_payload = _json(asdict(_assignment()))
+    assignment_payload["initial_context"].pop("signal_refs")
+    for name in (
+        "assignment_id",
+        "role_kind",
+        "perspective_key",
+        "planner_source",
+    ):
+        assignment_payload.pop(name)
+
+    packet = risk_packet_from_dict(packet_payload)
+    [assignment] = assignments_from_dict({"assignments": [assignment_payload]})
+
+    assert packet.changed_symbols == []
+    assert packet.signal_catalog == {}
+    assert assignment.assignment_id == ""
+    assert assignment.role_kind == "legacy"
+    assert assignment.perspective_key == "legacy"
+    assert assignment.planner_source == "legacy"
+    assert assignment.initial_context.signal_refs == []
 
 
 def test_repository_and_reviewer_artifacts_round_trip() -> None:
@@ -394,6 +436,15 @@ def test_downstream_artifacts_round_trip() -> None:
     assert completion_from_dict(_json(completion_to_dict(completion))) == completion
     assert final_risk_from_dict(_json(final_risk_to_dict(final_risk))) == final_risk
     assert review_brief_from_dict(_json(review_brief_to_dict(brief))) == brief
+
+
+def test_review_brief_hydration_defaults_missing_orchestration() -> None:
+    payload = _json(review_brief_to_dict(_review_brief()))
+    payload.pop("orchestration")
+
+    hydrated = review_brief_from_dict(payload)
+
+    assert hydrated.orchestration == {}
 
 
 def test_review_brief_hydration_accepts_abbreviated_final_risk_payload() -> None:

@@ -181,6 +181,47 @@ def test_factory_fake_adapter_dispatches_intent_inference_schema_without_changin
     assert reviewer_payload["status"] == "completed"
 
 
+@pytest.mark.parametrize(
+    ("response_schema", "expected_model", "expected_field"),
+    [
+        ("risk_proposal_v1", "fake-risk-assessor", "dimensions"),
+        ("portfolio_proposal_v1", "fake-portfolio-planner", "candidates"),
+    ],
+)
+def test_factory_fake_adapter_dispatches_planning_stage_schemas(
+    response_schema: str,
+    expected_model: str,
+    expected_field: str,
+) -> None:
+    factory = build_model_adapter_factory_from_config(
+        ModelAdapterConfig(
+            provider_name="fake",
+            model=None,
+            base_url=None,
+            api_key_env="REVIEW_AGENT_API_KEY",
+        )
+    )
+
+    response = factory.create().complete_turn(
+        ModelTurnRequest(
+            system="planning stage",
+            tools=[],
+            messages=[{"role": "user", "content": "{}"}],
+            tool_results=[],
+            parameters={
+                "tool_choice": "none",
+                "response_schema": response_schema,
+            },
+        )
+    )
+    payload = json.loads(response.final_text)
+
+    assert response.kind is ModelResponseKind.FINAL
+    assert response.model == expected_model
+    assert expected_field in payload
+    assert response.raw == {"fake": True, "response_schema": response_schema}
+
+
 def test_factory_creates_openai_compatible_adapter(monkeypatch):
     monkeypatch.setenv("REVIEW_AGENT_API_KEY", "secret-key")
 
@@ -237,6 +278,78 @@ def test_factory_rejects_missing_openai_base_url(monkeypatch):
                 model="review-model",
                 base_url=None,
                 api_key_env="REVIEW_AGENT_API_KEY",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "expected_option"),
+    [
+        ("model", "--risk-assessor-model"),
+        ("base_url", "--risk-assessor-base-url"),
+    ],
+)
+def test_factory_uses_custom_stage_label_in_configuration_errors(
+    monkeypatch,
+    missing_field: str,
+    expected_option: str,
+) -> None:
+    monkeypatch.setenv("RISK_API_KEY", "secret-key")
+    values = {
+        "provider_name": "openai-compatible",
+        "model": "risk-model",
+        "base_url": "https://example.test/v1",
+        "api_key_env": "RISK_API_KEY",
+    }
+    values[missing_field] = None
+
+    with pytest.raises(AdapterConfigError, match=expected_option):
+        build_model_adapter_factory_from_config(
+            ModelAdapterConfig(**values),
+            stage_label="risk_assessor",
+        )
+
+
+def test_factory_preserves_reviewer_as_default_error_label(monkeypatch) -> None:
+    monkeypatch.setenv("REVIEW_AGENT_API_KEY", "secret-key")
+
+    with pytest.raises(AdapterConfigError, match="--reviewer-model"):
+        build_model_adapter_factory_from_config(
+            ModelAdapterConfig(
+                provider_name="openai-compatible",
+                model=None,
+                base_url="https://example.test/v1",
+                api_key_env="REVIEW_AGENT_API_KEY",
+            )
+        )
+
+
+def test_factory_accepts_stage_label_from_adapter_config(monkeypatch) -> None:
+    monkeypatch.setenv("PLANNER_API_KEY", "secret-key")
+
+    with pytest.raises(AdapterConfigError, match="--portfolio-planner-base-url"):
+        build_model_adapter_factory_from_config(
+            ModelAdapterConfig(
+                provider_name="openai-compatible",
+                model="planner-model",
+                base_url=None,
+                api_key_env="PLANNER_API_KEY",
+                stage_label="portfolio_planner",
+            )
+        )
+
+
+def test_factory_labels_stage_specific_missing_api_key(monkeypatch) -> None:
+    monkeypatch.delenv("RISK_API_KEY", raising=False)
+
+    with pytest.raises(AdapterConfigError, match="risk-assessor.*RISK_API_KEY"):
+        build_model_adapter_factory_from_config(
+            ModelAdapterConfig(
+                provider_name="openai-compatible",
+                model="risk-model",
+                base_url="https://example.test/v1",
+                api_key_env="RISK_API_KEY",
+                stage_label="risk_assessor",
             )
         )
 

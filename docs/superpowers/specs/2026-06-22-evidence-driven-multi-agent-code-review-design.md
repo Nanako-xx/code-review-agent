@@ -1320,7 +1320,9 @@ Reviewer Execution Hardening 已落地：风险等级在本地展开为 turn、t
 
 Deterministic Quality Gates 已落地：固定 Head 的 Gate Plan 与安全发现、cheap/deep 两阶段策略、隔离 snapshot runner、完整终态 Observation、Risk/Assignment/Completion/Final Risk/Brief 传播、checkpoint resume 和 legacy hydration 均进入主路径。普通门禁失败继续 Reviewer 并形成 uncertainty，显式 blocking 门禁由 Completion 硬约束。
 
-仍待后续本地批次实现：模型辅助 Risk/Portfolio、语义 Reconciler 和有界补充调查。Eval 与 GitHub/PR 集成继续独立延期。
+Model-Assisted Risk Assessor 与 Portfolio Planner 已落地：Session schema v3 为 Risk、Portfolio 和 Reviewer 保存独立模型阶段配置，旧 v1/v2 Session 严格 hydrate 为 local planning 并保留原调度语义。Risk Assessor 只读取最小 Risk Packet，模型 proposal 经严格解析、有限重试、`signal_refs` allowlist 和本地风险下限编译后才成为权威 Risk；模型失败会确定性降级，并把不确定性暴露到 Planning Summary 与 Brief。Portfolio Planner 的 candidate proposal 同样不具调度权，Runtime 负责角色数量、Core Contract、权限和风险预算，必要时补齐 Core、Adversarial 与 Specialist。新 Session 的 `single`/`multi` 分别顺序/并行执行完整 portfolio；envelope、raw response、decision、authoritative plan 和稳定 invocation metadata 均作为可恢复、可审计 artifact 保存。
+
+仍待后续本地批次实现：语义 Reconciler 和有界补充调查。Eval 与 GitHub/PR 集成继续独立延期。
 
 ## 24. 实现同步原则
 

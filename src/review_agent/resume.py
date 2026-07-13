@@ -90,7 +90,7 @@ class ReviewSessionResumer:
         if manifest.schema_version == LEGACY_SESSION_SCHEMA_VERSION:
             if manifest.status is not RunStatus.COMPLETED:
                 raise ResumeBlockedError(
-                    "schema v1 Session is read-only; start a new schema v2 review"
+                    "schema v1 Session is read-only; start a new schema v3 review"
                 )
             return ResumeResult(
                 action=ResumeAction.AUDIT_COMPLETED,

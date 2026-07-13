@@ -420,6 +420,8 @@ class RiskAssessmentPacket:
     intent_status: IntentStatus
     intent_uncertainties: list[str]
     diff_excerpt: list[str]
+    changed_symbols: list[dict[str, object]] = field(default_factory=list)
+    signal_catalog: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -439,6 +441,7 @@ class InitialContext:
     code_ranges: list[str] = field(default_factory=list)
     quality_gate_summary: dict[str, str] = field(default_factory=dict)
     observation_refs: list[str] = field(default_factory=list)
+    signal_refs: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -515,8 +518,23 @@ class Assignment:
     max_provider_attempts: int = DEFAULT_REVIEWER_MAX_PROVIDER_ATTEMPTS
     repository_permission: str = "read_only"
     command_permission: str = "safe_checks_only"
+    assignment_id: str = ""
+    role_kind: str = "legacy"
+    perspective_key: str = "legacy"
+    planner_source: str = "legacy"
 
     def __post_init__(self) -> None:
+        _validate_non_empty_text(self.role, "assignment role")
+        _validate_non_empty_text(self.mission, "assignment mission")
+        _validate_text_list(self.assignment_reason, "assignment_reason")
+        _validate_text_list(self.assigned_contract, "assigned_contract")
+        _validate_text_list(self.required_checks, "required_checks")
+        if not isinstance(self.initial_context, InitialContext):
+            raise ValueError("initial_context must be an InitialContext")
+        if type(self.max_turns) is not int or self.max_turns <= 0:
+            raise ValueError("max_turns must be a positive integer")
+        if type(self.max_tool_calls) is not int or self.max_tool_calls < 0:
+            raise ValueError("max_tool_calls must be a non-negative integer")
         integer_budgets = {
             "max_output_tokens": self.max_output_tokens,
             "max_total_tokens": self.max_total_tokens,
@@ -532,6 +550,25 @@ class Assignment:
             or self.max_elapsed_seconds <= 0
         ):
             raise ValueError("max_elapsed_seconds must be a positive number")
+        if self.repository_permission != "read_only":
+            raise ValueError("repository_permission must be read_only")
+        if self.command_permission != "safe_checks_only":
+            raise ValueError("command_permission must be safe_checks_only")
+        if self.assignment_id:
+            _validate_non_empty_text(self.assignment_id, "assignment_id")
+        if self.role_kind not in {"legacy", "core", "adversarial", "specialist"}:
+            raise ValueError("role_kind is unsupported")
+        _validate_non_empty_text(self.perspective_key, "perspective_key")
+        if self.planner_source not in {
+            "legacy",
+            "local",
+            "model",
+            "runtime_injected",
+        }:
+            raise ValueError("planner_source is unsupported")
+        object.__setattr__(self, "assignment_reason", list(self.assignment_reason))
+        object.__setattr__(self, "assigned_contract", list(self.assigned_contract))
+        object.__setattr__(self, "required_checks", list(self.required_checks))
 
 
 @dataclass(frozen=True)

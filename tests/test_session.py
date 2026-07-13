@@ -16,9 +16,11 @@ from review_agent.run_state import (
 from review_agent.session import (
     LEGACY_SESSION_PHASES,
     LEGACY_SESSION_SCHEMA_VERSION,
+    PREVIOUS_SESSION_SCHEMA_VERSION,
     SESSION_PHASES,
     SESSION_SCHEMA_VERSION,
     ArtifactDescriptor,
+    ModelStageConfig,
     PhaseCheckpoint,
     PhaseStatus,
     ReviewerTaskCheckpoint,
@@ -44,6 +46,24 @@ def execution_config() -> ReviewExecutionConfig:
         reviewer_mode="multi",
         reviewer_loop="agent-loop",
         non_interactive=True,
+        risk_assessor=ModelStageConfig(
+            mode="model",
+            provider="openai-compatible",
+            model="risk-model",
+            base_url="https://risk.example/v1",
+            api_key_env="RISK_API_KEY",
+            max_output_tokens=2048,
+            max_provider_attempts=3,
+            max_elapsed_seconds=45,
+        ),
+        portfolio_planner=ModelStageConfig(
+            mode="model",
+            provider="fake",
+            api_key_env="PLANNER_API_KEY",
+            max_output_tokens=3072,
+            max_provider_attempts=2,
+            max_elapsed_seconds=60,
+        ),
     )
 
 
@@ -101,6 +121,17 @@ def test_session_manifest_round_trips_with_pending_phases() -> None:
     assert payload["phases"]["preflight"]["status"] == "pending"
     assert payload["phases"]["reviewers"]["tasks"] == {}
     assert payload["phases"]["intent_resolution"]["user_decisions"] == {}
+    assert payload["execution"]["risk_assessor"] == {
+        "mode": "model",
+        "provider": "openai-compatible",
+        "model": "risk-model",
+        "base_url": "https://risk.example/v1",
+        "api_key_env": "RISK_API_KEY",
+        "max_output_tokens": 2048,
+        "max_provider_attempts": 3,
+        "max_elapsed_seconds": 45.0,
+    }
+    assert payload["execution"]["portfolio_planner"]["provider"] == "fake"
     assert SESSION_PHASES == (
         RunPhase.PREFLIGHT,
         RunPhase.QUALITY_GATES,
@@ -161,6 +192,8 @@ def test_session_manifest_round_trips_reviewer_task_checkpoints() -> None:
 def test_session_manifest_loads_v1_layout_without_synthesizing_new_results() -> None:
     payload = session_manifest_to_dict(manifest())
     payload["schema_version"] = LEGACY_SESSION_SCHEMA_VERSION
+    payload["execution"].pop("risk_assessor")
+    payload["execution"].pop("portfolio_planner")
     payload["phases"] = {
         phase.value: payload["phases"][phase.value]
         for phase in LEGACY_SESSION_PHASES
@@ -179,7 +212,27 @@ def test_session_manifest_loads_v1_layout_without_synthesizing_new_results() -> 
     assert "planning" not in loaded.phases
     assert all(not checkpoint.tasks for checkpoint in loaded.phases.values())
     assert all(not checkpoint.user_decisions for checkpoint in loaded.phases.values())
+    assert loaded.execution.risk_assessor == ModelStageConfig()
+    assert loaded.execution.portfolio_planner == ModelStageConfig()
     assert session_manifest_to_dict(loaded)["schema_version"] == 1
+
+
+def test_session_manifest_loads_v2_model_stages_as_local_for_safe_resume() -> None:
+    payload = session_manifest_to_dict(manifest())
+    payload["schema_version"] = PREVIOUS_SESSION_SCHEMA_VERSION
+    payload["execution"].pop("risk_assessor")
+    payload["execution"].pop("portfolio_planner")
+
+    loaded = session_manifest_from_dict(payload)
+    serialized = session_manifest_to_dict(loaded)
+
+    assert loaded.schema_version == PREVIOUS_SESSION_SCHEMA_VERSION
+    assert loaded.execution.reviewer_provider == "openai-compatible"
+    assert loaded.execution.reviewer_mode == "multi"
+    assert loaded.execution.risk_assessor == ModelStageConfig()
+    assert loaded.execution.portfolio_planner == ModelStageConfig()
+    assert "risk_assessor" not in serialized["execution"]
+    assert "portfolio_planner" not in serialized["execution"]
 
 
 def test_awaiting_user_manifest_round_trips_with_committed_artifacts() -> None:
@@ -399,6 +452,26 @@ def test_session_manifest_never_serializes_api_key_values() -> None:
         "reviewer_mode": "multi",
         "reviewer_loop": "agent-loop",
         "non_interactive": True,
+        "risk_assessor": {
+            "mode": "model",
+            "provider": "openai-compatible",
+            "model": "risk-model",
+            "base_url": "https://risk.example/v1",
+            "api_key_env": "RISK_API_KEY",
+            "max_output_tokens": 2048,
+            "max_provider_attempts": 3,
+            "max_elapsed_seconds": 45.0,
+        },
+        "portfolio_planner": {
+            "mode": "model",
+            "provider": "fake",
+            "model": None,
+            "base_url": None,
+            "api_key_env": "PLANNER_API_KEY",
+            "max_output_tokens": 3072,
+            "max_provider_attempts": 2,
+            "max_elapsed_seconds": 60.0,
+        },
     }
     assert "api_key" not in execution
     assert "authorization" not in str(payload).casefold()
@@ -411,6 +484,57 @@ def test_session_manifest_rejects_secret_execution_fields(secret_field: str) -> 
 
     with pytest.raises(ValueError, match=secret_field.casefold()):
         session_manifest_from_dict(payload)
+
+
+@pytest.mark.parametrize("stage", ["risk_assessor", "portfolio_planner"])
+def test_session_manifest_rejects_secret_model_stage_fields(stage: str) -> None:
+    payload = session_manifest_to_dict(manifest())
+    payload["execution"][stage]["api_key"] = "secret-value"
+
+    with pytest.raises(ValueError, match="api_key"):
+        session_manifest_from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"mode": "automatic"}, "mode"),
+        ({"provider": "other"}, "provider"),
+        ({"mode": "local", "provider": "fake"}, "mode=local"),
+        ({"mode": "model", "provider": "none"}, "mode=model"),
+        ({"max_output_tokens": 0}, "max_output_tokens"),
+        ({"max_provider_attempts": True}, "max_provider_attempts"),
+        ({"max_elapsed_seconds": float("inf")}, "max_elapsed_seconds"),
+        ({"api_key_env": "sk-secret"}, "api_key_env"),
+    ],
+)
+def test_model_stage_config_rejects_invalid_values(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "mode": "model",
+        "provider": "fake",
+    }
+    values.update(changes)
+
+    with pytest.raises(ValueError, match=message):
+        ModelStageConfig(**values)
+
+
+def test_model_stage_config_rejects_incomplete_openai_configuration() -> None:
+    with pytest.raises(ValueError, match="model"):
+        ModelStageConfig(
+            mode="model",
+            provider="openai-compatible",
+            base_url="https://provider.example/v1",
+        )
+    with pytest.raises(ValueError, match="base_url"):
+        ModelStageConfig(
+            mode="model",
+            provider="openai-compatible",
+            model="stage-model",
+        )
 
 
 def test_execution_config_rejects_api_key_value_instead_of_environment_name() -> None:
@@ -529,6 +653,7 @@ def test_child_session_manifest_starts_isolated_and_preserves_root_lineage(
 @pytest.mark.parametrize(
     "model_type",
     [
+        ModelStageConfig,
         ReviewExecutionConfig,
         ArtifactDescriptor,
         PhaseCheckpoint,

@@ -124,6 +124,19 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
             "diff_stat": "1 file changed",
             "diff_excerpt": ["+reject bad token"],
         },
+        planning_summary={
+            "risk": {
+                "status": "accepted",
+                "local_floor": "high",
+                "proposed_level": "critical",
+                "final_level": "critical",
+            },
+            "portfolio": {
+                "status": "accepted",
+                "reviewer_count": 4,
+                "policy_actions": ["runtime injected Core Reviewer"],
+            },
+        },
     )
 
     payload = review_brief_to_dict(brief)
@@ -147,6 +160,7 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
     assert payload["reviewer_disagreements"] == ["core and adversarial disagree on token expiry"]
     assert payload["review_contract_coverage"][0]["contract"] == "Behavioral Correctness"
     assert payload["non_binding_recommendation"] == "manual_review"
+    assert payload["orchestration"]["risk"]["local_floor"] == "high"
     assert "auth.py" in payload["human_review_checklist_and_reading_order"][0]
     markdown = render_review_brief_markdown(brief)
     assert "Incremental priority map:" in markdown
@@ -156,6 +170,8 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
     assert "  - Output truncated: True" in markdown
     assert "  - Sandbox: git_blob_compile" in markdown
     assert "  - Observation: O-QG" in markdown
+    assert "## Risk And Portfolio Orchestration" in markdown
+    assert "local_floor=high" in markdown
 
 
 def test_render_review_brief_markdown_uses_spec_section_order() -> None:
@@ -185,6 +201,7 @@ def test_render_review_brief_markdown_uses_spec_section_order() -> None:
         "## Change Intent",
         "## Intent Assessment",
         "## Initial And Final Risk Assessment",
+        "## Risk And Portfolio Orchestration",
         "## Quality Gates",
         "## Change Map And Repository Impact",
         "## Verified Findings",

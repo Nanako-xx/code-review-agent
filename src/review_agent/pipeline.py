@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path, PurePosixPath
 from time import perf_counter
@@ -71,6 +72,13 @@ from review_agent.model_adapter_factory import (
     build_model_adapter_factory_from_config,
 )
 from review_agent.model_adapter import ModelAdapter
+from review_agent.model_risk import (
+    RiskModelRun,
+    risk_model_decision_to_dict,
+    risk_model_envelope_to_dict,
+    risk_model_raw_response_to_dict,
+    run_risk_assessment,
+)
 from review_agent.models import (
     Assignment,
     ClarificationQuestion,
@@ -108,6 +116,15 @@ from review_agent.quality_runner import (
     execute_quality_gate,
     skipped_quality_gate_execution,
 )
+from review_agent.portfolio import (
+    PORTFOLIO_PLANNER_SYSTEM_PROMPT,
+    PortfolioPacket,
+    PortfolioPlannerRun,
+    build_portfolio_packet,
+    portfolio_packet_to_dict,
+    portfolio_planner_run_to_dict,
+    run_portfolio_planner,
+)
 from review_agent.repository_intelligence import (
     RepositoryIntelligenceSnapshot,
     build_repository_intelligence,
@@ -121,8 +138,13 @@ from review_agent.reviewer_runtime import reviewer_runtime_to_dict
 from review_agent.review_contract import validate_reviewer_completion
 from review_agent.risk import LocalRiskAssessor, build_risk_packet
 from review_agent.run_state import RunPhase, RunState, RunStatus
-from review_agent.runtime import build_assignments
-from review_agent.session import PhaseStatus, ReviewExecutionConfig, SessionManifest
+from review_agent.runtime import compile_portfolio, portfolio_plan_to_dict
+from review_agent.session import (
+    ModelStageConfig,
+    PhaseStatus,
+    ReviewExecutionConfig,
+    SessionManifest,
+)
 from review_agent.session_store import SessionStore
 from review_agent.tool_gateway import ToolGateway
 
@@ -192,8 +214,11 @@ class PipelineContext:
     intent: IntentPacket | None = None
     risk_packet: RiskAssessmentPacket | None = None
     risk_assessment: RiskAssessment | None = None
+    risk_model_decision: dict[str, Any] | None = None
     incremental_priority: IncrementalPriorityMap | None = None
     assignments: list[Assignment] = field(default_factory=list)
+    portfolio_plan: dict[str, Any] | None = None
+    planning_summary: dict[str, Any] | None = None
     quality_gate_plan: QualityGatePlan | None = None
     quality_results: list[QualityGateResult] = field(default_factory=list)
     quality_gate_observations: ObservationStore | None = None
@@ -914,8 +939,36 @@ class ReviewPipeline:
             summary,
             intent,
             pre_risk_quality_status,
+            self.context.repository_intelligence,
         )
-        risk = LocalRiskAssessor().assess(risk_packet)
+        local_risk = LocalRiskAssessor().assess(risk_packet)
+        risk_stage = manifest.execution.risk_assessor
+        risk_adapter = self._model_stage_adapter(
+            risk_stage,
+            stage_label="risk-assessor",
+        )
+        risk_run = run_risk_assessment(
+            risk_packet,
+            review_id=manifest.review_id,
+            adapter=risk_adapter,
+            local_assessment=local_risk,
+            model=_model_stage_name(risk_stage, "configured-risk-model"),
+            max_output_tokens=risk_stage.max_output_tokens,
+            max_provider_attempts=risk_stage.max_provider_attempts,
+            max_elapsed_seconds=risk_stage.max_elapsed_seconds,
+        )
+        risk = risk_run.assessment
+        if risk_run.decision.status == "fallback":
+            risk = replace(
+                risk,
+                uncertainties=_dedupe(
+                    [
+                        *risk.uncertainties,
+                        "Model Risk Assessor fallback: "
+                        + str(risk_run.decision.failure_reason),
+                    ]
+                ),
+            )
         incremental_priority: IncrementalPriorityMap | None = None
         if manifest.incremental_from_sha is not None:
             incremental_summary = self._collect_change_summary(
@@ -928,6 +981,64 @@ class ReviewPipeline:
                 from_revision=manifest.incremental_from_sha,
                 to_revision=revisions.resolved_head_sha,
             )
+        portfolio_ref_catalog = {
+            ref: description.strip()
+            for ref, description in risk_packet.signal_catalog.items()
+            if description.strip()
+        }
+        portfolio_packet = build_portfolio_packet(
+            risk,
+            change_map={
+                "base_revision": revisions.resolved_base_sha,
+                "head_revision": revisions.resolved_head_sha,
+                "changed_files": list(summary.changed_files),
+                "diff_stat": summary.diff_stat,
+            },
+            changed_symbols=risk_packet.changed_symbols,
+            intent_summary={
+                "goal": intent.goal,
+                "acceptance_criteria": list(intent.acceptance_criteria),
+                "scope": list(intent.scope),
+                "constraints": list(intent.constraints),
+                "status": intent.status.value,
+            },
+            intent_uncertainties=intent.uncertainties,
+            ref_allowlist=portfolio_ref_catalog,
+            ref_catalog=portfolio_ref_catalog,
+        )
+        portfolio_stage = manifest.execution.portfolio_planner
+        portfolio_adapter = self._model_stage_adapter(
+            portfolio_stage,
+            stage_label="portfolio-planner",
+        )
+        portfolio_input_digest = _payload_digest(
+            portfolio_packet_to_dict(portfolio_packet)
+        )
+        portfolio_invocation_id = _planning_invocation_id(
+            manifest.review_id,
+            "portfolio",
+            portfolio_input_digest,
+        )
+        portfolio_run = (
+            run_portfolio_planner(
+                portfolio_adapter,
+                portfolio_packet,
+                invocation_id=portfolio_invocation_id,
+                model=_model_stage_name(
+                    portfolio_stage,
+                    "configured-portfolio-model",
+                ),
+                max_output_tokens=portfolio_stage.max_output_tokens,
+                max_provider_attempts=portfolio_stage.max_provider_attempts,
+                max_elapsed_seconds=portfolio_stage.max_elapsed_seconds,
+            )
+            if portfolio_adapter is not None
+            else None
+        )
+        portfolio = compile_portfolio(
+            portfolio_packet,
+            planner_run=portfolio_run,
+        )
         assignments = [
             replace(
                 assignment,
@@ -945,7 +1056,7 @@ class ReviewPipeline:
                     ),
                 ),
             )
-            for assignment in build_assignments(risk)
+            for assignment in portfolio.assignments
         ]
         workspace = self._phase_workspace(RunPhase.PLANNING)
         deep_observations = ObservationStore(workspace.path / "quality-obs")
@@ -1008,8 +1119,45 @@ class ReviewPipeline:
             )
             for assignment in assignments
         ]
+        risk_decision_payload = risk_model_decision_to_dict(risk_run.decision)
+        portfolio_packet_payload = portfolio_packet_to_dict(portfolio_packet)
+        portfolio_decision_payload = _portfolio_model_decision(
+            stage=portfolio_stage,
+            run=portfolio_run,
+            portfolio=portfolio,
+            invocation_id=portfolio_invocation_id,
+            input_digest=portfolio_input_digest,
+        )
+        portfolio_plan_payload = portfolio_plan_to_dict(portfolio)
+        planning_summary = _planning_summary(
+            risk_run=risk_run,
+            risk=risk,
+            portfolio_decision=portfolio_decision_payload,
+            portfolio_plan=portfolio_plan_payload,
+            assignments=assignments,
+        )
         workspace.write_json("risk_packet.json", asdict(risk_packet))
         workspace.write_json("risk.json", asdict(risk))
+        workspace.write_json(
+            "risk_model_decision.json",
+            risk_decision_payload,
+        )
+        workspace.write_json(
+            "portfolio_packet.json",
+            portfolio_packet_payload,
+        )
+        workspace.write_json(
+            "portfolio_model_decision.json",
+            portfolio_decision_payload,
+        )
+        workspace.write_json(
+            "portfolio_plan.json",
+            portfolio_plan_payload,
+        )
+        workspace.write_json(
+            "planning_summary.json",
+            planning_summary,
+        )
         workspace.write_json(
             "assignments.json",
             {"assignments": [asdict(item) for item in assignments]},
@@ -1021,12 +1169,78 @@ class ReviewPipeline:
         files: dict[str, tuple[str, str]] = {
             "risk_packet": ("risk_packet.json", "risk_packet.json"),
             "risk": ("risk.json", "risk.json"),
+            "risk_model_decision": (
+                "risk_model_decision.json",
+                "risk_model_decision.json",
+            ),
+            "portfolio_packet": (
+                "portfolio_packet.json",
+                "portfolio_packet.json",
+            ),
+            "portfolio_model_decision": (
+                "portfolio_model_decision.json",
+                "portfolio_model_decision.json",
+            ),
+            "portfolio_plan": (
+                "portfolio_plan.json",
+                "portfolio_plan.json",
+            ),
+            "planning_summary": (
+                "planning_summary.json",
+                "planning_summary.json",
+            ),
             "assignments": ("assignments.json", "assignments.json"),
             "deep_quality_gates": (
                 "deep_quality_gates.json",
                 "deep_quality_gates.json",
             ),
         }
+        if risk_run.envelope is not None:
+            workspace.write_json(
+                "risk_model_envelope.json",
+                risk_model_envelope_to_dict(risk_run.envelope),
+            )
+            files["risk_model_envelope"] = (
+                "risk_model_envelope.json",
+                "risk_model_envelope.json",
+            )
+        if risk_run.raw_response is not None:
+            workspace.write_json(
+                "risk_model_raw_response.json",
+                risk_model_raw_response_to_dict(risk_run.raw_response),
+            )
+            files["risk_model_raw_response"] = (
+                "risk_model_raw_response.json",
+                "risk_model_raw_response.json",
+            )
+        if portfolio_run is not None:
+            workspace.write_json(
+                "portfolio_model_envelope.json",
+                _portfolio_model_envelope(
+                    packet=portfolio_packet,
+                    stage=portfolio_stage,
+                    run=portfolio_run,
+                    review_id=manifest.review_id,
+                    invocation_id=portfolio_invocation_id,
+                    input_digest=portfolio_input_digest,
+                ),
+            )
+            workspace.write_json(
+                "portfolio_model_raw_response.json",
+                {
+                    "schema_version": "portfolio_model_raw_response_v1",
+                    "input_digest": portfolio_input_digest,
+                    **portfolio_planner_run_to_dict(portfolio_run),
+                },
+            )
+            files["portfolio_model_envelope"] = (
+                "portfolio_model_envelope.json",
+                "portfolio_model_envelope.json",
+            )
+            files["portfolio_model_raw_response"] = (
+                "portfolio_model_raw_response.json",
+                "portfolio_model_raw_response.json",
+            )
         if incremental_priority is not None:
             workspace.write_json(
                 "incremental_priority.json",
@@ -1048,8 +1262,11 @@ class ReviewPipeline:
         )
         self.context.risk_packet = risk_packet
         self.context.risk_assessment = risk
+        self.context.risk_model_decision = risk_decision_payload
         self.context.incremental_priority = incremental_priority
         self.context.assignments = assignments
+        self.context.portfolio_plan = portfolio_plan_payload
+        self.context.planning_summary = planning_summary
         self.context.quality_results = all_quality_results
         self.context.deep_quality_gate_observations = deep_observations
         return artifacts
@@ -1064,6 +1281,21 @@ class ReviewPipeline:
         )
         self.context.assignments = assignments_from_dict(
             self._read_json_artifact("assignments")
+        )
+        self.context.risk_model_decision = (
+            dict(self._read_json_artifact("risk_model_decision"))
+            if "risk_model_decision" in manifest.artifacts
+            else None
+        )
+        self.context.portfolio_plan = (
+            dict(self._read_json_artifact("portfolio_plan"))
+            if "portfolio_plan" in manifest.artifacts
+            else None
+        )
+        self.context.planning_summary = (
+            dict(self._read_json_artifact("planning_summary"))
+            if "planning_summary" in manifest.artifacts
+            else None
         )
         if "deep_quality_gates" in manifest.artifacts:
             deep_results = quality_results_from_dict(
@@ -1113,6 +1345,38 @@ class ReviewPipeline:
             )
         except AdapterConfigError as error:
             raise PipelineConfigurationError(str(error)) from error
+
+    def _model_stage_adapter(
+        self,
+        stage: ModelStageConfig,
+        *,
+        stage_label: str,
+    ) -> ModelAdapter | None:
+        if stage.mode == "local":
+            return None
+        try:
+            factory = self._build_adapter_factory(
+                ModelAdapterConfig(
+                    provider_name=stage.provider,
+                    model=stage.model,
+                    base_url=stage.base_url,
+                    api_key_env=stage.api_key_env,
+                    stage_label=stage_label,
+                )
+            )
+        except AdapterConfigError as error:
+            raise PipelineConfigurationError(str(error)) from error
+        if factory is None:
+            raise PipelineConfigurationError(
+                f"{stage_label} mode=model requires a model adapter"
+            )
+        try:
+            return factory.create()
+        except Exception as error:
+            return _UnavailableModelAdapter(
+                provider_name=stage.provider,
+                error=error,
+            )
 
     def _load_submitted_intent_decisions(self) -> list[IntentDecision]:
         checkpoint = self.context.manifest.phases[
@@ -1202,10 +1466,12 @@ class ReviewPipeline:
             self.context.multi_run = None
             return {}
 
-        assignments = (
-            self.context.assignments
-            if config.reviewer_mode == "multi"
-            else self.context.assignments[:1]
+        assignments = _assignments_for_execution(
+            manifest,
+            self.context.assignments,
+        )
+        single_artifacts = (
+            config.reviewer_mode == "single" and len(assignments) == 1
         )
         task_names = [f"reviewer-{index}" for index in range(len(assignments))]
         self.context.session_store.initialize_reviewer_tasks(
@@ -1252,13 +1518,14 @@ class ReviewPipeline:
                     adapter=adapter,
                     creation_error=creation_error,
                     initial_observations=dict(initial_reviewer_observations),
+                    single_artifacts=single_artifacts,
                 )
             )
 
         futures: dict[int, Future[_ReviewerAttempt]] = {}
         executor: ThreadPoolExecutor | None = None
         try:
-            if len(pending) > 1:
+            if config.reviewer_mode == "multi" and len(pending) > 1:
                 executor = ThreadPoolExecutor(
                     max_workers=min(len(pending), 32),
                     thread_name_prefix="pipeline-reviewer",
@@ -1307,7 +1574,7 @@ class ReviewPipeline:
         ]
 
         self.context.reviewer_executions = list(executions)
-        if config.reviewer_mode == "multi":
+        if config.reviewer_mode == "multi" or len(executions) > 1:
             multi_run = MultiReviewerRun(executions=executions)
             workspace = self._phase_workspace(RunPhase.REVIEWERS)
             workspace.write_json(
@@ -1434,7 +1701,7 @@ class ReviewPipeline:
 
         names = _reviewer_artifact_names(
             index,
-            single=manifest.execution.reviewer_mode == "single",
+            single=pending.single_artifacts,
             include_trace=manifest.execution.reviewer_loop == "agent-loop",
         )
         workspace.write_json(
@@ -1520,10 +1787,8 @@ class ReviewPipeline:
             self.context.reviewer_result = None
             self.context.multi_run = None
             return
-        assignment_count = (
-            len(self.context.assignments)
-            if manifest.execution.reviewer_mode == "multi"
-            else min(1, len(self.context.assignments))
+        assignment_count = len(
+            _assignments_for_execution(manifest, self.context.assignments)
         )
         executions: list[ReviewerExecution] = []
         checkpoint = manifest.phases[RunPhase.REVIEWERS.value]
@@ -1545,7 +1810,7 @@ class ReviewPipeline:
                 execution = self._load_reviewer_execution(index)
                 executions.append(execution)
                 self.context.reviewer_observations[index] = legacy_observations
-        if manifest.execution.reviewer_mode == "multi":
+        if manifest.execution.reviewer_mode == "multi" or len(executions) > 1:
             self.context.multi_run = MultiReviewerRun(executions=executions)
             self.context.reviewer_result = None
         else:
@@ -1573,7 +1838,16 @@ class ReviewPipeline:
                 raise ValueError(f"reviewer task artifact schema is invalid: {artifact_name}")
         names = _reviewer_artifact_names(
             index,
-            single=manifest.execution.reviewer_mode == "single",
+            single=(
+                manifest.execution.reviewer_mode == "single"
+                and len(
+                    _assignments_for_execution(
+                        manifest,
+                        self.context.assignments,
+                    )
+                )
+                == 1
+            ),
             include_trace=manifest.execution.reviewer_loop == "agent-loop",
         )
         observations = self._load_observation_artifact(
@@ -1600,7 +1874,16 @@ class ReviewPipeline:
         manifest = self.context.manifest
         names = _reviewer_artifact_names(
             index,
-            single=manifest.execution.reviewer_mode == "single",
+            single=(
+                manifest.execution.reviewer_mode == "single"
+                and len(
+                    _assignments_for_execution(
+                        manifest,
+                        self.context.assignments,
+                    )
+                )
+                == 1
+            ),
             include_trace=manifest.execution.reviewer_loop == "agent-loop",
         )
         envelope_payload = self._read_json_artifact(names.envelope)
@@ -1805,6 +2088,7 @@ class ReviewPipeline:
                 if self.context.incremental_priority is not None
                 else None
             ),
+            planning_summary=self.context.planning_summary,
         )
         workspace.write_json("review_brief.json", review_brief_to_dict(brief))
         workspace.write_text("report.md", render_review_brief_markdown(brief))
@@ -2046,6 +2330,18 @@ class ReviewPipeline:
 
 
 @dataclass(frozen=True)
+class _UnavailableModelAdapter:
+    provider_name: str
+    error: Exception
+
+    def complete_turn(self, _request: object) -> Any:
+        raise RuntimeError(
+            "model adapter creation failed: "
+            f"{type(self.error).__name__}: {self.error}"
+        )
+
+
+@dataclass(frozen=True)
 class _PendingReviewer:
     index: int
     task_name: str
@@ -2053,6 +2349,7 @@ class _PendingReviewer:
     adapter: ModelAdapter | None
     creation_error: Exception | None = None
     initial_observations: dict[str, str] = field(default_factory=dict)
+    single_artifacts: bool = False
 
 
 @dataclass(frozen=True)
@@ -2197,6 +2494,198 @@ def _reviewer_artifact_names(
         result=f"{prefix}_result",
         trace=f"{prefix}_agent_trace" if include_trace else None,
     )
+
+
+def _assignments_for_execution(
+    manifest: SessionManifest,
+    assignments: list[Assignment],
+) -> list[Assignment]:
+    """Expand risk depth independently from sequential/parallel scheduling.
+
+    Session v2 used ``single`` to truncate the portfolio. Session v3 defines it
+    as one worker executing the complete Runtime-compiled portfolio in order.
+    The schema check preserves the historical behavior when an old Session is
+    resumed.
+    """
+
+    if manifest.schema_version >= 3 or manifest.execution.reviewer_mode == "multi":
+        return list(assignments)
+    return list(assignments[:1])
+
+
+def _model_stage_name(stage: ModelStageConfig, fallback: str) -> str:
+    return stage.model or fallback
+
+
+def _payload_digest(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _planning_invocation_id(
+    review_id: str,
+    stage: str,
+    input_digest: str,
+) -> str:
+    identity = json.dumps(
+        {
+            "review_id": review_id,
+            "stage": stage,
+            "input_digest": input_digest,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    return f"{stage}_{suffix}"
+
+
+def _portfolio_model_envelope(
+    *,
+    packet: PortfolioPacket,
+    stage: ModelStageConfig,
+    run: PortfolioPlannerRun,
+    review_id: str,
+    invocation_id: str,
+    input_digest: str,
+) -> dict[str, Any]:
+    packet_payload = portfolio_packet_to_dict(packet)
+    return {
+        "schema_version": "portfolio_model_envelope_v1",
+        "invocation_id": invocation_id,
+        "input_digest": input_digest,
+        "review_id": review_id,
+        "stage": "portfolio",
+        "provider_name": run.provider_name,
+        "model": run.model,
+        "request": {
+            "system": PORTFOLIO_PLANNER_SYSTEM_PROMPT,
+            "tools": [],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        packet_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                }
+            ],
+            "tool_results": [],
+            "parameters": {
+                "model": _model_stage_name(
+                    stage,
+                    "configured-portfolio-model",
+                ),
+                "max_output_tokens": stage.max_output_tokens,
+                "max_provider_attempts": stage.max_provider_attempts,
+                "max_elapsed_seconds": stage.max_elapsed_seconds,
+                "temperature": 0,
+                "tool_choice": "none",
+                "response_schema": "portfolio_proposal_v1",
+                "invocation_id": invocation_id,
+            },
+        },
+    }
+
+
+def _portfolio_model_decision(
+    *,
+    stage: ModelStageConfig,
+    run: PortfolioPlannerRun | None,
+    portfolio: Any,
+    invocation_id: str,
+    input_digest: str,
+) -> dict[str, Any]:
+    if run is None:
+        model_status = "disabled"
+        provider_name = "none"
+        model = "none"
+        attempts = 0
+        failure_reason = None
+    else:
+        model_status = (
+            "accepted"
+            if portfolio.planner_status == "accepted"
+            else "failed"
+        )
+        provider_name = run.provider_name
+        model = run.model
+        attempts = len(run.attempts)
+        failure_reason = portfolio.fallback_reason or run.failure_reason
+    return {
+        "schema_version": "portfolio_model_decision_v1",
+        "invocation_id": invocation_id,
+        "input_digest": input_digest,
+        "status": portfolio.planner_status,
+        "model_status": model_status,
+        "provider_name": provider_name,
+        "model": model,
+        "attempts": attempts,
+        "failure_reason": failure_reason,
+        "fallback_used": portfolio.planner_status == "fallback",
+        "final_reviewer_count": portfolio.final_reviewer_count,
+        "minimum_reviewers": portfolio.minimum_reviewers,
+        "maximum_reviewers": portfolio.maximum_reviewers,
+        "selected_candidate_ids": list(portfolio.selected_candidate_ids),
+        "rejected_candidate_ids": list(portfolio.rejected_candidate_ids),
+        "policy_actions": list(portfolio.policy_actions),
+        "configured_mode": stage.mode,
+    }
+
+
+def _planning_summary(
+    *,
+    risk_run: RiskModelRun,
+    risk: RiskAssessment,
+    portfolio_decision: Mapping[str, Any],
+    portfolio_plan: Mapping[str, Any],
+    assignments: list[Assignment],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "planning_summary_v1",
+        "risk": risk_model_decision_to_dict(risk_run.decision),
+        "portfolio": dict(portfolio_decision),
+        "reviewer_portfolio": [
+            {
+                "assignment_id": assignment.assignment_id,
+                "role_kind": assignment.role_kind,
+                "role": assignment.role,
+                "perspective_key": assignment.perspective_key,
+                "planner_source": assignment.planner_source,
+                "assigned_contract": list(assignment.assigned_contract),
+                "budget": {
+                    "max_turns": assignment.max_turns,
+                    "max_tool_calls": assignment.max_tool_calls,
+                    "max_output_tokens": assignment.max_output_tokens,
+                    "max_total_tokens": assignment.max_total_tokens,
+                    "max_elapsed_seconds": assignment.max_elapsed_seconds,
+                    "max_provider_attempts": assignment.max_provider_attempts,
+                },
+                "permissions": {
+                    "repository": assignment.repository_permission,
+                    "commands": assignment.command_permission,
+                },
+            }
+            for assignment in assignments
+        ],
+        "uncertainties": _dedupe(
+            [
+                *risk.uncertainties,
+                *(
+                    str(item)
+                    for item in portfolio_plan.get("uncertainties", [])
+                ),
+            ]
+        ),
+    }
 
 
 def _reviewer_artifact_filename(name: str) -> str:

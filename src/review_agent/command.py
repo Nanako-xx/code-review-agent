@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -19,7 +20,14 @@ from review_agent.pipeline import (
 from review_agent.revision import RevisionResolver
 from review_agent.resume import ResumeAction, ResumeBlockedError, ReviewSessionResumer
 from review_agent.run_state import RunStatus
-from review_agent.session import ReviewExecutionConfig, initial_session_manifest
+from review_agent.session import (
+    DEFAULT_MODEL_STAGE_MAX_ELAPSED_SECONDS,
+    DEFAULT_MODEL_STAGE_MAX_OUTPUT_TOKENS,
+    DEFAULT_MODEL_STAGE_MAX_PROVIDER_ATTEMPTS,
+    ModelStageConfig,
+    ReviewExecutionConfig,
+    initial_session_manifest,
+)
 from review_agent.session_store import SessionStore
 
 
@@ -63,6 +71,8 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument("--reviewer-model")
     review.add_argument("--reviewer-base-url")
     review.add_argument("--reviewer-api-key-env", default="REVIEW_AGENT_API_KEY")
+    _add_model_stage_arguments(review, "risk-assessor")
+    _add_model_stage_arguments(review, "portfolio-planner")
 
     resume = subparsers.add_parser(
         "resume",
@@ -71,6 +81,101 @@ def _build_parser() -> argparse.ArgumentParser:
     resume.add_argument("review_id", help="Review id under .review-agent/runs")
     resume.add_argument("--repo", default=".", help="Repository path")
     return parser
+
+
+def _add_model_stage_arguments(
+    parser: argparse.ArgumentParser,
+    stage: str,
+) -> None:
+    parser.add_argument(
+        f"--{stage}-mode",
+        choices=["local", "model"],
+        default="local",
+    )
+    parser.add_argument(
+        f"--{stage}-provider",
+        choices=["inherit", "none", "fake", "openai-compatible"],
+        default="inherit",
+    )
+    parser.add_argument(f"--{stage}-model")
+    parser.add_argument(f"--{stage}-base-url")
+    parser.add_argument(f"--{stage}-api-key-env")
+    parser.add_argument(
+        f"--{stage}-max-output-tokens",
+        type=int,
+        default=DEFAULT_MODEL_STAGE_MAX_OUTPUT_TOKENS,
+    )
+    parser.add_argument(
+        f"--{stage}-max-provider-attempts",
+        type=int,
+        default=DEFAULT_MODEL_STAGE_MAX_PROVIDER_ATTEMPTS,
+    )
+    parser.add_argument(
+        f"--{stage}-max-elapsed-seconds",
+        type=float,
+        default=DEFAULT_MODEL_STAGE_MAX_ELAPSED_SECONDS,
+    )
+
+
+def _resolve_model_stage_config(
+    args: argparse.Namespace,
+    stage: str,
+    reviewer: ReviewExecutionConfig,
+) -> ModelStageConfig:
+    argument_prefix = stage.replace("-", "_")
+    mode = getattr(args, f"{argument_prefix}_mode")
+    api_key_env_override = getattr(args, f"{argument_prefix}_api_key_env")
+    common = {
+        "api_key_env": (
+            reviewer.reviewer_api_key_env
+            if api_key_env_override is None
+            else api_key_env_override
+        ),
+        "max_output_tokens": getattr(
+            args,
+            f"{argument_prefix}_max_output_tokens",
+        ),
+        "max_provider_attempts": getattr(
+            args,
+            f"{argument_prefix}_max_provider_attempts",
+        ),
+        "max_elapsed_seconds": getattr(
+            args,
+            f"{argument_prefix}_max_elapsed_seconds",
+        ),
+    }
+    if mode == "local":
+        try:
+            return ModelStageConfig(mode="local", provider="none", **common)
+        except ValueError as error:
+            raise ValueError(f"{stage}: {error}") from error
+
+    requested_provider = getattr(args, f"{argument_prefix}_provider")
+    provider = (
+        reviewer.reviewer_provider
+        if requested_provider == "inherit"
+        else requested_provider
+    )
+    model_override = getattr(args, f"{argument_prefix}_model")
+    base_url_override = getattr(args, f"{argument_prefix}_base_url")
+    try:
+        return ModelStageConfig(
+            mode="model",
+            provider=provider,
+            model=(
+                reviewer.reviewer_model
+                if model_override is None
+                else model_override
+            ),
+            base_url=(
+                reviewer.reviewer_base_url
+                if base_url_override is None
+                else base_url_override
+            ),
+            **common,
+        )
+    except ValueError as error:
+        raise ValueError(f"{stage}: {error}") from error
 
 
 def _run_review(args: argparse.Namespace) -> int:
@@ -96,6 +201,24 @@ def _run_review(args: argparse.Namespace) -> int:
         )
     except ValueError as error:
         print(f"Reviewer session configuration error: {error}")
+        return 2
+
+    try:
+        execution_config = replace(
+            execution_config,
+            risk_assessor=_resolve_model_stage_config(
+                args,
+                "risk-assessor",
+                execution_config,
+            ),
+            portfolio_planner=_resolve_model_stage_config(
+                args,
+                "portfolio-planner",
+                execution_config,
+            ),
+        )
+    except ValueError as error:
+        print(f"Planning model stage configuration error: {error}")
         return 2
 
     review_id = f"review-{uuid.uuid4().hex[:12]}"

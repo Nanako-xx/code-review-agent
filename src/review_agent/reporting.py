@@ -27,6 +27,10 @@ def render_review_brief_markdown(brief: ReviewBrief) -> str:
             "",
             _risk_section(brief),
             "",
+            "## Risk And Portfolio Orchestration",
+            "",
+            _orchestration_section(brief),
+            "",
             "## Quality Gates",
             "",
             _quality_gates_section(brief),
@@ -88,6 +92,7 @@ def render_markdown_report(
     completion_summary: dict[str, object] | None = None,
     intent_packet: IntentPacket | None = None,
     quality_results: list[QualityGateResult] | None = None,
+    planning_summary: dict[str, object] | None = None,
 ) -> str:
     brief = build_review_brief(
         review_id=review_id,
@@ -103,6 +108,7 @@ def render_markdown_report(
         multi_reviewer_summary=multi_reviewer_summary,
         reconciliation_payload=reconciliation_summary,
         completion_summary=completion_summary,
+        planning_summary=planning_summary,
     )
     return render_review_brief_markdown(brief)
 
@@ -276,6 +282,12 @@ def _risk_section(brief: ReviewBrief) -> str:
             _string_list(final.get("reasons", []), "No final risk notes recorded"),
         ]
     )
+
+
+def _orchestration_section(brief: ReviewBrief) -> str:
+    if not brief.orchestration:
+        return "- No model-assisted planning metadata recorded"
+    return _dict_lines(dict(brief.orchestration))
 
 
 def _quality_gates_section(brief: ReviewBrief) -> str:

@@ -39,7 +39,7 @@ def check_completion(
         uncertainties.append("Intent Packet partial")
     uncertainties.extend(intent.uncertainties)
 
-    if not any(_is_core_reviewer(execution.assignment.role) for execution in executions):
+    if not any(_is_core_reviewer(execution.assignment) for execution in executions):
         blockers.append("Core Reviewer did not run")
 
     if quality_plan is None:
@@ -58,15 +58,16 @@ def check_completion(
     contract_coverage = _contract_coverage(reconciliation)
     for execution in executions:
         role = execution.assignment.role
+        is_core = _is_core_reviewer(execution.assignment)
         if execution.result.status is ReviewerResultStatus.FAILED:
-            if _is_core_reviewer(role):
+            if is_core:
                 blockers.append(f"{role} failed")
             else:
                 missing_perspectives.append(role)
         elif execution.result.status is ReviewerResultStatus.PARTIAL:
             uncertainties.append(f"{role} returned partial review")
         elif execution.result.status is ReviewerResultStatus.BLOCKED:
-            if _is_core_reviewer(role):
+            if is_core:
                 blockers.append(f"{role} was blocked")
             else:
                 missing_perspectives.append(role)
@@ -79,7 +80,7 @@ def check_completion(
                     continue
                 coverage_problem = "missing" if coverage_status is None else "incomplete"
                 message = f"{role} {coverage_problem} contract coverage: {contract}"
-                if _is_core_reviewer(role):
+                if is_core:
                     blockers.append(message)
                 else:
                     uncertainties.append(message)
@@ -120,8 +121,12 @@ def completion_to_dict(result: CompletionResult) -> dict[str, Any]:
     return asdict(result)
 
 
-def _is_core_reviewer(role: str) -> bool:
-    return "core" in role.casefold()
+def _is_core_reviewer(assignment: object) -> bool:
+    role_kind = getattr(assignment, "role_kind", None)
+    if role_kind is not None and role_kind != "legacy":
+        return role_kind == "core"
+    role = getattr(assignment, "role", "")
+    return isinstance(role, str) and "core" in role.casefold()
 
 
 def _check_quality_gates(

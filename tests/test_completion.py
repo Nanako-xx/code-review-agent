@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from review_agent.completion import check_completion, completion_to_dict
 from review_agent.evidence import ContractCoverage, EvidenceReconciliation
 from review_agent.model_protocol import ModelResponse
@@ -88,6 +90,53 @@ def test_completion_blocks_when_core_reviewer_did_not_run():
     assert result.status == "blocked"
     assert result.recommendation == "manual_review"
     assert result.blockers == ["Core Reviewer did not run"]
+
+
+def test_completion_prefers_new_core_role_kind_over_role_name():
+    misleading = execution(0, "Core Reviewer", ReviewerResultStatus.FAILED)
+    misleading = replace(
+        misleading,
+        assignment=replace(
+            misleading.assignment,
+            role_kind="specialist",
+            perspective_key="security",
+            planner_source="model",
+        ),
+    )
+
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[misleading],
+        reconciliation=reconciliation(),
+    )
+
+    assert "Core Reviewer did not run" in result.blockers
+    assert "Core Reviewer failed" not in result.blockers
+    assert result.missing_perspectives == ["Core Reviewer"]
+
+
+def test_completion_accepts_new_core_kind_without_legacy_core_name():
+    typed_core = execution(0, "Primary Reviewer", ReviewerResultStatus.FAILED)
+    typed_core = replace(
+        typed_core,
+        assignment=replace(
+            typed_core.assignment,
+            role_kind="core",
+            perspective_key="core",
+            planner_source="runtime_injected",
+        ),
+    )
+
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[typed_core],
+        reconciliation=reconciliation(),
+    )
+
+    assert "Core Reviewer did not run" not in result.blockers
+    assert "Primary Reviewer failed" in result.blockers
 
 
 def test_completion_with_uncertainties_when_specialist_failed():

@@ -59,6 +59,7 @@ class ReviewBrief:
     verification_evidence: list[dict[str, Any]]
     human_review_checklist_and_reading_order: list[str]
     non_binding_recommendation: str
+    orchestration: dict[str, Any] = field(default_factory=dict)
 
 
 def build_review_brief(
@@ -78,6 +79,7 @@ def build_review_brief(
     completion_summary: dict[str, Any] | None = None,
     final_risk_assessment: dict[str, Any] | None = None,
     incremental_priority: dict[str, Any] | None = None,
+    planning_summary: dict[str, Any] | None = None,
 ) -> ReviewBrief:
     observations = observation_summaries or {}
     reconciliation = reconciliation_payload or {}
@@ -85,6 +87,19 @@ def build_review_brief(
     verified_findings = _verified_findings(reconciliation)
     rejected_hypotheses = _rejected_hypotheses(reconciliation, reviewer_result)
     uncertainties = _uncertainties(intent_packet, risk_assessment, reviewer_result, completion)
+    if planning_summary is not None:
+        planning_uncertainties = planning_summary.get("uncertainties", [])
+        if isinstance(planning_uncertainties, list):
+            uncertainties = _dedupe(
+                [
+                    *uncertainties,
+                    *(
+                        str(item)
+                        for item in planning_uncertainties
+                        if str(item).strip()
+                    ),
+                ]
+            )
 
     change_map: dict[str, Any] = {
         "changed_files": list(changed_files),
@@ -154,6 +169,7 @@ def build_review_brief(
             uncertainties=uncertainties,
         ),
         non_binding_recommendation=str(completion.get("recommendation", "manual_review")),
+        orchestration=dict(planning_summary or {}),
     )
 
 

@@ -15,9 +15,11 @@ from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
     LEGACY_SESSION_PHASES,
     LEGACY_SESSION_SCHEMA_VERSION,
+    PREVIOUS_SESSION_SCHEMA_VERSION,
     SESSION_PHASES,
     SESSION_SCHEMA_VERSION,
     ArtifactDescriptor,
+    ModelStageConfig,
     PhaseCheckpoint,
     PhaseStatus,
     ReviewExecutionConfig,
@@ -132,6 +134,8 @@ def test_session_store_loads_v1_for_audit_without_synthesizing_results(
 ) -> None:
     payload = session_manifest_to_dict(manifest())
     payload["schema_version"] = LEGACY_SESSION_SCHEMA_VERSION
+    payload["execution"].pop("risk_assessor")
+    payload["execution"].pop("portfolio_planner")
     payload["phases"] = {
         phase.value: payload["phases"][phase.value]
         for phase in LEGACY_SESSION_PHASES
@@ -150,6 +154,8 @@ def test_session_store_loads_v1_for_audit_without_synthesizing_results(
     assert loaded.schema_version == 1
     assert list(loaded.phases) == [phase.value for phase in LEGACY_SESSION_PHASES]
     assert "intent_resolution" not in loaded.phases
+    assert loaded.execution.risk_assessor == ModelStageConfig()
+    assert loaded.execution.portfolio_planner == ModelStageConfig()
     with pytest.raises(ValueError, match="read-only audit|schema v1"):
         store.mark_phase_running(RunPhase.PREFLIGHT, "2026-07-10T00:01:00Z")
 
@@ -157,6 +163,8 @@ def test_session_store_loads_v1_for_audit_without_synthesizing_results(
 def test_session_store_refuses_to_create_a_new_v1_session(tmp_path: Path) -> None:
     payload = session_manifest_to_dict(manifest())
     payload["schema_version"] = LEGACY_SESSION_SCHEMA_VERSION
+    payload["execution"].pop("risk_assessor")
+    payload["execution"].pop("portfolio_planner")
     payload["phases"] = {
         phase.value: payload["phases"][phase.value]
         for phase in LEGACY_SESSION_PHASES
@@ -167,6 +175,37 @@ def test_session_store_refuses_to_create_a_new_v1_session(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match="new Sessions.*current"):
         SessionStore(tmp_path).create(legacy)
+
+
+def test_session_store_loads_v2_with_local_model_stages(tmp_path: Path) -> None:
+    payload = session_manifest_to_dict(manifest())
+    payload["schema_version"] = PREVIOUS_SESSION_SCHEMA_VERSION
+    payload["execution"].pop("risk_assessor")
+    payload["execution"].pop("portfolio_planner")
+    (tmp_path / "session.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = SessionStore(tmp_path).load()
+
+    assert loaded.schema_version == PREVIOUS_SESSION_SCHEMA_VERSION
+    assert loaded.execution.reviewer_provider == "fake"
+    assert loaded.execution.risk_assessor == ModelStageConfig()
+    assert loaded.execution.portfolio_planner == ModelStageConfig()
+
+
+def test_session_store_resumes_v2_without_enabling_model_stages(tmp_path: Path) -> None:
+    payload = session_manifest_to_dict(manifest())
+    payload["schema_version"] = PREVIOUS_SESSION_SCHEMA_VERSION
+    payload["execution"].pop("risk_assessor")
+    payload["execution"].pop("portfolio_planner")
+    (tmp_path / "session.json").write_text(json.dumps(payload), encoding="utf-8")
+    store = SessionStore(tmp_path)
+
+    updated = store.mark_phase_running(RunPhase.PREFLIGHT, NOW)
+
+    assert updated.schema_version == PREVIOUS_SESSION_SCHEMA_VERSION
+    assert updated.phases[RunPhase.PREFLIGHT.value].status is PhaseStatus.RUNNING
+    assert updated.execution.risk_assessor == ModelStageConfig()
+    assert updated.execution.portfolio_planner == ModelStageConfig()
 
 
 def test_session_store_create_never_overwrites_existing_session(tmp_path: Path) -> None:
