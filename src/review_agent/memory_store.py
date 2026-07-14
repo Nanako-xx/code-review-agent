@@ -16,12 +16,14 @@ from enum import Enum
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shutil
 import sqlite3
 import stat
+import threading
 import time
 from typing import (
     Any,
@@ -48,6 +50,8 @@ from review_agent.memory_identity import (
     validate_repository_memory_namespace,
 )
 from review_agent.memory_models import (
+    CURRENT_MEMORY_STORE_SCHEMA_VERSION,
+    CandidateAuthorityReceipt,
     CandidateStatus,
     DurableMemoryRecord,
     FeedbackRecord,
@@ -67,14 +71,21 @@ from review_agent.memory_models import (
 )
 
 
-STORE_SCHEMA_NAME = "memory_store_schema_v1"
-STORE_SCHEMA_VERSION = 1
+STORE_SCHEMA_NAME = "memory_store_schema_v2"
+STORE_SCHEMA_VERSION = CURRENT_MEMORY_STORE_SCHEMA_VERSION
 EVENT_SCHEMA_VERSION = 1
-EXPORT_SCHEMA_NAME = "memory_store_export_v1"
-EXPORT_SCHEMA_VERSION = 1
+EVENT_ID_NAMESPACE = "memory_store_schema_v1"
+EXPORT_SCHEMA_NAME = "memory_store_export_v2"
+EXPORT_SCHEMA_VERSION = 2
+LEGACY_REQUEST_HASH_VERSION = 1
+SEMANTIC_REQUEST_HASH_VERSION = 2
+GENERATION_METADATA_STORE_SCHEMA_VERSION = CURRENT_MEMORY_STORE_SCHEMA_VERSION
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 MAX_BUSY_TIMEOUT_MS = 120_000
 MAX_BLOB_SIZE_BYTES = 512 * 1024 * 1024
+MAX_IMPORT_MANIFEST_BYTES = 64 * 1024 * 1024
+_GC_PREVIEW_SECRET = os.urandom(32)
+_FILE_LOCK_STATE = threading.local()
 ZERO_EVENT_HASH = "0" * 64
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -92,7 +103,7 @@ _SUBJECT_TYPES = frozenset(
 _PIN_TYPES = frozenset({"session", "source_bundle", "manual", "knowledge"})
 
 
-_SCHEMA_STATEMENTS = (
+_V1_SCHEMA_STATEMENTS = (
     """
     CREATE TABLE metadata (
         key TEXT PRIMARY KEY,
@@ -341,6 +352,89 @@ _SCHEMA_STATEMENTS = (
     """,
 )
 
+_V1_SCHEMA_DEFINITION_HASH = hashlib.sha256(
+    "\n".join(
+        statement.strip() for statement in _V1_SCHEMA_STATEMENTS
+    ).encode("utf-8")
+).hexdigest()
+_V1_SCHEMA_DEFINITION_FINGERPRINT = (
+    "fc9526cf9ee81260311fb5c478d28bd60f897e31eebb2f66c6ad297f5759e358"
+)
+_V1_SCHEMA_OBJECT_DIGEST = (
+    "a787ab0bb03aee39ce6c72361b5bb95ff7e269aa5a4a79680db9d88e418b8454"
+)
+_V1_STORE_SCHEMA_NAME = "memory_store_schema_v1"
+_V1_STORE_SCHEMA_VERSION = 1
+
+_V2_OUTBOX_RECEIPTS_STATEMENT = """
+    CREATE TABLE outbox_receipts (
+        request_id TEXT PRIMARY KEY,
+        repository_key TEXT NOT NULL
+            REFERENCES repositories(repository_key) ON DELETE CASCADE,
+        operation TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        request_hash_version INTEGER NOT NULL,
+        subject_id TEXT NOT NULL,
+        event_id TEXT REFERENCES events(event_id) ON DELETE RESTRICT,
+        result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        CHECK (length(request_hash) = 64),
+        CHECK (request_hash_version IN (1, 2))
+    )
+"""
+
+_V2_SCHEMA_ADDITIONS = (
+    """
+    CREATE TABLE candidate_authority_receipts (
+        receipt_id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL
+            REFERENCES candidates(candidate_id) ON DELETE RESTRICT,
+        authority_resolution_hash TEXT NOT NULL,
+        model_json TEXT NOT NULL,
+        body_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (candidate_id, authority_resolution_hash),
+        CHECK (length(authority_resolution_hash) = 64),
+        CHECK (length(body_hash) = 64)
+    )
+    """,
+    _V2_OUTBOX_RECEIPTS_STATEMENT,
+    """
+    CREATE TRIGGER candidate_authority_receipts_no_update
+    BEFORE UPDATE ON candidate_authority_receipts
+    BEGIN
+        SELECT RAISE(ABORT, 'candidate authority receipts are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER candidate_authority_receipts_no_delete
+    BEFORE DELETE ON candidate_authority_receipts
+    BEGIN
+        SELECT RAISE(ABORT, 'candidate authority receipts are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER outbox_receipts_no_update
+    BEFORE UPDATE ON outbox_receipts
+    BEGIN
+        SELECT RAISE(ABORT, 'request receipts are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER outbox_receipts_no_delete
+    BEFORE DELETE ON outbox_receipts
+    BEGIN
+        SELECT RAISE(ABORT, 'request receipts are immutable');
+    END
+    """,
+)
+
+_SCHEMA_STATEMENTS = tuple(
+    statement
+    for statement in _V1_SCHEMA_STATEMENTS
+    if "CREATE TABLE outbox_receipts" not in statement
+) + _V2_SCHEMA_ADDITIONS
+
 SCHEMA_DEFINITION_HASH = hashlib.sha256(
     "\n".join(statement.strip() for statement in _SCHEMA_STATEMENTS).encode("utf-8")
 ).hexdigest()
@@ -354,6 +448,7 @@ _REQUIRED_TABLES = frozenset(
         "blobs",
         "blob_pins",
         "candidates",
+        "candidate_authority_receipts",
         "source_bundles",
         "records",
         "feedback",
@@ -373,6 +468,10 @@ _REQUIRED_TRIGGERS = frozenset(
         "knowledge_body_immutable",
         "source_bundles_immutable",
         "blobs_immutable",
+        "candidate_authority_receipts_no_update",
+        "candidate_authority_receipts_no_delete",
+        "outbox_receipts_no_update",
+        "outbox_receipts_no_delete",
     }
 )
 
@@ -559,6 +658,8 @@ class BlobGCResult:
     deleted_orphan_paths: Tuple[str, ...]
     reclaimed_bytes: int
     dry_run: bool
+    cutoff: Optional[float] = None
+    preview_token: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -573,6 +674,7 @@ class MemoryStoreReadView:
 class ImportPlan:
     repository_keys: Tuple[str, ...]
     candidate_count: int
+    authority_receipt_count: int
     record_count: int
     feedback_count: int
     knowledge_count: int
@@ -583,6 +685,15 @@ class ImportPlan:
     redacted: bool
     restorable: bool
     applied: bool = False
+
+
+@dataclass(frozen=True)
+class PreparedImport:
+    """A validated canonical manifest detached from its source path."""
+
+    plan: ImportPlan
+    manifest_hash: str
+    _manifest_json: str
 
 
 @dataclass(frozen=True)
@@ -650,6 +761,7 @@ class MemoryStore:
         self.blob_root = namespace_path / "blobs" / "sha256"
         self._blob_temp_root = namespace_path / "blobs" / ".tmp"
         self._blob_lock_path = namespace_path / "blobs" / ".blob-store.lock"
+        self._memory_lock_path = namespace_path / ".memory-store.lock"
         self._busy_timeout_ms = busy_timeout_ms
         self._read_only = read_only
 
@@ -658,6 +770,28 @@ class MemoryStore:
                 self.namespace_path.mkdir(parents=True, exist_ok=True)
             except OSError:
                 raise MemoryStoreUnavailableError() from None
+            # Make the coordination primitive part of every writable namespace.
+            # Read-only Store instances can then lock without creating files.
+            with _exclusive_file_lock(
+                self._memory_lock_path,
+                self._busy_timeout_ms,
+            ):
+                pass
+        else:
+            try:
+                lock_status = self._memory_lock_path.stat()
+            except OSError:
+                raise MemoryStoreUnavailableError(
+                    "read-only memory store coordination lock is unavailable"
+                ) from None
+            if (
+                self._memory_lock_path.is_symlink()
+                or not stat.S_ISREG(lock_status.st_mode)
+                or lock_status.st_size < 1
+            ):
+                raise MemoryStoreUnavailableError(
+                    "read-only memory store coordination lock is unavailable"
+                )
         self._initialize_or_validate()
         if not read_only:
             try:
@@ -695,12 +829,23 @@ class MemoryStore:
                 uri_path = self.database_path.as_posix().replace("?", "%3f").replace(
                     "#", "%23"
                 )
-                connection = sqlite3.connect(
-                    "file:%s?mode=ro" % uri_path,
-                    uri=True,
-                    timeout=self._busy_timeout_ms / 1000.0,
-                    isolation_level=None,
+                use_immutable = self._read_only and not _database_has_live_wal(
+                    self.database_path
                 )
+                while True:
+                    immutable = "&immutable=1" if use_immutable else ""
+                    connection = sqlite3.connect(
+                        "file:%s?mode=ro%s" % (uri_path, immutable),
+                        uri=True,
+                        timeout=self._busy_timeout_ms / 1000.0,
+                        isolation_level=None,
+                    )
+                    if not use_immutable or not _database_has_live_wal(
+                        self.database_path
+                    ):
+                        break
+                    connection.close()
+                    use_immutable = False
             else:
                 connection = sqlite3.connect(
                     str(self.database_path),
@@ -732,19 +877,17 @@ class MemoryStore:
             raise MemoryStoreReadOnlyError(
                 "raw writable connections are not part of the MemoryStore API"
             )
-        connection = self._connect(read_only=True)
-        try:
-            yield connection
-        except MemoryStoreError:
-            if connection.in_transaction:
-                connection.rollback()
-            raise
-        except sqlite3.Error as error:
-            if connection.in_transaction:
-                connection.rollback()
-            raise _translate_sqlite_error(error) from None
-        finally:
-            connection.close()
+        with self._reader() as connection:
+            try:
+                yield connection
+            except MemoryStoreError:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+            except sqlite3.Error as error:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise _translate_sqlite_error(error) from None
 
     @contextmanager
     def _maintenance_connection(self) -> Iterator[sqlite3.Connection]:
@@ -768,6 +911,23 @@ class MemoryStore:
 
     @contextmanager
     def _reader(self) -> Iterator[sqlite3.Connection]:
+        if self._read_only:
+            # immutable=1 is the only SQLite read path that is guaranteed not to
+            # create WAL/SHM files, but it ignores a WAL created after connect.
+            # Holding the same lock as every authority write closes that race for
+            # the entire query, not merely while the connection is opened.
+            with _exclusive_file_lock(
+                self._memory_lock_path,
+                self._busy_timeout_ms,
+            ):
+                with self._reader_connection() as connection:
+                    yield connection
+            return
+        with self._reader_connection() as connection:
+            yield connection
+
+    @contextmanager
+    def _reader_connection(self) -> Iterator[sqlite3.Connection]:
         connection = self._connect(read_only=True)
         try:
             yield connection
@@ -780,108 +940,291 @@ class MemoryStore:
 
     @contextmanager
     def _authority(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connect(read_only=False)
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            yield connection
-            connection.commit()
-        except MemoryStoreError:
-            if connection.in_transaction:
-                connection.rollback()
-            raise
-        except sqlite3.Error as error:
-            if connection.in_transaction:
-                connection.rollback()
-            raise _translate_sqlite_error(error) from None
-        except Exception:
-            if connection.in_transaction:
-                connection.rollback()
-            raise
-        finally:
-            connection.close()
+        if self._read_only:
+            raise MemoryStoreReadOnlyError()
+        with _exclusive_file_lock(self._memory_lock_path, self._busy_timeout_ms):
+            connection = self._connect(read_only=False)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                yield connection
+                connection.commit()
+            except MemoryStoreError:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+            except sqlite3.Error as error:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise _translate_sqlite_error(error) from None
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+            finally:
+                connection.close()
 
     def _initialize_or_validate(self) -> None:
         if self._read_only and not self.database_path.is_file():
             raise MemoryStoreUnavailableError()
-        connection = self._connect(read_only=self._read_only)
-        try:
-            tables = _table_names(connection)
-            if not tables:
-                if self._read_only:
-                    raise MemoryStoreSchemaError()
-                mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
-                if str(mode).casefold() != "wal":
-                    raise MemoryStoreUnavailableError(
-                        "memory store could not enable write-ahead logging"
-                    )
-                connection.execute("BEGIN IMMEDIATE")
+        if self._read_only:
+            with _exclusive_file_lock(
+                self._memory_lock_path,
+                self._busy_timeout_ms,
+            ):
+                connection = self._connect(read_only=True)
                 try:
-                    # Another initializer may have completed while this process waited.
-                    if _table_names(connection):
-                        _validate_schema_connection(connection)
-                    else:
-                        created_at = _utc_now()
-                        for statement in _SCHEMA_STATEMENTS:
-                            connection.execute(statement)
-                        metadata = (
-                            ("schema_name", STORE_SCHEMA_NAME),
-                            ("schema_version", str(STORE_SCHEMA_VERSION)),
-                            ("schema_definition_hash", SCHEMA_DEFINITION_HASH),
-                            ("schema_created_at", created_at),
-                        )
-                        connection.executemany(
-                            "INSERT INTO metadata(key, value) VALUES (?, ?)",
-                            metadata,
-                        )
-                        connection.execute(
-                            """
-                            INSERT INTO schema_migrations(
-                                schema_version, schema_name, definition_hash, applied_at
-                            ) VALUES (?, ?, ?, ?)
-                            """,
-                            (
-                                STORE_SCHEMA_VERSION,
-                                STORE_SCHEMA_NAME,
-                                SCHEMA_DEFINITION_HASH,
-                                created_at,
-                            ),
-                        )
-                        connection.execute(
-                            "PRAGMA user_version = %d" % STORE_SCHEMA_VERSION
-                        )
-                    connection.commit()
-                except Exception:
-                    if connection.in_transaction:
-                        connection.rollback()
-                    raise
-            else:
-                # Validate before any mutating PRAGMA so unknown schemas fail closed.
-                _validate_schema_connection(connection)
-                if not self._read_only:
+                    state = self._inspect_store_connection(connection)
+                finally:
+                    connection.close()
+            if state == "v1":
+                raise MemoryStoreSchemaError(
+                    "memory store schema v1 requires a writable staged migration"
+                )
+            if state == "empty":
+                raise MemoryStoreSchemaError()
+            return
+
+        # Existing stores are first inspected through a real read-only
+        # connection. Opening a crash-recovered v1 database read/write here can
+        # checkpoint its WAL merely when the preflight connection closes.
+        if self.database_path.is_file():
+            connection = self._connect(read_only=True)
+            try:
+                state = self._inspect_store_connection(connection)
+            finally:
+                connection.close()
+            if state == "current":
+                return
+            if state == "v1":
+                self._migrate_v1_store()
+                self._initialize_or_validate()
+                return
+
+        migrate_v1 = False
+        with _exclusive_file_lock(self._memory_lock_path, self._busy_timeout_ms):
+            # Recheck after acquiring the initializer/authority lock. Another
+            # opener may have initialized or migrated the namespace meanwhile.
+            if self.database_path.is_file():
+                connection = self._connect(read_only=True)
+                try:
+                    state = self._inspect_store_connection(connection)
+                finally:
+                    connection.close()
+                if state == "current":
+                    return
+                migrate_v1 = state == "v1"
+
+            if not migrate_v1:
+                connection = self._connect(read_only=False)
+                try:
                     mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
                     if str(mode).casefold() != "wal":
                         raise MemoryStoreUnavailableError(
                             "memory store could not enable write-ahead logging"
                         )
+                    connection.execute("BEGIN IMMEDIATE")
+                    try:
+                        if _table_names(connection):
+                            _validate_schema_connection(connection)
+                        else:
+                            created_at = _utc_now()
+                            for statement in _SCHEMA_STATEMENTS:
+                                connection.execute(statement)
+                            connection.executemany(
+                                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                                (
+                                    ("schema_name", STORE_SCHEMA_NAME),
+                                    ("schema_version", str(STORE_SCHEMA_VERSION)),
+                                    ("schema_definition_hash", SCHEMA_DEFINITION_HASH),
+                                    ("schema_created_at", created_at),
+                                ),
+                            )
+                            connection.execute(
+                                """
+                                INSERT INTO schema_migrations(
+                                    schema_version, schema_name, definition_hash, applied_at
+                                ) VALUES (?, ?, ?, ?)
+                                """,
+                                (
+                                    STORE_SCHEMA_VERSION,
+                                    STORE_SCHEMA_NAME,
+                                    SCHEMA_DEFINITION_HASH,
+                                    created_at,
+                                ),
+                            )
+                            connection.execute(
+                                "PRAGMA user_version = %d" % STORE_SCHEMA_VERSION
+                            )
+                        connection.commit()
+                    except Exception:
+                        if connection.in_transaction:
+                            connection.rollback()
+                        raise
+                    self._inspect_store_connection(connection)
+                except MemoryStoreError:
+                    raise
+                except sqlite3.Error as error:
+                    raise _translate_sqlite_error(error) from None
+                finally:
+                    connection.close()
 
-            _validate_schema_connection(connection)
-            journal_mode = str(
-                connection.execute("PRAGMA journal_mode").fetchone()[0]
-            ).casefold()
-            if journal_mode != "wal":
-                raise MemoryStoreCorruptionError(
-                    "memory store write-ahead logging is not enabled"
+        if migrate_v1:
+            self._migrate_v1_store()
+            self._initialize_or_validate()
+
+    def _inspect_store_connection(self, connection: sqlite3.Connection) -> str:
+        tables = _table_names(connection)
+        if not tables:
+            return "empty"
+        if _is_v1_schema_connection(connection):
+            _validate_v1_schema_connection(connection)
+            return "v1"
+        _validate_schema_connection(connection)
+        if not _database_header_uses_wal(self.database_path):
+            raise MemoryStoreCorruptionError(
+                "memory store write-ahead logging is not enabled"
+            )
+        if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise MemoryStoreUnavailableError(
+                "memory store could not enable foreign-key validation"
+            )
+        return "current"
+
+    def _migrate_v1_store(self) -> None:
+        """Upgrade a validated v1 database through an atomic staged copy."""
+
+        staging = self.database_path.with_name(
+            _temporary_name(".v1-to-v2.migration.sqlite3")
+        )
+        lock_path = self.namespace_path / ".memory-store.lock"
+        with _exclusive_file_lock(lock_path, self._busy_timeout_ms):
+            try:
+                source = self._connect(read_only=True)
+                try:
+                    if not _is_v1_schema_connection(source):
+                        _validate_schema_connection(source)
+                        return
+                    _validate_v1_schema_connection(source)
+                    staged_connection = sqlite3.connect(
+                        str(staging), isolation_level=None
+                    )
+                    try:
+                        source.backup(staged_connection)
+                    finally:
+                        staged_connection.close()
+                finally:
+                    source.close()
+
+                staged_connection = sqlite3.connect(
+                    str(staging),
+                    timeout=self._busy_timeout_ms / 1000.0,
+                    isolation_level=None,
                 )
-            if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
-                raise MemoryStoreUnavailableError(
-                    "memory store could not enable foreign-key validation"
+                staged_connection.row_factory = sqlite3.Row
+                try:
+                    staged_connection.execute("PRAGMA foreign_keys = ON")
+                    _validate_v1_schema_connection(staged_connection)
+                    staged_connection.execute("BEGIN IMMEDIATE")
+                    self._migrate_v1_connection(staged_connection)
+                    staged_connection.commit()
+                    if staged_connection.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchone() is not None:
+                        raise MemoryStoreMigrationError()
+                    integrity = staged_connection.execute(
+                        "PRAGMA integrity_check"
+                    ).fetchone()
+                    if integrity is None or str(integrity[0]).casefold() != "ok":
+                        raise MemoryStoreMigrationError()
+                    _validate_schema_connection(staged_connection)
+                    mode = staged_connection.execute(
+                        "PRAGMA journal_mode = WAL"
+                    ).fetchone()[0]
+                    if str(mode).casefold() != "wal":
+                        raise MemoryStoreMigrationError()
+                    staged_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    if staged_connection.in_transaction:
+                        staged_connection.rollback()
+                    raise MemoryStoreMigrationError() from None
+                finally:
+                    staged_connection.close()
+
+                staged_store = MemoryStore(
+                    staging,
+                    busy_timeout_ms=self._busy_timeout_ms,
+                    read_only=True,
                 )
-        except MemoryStoreError:
-            raise
-        except sqlite3.Error as error:
-            raise _translate_sqlite_error(error) from None
-        finally:
-            connection.close()
+                staged_store.validate_integrity()
+                os.replace(str(staging), str(self.database_path))
+                for suffix in ("-wal", "-shm"):
+                    try:
+                        Path(str(self.database_path) + suffix).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                _fsync_directory(self.database_path.parent)
+            except MemoryStoreMigrationError:
+                raise
+            except (MemoryStoreError, OSError, sqlite3.Error):
+                raise MemoryStoreMigrationError() from None
+            finally:
+                for path in (
+                    staging,
+                    Path(str(staging) + "-wal"),
+                    Path(str(staging) + "-shm"),
+                ):
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+    @staticmethod
+    def _migrate_v1_connection(connection: sqlite3.Connection) -> None:
+        applied_at = _utc_now()
+        connection.execute(
+            "ALTER TABLE outbox_receipts RENAME TO outbox_receipts_v1"
+        )
+        connection.execute(_V2_OUTBOX_RECEIPTS_STATEMENT)
+        connection.execute(
+            """
+            INSERT INTO outbox_receipts(
+                request_id, repository_key, operation, request_hash,
+                request_hash_version, subject_id, event_id, result_json,
+                created_at
+            )
+            SELECT request_id, repository_key, operation, request_hash,
+                   ?, subject_id, event_id, result_json, created_at
+            FROM outbox_receipts_v1
+            """,
+            (LEGACY_REQUEST_HASH_VERSION,),
+        )
+        connection.execute("DROP TABLE outbox_receipts_v1")
+        for statement in _V2_SCHEMA_ADDITIONS:
+            if statement == _V2_OUTBOX_RECEIPTS_STATEMENT:
+                continue
+            connection.execute(statement)
+        connection.executemany(
+            "UPDATE metadata SET value = ? WHERE key = ?",
+            (
+                (STORE_SCHEMA_NAME, "schema_name"),
+                (str(STORE_SCHEMA_VERSION), "schema_version"),
+                (SCHEMA_DEFINITION_HASH, "schema_definition_hash"),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(
+                schema_version, schema_name, definition_hash, applied_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                STORE_SCHEMA_VERSION,
+                STORE_SCHEMA_NAME,
+                SCHEMA_DEFINITION_HASH,
+                applied_at,
+            ),
+        )
+        connection.execute("PRAGMA user_version = %d" % STORE_SCHEMA_VERSION)
 
     def metadata(self) -> Dict[str, str]:
         with self._reader() as connection:
@@ -1051,14 +1394,14 @@ class MemoryStore:
         ).fetchone()
         if row is None:
             return GenerationMetadata(
-                store_schema_version=STORE_SCHEMA_VERSION,
+                store_schema_version=GENERATION_METADATA_STORE_SCHEMA_VERSION,
                 memory_generation=0,
                 feedback_generation=0,
                 knowledge_generation=0,
             )
         try:
             return GenerationMetadata(
-                store_schema_version=STORE_SCHEMA_VERSION,
+                store_schema_version=GENERATION_METADATA_STORE_SCHEMA_VERSION,
                 memory_generation=row["memory_generation"],
                 feedback_generation=row["feedback_generation"],
                 knowledge_generation=row["knowledge_generation"],
@@ -1073,8 +1416,7 @@ class MemoryStore:
         kind: str,
         expected: Optional[int],
     ) -> int:
-        if expected is not None and (type(expected) is not int or expected < 0):
-            raise MemoryStoreValidationError("expected generation must be non-negative")
+        expected = _expected_generation(expected)
         generations = MemoryStore._generations_from_connection(
             connection, repository_key
         )
@@ -1113,20 +1455,35 @@ class MemoryStore:
         repository_key: Optional[str],
         operation: str,
         request_hash: str,
+        legacy_request_hash: str,
     ) -> Optional[WriteResult]:
         row = connection.execute(
             """
-            SELECT repository_key, operation, request_hash, result_json
+            SELECT repository_key, operation, request_hash,
+                   request_hash_version, result_json
             FROM outbox_receipts WHERE request_id = ?
             """,
             (request_id,),
         ).fetchone()
         if row is None:
             return None
+        version = row["request_hash_version"]
+        if type(version) is not int or version not in {
+            LEGACY_REQUEST_HASH_VERSION,
+            SEMANTIC_REQUEST_HASH_VERSION,
+        }:
+            raise MemoryStoreCorruptionError(
+                "memory request hash version is invalid"
+            )
+        expected_hash = (
+            legacy_request_hash
+            if version == LEGACY_REQUEST_HASH_VERSION
+            else request_hash
+        )
         if (
             (repository_key is not None and row["repository_key"] != repository_key)
             or row["operation"] != operation
-            or not hmac.compare_digest(str(row["request_hash"]), request_hash)
+            or not hmac.compare_digest(str(row["request_hash"]), expected_hash)
         ):
             raise MemoryStoreConflictError("request ID was reused for different content")
         try:
@@ -1150,15 +1507,17 @@ class MemoryStore:
         connection.execute(
             """
             INSERT INTO outbox_receipts(
-                request_id, repository_key, operation, request_hash, subject_id,
-                event_id, result_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                request_id, repository_key, operation, request_hash,
+                request_hash_version, subject_id, event_id, result_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id,
                 repository_key,
                 operation,
                 request_hash,
+                SEMANTIC_REQUEST_HASH_VERSION,
                 result.subject_id,
                 result.event_id,
                 canonical_json(result.to_dict()),
@@ -1205,7 +1564,7 @@ class MemoryStore:
         actual_event_id = _event_id(
             event_id
             or stable_event_id(
-                STORE_SCHEMA_NAME,
+                EVENT_ID_NAMESPACE,
                 key,
                 checked_subject_type,
                 checked_subject_id,
@@ -1572,6 +1931,7 @@ class MemoryStore:
     def put_candidate(
         self,
         candidate: MemoryCandidate,
+        authority_receipt: Optional[CandidateAuthorityReceipt] = None,
         *,
         request_id: Optional[str] = None,
         expected_generation: Optional[int] = None,
@@ -1592,18 +1952,33 @@ class MemoryStore:
         )
         producer_type = actor_type or candidate.producer.producer_type.value
         producer_id = actor_id or candidate.producer.name
-        request_hash = canonical_sha256(
-            {
-                "operation": operation,
-                "candidate": candidate.to_dict(),
-                "expected_generation": expected_generation,
-                "actor_type": producer_type,
-                "actor_id": producer_id,
-                "reason_code": reason_code,
-                "reason": reason,
-            }
+        checked_authority = _canonical_candidate_authority_receipt(
+            authority_receipt,
+            candidate,
+        )
+        legacy_payload = {
+            "operation": operation,
+            "candidate": candidate.to_dict(),
+            "actor_type": producer_type,
+            "actor_id": producer_id,
+            "reason_code": reason_code,
+            "reason": reason,
+        }
+        semantic_payload = dict(legacy_payload)
+        semantic_payload["authority_receipt"] = (
+            None if checked_authority is None else checked_authority.to_dict()
+        )
+        request_hash, legacy_request_hash = _request_hash_pair(
+            semantic_payload,
+            expected_generation=expected_generation,
+            legacy_payload=legacy_payload,
         )
         model_json, body_hash = _model_storage(candidate)
+        authority_storage = (
+            None
+            if checked_authority is None
+            else _model_storage(checked_authority)
+        )
         with self._authority() as connection:
             self._ensure_repository_rows(
                 connection, candidate.repository_key, candidate.created_at
@@ -1614,6 +1989,7 @@ class MemoryStore:
                 repository_key=candidate.repository_key,
                 operation=operation,
                 request_hash=request_hash,
+                legacy_request_hash=legacy_request_hash,
             )
             if replay is not None:
                 return replay
@@ -1636,6 +2012,49 @@ class MemoryStore:
                     raise MemoryStoreConflictError(
                         "candidate ID already exists with different canonical content"
                     )
+                authority_applied = False
+                if checked_authority is not None:
+                    existing_authority_row = connection.execute(
+                        """
+                        SELECT * FROM candidate_authority_receipts
+                        WHERE candidate_id = ?
+                          AND authority_resolution_hash = ?
+                        """,
+                        (
+                            candidate.candidate_id,
+                            checked_authority.authority_resolution_hash,
+                        ),
+                    ).fetchone()
+                    if existing_authority_row is None:
+                        authority_json, authority_body_hash = authority_storage
+                        connection.execute(
+                            """
+                            INSERT INTO candidate_authority_receipts(
+                                receipt_id, candidate_id,
+                                authority_resolution_hash, model_json,
+                                body_hash, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                checked_authority.receipt_id,
+                                candidate.candidate_id,
+                                checked_authority.authority_resolution_hash,
+                                authority_json,
+                                authority_body_hash,
+                                checked_authority.created_at,
+                            ),
+                        )
+                        authority_applied = True
+                    else:
+                        existing_authority = _candidate_authority_receipt_from_row(
+                            connection,
+                            existing_authority_row,
+                        )
+                        if existing_authority != checked_authority:
+                            raise MemoryStoreConflictError(
+                                "candidate authority resolution already has a "
+                                "different immutable receipt"
+                            )
                 result = WriteResult(
                     operation=operation,
                     subject_id=candidate.candidate_id,
@@ -1643,7 +2062,7 @@ class MemoryStore:
                     generations=self._generations_from_connection(
                         connection, candidate.repository_key
                     ),
-                    applied=False,
+                    applied=authority_applied,
                 )
                 self._store_request_receipt(
                     connection,
@@ -1677,6 +2096,24 @@ class MemoryStore:
                     candidate.created_at,
                 ),
             )
+            if checked_authority is not None and authority_storage is not None:
+                authority_json, authority_body_hash = authority_storage
+                connection.execute(
+                    """
+                    INSERT INTO candidate_authority_receipts(
+                        receipt_id, candidate_id, authority_resolution_hash,
+                        model_json, body_hash, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        checked_authority.receipt_id,
+                        candidate.candidate_id,
+                        checked_authority.authority_resolution_hash,
+                        authority_json,
+                        authority_body_hash,
+                        checked_authority.created_at,
+                    ),
+                )
             event = self._append_event(
                 connection,
                 repository_key=candidate.repository_key,
@@ -1730,6 +2167,122 @@ class MemoryStore:
             raise MemoryStoreNotFoundError("memory candidate was not found")
         return candidate
 
+    def find_candidate_authority_receipt(
+        self,
+        candidate_id: str,
+        *,
+        authority_resolution_hash: Optional[str] = None,
+    ) -> Optional[CandidateAuthorityReceipt]:
+        checked_id = _stable_subject_id(candidate_id, "MC", "candidate_id")
+        checked_resolution = (
+            None
+            if authority_resolution_hash is None
+            else _digest(
+                authority_resolution_hash,
+                "authority_resolution_hash",
+            )
+        )
+        with self._reader() as connection:
+            if checked_resolution is not None:
+                row = connection.execute(
+                    """
+                    SELECT * FROM candidate_authority_receipts
+                    WHERE candidate_id = ?
+                      AND authority_resolution_hash = ?
+                    """,
+                    (checked_id, checked_resolution),
+                ).fetchone()
+                return (
+                    None
+                    if row is None
+                    else _candidate_authority_receipt_from_row(connection, row)
+                )
+            rows = connection.execute(
+                """
+                SELECT * FROM candidate_authority_receipts
+                WHERE candidate_id = ?
+                ORDER BY authority_resolution_hash, receipt_id
+                """,
+                (checked_id,),
+            ).fetchall()
+            if not rows:
+                return None
+            if len(rows) != 1:
+                raise MemoryStoreConflictError(
+                    "candidate has multiple authority contexts; an exact "
+                    "authority_resolution_hash is required"
+                )
+            return _candidate_authority_receipt_from_row(connection, rows[0])
+
+    def get_candidate_authority_receipt(
+        self,
+        candidate_id: str,
+        *,
+        authority_resolution_hash: Optional[str] = None,
+    ) -> CandidateAuthorityReceipt:
+        receipt = self.find_candidate_authority_receipt(
+            candidate_id,
+            authority_resolution_hash=authority_resolution_hash,
+        )
+        if receipt is None:
+            raise MemoryStoreNotFoundError(
+                "candidate authority receipt was not found"
+            )
+        return receipt
+
+    def list_candidate_authority_receipts(
+        self,
+        candidate_id: str,
+    ) -> Tuple[CandidateAuthorityReceipt, ...]:
+        checked_id = _stable_subject_id(candidate_id, "MC", "candidate_id")
+        with self._reader() as connection:
+            return tuple(
+                _candidate_authority_receipt_from_row(connection, row)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM candidate_authority_receipts
+                    WHERE candidate_id = ?
+                    ORDER BY authority_resolution_hash, receipt_id
+                    """,
+                    (checked_id,),
+                )
+            )
+
+    def select_candidate_authority_receipt(
+        self,
+        candidate_id: str,
+        *,
+        authority_resolution_hash: str,
+    ) -> CandidateAuthorityReceipt:
+        return self.get_candidate_authority_receipt(
+            candidate_id,
+            authority_resolution_hash=authority_resolution_hash,
+        )
+
+    @staticmethod
+    def _require_candidate_authority(
+        connection: sqlite3.Connection,
+        candidate_id: str,
+        authority_resolution_hash: Optional[str],
+    ) -> CandidateAuthorityReceipt:
+        if authority_resolution_hash is None:
+            raise MemoryStoreValidationError(
+                "approval/materialization requires an exact current-context "
+                "authority_resolution_hash"
+            )
+        row = connection.execute(
+            """
+            SELECT * FROM candidate_authority_receipts
+            WHERE candidate_id = ? AND authority_resolution_hash = ?
+            """,
+            (candidate_id, authority_resolution_hash),
+        ).fetchone()
+        if row is None:
+            raise MemoryStoreConflictError(
+                "selected candidate authority context is not stored"
+            )
+        return _candidate_authority_receipt_from_row(connection, row)
+
     def list_candidates(
         self,
         repository_key: str,
@@ -1765,6 +2318,7 @@ class MemoryStore:
         created_at: Optional[str] = None,
         reason: Optional[str] = None,
         expected_generation: Optional[int] = None,
+        authority_resolution_hash: Optional[str] = None,
     ) -> WriteResult:
         checked_id = _stable_subject_id(candidate_id, "MC", "candidate_id")
         if not isinstance(expected_status, CandidateStatus) or not isinstance(
@@ -1774,19 +2328,32 @@ class MemoryStore:
         operation = "transition_candidate"
         timestamp = _timestamp(created_at or _utc_now(), "created_at")
         checked_request = _request_id(request_id)
-        request_hash = canonical_sha256(
-            {
-                "operation": operation,
-                "candidate_id": checked_id,
-                "expected_status": expected_status.value,
-                "new_status": new_status.value,
-                "action": action,
-                "actor_type": actor_type,
-                "actor_id": actor_id,
-                "reason_code": reason_code,
-                "reason": reason,
-                "expected_generation": expected_generation,
-            }
+        checked_authority_resolution = _optional_digest(
+            authority_resolution_hash,
+            "authority_resolution_hash",
+        )
+        legacy_payload = {
+            "operation": operation,
+            "candidate_id": checked_id,
+            "expected_status": expected_status.value,
+            "new_status": new_status.value,
+            "action": action,
+            "actor_type": actor_type,
+            "actor_id": actor_id,
+            "reason_code": reason_code,
+            "reason": reason,
+        }
+        semantic_payload = dict(legacy_payload)
+        semantic_payload["created_at"] = (
+            None if created_at is None else timestamp
+        )
+        semantic_payload["authority_resolution_hash"] = (
+            checked_authority_resolution
+        )
+        request_hash, legacy_request_hash = _request_hash_pair(
+            semantic_payload,
+            expected_generation=expected_generation,
+            legacy_payload=legacy_payload,
         )
         with self._authority() as connection:
             row = connection.execute(
@@ -1801,9 +2368,16 @@ class MemoryStore:
                 repository_key=candidate.repository_key,
                 operation=operation,
                 request_hash=request_hash,
+                legacy_request_hash=legacy_request_hash,
             )
             if replay is not None:
                 return replay
+            if new_status is CandidateStatus.APPROVED:
+                self._require_candidate_authority(
+                    connection,
+                    checked_id,
+                    checked_authority_resolution,
+                )
             self._assert_generation(
                 connection,
                 candidate.repository_key,
@@ -2219,14 +2793,51 @@ class MemoryStore:
         return self.get_blob_info(blob_hash, validate=True)
 
     def read_blob(self, blob_hash: str) -> bytes:
-        with _exclusive_file_lock(self._blob_lock_path, self._busy_timeout_ms):
-            info = self.get_blob_info(blob_hash, validate=True)
-            try:
-                return Path(info.path).read_bytes()
-            except OSError:
-                raise MemoryStoreCorruptionError(
-                    "memory blob is missing or unreadable"
-                ) from None
+        info = self.get_blob_info(blob_hash, validate=False)
+        path = Path(info.path)
+        descriptor: Optional[int] = None
+        try:
+            if path.is_symlink():
+                raise MemoryStoreCorruptionError("memory blob is not a regular file")
+            descriptor = os.open(
+                str(path),
+                os.O_RDONLY
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            file_status = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(file_status.st_mode)
+                or file_status.st_size != info.size_bytes
+            ):
+                raise MemoryStoreCorruptionError("memory blob size validation failed")
+            chunks: List[bytes] = []
+            actual = hashlib.sha256()
+            remaining = info.size_bytes
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise MemoryStoreCorruptionError(
+                        "memory blob size validation failed"
+                    )
+                chunks.append(chunk)
+                actual.update(chunk)
+                remaining -= len(chunk)
+            if os.read(descriptor, 1):
+                raise MemoryStoreCorruptionError("memory blob size validation failed")
+            if not hmac.compare_digest(actual.hexdigest(), info.blob_hash):
+                raise MemoryStoreCorruptionError("memory blob hash validation failed")
+            return b"".join(chunks)
+        except MemoryStoreError:
+            raise
+        except (OSError, ValueError):
+            raise MemoryStoreCorruptionError(
+                "memory blob is missing or unreadable"
+            ) from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     def pin_blob(
         self,
@@ -2270,6 +2881,7 @@ class MemoryStore:
         *,
         request_id: Optional[str] = None,
         expected_generation: Optional[int] = None,
+        authority_resolution_hash: Optional[str] = None,
     ) -> WriteResult:
         if not isinstance(bundle, SourceBundleDescriptor):
             raise MemoryStoreValidationError(
@@ -2279,12 +2891,22 @@ class MemoryStore:
         checked_request = _request_id(
             request_id or stable_request_id(operation, bundle.bundle_hash)
         )
-        request_hash = canonical_sha256(
-            {
-                "operation": operation,
-                "bundle": bundle.to_dict(),
-                "expected_generation": expected_generation,
-            }
+        checked_authority_resolution = _optional_digest(
+            authority_resolution_hash,
+            "authority_resolution_hash",
+        )
+        legacy_payload = {
+            "operation": operation,
+            "bundle": bundle.to_dict(),
+        }
+        semantic_payload = dict(legacy_payload)
+        semantic_payload["authority_resolution_hash"] = (
+            checked_authority_resolution
+        )
+        request_hash, legacy_request_hash = _request_hash_pair(
+            semantic_payload,
+            expected_generation=expected_generation,
+            legacy_payload=legacy_payload,
         )
         model_json, body_hash = _model_storage(bundle)
         with self._authority() as connection:
@@ -2295,6 +2917,7 @@ class MemoryStore:
                 repository_key=bundle.repository_key,
                 operation=operation,
                 request_hash=request_hash,
+                legacy_request_hash=legacy_request_hash,
             )
             if replay is not None:
                 return replay
@@ -2334,6 +2957,11 @@ class MemoryStore:
                     applied=False,
                 )
             else:
+                self._require_candidate_authority(
+                    connection,
+                    bundle.candidate_id,
+                    checked_authority_resolution,
+                )
                 generation = self._bump_generation(
                     connection, bundle.repository_key, "memory"
                 )
@@ -2431,6 +3059,7 @@ class MemoryStore:
         request_id: str,
         expected_candidate_status: CandidateStatus,
         expected_generation: Optional[int] = None,
+        authority_resolution_hash: Optional[str] = None,
         actor_type: str = "human",
         actor_id: Optional[str] = None,
         reason_code: str = "approved",
@@ -2514,24 +3143,34 @@ class MemoryStore:
         operation = "approve_candidate_with_source_bundle"
         checked_request = _request_id(request_id)
         approver = actor_id or record.approved_by
-        request_hash = canonical_sha256(
-            {
-                "operation": operation,
-                "record": record.to_dict(),
-                "bundle": bundle.to_dict(),
-                "expected_candidate_status": expected_candidate_status.value,
-                "expected_generation": expected_generation,
-                "actor_type": actor_type,
-                "actor_id": approver,
-                "reason_code": reason_code,
-                "reason": reason,
-                "supersede_memory_id": checked_supersede_id,
-                "expected_supersede_status": (
-                    None
-                    if expected_supersede_status is None
-                    else expected_supersede_status.value
-                ),
-            }
+        checked_authority_resolution = _optional_digest(
+            authority_resolution_hash,
+            "authority_resolution_hash",
+        )
+        legacy_payload = {
+            "operation": operation,
+            "record": record.to_dict(),
+            "bundle": bundle.to_dict(),
+            "expected_candidate_status": expected_candidate_status.value,
+            "actor_type": actor_type,
+            "actor_id": approver,
+            "reason_code": reason_code,
+            "reason": reason,
+            "supersede_memory_id": checked_supersede_id,
+            "expected_supersede_status": (
+                None
+                if expected_supersede_status is None
+                else expected_supersede_status.value
+            ),
+        }
+        semantic_payload = dict(legacy_payload)
+        semantic_payload["authority_resolution_hash"] = (
+            checked_authority_resolution
+        )
+        request_hash, legacy_request_hash = _request_hash_pair(
+            semantic_payload,
+            expected_generation=expected_generation,
+            legacy_payload=legacy_payload,
         )
         record_json, record_body_hash = _model_storage(record)
         bundle_json, bundle_body_hash = _model_storage(bundle)
@@ -2548,9 +3187,15 @@ class MemoryStore:
                 repository_key=record.repository_key,
                 operation=operation,
                 request_hash=request_hash,
+                legacy_request_hash=legacy_request_hash,
             )
             if replay is not None:
                 return replay
+            self._require_candidate_authority(
+                connection,
+                record.candidate_id,
+                checked_authority_resolution,
+            )
             self._assert_generation(
                 connection,
                 record.repository_key,
@@ -2824,6 +3469,7 @@ class MemoryStore:
         request_id: str,
         expected_candidate_status: CandidateStatus,
         expected_generation: Optional[int] = None,
+        authority_resolution_hash: Optional[str] = None,
         actor_type: str = "human",
         actor_id: Optional[str] = None,
         reason_code: str = "approved",
@@ -2844,17 +3490,27 @@ class MemoryStore:
         operation = "approve_candidate"
         checked_request = _request_id(request_id)
         approver = actor_id or record.approved_by
-        request_hash = canonical_sha256(
-            {
-                "operation": operation,
-                "record": record.to_dict(),
-                "expected_candidate_status": expected_candidate_status.value,
-                "expected_generation": expected_generation,
-                "actor_type": actor_type,
-                "actor_id": approver,
-                "reason_code": reason_code,
-                "reason": reason,
-            }
+        checked_authority_resolution = _optional_digest(
+            authority_resolution_hash,
+            "authority_resolution_hash",
+        )
+        legacy_payload = {
+            "operation": operation,
+            "record": record.to_dict(),
+            "expected_candidate_status": expected_candidate_status.value,
+            "actor_type": actor_type,
+            "actor_id": approver,
+            "reason_code": reason_code,
+            "reason": reason,
+        }
+        semantic_payload = dict(legacy_payload)
+        semantic_payload["authority_resolution_hash"] = (
+            checked_authority_resolution
+        )
+        request_hash, legacy_request_hash = _request_hash_pair(
+            semantic_payload,
+            expected_generation=expected_generation,
+            legacy_payload=legacy_payload,
         )
         model_json, body_hash = _model_storage(record)
         with self._authority() as connection:
@@ -2865,9 +3521,15 @@ class MemoryStore:
                 repository_key=record.repository_key,
                 operation=operation,
                 request_hash=request_hash,
+                legacy_request_hash=legacy_request_hash,
             )
             if replay is not None:
                 return replay
+            self._require_candidate_authority(
+                connection,
+                record.candidate_id,
+                checked_authority_resolution,
+            )
             self._assert_generation(
                 connection, record.repository_key, "memory", expected_generation
             )
@@ -3070,19 +3732,25 @@ class MemoryStore:
         operation = "transition_record"
         timestamp = _timestamp(created_at or _utc_now(), "created_at")
         checked_request = _request_id(request_id)
-        request_hash = canonical_sha256(
-            {
-                "operation": operation,
-                "memory_id": checked_id,
-                "expected_status": expected_status.value,
-                "new_status": new_status.value,
-                "action": action,
-                "actor_type": actor_type,
-                "actor_id": actor_id,
-                "reason_code": reason_code,
-                "reason": reason,
-                "expected_generation": expected_generation,
-            }
+        legacy_payload = {
+            "operation": operation,
+            "memory_id": checked_id,
+            "expected_status": expected_status.value,
+            "new_status": new_status.value,
+            "action": action,
+            "actor_type": actor_type,
+            "actor_id": actor_id,
+            "reason_code": reason_code,
+            "reason": reason,
+        }
+        semantic_payload = dict(legacy_payload)
+        semantic_payload["created_at"] = (
+            None if created_at is None else timestamp
+        )
+        request_hash, legacy_request_hash = _request_hash_pair(
+            semantic_payload,
+            expected_generation=expected_generation,
+            legacy_payload=legacy_payload,
         )
         with self._authority() as connection:
             row = connection.execute(
@@ -3097,6 +3765,7 @@ class MemoryStore:
                 repository_key=record.repository_key,
                 operation=operation,
                 request_hash=request_hash,
+                legacy_request_hash=legacy_request_hash,
             )
             if replay is not None:
                 return replay
@@ -3172,12 +3841,12 @@ class MemoryStore:
         checked_request = _request_id(
             request_id or stable_request_id(operation, feedback.feedback_id)
         )
-        request_hash = canonical_sha256(
+        request_hash, legacy_request_hash = _request_hash_pair(
             {
                 "operation": operation,
                 "feedback": feedback.to_dict(),
-                "expected_generation": expected_generation,
-            }
+            },
+            expected_generation=expected_generation,
         )
         model_json, body_hash = _model_storage(feedback)
         with self._authority() as connection:
@@ -3190,6 +3859,7 @@ class MemoryStore:
                 repository_key=feedback.repository_key,
                 operation=operation,
                 request_hash=request_hash,
+                legacy_request_hash=legacy_request_hash,
             )
             if replay is not None:
                 return replay
@@ -3336,18 +4006,24 @@ class MemoryStore:
         operation = "transition_feedback"
         timestamp = _timestamp(created_at or _utc_now(), "created_at")
         checked_request = _request_id(request_id)
-        request_hash = canonical_sha256(
-            {
-                "operation": operation,
-                "feedback_id": checked_id,
-                "expected_status": expected_status.value,
-                "new_status": new_status.value,
-                "action": action,
-                "actor_id": actor_id,
-                "reason_code": reason_code,
-                "reason": reason,
-                "expected_generation": expected_generation,
-            }
+        legacy_payload = {
+            "operation": operation,
+            "feedback_id": checked_id,
+            "expected_status": expected_status.value,
+            "new_status": new_status.value,
+            "action": action,
+            "actor_id": actor_id,
+            "reason_code": reason_code,
+            "reason": reason,
+        }
+        semantic_payload = dict(legacy_payload)
+        semantic_payload["created_at"] = (
+            None if created_at is None else timestamp
+        )
+        request_hash, legacy_request_hash = _request_hash_pair(
+            semantic_payload,
+            expected_generation=expected_generation,
+            legacy_payload=legacy_payload,
         )
         with self._authority() as connection:
             row = connection.execute(
@@ -3362,6 +4038,7 @@ class MemoryStore:
                 repository_key=feedback.repository_key,
                 operation=operation,
                 request_hash=request_hash,
+                legacy_request_hash=legacy_request_hash,
             )
             if replay is not None:
                 return replay
@@ -3437,12 +4114,12 @@ class MemoryStore:
         checked_request = _request_id(
             request_id or stable_request_id(operation, entry.entry_id)
         )
-        request_hash = canonical_sha256(
+        request_hash, legacy_request_hash = _request_hash_pair(
             {
                 "operation": operation,
                 "entry": entry.to_dict(),
-                "expected_generation": expected_generation,
-            }
+            },
+            expected_generation=expected_generation,
         )
         model_json, body_hash = _model_storage(entry)
         repository_key = entry.key.repository_key
@@ -3454,6 +4131,7 @@ class MemoryStore:
                 repository_key=repository_key,
                 operation=operation,
                 request_hash=request_hash,
+                legacy_request_hash=legacy_request_hash,
             )
             if replay is not None:
                 return replay
@@ -3692,12 +4370,18 @@ class MemoryStore:
         checked_request = _request_id(request_id)
         timestamp = _timestamp(created_at or _utc_now(), "created_at")
         operation = "delete_knowledge_entry"
-        request_hash = canonical_sha256(
-            {
-                "operation": operation,
-                "entry_id": checked_id,
-                "expected_generation": expected_generation,
-            }
+        legacy_payload = {
+            "operation": operation,
+            "entry_id": checked_id,
+        }
+        semantic_payload = dict(legacy_payload)
+        semantic_payload["created_at"] = (
+            None if created_at is None else timestamp
+        )
+        request_hash, legacy_request_hash = _request_hash_pair(
+            semantic_payload,
+            expected_generation=expected_generation,
+            legacy_payload=legacy_payload,
         )
         with self._authority() as connection:
             replay = self._request_receipt(
@@ -3706,6 +4390,7 @@ class MemoryStore:
                 repository_key=None,
                 operation=operation,
                 request_hash=request_hash,
+                legacy_request_hash=legacy_request_hash,
             )
             if replay is not None:
                 return replay
@@ -3774,26 +4459,47 @@ class MemoryStore:
         dry_run: bool = True,
         grace_seconds: float = 0,
         now: Optional[float] = None,
-    ) -> BlobGCResult:
-        with _exclusive_file_lock(self._blob_lock_path, self._busy_timeout_ms):
-            return self._gc_blobs_locked(
-                dry_run=dry_run,
-                grace_seconds=grace_seconds,
-                now=now,
-            )
-
-    def _gc_blobs_locked(
-        self,
-        *,
-        dry_run: bool = True,
-        grace_seconds: float = 0,
-        now: Optional[float] = None,
+        confirmed_preview: Optional[BlobGCResult] = None,
     ) -> BlobGCResult:
         if type(dry_run) is not bool:
             raise MemoryStoreValidationError("dry_run must be a boolean")
-        if not isinstance(grace_seconds, (int, float)) or grace_seconds < 0:
-            raise MemoryStoreValidationError("GC grace period must be non-negative")
-        cutoff = (time.time() if now is None else float(now)) - float(grace_seconds)
+        if dry_run:
+            if confirmed_preview is not None:
+                raise MemoryStoreValidationError(
+                    "a confirmed GC preview is only valid for apply"
+                )
+            cutoff = _gc_cutoff(grace_seconds, now)
+            return self._scan_blob_gc(cutoff=cutoff)
+        if self._read_only:
+            raise MemoryStoreReadOnlyError()
+        _gc_cutoff(grace_seconds, now)
+        if grace_seconds != 0 or now is not None:
+            raise MemoryStoreValidationError(
+                "GC apply uses the cutoff signed into its confirmed preview"
+            )
+        preview = _validated_gc_preview(
+            confirmed_preview,
+            database_path=self.database_path,
+        )
+        assert preview.cutoff is not None
+        with _exclusive_file_lock(self._blob_lock_path, self._busy_timeout_ms):
+            return self._apply_blob_gc_locked(preview, cutoff=preview.cutoff)
+
+    def apply_blob_gc(
+        self,
+        preview: BlobGCResult,
+        *,
+        grace_seconds: float = 0,
+        now: Optional[float] = None,
+    ) -> BlobGCResult:
+        return self.gc_blobs(
+            dry_run=False,
+            grace_seconds=grace_seconds,
+            now=now,
+            confirmed_preview=preview,
+        )
+
+    def _scan_blob_gc(self, *, cutoff: float) -> BlobGCResult:
         with self._reader() as connection:
             rows = connection.execute(
                 """
@@ -3855,23 +4561,39 @@ class MemoryStore:
                 raise MemoryStoreUnavailableError("memory blob GC scan failed") from None
 
         candidate_hashes = tuple(digest for digest, _ in candidates)
-        if dry_run:
-            return BlobGCResult(
-                candidate_hashes=candidate_hashes,
-                deleted_hashes=(),
-                orphan_paths=tuple(sorted(str(path) for path in orphan_paths)),
-                deleted_orphan_paths=(),
-                reclaimed_bytes=sum(size for _, size in candidates),
-                dry_run=True,
-            )
+        orphan_path_values = tuple(sorted(str(path) for path in orphan_paths))
+        reclaimed_bytes = sum(size for _, size in candidates)
+        preview_token = _gc_preview_token(
+            database_path=self.database_path,
+            candidate_hashes=candidate_hashes,
+            orphan_paths=orphan_path_values,
+            reclaimed_bytes=reclaimed_bytes,
+            cutoff=cutoff,
+        )
+        return BlobGCResult(
+            candidate_hashes=candidate_hashes,
+            deleted_hashes=(),
+            orphan_paths=orphan_path_values,
+            deleted_orphan_paths=(),
+            reclaimed_bytes=reclaimed_bytes,
+            dry_run=True,
+            cutoff=cutoff,
+            preview_token=preview_token,
+        )
 
+    def _apply_blob_gc_locked(
+        self,
+        preview: BlobGCResult,
+        *,
+        cutoff: float,
+    ) -> BlobGCResult:
         deleted: List[str] = []
         reclaimed = 0
         with self._authority() as connection:
-            for digest, size in candidates:
+            for digest in preview.candidate_hashes:
                 eligible = connection.execute(
                     """
-                    SELECT 1 FROM blobs AS b
+                    SELECT b.size_bytes FROM blobs AS b
                     WHERE b.blob_hash = ?
                       AND NOT EXISTS (SELECT 1 FROM source_bundles s WHERE s.blob_hash = b.blob_hash)
                       AND NOT EXISTS (SELECT 1 FROM knowledge_entries k WHERE k.blob_hash = b.blob_hash)
@@ -3881,9 +4603,15 @@ class MemoryStore:
                 ).fetchone()
                 if eligible is None:
                     continue
+                path = self.blob_path(digest)
+                try:
+                    if path.exists() and path.stat().st_mtime > cutoff:
+                        continue
+                except OSError:
+                    continue
                 connection.execute("DELETE FROM blobs WHERE blob_hash = ?", (digest,))
                 deleted.append(digest)
-                reclaimed += size
+                reclaimed += int(eligible["size_bytes"])
 
         deleted_orphans: List[str] = []
         for digest in deleted:
@@ -3895,8 +4623,22 @@ class MemoryStore:
                 # A committed DB deletion followed by a failed unlink is a safe orphan;
                 # the next GC pass will retry it.
                 pass
-        for path in sorted(orphan_paths, key=lambda item: str(item)):
+        for raw_path in preview.orphan_paths:
+            path = Path(raw_path)
+            if not self._is_confirmed_orphan_path(path):
+                continue
             try:
+                if not path.is_file() or path.is_symlink():
+                    continue
+                if path.stat().st_mtime > cutoff:
+                    continue
+                if _SHA256_PATTERN.fullmatch(path.name) is not None:
+                    with self._reader() as connection:
+                        if connection.execute(
+                            "SELECT 1 FROM blobs WHERE blob_hash = ?",
+                            (path.name,),
+                        ).fetchone() is not None:
+                            continue
                 size = path.stat().st_size
                 path.unlink(missing_ok=True)
                 reclaimed += size
@@ -3904,80 +4646,95 @@ class MemoryStore:
             except OSError:
                 pass
         return BlobGCResult(
-            candidate_hashes=candidate_hashes,
+            candidate_hashes=preview.candidate_hashes,
             deleted_hashes=tuple(deleted),
-            orphan_paths=tuple(sorted(str(path) for path in orphan_paths)),
+            orphan_paths=preview.orphan_paths,
             deleted_orphan_paths=tuple(sorted(set(deleted_orphans))),
             reclaimed_bytes=reclaimed,
             dry_run=False,
+            cutoff=cutoff,
         )
+
+    def _is_confirmed_orphan_path(self, path: Path) -> bool:
+        try:
+            resolved = path.resolve(strict=False)
+            blob_root = self.blob_root.resolve(strict=False)
+            temp_root = self._blob_temp_root.resolve(strict=False)
+            return (
+                resolved == blob_root
+                or blob_root in resolved.parents
+                or resolved == temp_root
+                or temp_root in resolved.parents
+            ) and resolved not in {blob_root, temp_root}
+        except OSError:
+            return False
 
     def read_view(self, repository_key: str) -> MemoryStoreReadView:
         """Capture validated projections and generations in one read snapshot."""
 
         key = _repository_key(repository_key)
-        connection = self._connect(read_only=True)
-        try:
-            connection.execute("BEGIN")
-            self._verify_event_chain_connection(connection, key)
-            self._verify_projection_connection(connection, key)
-            generations = self._generations_from_connection(connection, key)
-            records = tuple(
-                _validated_record_from_row(connection, row)
-                for row in connection.execute(
-                    "SELECT * FROM records WHERE repository_key = ? ORDER BY memory_id",
-                    (key,),
+        with self._reader() as connection:
+            try:
+                connection.execute("BEGIN")
+                self._verify_event_chain_connection(connection, key)
+                self._verify_projection_connection(connection, key)
+                generations = self._generations_from_connection(connection, key)
+                records = tuple(
+                    _validated_record_from_row(connection, row)
+                    for row in connection.execute(
+                        "SELECT * FROM records WHERE repository_key = ? ORDER BY memory_id",
+                        (key,),
+                    )
                 )
-            )
-            feedback = tuple(
-                _feedback_from_row(row)
-                for row in connection.execute(
-                    "SELECT * FROM feedback WHERE repository_key = ? ORDER BY feedback_id",
-                    (key,),
+                feedback = tuple(
+                    _feedback_from_row(row)
+                    for row in connection.execute(
+                        "SELECT * FROM feedback WHERE repository_key = ? ORDER BY feedback_id",
+                        (key,),
+                    )
                 )
-            )
-            knowledge = tuple(
-                _knowledge_from_row(connection, row)
-                for row in connection.execute(
-                    """
-                    SELECT * FROM knowledge_entries
-                    WHERE repository_key = ? ORDER BY entry_id
-                    """,
-                    (key,),
+                knowledge = tuple(
+                    _knowledge_from_row(connection, row)
+                    for row in connection.execute(
+                        """
+                        SELECT * FROM knowledge_entries
+                        WHERE repository_key = ? ORDER BY entry_id
+                        """,
+                        (key,),
+                    )
                 )
-            )
-            for record in records:
-                bundle_row = connection.execute(
-                    "SELECT * FROM source_bundles WHERE bundle_hash = ?",
-                    (record.source_bundle_hash,),
-                ).fetchone()
-                if bundle_row is None:
-                    raise MemoryStoreCorruptionError("record source bundle is missing")
-                bundle = _validated_source_bundle_from_row(connection, bundle_row)
-                self._blob_info_from_connection(
-                    connection, bundle.blob_hash, validate_file=True
+                for record in records:
+                    bundle_row = connection.execute(
+                        "SELECT * FROM source_bundles WHERE bundle_hash = ?",
+                        (record.source_bundle_hash,),
+                    ).fetchone()
+                    if bundle_row is None:
+                        raise MemoryStoreCorruptionError(
+                            "record source bundle is missing"
+                        )
+                    bundle = _validated_source_bundle_from_row(connection, bundle_row)
+                    self._blob_info_from_connection(
+                        connection, bundle.blob_hash, validate_file=True
+                    )
+                for entry in knowledge:
+                    self._blob_info_from_connection(
+                        connection, entry.blob_hash, validate_file=True
+                    )
+                connection.commit()
+                return MemoryStoreReadView(
+                    generations=generations,
+                    records=records,
+                    feedback=feedback,
+                    knowledge_entries=knowledge,
                 )
-            for entry in knowledge:
-                self._blob_info_from_connection(
-                    connection, entry.blob_hash, validate_file=True
-                )
-            connection.commit()
-            return MemoryStoreReadView(
-                generations=generations,
-                records=records,
-                feedback=feedback,
-                knowledge_entries=knowledge,
-            )
-        except MemoryStoreError:
-            if connection.in_transaction:
-                connection.rollback()
-            raise
-        except sqlite3.Error as error:
-            if connection.in_transaction:
-                connection.rollback()
-            raise _translate_sqlite_error(error) from None
-        finally:
-            connection.close()
+            except MemoryStoreError:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+            except sqlite3.Error as error:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise _translate_sqlite_error(error) from None
 
     validated_read_view = read_view
 
@@ -4030,6 +4787,9 @@ class MemoryStore:
                         "repository identity metadata is invalid"
                     ) from None
             candidates = connection.execute("SELECT * FROM candidates").fetchall()
+            authority_receipts = connection.execute(
+                "SELECT * FROM candidate_authority_receipts"
+            ).fetchall()
             bundles = connection.execute("SELECT * FROM source_bundles").fetchall()
             records = connection.execute("SELECT * FROM records").fetchall()
             feedback_rows = connection.execute("SELECT * FROM feedback").fetchall()
@@ -4037,6 +4797,8 @@ class MemoryStore:
             blobs = connection.execute("SELECT * FROM blobs").fetchall()
             for row in candidates:
                 _candidate_from_row(row)
+            for row in authority_receipts:
+                _candidate_authority_receipt_from_row(connection, row)
             for row in bundles:
                 bundle = _validated_source_bundle_from_row(connection, row)
                 info = self._blob_info_from_connection(
@@ -4073,10 +4835,14 @@ class MemoryStore:
                 receipt = _receipt_from_row(row)
                 if receipt["event_id"] is not None:
                     event = connection.execute(
-                        "SELECT request_id FROM events WHERE event_id = ?",
+                        "SELECT request_id, repository_key FROM events WHERE event_id = ?",
                         (receipt["event_id"],),
                     ).fetchone()
-                    if event is None or event["request_id"] != receipt["request_id"]:
+                    if (
+                        event is None
+                        or event["request_id"] != receipt["request_id"]
+                        or event["repository_key"] != receipt["repository_key"]
+                    ):
                         raise MemoryStoreCorruptionError(
                             "memory request receipt event is invalid"
                         )
@@ -4182,6 +4948,15 @@ class MemoryStore:
                     "SELECT * FROM candidates ORDER BY candidate_id"
                 )
             ]
+            candidate_authority_receipts = [
+                _export_candidate_authority_receipt_row(row, redact=redact)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM candidate_authority_receipts
+                    ORDER BY candidate_id, authority_resolution_hash, receipt_id
+                    """
+                )
+            ]
             source_bundles = [
                 _export_model_row(row, id_column="bundle_hash", redact=redact)
                 for row in connection.execute(
@@ -4250,6 +5025,7 @@ class MemoryStore:
             "blobs": blobs,
             "blob_pins": pins,
             "candidates": candidates,
+            "candidate_authority_receipts": candidate_authority_receipts,
             "source_bundles": source_bundles,
             "records": records,
             "feedback": feedback,
@@ -4329,6 +5105,7 @@ class MemoryStore:
             "blobs",
             "blob_pins",
             "candidates",
+            "candidate_authority_receipts",
             "source_bundles",
             "records",
             "feedback",
@@ -4361,6 +5138,7 @@ class MemoryStore:
             "blobs",
             "blob_pins",
             "candidates",
+            "candidate_authority_receipts",
             "source_bundles",
             "records",
             "feedback",
@@ -4477,6 +5255,10 @@ class MemoryStore:
         _validate_export_model_rows(
             manifest["candidates"], MemoryCandidate, "candidate_id", redacted
         )
+        _validate_export_candidate_authority_receipts(
+            manifest["candidate_authority_receipts"],
+            redacted,
+        )
         _validate_export_model_rows(
             manifest["source_bundles"],
             SourceBundleDescriptor,
@@ -4499,6 +5281,9 @@ class MemoryStore:
         return ImportPlan(
             repository_keys=tuple(repository_keys),
             candidate_count=len(manifest["candidates"]),
+            authority_receipt_count=len(
+                manifest["candidate_authority_receipts"]
+            ),
             record_count=len(manifest["records"]),
             feedback_count=len(manifest["feedback"]),
             knowledge_count=len(manifest["knowledge_entries"]),
@@ -4510,6 +5295,57 @@ class MemoryStore:
             restorable=restorable,
         )
 
+    def prepare_import_manifest(
+        self,
+        manifest_or_path: Union[Mapping[str, Any], PathInput],
+    ) -> PreparedImport:
+        loaded = _load_manifest(manifest_or_path)
+        try:
+            manifest_json = canonical_json(loaded)
+            manifest = json.loads(manifest_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise MemoryStoreValidationError(
+                "memory import manifest cannot be canonicalized"
+            ) from None
+        plan = self.validate_import_manifest(manifest)
+        self._validate_import_target_identity(plan.repository_keys)
+        return PreparedImport(
+            plan=plan,
+            manifest_hash=str(manifest["manifest_hash"]),
+            _manifest_json=manifest_json,
+        )
+
+    prepare_import = prepare_import_manifest
+
+    def apply_prepared_import(
+        self,
+        prepared: PreparedImport,
+        *,
+        blob_source_root: Optional[PathInput] = None,
+    ) -> ImportPlan:
+        if type(prepared) is not PreparedImport:
+            raise MemoryStoreValidationError(
+                "prepared import must come from prepare_import_manifest"
+            )
+        try:
+            manifest = json.loads(prepared._manifest_json)
+        except (TypeError, json.JSONDecodeError):
+            raise MemoryStoreValidationError("prepared import is invalid") from None
+        if (
+            not isinstance(manifest, Mapping)
+            or canonical_json(manifest) != prepared._manifest_json
+            or manifest.get("manifest_hash") != prepared.manifest_hash
+        ):
+            raise MemoryStoreValidationError("prepared import is invalid")
+        plan = self.validate_import_manifest(manifest)
+        if plan != prepared.plan:
+            raise MemoryStoreValidationError("prepared import plan is inconsistent")
+        self._validate_import_target_identity(plan.repository_keys)
+        if not plan.restorable:
+            raise MemoryStoreValidationError("redacted memory exports cannot be applied")
+        self._apply_import_manifest(manifest, blob_source_root=blob_source_root)
+        return replace(plan, applied=True)
+
     def import_manifest(
         self,
         manifest_or_path: Union[Mapping[str, Any], PathInput],
@@ -4519,15 +5355,13 @@ class MemoryStore:
     ) -> ImportPlan:
         if type(dry_run) is not bool:
             raise MemoryStoreValidationError("dry_run must be a boolean")
-        manifest = _load_manifest(manifest_or_path)
-        plan = self.validate_import_manifest(manifest)
-        self._validate_import_target_identity(plan.repository_keys)
+        prepared = self.prepare_import_manifest(manifest_or_path)
         if dry_run:
-            return plan
-        if not plan.restorable:
-            raise MemoryStoreValidationError("redacted memory exports cannot be applied")
-        self._apply_import_manifest(manifest, blob_source_root=blob_source_root)
-        return replace(plan, applied=True)
+            return prepared.plan
+        return self.apply_prepared_import(
+            prepared,
+            blob_source_root=blob_source_root,
+        )
 
     def _validate_import_target_identity(
         self,
@@ -4547,6 +5381,76 @@ class MemoryStore:
             )
 
     def _apply_import_manifest(
+        self,
+        manifest: Mapping[str, Any],
+        *,
+        blob_source_root: Optional[PathInput],
+    ) -> None:
+        manifest_hashes = tuple(str(item["blob_hash"]) for item in manifest["blobs"])
+        with _exclusive_file_lock(self._blob_lock_path, self._busy_timeout_ms):
+            with self._reader() as connection:
+                registered_before = {
+                    str(row["blob_hash"])
+                    for row in connection.execute("SELECT blob_hash FROM blobs")
+                }
+            files_before = {
+                digest: self.blob_path(digest).is_file()
+                for digest in manifest_hashes
+            }
+            try:
+                self._apply_import_manifest_locked(
+                    manifest,
+                    blob_source_root=blob_source_root,
+                )
+            except Exception:
+                self._rollback_import_blobs_locked(
+                    manifest_hashes=manifest_hashes,
+                    registered_before=registered_before,
+                    files_before=files_before,
+                )
+                raise
+
+    def _rollback_import_blobs_locked(
+        self,
+        *,
+        manifest_hashes: Sequence[str],
+        registered_before: Set[str],
+        files_before: Mapping[str, bool],
+    ) -> None:
+        removable: List[str] = []
+        try:
+            with self._authority() as connection:
+                for digest in manifest_hashes:
+                    if digest in registered_before:
+                        continue
+                    referenced = any(
+                        connection.execute(query, (digest,)).fetchone() is not None
+                        for query in (
+                            "SELECT 1 FROM source_bundles WHERE blob_hash = ?",
+                            "SELECT 1 FROM knowledge_entries WHERE blob_hash = ?",
+                            "SELECT 1 FROM blob_pins WHERE blob_hash = ?",
+                        )
+                    )
+                    if referenced:
+                        continue
+                    connection.execute(
+                        "DELETE FROM blobs WHERE blob_hash = ?",
+                        (digest,),
+                    )
+                    # Promotion precedes metadata insertion. If that INSERT was
+                    # the failing statement there is no row to delete, but the
+                    # newly promoted file is still ours to compensate.
+                    if not files_before.get(digest, False):
+                        removable.append(digest)
+        except MemoryStoreError:
+            return
+        for digest in removable:
+            try:
+                self.blob_path(digest).unlink(missing_ok=True)
+            except (MemoryStoreError, OSError):
+                pass
+
+    def _apply_import_manifest_locked(
         self,
         manifest: Mapping[str, Any],
         *,
@@ -4586,7 +5490,7 @@ class MemoryStore:
                 raw = source.read_bytes()
             except OSError:
                 raise MemoryStoreValidationError("import blob content is unreadable") from None
-            self.put_blob(
+            self._put_blob_locked(
                 raw,
                 media_type=blob["media_type"],
                 expected_hash=digest,
@@ -4686,6 +5590,25 @@ class MemoryStore:
                         envelope["current_status"],
                         envelope["generation"],
                         candidate.created_at,
+                    ),
+                )
+            for envelope in manifest["candidate_authority_receipts"]:
+                payload = envelope["model"]
+                receipt = CandidateAuthorityReceipt.from_dict(payload)
+                connection.execute(
+                    """
+                    INSERT INTO candidate_authority_receipts(
+                        receipt_id, candidate_id, authority_resolution_hash,
+                        model_json, body_hash, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        receipt.receipt_id,
+                        receipt.candidate_id,
+                        receipt.authority_resolution_hash,
+                        canonical_json(payload),
+                        envelope["body_hash"],
+                        receipt.created_at,
                     ),
                 )
             for envelope in manifest["source_bundles"]:
@@ -4826,14 +5749,16 @@ class MemoryStore:
                     """
                     INSERT INTO outbox_receipts(
                         request_id, repository_key, operation, request_hash,
-                        subject_id, event_id, result_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        request_hash_version, subject_id, event_id,
+                        result_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         receipt["request_id"],
                         receipt["repository_key"],
                         receipt["operation"],
                         receipt["request_hash"],
+                        receipt["request_hash_version"],
                         receipt["subject_id"],
                         receipt["event_id"],
                         canonical_json(receipt["result"]),
@@ -4875,7 +5800,31 @@ class MemoryStore:
                         item["repository_key"],
                     ),
                 )
-        self.validate_integrity()
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise MemoryStoreCorruptionError(
+                    "memory import foreign-key validation failed"
+                )
+            for key in repository_keys:
+                self._verify_event_chain_connection(connection, key)
+                self._verify_projection_connection(connection, key)
+            for row in connection.execute(
+                "SELECT * FROM outbox_receipts ORDER BY request_id"
+            ):
+                receipt = _receipt_from_row(row)
+                if receipt["event_id"] is None:
+                    continue
+                event = connection.execute(
+                    "SELECT request_id, repository_key FROM events WHERE event_id = ?",
+                    (receipt["event_id"],),
+                ).fetchone()
+                if (
+                    event is None
+                    or event["request_id"] != receipt["request_id"]
+                    or event["repository_key"] != receipt["repository_key"]
+                ):
+                    raise MemoryStoreCorruptionError(
+                        "memory import request receipt event is invalid"
+                    )
 
     def backup_to(self, destination: PathInput) -> Path:
         if self._read_only:
@@ -4884,18 +5833,22 @@ class MemoryStore:
         target = Path(destination).resolve(strict=False)
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
+            with _exclusive_file_lock(
+                target.parent / ".memory-store.lock",
+                self._busy_timeout_ms,
+            ):
+                pass
         except OSError:
             raise MemoryStoreUnavailableError("memory backup destination is unavailable") from None
         staging = target.with_name(_temporary_name(".backup"))
         try:
             self.validate_integrity()
-            source = self._connect(read_only=True)
-            backup = sqlite3.connect(str(staging), isolation_level=None)
-            try:
-                source.backup(backup)
-            finally:
-                backup.close()
-                source.close()
+            with self._reader() as source:
+                backup = sqlite3.connect(str(staging), isolation_level=None)
+                try:
+                    source.backup(backup)
+                finally:
+                    backup.close()
             staged_store = MemoryStore(
                 staging,
                 busy_timeout_ms=self._busy_timeout_ms,
@@ -4926,46 +5879,66 @@ class MemoryStore:
         if not callable(migration) or (validator is not None and not callable(validator)):
             raise MemoryStoreValidationError("migration callbacks must be callable")
         staging = self.database_path.with_name(_temporary_name(".migration.sqlite3"))
-        with _exclusive_file_lock(
-            self.namespace_path / ".memory-store.lock", self._busy_timeout_ms
-        ):
-            try:
-                self.checkpoint("TRUNCATE")
+        source: Optional[sqlite3.Connection] = None
+        try:
+            # Take the snapshot under the authority lock, then release the lock
+            # while external migration/validation callbacks run against staging.
+            # Keeping this connection open lets PRAGMA data_version detect any
+            # intervening committed source write before the final replace.
+            with _exclusive_file_lock(
+                self._memory_lock_path,
+                self._busy_timeout_ms,
+            ):
                 source = self._connect(read_only=True)
+                source_version = int(
+                    source.execute("PRAGMA data_version").fetchone()[0]
+                )
                 staged_connection = sqlite3.connect(str(staging), isolation_level=None)
                 try:
                     source.backup(staged_connection)
                 finally:
                     staged_connection.close()
-                    source.close()
 
-                staged_connection = sqlite3.connect(
-                    str(staging),
-                    timeout=self._busy_timeout_ms / 1000.0,
-                    isolation_level=None,
-                )
-                staged_connection.row_factory = sqlite3.Row
-                try:
-                    staged_connection.execute("PRAGMA foreign_keys = ON")
-                    staged_connection.execute("BEGIN IMMEDIATE")
-                    migration(staged_connection)
-                    staged_connection.commit()
-                    if validator is not None:
-                        validator(staged_connection)
-                    staged_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except Exception:
-                    if staged_connection.in_transaction:
-                        staged_connection.rollback()
-                    raise MemoryStoreMigrationError() from None
-                finally:
-                    staged_connection.close()
+            staged_connection = sqlite3.connect(
+                str(staging),
+                timeout=self._busy_timeout_ms / 1000.0,
+                isolation_level=None,
+            )
+            staged_connection.row_factory = sqlite3.Row
+            try:
+                staged_connection.execute("PRAGMA foreign_keys = ON")
+                staged_connection.execute("BEGIN IMMEDIATE")
+                migration(staged_connection)
+                staged_connection.commit()
+                if validator is not None:
+                    validator(staged_connection)
+                staged_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                if staged_connection.in_transaction:
+                    staged_connection.rollback()
+                raise MemoryStoreMigrationError() from None
+            finally:
+                staged_connection.close()
 
-                staged_store = MemoryStore(
-                    staging,
-                    busy_timeout_ms=self._busy_timeout_ms,
-                    read_only=True,
-                )
-                staged_store.validate_integrity()
+            staged_store = MemoryStore(
+                staging,
+                busy_timeout_ms=self._busy_timeout_ms,
+                read_only=True,
+            )
+            staged_store.validate_integrity()
+
+            with _exclusive_file_lock(
+                self._memory_lock_path,
+                self._busy_timeout_ms,
+            ):
+                if int(source.execute("PRAGMA data_version").fetchone()[0]) != (
+                    source_version
+                ):
+                    raise MemoryStoreMigrationError(
+                        "memory store changed while its staged migration was prepared"
+                    )
+                source.close()
+                source = None
                 os.replace(str(staging), str(self.database_path))
                 for suffix in ("-wal", "-shm"):
                     try:
@@ -4973,23 +5946,25 @@ class MemoryStore:
                     except OSError:
                         pass
                 _fsync_directory(self.database_path.parent)
-                self._initialize_or_validate()
-            except MemoryStoreMigrationError:
-                raise
-            except MemoryStoreError:
-                raise MemoryStoreMigrationError() from None
-            except (OSError, sqlite3.Error):
-                raise MemoryStoreMigrationError() from None
-            finally:
-                for path in (
-                    staging,
-                    Path(str(staging) + "-wal"),
-                    Path(str(staging) + "-shm"),
-                ):
-                    try:
-                        path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+            self._initialize_or_validate()
+        except MemoryStoreMigrationError:
+            raise
+        except MemoryStoreError:
+            raise MemoryStoreMigrationError() from None
+        except (OSError, sqlite3.Error):
+            raise MemoryStoreMigrationError() from None
+        finally:
+            if source is not None:
+                source.close()
+            for path in (
+                staging,
+                Path(str(staging) + "-wal"),
+                Path(str(staging) + "-shm"),
+            ):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def _table_names(connection: sqlite3.Connection) -> Set[str]:
@@ -5002,6 +5977,46 @@ def _table_names(connection: sqlite3.Connection) -> Set[str]:
             """
         )
     }
+
+
+def _database_header_uses_wal(database_path: Path) -> bool:
+    """Validate persistent WAL mode without mutating an immutable database."""
+
+    try:
+        with database_path.open("rb") as stream:
+            header = stream.read(20)
+    except OSError:
+        raise MemoryStoreUnavailableError() from None
+    return (
+        len(header) == 20
+        and header[:16] == b"SQLite format 3\x00"
+        and header[18:20] == b"\x02\x02"
+    )
+
+
+def _database_has_live_wal(database_path: Path) -> bool:
+    try:
+        return Path(str(database_path) + "-wal").stat().st_size > 0
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise MemoryStoreUnavailableError() from None
+
+
+def _is_v1_schema_connection(connection: sqlite3.Connection) -> bool:
+    if "metadata" not in _table_names(connection):
+        return False
+    try:
+        metadata = {
+            str(row["key"]): str(row["value"])
+            for row in connection.execute("SELECT key, value FROM metadata")
+        }
+    except (sqlite3.Error, TypeError, KeyError):
+        return False
+    return (
+        metadata.get("schema_name") == _V1_STORE_SCHEMA_NAME
+        and metadata.get("schema_version") == str(_V1_STORE_SCHEMA_VERSION)
+    )
 
 
 def _schema_object_digest(connection: sqlite3.Connection) -> str:
@@ -5098,6 +6113,80 @@ def _validate_schema_connection(connection: sqlite3.Connection) -> None:
         raise MemoryStoreCorruptionError("memory store migration metadata is invalid")
 
 
+def _validate_v1_schema_connection(connection: sqlite3.Connection) -> None:
+    """Validate the one frozen schema eligible for the staged v2 migration."""
+
+    if _V1_SCHEMA_DEFINITION_HASH != _V1_SCHEMA_DEFINITION_FINGERPRINT:
+        raise MemoryStoreCorruptionError(
+            "frozen memory store v1 schema definition is inconsistent"
+        )
+    tables = _table_names(connection)
+    required_tables = _REQUIRED_TABLES - {"candidate_authority_receipts"}
+    if "metadata" not in tables:
+        raise MemoryStoreSchemaError()
+    try:
+        metadata = {
+            str(row["key"]): str(row["value"])
+            for row in connection.execute("SELECT key, value FROM metadata")
+        }
+    except (sqlite3.Error, TypeError, KeyError):
+        raise MemoryStoreSchemaError() from None
+    if (
+        metadata.get("schema_name") != _V1_STORE_SCHEMA_NAME
+        or metadata.get("schema_version") != str(_V1_STORE_SCHEMA_VERSION)
+        or connection.execute("PRAGMA user_version").fetchone()[0]
+        != _V1_STORE_SCHEMA_VERSION
+    ):
+        raise MemoryStoreSchemaError()
+    if required_tables - tables:
+        raise MemoryStoreCorruptionError("memory store v1 schema is incomplete")
+    triggers = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        )
+    }
+    required_triggers = _REQUIRED_TRIGGERS - {
+        "candidate_authority_receipts_no_update",
+        "candidate_authority_receipts_no_delete",
+        "outbox_receipts_no_update",
+        "outbox_receipts_no_delete",
+    }
+    if required_triggers - triggers:
+        raise MemoryStoreCorruptionError(
+            "memory store v1 append-only guards are incomplete"
+        )
+    if metadata.get("schema_definition_hash") != _V1_SCHEMA_DEFINITION_FINGERPRINT:
+        raise MemoryStoreCorruptionError(
+            "memory store v1 schema definition is invalid"
+        )
+    try:
+        actual_schema_digest = _schema_object_digest(connection)
+    except sqlite3.Error:
+        raise MemoryStoreCorruptionError(
+            "memory store v1 schema definition is unreadable"
+        ) from None
+    if not hmac.compare_digest(actual_schema_digest, _V1_SCHEMA_OBJECT_DIGEST):
+        raise MemoryStoreCorruptionError(
+            "memory store v1 live schema does not match its frozen definition"
+        )
+    migration = connection.execute(
+        """
+        SELECT schema_name, definition_hash FROM schema_migrations
+        WHERE schema_version = ?
+        """,
+        (_V1_STORE_SCHEMA_VERSION,),
+    ).fetchone()
+    if (
+        migration is None
+        or migration["schema_name"] != _V1_STORE_SCHEMA_NAME
+        or migration["definition_hash"] != _V1_SCHEMA_DEFINITION_FINGERPRINT
+    ):
+        raise MemoryStoreCorruptionError(
+            "memory store v1 migration metadata is invalid"
+        )
+
+
 def _translate_sqlite_error(error: sqlite3.Error) -> MemoryStoreError:
     message = str(error).casefold()
     if "locked" in message or "busy" in message:
@@ -5181,6 +6270,10 @@ def _digest(value: Any, field_name: str) -> str:
     return value
 
 
+def _optional_digest(value: Any, field_name: str) -> Optional[str]:
+    return None if value is None else _digest(value, field_name)
+
+
 def _media_type(value: Any) -> str:
     if not isinstance(value, str) or _MEDIA_TYPE_PATTERN.fullmatch(value) is None:
         raise MemoryStoreValidationError("media type is invalid")
@@ -5210,6 +6303,124 @@ def _stable_subject_id(value: Any, prefix: str, field_name: str) -> str:
 
 def _request_id(value: Any) -> str:
     return _stable_subject_id(value, "REQ", "request_id")
+
+
+def _expected_generation(value: Any) -> Optional[int]:
+    if value is not None and (type(value) is not int or value < 0):
+        raise MemoryStoreValidationError(
+            "expected generation must be non-negative"
+        )
+    return value
+
+
+def _request_hash_version(value: Any) -> int:
+    if type(value) is not int or value not in {
+        LEGACY_REQUEST_HASH_VERSION,
+        SEMANTIC_REQUEST_HASH_VERSION,
+    }:
+        raise MemoryStoreValidationError("request hash version is invalid")
+    return value
+
+
+def _request_hash_pair(
+    semantic_payload: Mapping[str, Any],
+    *,
+    expected_generation: Optional[int],
+    legacy_payload: Optional[Mapping[str, Any]] = None,
+) -> Tuple[str, str]:
+    """Return semantic-v2 and byte-compatible legacy-v1 request hashes."""
+
+    checked_generation = _expected_generation(expected_generation)
+    semantic_hash = canonical_sha256(dict(semantic_payload))
+    legacy_body = dict(
+        semantic_payload if legacy_payload is None else legacy_payload
+    )
+    legacy_body["expected_generation"] = checked_generation
+    return semantic_hash, canonical_sha256(legacy_body)
+
+
+def _gc_cutoff(grace_seconds: Any, now: Optional[Any]) -> float:
+    if (
+        isinstance(grace_seconds, bool)
+        or not isinstance(grace_seconds, (int, float))
+        or not math.isfinite(float(grace_seconds))
+        or grace_seconds < 0
+    ):
+        raise MemoryStoreValidationError("GC grace period must be non-negative")
+    if now is None:
+        current = time.time()
+    elif (
+        isinstance(now, bool)
+        or not isinstance(now, (int, float))
+        or not math.isfinite(float(now))
+    ):
+        raise MemoryStoreValidationError("GC current time is invalid")
+    else:
+        current = float(now)
+    return current - float(grace_seconds)
+
+
+def _validated_gc_preview(
+    value: Any,
+    *,
+    database_path: Path,
+) -> BlobGCResult:
+    if type(value) is not BlobGCResult or not value.dry_run:
+        raise MemoryStoreValidationError(
+            "GC apply requires the exact confirmed dry-run preview"
+        )
+    candidate_hashes = tuple(
+        _digest(item, "GC candidate blob hash") for item in value.candidate_hashes
+    )
+    if candidate_hashes != tuple(sorted(set(candidate_hashes))):
+        raise MemoryStoreValidationError("GC preview candidates are not canonical")
+    if any(not isinstance(path, str) or not path for path in value.orphan_paths):
+        raise MemoryStoreValidationError("GC preview orphan paths are invalid")
+    if value.orphan_paths != tuple(sorted(set(value.orphan_paths))):
+        raise MemoryStoreValidationError("GC preview orphan paths are not canonical")
+    if value.deleted_hashes or value.deleted_orphan_paths:
+        raise MemoryStoreValidationError("GC preview already contains deletions")
+    if type(value.reclaimed_bytes) is not int or value.reclaimed_bytes < 0:
+        raise MemoryStoreValidationError("GC preview reclaimed size is invalid")
+    if (
+        isinstance(value.cutoff, bool)
+        or not isinstance(value.cutoff, (int, float))
+        or not math.isfinite(float(value.cutoff))
+    ):
+        raise MemoryStoreValidationError("GC preview cutoff is invalid")
+    preview_token = _digest(value.preview_token, "GC preview token")
+    expected_token = _gc_preview_token(
+        database_path=database_path,
+        candidate_hashes=candidate_hashes,
+        orphan_paths=value.orphan_paths,
+        reclaimed_bytes=value.reclaimed_bytes,
+        cutoff=float(value.cutoff),
+    )
+    if not hmac.compare_digest(preview_token, expected_token):
+        raise MemoryStoreValidationError(
+            "GC preview was not issued for this Memory Store"
+        )
+    return value
+
+
+def _gc_preview_token(
+    *,
+    database_path: Path,
+    candidate_hashes: Sequence[str],
+    orphan_paths: Sequence[str],
+    reclaimed_bytes: int,
+    cutoff: float,
+) -> str:
+    payload = canonical_json(
+        {
+            "database_path": str(database_path.resolve(strict=False)),
+            "candidate_hashes": list(candidate_hashes),
+            "orphan_paths": list(orphan_paths),
+            "reclaimed_bytes": reclaimed_bytes,
+            "cutoff": format(float(cutoff), ".17g"),
+        }
+    ).encode("utf-8")
+    return hmac.new(_GC_PREVIEW_SECRET, payload, hashlib.sha256).hexdigest()
 
 
 def _event_id(value: Any) -> str:
@@ -5253,6 +6464,81 @@ def _candidate_from_row(row: sqlite3.Row) -> MemoryCandidate:
         return replace(candidate, status=status)
     except (TypeError, ValueError):
         raise MemoryStoreCorruptionError("candidate projection is invalid") from None
+
+
+def _canonical_candidate_authority_receipt(
+    receipt: Optional[CandidateAuthorityReceipt],
+    candidate: MemoryCandidate,
+) -> Optional[CandidateAuthorityReceipt]:
+    if receipt is None:
+        return None
+    if type(receipt) is not CandidateAuthorityReceipt:
+        raise MemoryStoreValidationError(
+            "authority receipt must be a canonical CandidateAuthorityReceipt"
+        )
+    try:
+        hydrated = CandidateAuthorityReceipt.from_dict(receipt.to_dict())
+    except (TypeError, ValueError):
+        raise MemoryStoreValidationError(
+            "candidate authority receipt is not canonical"
+        ) from None
+    if hydrated != receipt:
+        raise MemoryStoreValidationError(
+            "candidate authority receipt is not canonical"
+        )
+    if (
+        receipt.candidate_id != candidate.candidate_id
+        or receipt.authority_repository_key != candidate.repository_key
+        or receipt.review_id != candidate.origin_review_id
+        or receipt.authorized_source_refs != candidate.source_refs
+    ):
+        raise MemoryStoreValidationError(
+            "candidate authority receipt does not match its immutable candidate"
+        )
+    return receipt
+
+
+def _candidate_authority_receipt_from_row(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> CandidateAuthorityReceipt:
+    try:
+        model_json = str(row["model_json"])
+        payload = json.loads(model_json)
+        if canonical_json(payload) != model_json:
+            raise ValueError
+        receipt = CandidateAuthorityReceipt.from_dict(payload)
+        if (
+            receipt.receipt_id != row["receipt_id"]
+            or receipt.candidate_id != row["candidate_id"]
+            or receipt.authority_resolution_hash
+            != row["authority_resolution_hash"]
+            or receipt.created_at != row["created_at"]
+            or not hmac.compare_digest(
+                canonical_sha256(payload),
+                _digest(row["body_hash"], "authority receipt body_hash"),
+            )
+        ):
+            raise ValueError
+        candidate_row = connection.execute(
+            "SELECT * FROM candidates WHERE candidate_id = ?",
+            (receipt.candidate_id,),
+        ).fetchone()
+        if candidate_row is None:
+            raise ValueError
+        candidate = _candidate_from_row(candidate_row)
+        _canonical_candidate_authority_receipt(receipt, candidate)
+        return receipt
+    except (
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        MemoryStoreError,
+    ):
+        raise MemoryStoreCorruptionError(
+            "candidate authority receipt row is invalid"
+        ) from None
 
 
 def _source_bundle_from_row(row: sqlite3.Row) -> SourceBundleDescriptor:
@@ -5513,6 +6799,108 @@ def _export_model_row(
     }
 
 
+def _export_candidate_authority_receipt_row(
+    row: sqlite3.Row,
+    *,
+    redact: bool,
+) -> Dict[str, Any]:
+    return {
+        "receipt_id": str(row["receipt_id"]),
+        "candidate_id": str(row["candidate_id"]),
+        "authority_resolution_hash": str(row["authority_resolution_hash"]),
+        "model": None if redact else json.loads(row["model_json"]),
+        "body_hash": str(row["body_hash"]),
+        "created_at": str(row["created_at"]),
+        "redacted": redact,
+    }
+
+
+def _validate_export_candidate_authority_receipts(
+    rows: Sequence[Mapping[str, Any]],
+    redacted_manifest: bool,
+) -> None:
+    expected = {
+        "receipt_id",
+        "candidate_id",
+        "authority_resolution_hash",
+        "model",
+        "body_hash",
+        "created_at",
+        "redacted",
+    }
+    order: List[Tuple[str, str, str]] = []
+    receipt_ids: Set[str] = set()
+    contexts: Set[Tuple[str, str]] = set()
+    for envelope in rows:
+        if not isinstance(envelope, Mapping) or set(envelope) != expected:
+            raise MemoryStoreValidationError(
+                "memory import candidate authority receipt is invalid"
+            )
+        receipt_id = _stable_subject_id(
+            envelope["receipt_id"],
+            "CAR",
+            "receipt_id",
+        )
+        candidate_id = _stable_subject_id(
+            envelope["candidate_id"],
+            "MC",
+            "candidate_id",
+        )
+        resolution_hash = _digest(
+            envelope["authority_resolution_hash"],
+            "authority_resolution_hash",
+        )
+        body_hash = _digest(envelope["body_hash"], "body_hash")
+        created_at = _timestamp(envelope["created_at"], "receipt created_at")
+        redacted = _required_bool(envelope["redacted"], "receipt redacted")
+        if redacted != redacted_manifest:
+            raise MemoryStoreValidationError(
+                "memory import candidate authority redaction is inconsistent"
+            )
+        if redacted:
+            if envelope["model"] is not None:
+                raise MemoryStoreValidationError(
+                    "memory import candidate authority redaction is invalid"
+                )
+        else:
+            if not isinstance(envelope["model"], Mapping):
+                raise MemoryStoreValidationError(
+                    "memory import candidate authority model is missing"
+                )
+            try:
+                receipt = CandidateAuthorityReceipt.from_dict(envelope["model"])
+            except (TypeError, ValueError):
+                raise MemoryStoreValidationError(
+                    "memory import candidate authority model is invalid"
+                ) from None
+            if (
+                receipt.receipt_id != receipt_id
+                or receipt.candidate_id != candidate_id
+                or receipt.authority_resolution_hash != resolution_hash
+                or receipt.created_at != created_at
+                or not hmac.compare_digest(
+                    canonical_sha256(envelope["model"]),
+                    body_hash,
+                )
+            ):
+                raise MemoryStoreValidationError(
+                    "memory import candidate authority envelope is inconsistent"
+                )
+        key = (candidate_id, resolution_hash, receipt_id)
+        context = (candidate_id, resolution_hash)
+        if receipt_id in receipt_ids or context in contexts:
+            raise MemoryStoreValidationError(
+                "memory import candidate authority identity is duplicated"
+            )
+        receipt_ids.add(receipt_id)
+        contexts.add(context)
+        order.append(key)
+    if order != sorted(order):
+        raise MemoryStoreValidationError(
+            "memory import candidate authority receipts are not canonical"
+        )
+
+
 def _validate_export_model_rows(
     rows: Sequence[Mapping[str, Any]],
     model_type: Any,
@@ -5614,6 +7002,9 @@ def _receipt_from_row(row: sqlite3.Row) -> Dict[str, Any]:
             "repository_key": _repository_key(row["repository_key"]),
             "operation": _required_token(row["operation"], "operation"),
             "request_hash": _digest(row["request_hash"], "request_hash"),
+            "request_hash_version": _request_hash_version(
+                row["request_hash_version"]
+            ),
             "subject_id": _required_text(row["subject_id"], "subject_id", 512),
             "event_id": event_id,
             "result": result.to_dict(),
@@ -5633,6 +7024,7 @@ def _validate_export_receipts(rows: Sequence[Mapping[str, Any]]) -> None:
         "repository_key",
         "operation",
         "request_hash",
+        "request_hash_version",
         "subject_id",
         "event_id",
         "result",
@@ -5647,6 +7039,7 @@ def _validate_export_receipts(rows: Sequence[Mapping[str, Any]]) -> None:
         _repository_key(receipt["repository_key"])
         operation = _required_token(receipt["operation"], "operation")
         _digest(receipt["request_hash"], "request_hash")
+        _request_hash_version(receipt["request_hash_version"])
         subject_id = _required_text(receipt["subject_id"], "subject_id", 512)
         event_id = (
             None if receipt["event_id"] is None else _event_id(receipt["event_id"])
@@ -5685,22 +7078,38 @@ def _validate_manifest_relationships(manifest: Mapping[str, Any]) -> None:
     }
     candidate_models: Dict[str, MemoryCandidate] = {}
     for identifier, envelope in candidate_envelopes.items():
-        if envelope["model"] is None:
-            continue
-        candidate = MemoryCandidate.from_dict(envelope["model"])
-        candidate_models[identifier] = candidate
-        if candidate.repository_key not in repository_keys:
-            raise MemoryStoreValidationError("memory import candidate repository is missing")
         try:
             CandidateStatus(envelope["current_status"])
         except ValueError:
             raise MemoryStoreValidationError(
                 "memory import candidate projection is invalid"
             ) from None
+        if envelope["model"] is None:
+            continue
+        candidate = MemoryCandidate.from_dict(envelope["model"])
+        candidate_models[identifier] = candidate
+        if candidate.repository_key not in repository_keys:
+            raise MemoryStoreValidationError("memory import candidate repository is missing")
         if envelope["generation"] > generation_map[
             candidate.repository_key
         ].memory_generation:
             raise MemoryStoreValidationError("memory import candidate generation is invalid")
+
+    for envelope in manifest["candidate_authority_receipts"]:
+        candidate_id = str(envelope["candidate_id"])
+        if candidate_id not in candidate_envelopes:
+            raise MemoryStoreValidationError(
+                "memory import candidate authority candidate is missing"
+            )
+        if envelope["model"] is None:
+            continue
+        receipt = CandidateAuthorityReceipt.from_dict(envelope["model"])
+        candidate = candidate_models.get(candidate_id)
+        if candidate is None:
+            raise MemoryStoreValidationError(
+                "memory import candidate authority relationship is incomplete"
+            )
+        _canonical_candidate_authority_receipt(receipt, candidate)
 
     bundle_models: Dict[str, SourceBundleDescriptor] = {}
     for identifier, envelope in bundle_envelopes.items():
@@ -5730,20 +7139,22 @@ def _validate_manifest_relationships(manifest: Mapping[str, Any]) -> None:
         ].memory_generation:
             raise MemoryStoreValidationError("memory import source bundle generation is invalid")
 
+    record_models: Dict[str, DurableMemoryRecord] = {}
     for envelope in manifest["records"]:
+        try:
+            RecordStatus(envelope["current_status"])
+        except ValueError:
+            raise MemoryStoreValidationError("memory import record projection is invalid") from None
         if envelope["model"] is None:
             continue
         record = DurableMemoryRecord.from_dict(envelope["model"])
+        record_models[record.memory_id] = record
         if (
             record.repository_key not in repository_keys
             or record.candidate_id not in candidate_envelopes
             or record.source_bundle_hash not in bundle_envelopes
         ):
             raise MemoryStoreValidationError("memory import record reference is missing")
-        try:
-            RecordStatus(envelope["current_status"])
-        except ValueError:
-            raise MemoryStoreValidationError("memory import record projection is invalid") from None
         candidate = candidate_models.get(record.candidate_id)
         if candidate is not None and not _record_matches_candidate(record, candidate):
             raise MemoryStoreValidationError(
@@ -5759,25 +7170,29 @@ def _validate_manifest_relationships(manifest: Mapping[str, Any]) -> None:
         ].memory_generation:
             raise MemoryStoreValidationError("memory import record generation is invalid")
 
+    feedback_models: Dict[str, FeedbackRecord] = {}
     for envelope in manifest["feedback"]:
-        if envelope["model"] is None:
-            continue
-        feedback = FeedbackRecord.from_dict(envelope["model"])
-        if feedback.repository_key not in repository_keys:
-            raise MemoryStoreValidationError("memory import feedback repository is missing")
         try:
             FeedbackStatus(envelope["current_status"])
         except ValueError:
             raise MemoryStoreValidationError(
                 "memory import feedback projection is invalid"
             ) from None
+        if envelope["model"] is None:
+            continue
+        feedback = FeedbackRecord.from_dict(envelope["model"])
+        feedback_models[feedback.feedback_id] = feedback
+        if feedback.repository_key not in repository_keys:
+            raise MemoryStoreValidationError("memory import feedback repository is missing")
         if envelope["generation"] > generation_map[
             feedback.repository_key
         ].feedback_generation:
             raise MemoryStoreValidationError("memory import feedback generation is invalid")
 
+    knowledge_models: Dict[str, RepositoryKnowledgeEntry] = {}
     for envelope in manifest["knowledge_entries"]:
         entry = RepositoryKnowledgeEntry.from_dict(envelope["model"])
+        knowledge_models[entry.entry_id] = entry
         repository_key = entry.key.repository_key
         if repository_key not in repository_keys or entry.blob_hash not in blob_map:
             raise MemoryStoreValidationError("memory import knowledge reference is missing")
@@ -5791,6 +7206,8 @@ def _validate_manifest_relationships(manifest: Mapping[str, Any]) -> None:
 
     last_generation: Dict[Tuple[str, str], int] = {}
     event_ids: Set[str] = set()
+    events_by_id: Dict[str, MemoryEvent] = {}
+    latest_events: Dict[Tuple[str, str], MemoryEvent] = {}
     for envelope in manifest["events"]:
         event = _event_from_payload(envelope["event"])
         if event.repository_key not in repository_keys:
@@ -5801,6 +7218,8 @@ def _validate_manifest_relationships(manifest: Mapping[str, Any]) -> None:
             raise MemoryStoreValidationError("memory import event generation is invalid")
         last_generation[key] = event.generation
         event_ids.add(event.event_id)
+        events_by_id[event.event_id] = event
+        latest_events[(event.subject_type, event.subject_id)] = event
     for repository_key, generations in generation_map.items():
         if (
             last_generation.get((repository_key, "memory"), 0)
@@ -5813,11 +7232,171 @@ def _validate_manifest_relationships(manifest: Mapping[str, Any]) -> None:
             raise MemoryStoreValidationError(
                 "memory import generations do not match the event log"
             )
-    for receipt in manifest["outbox_receipts"]:
+
+    receipt_results = [
+        (receipt, WriteResult.from_dict(receipt["result"]))
+        for receipt in manifest["outbox_receipts"]
+    ]
+
+    def require_projection_event(
+        *,
+        subject_type: str,
+        subject_id: str,
+        status: str,
+        generation: Any,
+        generation_kind: str,
+    ) -> MemoryEvent:
+        event = latest_events.get((subject_type, subject_id))
+        if (
+            event is None
+            or event.new_status != status
+            or event.generation_kind != generation_kind
+            or type(generation) is not int
+            or event.generation != generation
+        ):
+            raise MemoryStoreValidationError(
+                "memory import %s projection does not match its latest event"
+                % subject_type
+            )
+        return event
+
+    candidate_ids = set(candidate_envelopes)
+    for candidate_id, envelope in candidate_envelopes.items():
+        require_projection_event(
+            subject_type="candidate",
+            subject_id=candidate_id,
+            status=str(envelope["current_status"]),
+            generation=envelope["generation"],
+            generation_kind="memory",
+        )
+
+    bundle_ids = set(bundle_envelopes)
+    for bundle_id, envelope in bundle_envelopes.items():
+        require_projection_event(
+            subject_type="source_bundle",
+            subject_id=bundle_id,
+            status="stored",
+            generation=envelope["generation"],
+            generation_kind="memory",
+        )
+
+    record_envelopes = {
+        str(envelope["id"]): envelope for envelope in manifest["records"]
+    }
+    record_ids = set(record_envelopes)
+    for memory_id, envelope in record_envelopes.items():
+        record = record_models.get(memory_id)
+        event = latest_events.get(("record", memory_id))
+        if event is not None:
+            require_projection_event(
+                subject_type="record",
+                subject_id=memory_id,
+                status=str(envelope["current_status"]),
+                generation=envelope["generation"],
+                generation_kind="memory",
+            )
+        else:
+            approval_receipts = [
+                (receipt, result)
+                for receipt, result in receipt_results
+                if result.subject_id == memory_id
+                and result.operation
+                in {"approve_candidate", "approve_candidate_with_source_bundle"}
+            ]
+            approval = (
+                None
+                if len(approval_receipts) != 1
+                else events_by_id.get(approval_receipts[0][0]["event_id"])
+            )
+            receipt_repository = (
+                None
+                if len(approval_receipts) != 1
+                else approval_receipts[0][0]["repository_key"]
+            )
+            if (
+                approval is None
+                or approval.action != "approve"
+                or approval.new_status != CandidateStatus.APPROVED.value
+                or envelope["current_status"] != RecordStatus.ACTIVE.value
+                or approval.generation_kind != "memory"
+                or approval.generation != envelope["generation"]
+                or approval.repository_key != receipt_repository
+                or (record is not None and approval.subject_id != record.candidate_id)
+            ):
+                raise MemoryStoreValidationError(
+                    "memory import record projection does not match candidate approval"
+                )
+
+    feedback_envelopes = {
+        str(envelope["id"]): envelope for envelope in manifest["feedback"]
+    }
+    feedback_ids = set(feedback_envelopes)
+    for feedback_id, envelope in feedback_envelopes.items():
+        require_projection_event(
+            subject_type="feedback",
+            subject_id=feedback_id,
+            status=str(envelope["current_status"]),
+            generation=envelope["generation"],
+            generation_kind="feedback",
+        )
+
+    knowledge_envelopes = {
+        str(envelope["id"]): envelope
+        for envelope in manifest["knowledge_entries"]
+    }
+    knowledge_ids = set(knowledge_envelopes)
+    for entry_id, envelope in knowledge_envelopes.items():
+        require_projection_event(
+            subject_type="knowledge",
+            subject_id=entry_id,
+            status="stored",
+            generation=envelope["generation"],
+            generation_kind="knowledge",
+        )
+
+    present = {
+        "candidate": candidate_ids,
+        "source_bundle": bundle_ids,
+        "record": record_ids,
+        "feedback": feedback_ids,
+        "knowledge": knowledge_ids,
+    }
+    for (subject_type, subject_id), event in latest_events.items():
+        if subject_type == "knowledge" and event.new_status == "deleted":
+            if subject_id in knowledge_ids:
+                raise MemoryStoreValidationError(
+                    "memory import deleted knowledge projection still exists"
+                )
+            continue
+        if subject_id not in present[subject_type]:
+            raise MemoryStoreValidationError(
+                "memory import %s event has no matching projection" % subject_type
+            )
+
+    for receipt, result in receipt_results:
         if receipt["repository_key"] not in repository_keys:
             raise MemoryStoreValidationError("memory import receipt repository is missing")
-        if receipt["event_id"] is not None and receipt["event_id"] not in event_ids:
-            raise MemoryStoreValidationError("memory import receipt event is missing")
+        event_id = receipt["event_id"]
+        if event_id is not None:
+            event = events_by_id.get(event_id)
+            if event is None:
+                raise MemoryStoreValidationError("memory import receipt event is missing")
+            if (
+                event.request_id != receipt["request_id"]
+                or event.repository_key != receipt["repository_key"]
+            ):
+                raise MemoryStoreValidationError(
+                    "memory import receipt event relationship is invalid"
+                )
+        current = generation_map[str(receipt["repository_key"])]
+        if (
+            result.generations.memory_generation > current.memory_generation
+            or result.generations.feedback_generation > current.feedback_generation
+            or result.generations.knowledge_generation > current.knowledge_generation
+        ):
+            raise MemoryStoreValidationError(
+                "memory import request result generation is invalid"
+            )
 
 
 def _load_manifest(
@@ -5827,9 +7406,11 @@ def _load_manifest(
         return manifest_or_path
     path = Path(manifest_or_path).resolve(strict=False)
     try:
-        if path.stat().st_size > 64 * 1024 * 1024:
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_IMPORT_MANIFEST_BYTES + 1)
+        if len(raw) > MAX_IMPORT_MANIFEST_BYTES:
             raise MemoryStoreValidationError("memory import manifest is too large")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
     except MemoryStoreError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -5905,6 +7486,23 @@ def _fsync_directory(path: Path) -> None:
 
 @contextmanager
 def _exclusive_file_lock(path: Path, timeout_ms: int) -> Iterator[None]:
+    lock_key = os.path.normcase(os.path.abspath(os.fspath(path)))
+    held = getattr(_FILE_LOCK_STATE, "held", None)
+    if held is None:
+        held = {}
+        _FILE_LOCK_STATE.held = held
+    depth = held.get(lock_key, 0)
+    if depth:
+        held[lock_key] = depth + 1
+        try:
+            yield
+        finally:
+            if held[lock_key] == 1:
+                del held[lock_key]
+            else:
+                held[lock_key] -= 1
+        return
+
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.is_symlink():
@@ -5946,8 +7544,10 @@ def _exclusive_file_lock(path: Path, timeout_ms: int) -> Iterator[None]:
                 if time.monotonic() >= deadline:
                     raise MemoryStoreBusyError("memory migration lock is busy") from None
                 time.sleep(0.01)
+        held[lock_key] = 1
         yield
     finally:
+        held.pop(lock_key, None)
         if acquired:
             try:
                 if os.name == "nt":
@@ -5972,6 +7572,7 @@ __all__ = [
     "BlobGCResult",
     "BlobInfo",
     "DEFAULT_BUSY_TIMEOUT_MS",
+    "EVENT_ID_NAMESPACE",
     "EVENT_SCHEMA_VERSION",
     "EXPORT_SCHEMA_NAME",
     "EXPORT_SCHEMA_VERSION",
@@ -5991,6 +7592,7 @@ __all__ = [
     "MemoryStoreSchemaError",
     "MemoryStoreUnavailableError",
     "MemoryStoreValidationError",
+    "PreparedImport",
     "SCHEMA_DEFINITION_HASH",
     "STORE_SCHEMA_NAME",
     "STORE_SCHEMA_VERSION",

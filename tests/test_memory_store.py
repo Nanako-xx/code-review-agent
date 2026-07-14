@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import io
 import json
 import os
 import sqlite3
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -19,6 +21,7 @@ from review_agent.memory_identity import (
     plan_repository_memory_namespace,
 )
 from review_agent.memory_models import (
+    CandidateAuthorityReceipt,
     CandidateStatus,
     DurableMemoryRecord,
     FeedbackDecision,
@@ -43,10 +46,12 @@ from review_agent.memory_models import (
     SourceBundleDescriptor,
     ValidityPolicy,
     canonical_json,
+    canonical_sha256,
     stable_event_id,
     stable_request_id,
 )
 from review_agent.memory_store import (
+    BlobGCResult,
     EXPORT_SCHEMA_NAME,
     STORE_SCHEMA_NAME,
     STORE_SCHEMA_VERSION,
@@ -57,6 +62,7 @@ from review_agent.memory_store import (
     MemoryStoreMigrationError,
     MemoryStoreReadOnlyError,
     MemoryStoreSchemaError,
+    MemoryStoreUnavailableError,
     MemoryStoreValidationError,
 )
 from review_agent.revision import RevisionResolver
@@ -67,6 +73,7 @@ HASH_1 = "1" * 64
 HASH_2 = "2" * 64
 CREATED_AT = "2026-07-14T12:00:00Z"
 REPOSITORY_KEY = "4" * 64
+AUTHORITY_RESOLUTION = "7" * 64
 
 
 def _source() -> RepositoryRangeSourceRef:
@@ -117,6 +124,28 @@ def _candidate(
         origin_review_id="review-001",
         status=status,
         created_at=CREATED_AT,
+    )
+
+
+def _authority_receipt(
+    candidate: MemoryCandidate,
+    *,
+    authority_resolution_hash: str = AUTHORITY_RESOLUTION,
+    created_at: str = CREATED_AT,
+) -> CandidateAuthorityReceipt:
+    return CandidateAuthorityReceipt(
+        candidate_id=candidate.candidate_id,
+        authority_repository_key=candidate.repository_key,
+        locator_repository_key=candidate.repository_key,
+        origin=candidate.producer.producer_type,
+        review_id=candidate.origin_review_id,
+        proposal_head_sha=candidate.valid_from_sha,
+        authorized_source_refs=candidate.source_refs,
+        human_declarations=(),
+        initial_validation_report_hash="8" * 64,
+        authority_resolution_hash=authority_resolution_hash,
+        binding_id=None,
+        created_at=created_at,
     )
 
 
@@ -204,6 +233,77 @@ def _knowledge(content: bytes) -> RepositoryKnowledgeEntry:
         created_at=CREATED_AT,
         pinned_by_review_ids=("review-001",),
     )
+
+
+def _downgrade_store_to_frozen_v1(store: MemoryStore) -> None:
+    store.checkpoint("TRUNCATE")
+    connection = sqlite3.connect(str(store.database_path), isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("BEGIN IMMEDIATE")
+        for trigger in (
+            "candidate_authority_receipts_no_update",
+            "candidate_authority_receipts_no_delete",
+            "outbox_receipts_no_update",
+            "outbox_receipts_no_delete",
+        ):
+            connection.execute("DROP TRIGGER IF EXISTS " + trigger)
+        connection.execute("DROP TABLE candidate_authority_receipts")
+        connection.execute("ALTER TABLE outbox_receipts RENAME TO outbox_receipts_v2")
+        v1_outbox = next(
+            statement
+            for statement in memory_store_module._V1_SCHEMA_STATEMENTS
+            if "CREATE TABLE outbox_receipts" in statement
+        )
+        connection.execute(v1_outbox)
+        connection.execute(
+            """
+            INSERT INTO outbox_receipts(
+                request_id, repository_key, operation, request_hash,
+                subject_id, event_id, result_json, created_at
+            )
+            SELECT request_id, repository_key, operation, request_hash,
+                   subject_id, event_id, result_json, created_at
+            FROM outbox_receipts_v2
+            """
+        )
+        connection.execute("DROP TABLE outbox_receipts_v2")
+        connection.executemany(
+            "UPDATE metadata SET value = ? WHERE key = ?",
+            (
+                ("memory_store_schema_v1", "schema_name"),
+                ("1", "schema_version"),
+                (
+                    memory_store_module._V1_SCHEMA_DEFINITION_FINGERPRINT,
+                    "schema_definition_hash",
+                ),
+            ),
+        )
+        connection.execute("DELETE FROM schema_migrations")
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(
+                schema_version, schema_name, definition_hash, applied_at
+            ) VALUES (1, 'memory_store_schema_v1', ?, ?)
+            """,
+            (memory_store_module._V1_SCHEMA_DEFINITION_FINGERPRINT, CREATED_AT),
+        )
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+        assert memory_store_module._schema_object_digest(connection) == (
+            memory_store_module._V1_SCHEMA_OBJECT_DIGEST
+        )
+    finally:
+        connection.close()
+
+
+def _table_snapshot(database_path: Path, table: str) -> tuple[tuple[object, ...], ...]:
+    connection = sqlite3.connect(str(database_path))
+    try:
+        return tuple(tuple(row) for row in connection.execute("SELECT * FROM " + table))
+    finally:
+        connection.close()
 
 
 def test_open_creates_final_schema_once_and_enables_required_pragmas(
@@ -445,6 +545,170 @@ def test_candidate_write_generation_event_and_request_replay_are_atomic(
     assert store.get_generations(REPOSITORY_KEY).memory_generation == 1
 
 
+def test_transition_request_replay_ignores_runtime_timestamp_and_stale_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate()
+    receipt = _authority_receipt(candidate)
+    store.put_candidate(
+        candidate,
+        receipt,
+        request_id=stable_request_id("candidate", candidate.candidate_id),
+    )
+    request_id = stable_request_id("validate", candidate.candidate_id)
+    timestamps = iter(
+        (
+            "2026-07-14T12:00:01Z",
+            "2026-07-14T12:00:02Z",
+            "2026-07-14T12:00:03Z",
+        )
+    )
+    monkeypatch.setattr(memory_store_module, "_utc_now", lambda: next(timestamps))
+
+    first = store.transition_candidate(
+        candidate.candidate_id,
+        expected_status=CandidateStatus.PROPOSED,
+        new_status=CandidateStatus.VALIDATED,
+        action="candidate_validated",
+        actor_type="runtime",
+        actor_id="memory_sources",
+        reason_code="sources_valid",
+        request_id=request_id,
+        expected_generation=1,
+    )
+    replay = store.transition_candidate(
+        candidate.candidate_id,
+        expected_status=CandidateStatus.PROPOSED,
+        new_status=CandidateStatus.VALIDATED,
+        action="candidate_validated",
+        actor_type="runtime",
+        actor_id="memory_sources",
+        reason_code="sources_valid",
+        request_id=request_id,
+        expected_generation=999,
+    )
+
+    assert first.applied and replay.replayed and not replay.applied
+    assert replay.event_id == first.event_id
+    assert store.get_generations(REPOSITORY_KEY).memory_generation == 2
+    with pytest.raises(MemoryStoreConflictError, match="reused"):
+        store.transition_candidate(
+            candidate.candidate_id,
+            expected_status=CandidateStatus.PROPOSED,
+            new_status=CandidateStatus.VALIDATED,
+            action="candidate_validated",
+            actor_type="runtime",
+            actor_id="memory_sources",
+            reason_code="different_semantics",
+            request_id=request_id,
+            expected_generation=2,
+        )
+
+
+def test_candidate_authority_receipts_are_atomic_multi_context_and_immutable(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate()
+    first = _authority_receipt(candidate)
+    first_request = stable_request_id("candidate-authority", first.receipt_id)
+
+    written = store.put_candidate(
+        candidate,
+        first,
+        request_id=first_request,
+    )
+    replay = store.put_candidate(
+        candidate,
+        first,
+        request_id=first_request,
+        expected_generation=0,
+    )
+    assert written.applied and replay.replayed
+    assert store.get_generations(REPOSITORY_KEY).memory_generation == 1
+
+    second = _authority_receipt(
+        candidate,
+        authority_resolution_hash="9" * 64,
+    )
+    added = store.put_candidate(
+        candidate,
+        second,
+        request_id=stable_request_id("candidate-authority", second.receipt_id),
+        expected_generation=1,
+    )
+    assert added.applied and added.event_id is None
+    assert store.get_generations(REPOSITORY_KEY).memory_generation == 1
+    assert store.list_candidate_authority_receipts(candidate.candidate_id) == (
+        first,
+        second,
+    )
+    with pytest.raises(MemoryStoreConflictError, match="multiple authority"):
+        store.get_candidate_authority_receipt(candidate.candidate_id)
+    assert store.select_candidate_authority_receipt(
+        candidate.candidate_id,
+        authority_resolution_hash=second.authority_resolution_hash,
+    ) == second
+
+    conflicting = replace(second, created_at="2026-07-14T12:00:01Z")
+    with pytest.raises(MemoryStoreConflictError, match="different immutable"):
+        store.put_candidate(
+            candidate,
+            conflicting,
+            request_id=stable_request_id("authority-conflict", conflicting.receipt_id),
+        )
+    with pytest.raises(MemoryStoreValidationError, match="does not match"):
+        store.put_candidate(
+            candidate,
+            _authority_receipt(_candidate(statement="Different candidate.")),
+            request_id=stable_request_id("authority-mismatch", candidate.candidate_id),
+        )
+
+    with pytest.raises(MemoryStoreConflictError):
+        with store._maintenance_connection() as connection:
+            connection.execute(
+                "UPDATE candidate_authority_receipts SET created_at = ? "
+                "WHERE receipt_id = ?",
+                ("2026-07-14T12:00:02Z", first.receipt_id),
+            )
+    with pytest.raises(MemoryStoreConflictError):
+        with store._maintenance_connection() as connection:
+            connection.execute(
+                "DELETE FROM candidate_authority_receipts WHERE receipt_id = ?",
+                (first.receipt_id,),
+            )
+    store.validate_integrity()
+
+
+def test_candidate_and_authority_receipt_insert_roll_back_together(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate(statement="Receipt insertion must be atomic.")
+    receipt = _authority_receipt(candidate)
+    with store._maintenance_connection() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_authority_receipt
+            BEFORE INSERT ON candidate_authority_receipts
+            BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END
+            """
+        )
+
+    with pytest.raises(MemoryStoreConflictError):
+        store.put_candidate(
+            candidate,
+            receipt,
+            request_id=stable_request_id("atomic-authority", candidate.candidate_id),
+        )
+    assert store.find_candidate(candidate.candidate_id) is None
+    assert store.list_candidate_authority_receipts(candidate.candidate_id) == ()
+    assert store.get_generations(REPOSITORY_KEY).memory_generation == 0
+    assert store.list_events(REPOSITORY_KEY) == ()
+
+
 def test_failed_event_insert_rolls_back_projection_and_generation(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path / "memory")
     candidate = _candidate()
@@ -473,6 +737,7 @@ def test_approval_uses_generation_and_status_cas_without_duplicate_record(
     candidate = _candidate(status=CandidateStatus.VALIDATED)
     store.put_candidate(
         candidate,
+        _authority_receipt(candidate),
         request_id=stable_request_id("candidate", candidate.candidate_id),
     )
     content = b'{"sources":["payments/money.py:10-18"]}'
@@ -484,6 +749,7 @@ def test_approval_uses_generation_and_status_cas_without_duplicate_record(
     store.put_source_bundle(
         bundle,
         request_id=stable_request_id("bundle", bundle.bundle_hash),
+        authority_resolution_hash=AUTHORITY_RESOLUTION,
     )
     request_id = stable_request_id("approve", candidate.candidate_id)
     record = _record(candidate, bundle, request_id)
@@ -497,6 +763,7 @@ def test_approval_uses_generation_and_status_cas_without_duplicate_record(
             ),
             expected_candidate_status=CandidateStatus.VALIDATED,
             expected_generation=expected_generation,
+            authority_resolution_hash=AUTHORITY_RESOLUTION,
         )
     assert store.get_generations(REPOSITORY_KEY).memory_generation == expected_generation
 
@@ -505,6 +772,7 @@ def test_approval_uses_generation_and_status_cas_without_duplicate_record(
         request_id=request_id,
         expected_candidate_status=CandidateStatus.VALIDATED,
         expected_generation=expected_generation,
+        authority_resolution_hash=AUTHORITY_RESOLUTION,
     )
 
     assert result.applied
@@ -517,6 +785,7 @@ def test_approval_uses_generation_and_status_cas_without_duplicate_record(
             record,
             request_id=stable_request_id("second-approval", candidate.candidate_id),
             expected_candidate_status=CandidateStatus.VALIDATED,
+            authority_resolution_hash=AUTHORITY_RESOLUTION,
         )
     assert store.count_records(REPOSITORY_KEY) == 1
 
@@ -543,6 +812,7 @@ def test_atomic_lifecycle_approval_rolls_back_bundle_pin_and_authority(
     candidate = _candidate(status=CandidateStatus.PENDING_APPROVAL)
     store.put_candidate(
         candidate,
+        _authority_receipt(candidate),
         request_id=stable_request_id("candidate", candidate.candidate_id),
     )
     content = b'{"schema":"memory_source_bundle_v1","sources":[]}'
@@ -579,6 +849,7 @@ def test_atomic_lifecycle_approval_rolls_back_bundle_pin_and_authority(
             request_id=request_id,
             expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
             expected_generation=generation,
+            authority_resolution_hash=AUTHORITY_RESOLUTION,
             actor_id="amy",
             reason="Approved after source revalidation.",
         )
@@ -600,6 +871,7 @@ def test_atomic_lifecycle_approval_rolls_back_bundle_pin_and_authority(
         request_id=request_id,
         expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
         expected_generation=generation,
+        authority_resolution_hash=AUTHORITY_RESOLUTION,
         actor_id="amy",
         reason="Approved after source revalidation.",
     )
@@ -803,6 +1075,65 @@ def test_read_only_store_never_promotes_a_blob_before_rejecting_write(
     assert not store.blob_path(digest).exists()
 
 
+def test_read_only_blob_read_does_not_create_a_blob_lock_file(
+    tmp_path: Path,
+) -> None:
+    namespace = tmp_path / "memory"
+    writer = MemoryStore(namespace)
+    content = b"read-only blob access must not mutate its namespace"
+    blob = writer.put_blob(content, media_type="application/octet-stream")
+    lock_path = namespace / "blobs" / ".blob-store.lock"
+    lock_path.unlink()
+    read_only = MemoryStore(namespace, read_only=True)
+    before = {
+        path.relative_to(namespace).as_posix(): path.stat().st_mtime_ns
+        for path in namespace.rglob("*")
+        if path.is_file()
+    }
+
+    assert read_only.read_blob(blob.blob_hash) == content
+
+    after = {
+        path.relative_to(namespace).as_posix(): path.stat().st_mtime_ns
+        for path in namespace.rglob("*")
+        if path.is_file()
+    }
+    assert before == after
+    assert not lock_path.exists()
+
+
+def test_read_only_store_rejects_a_missing_coordination_lock_without_writing(
+    tmp_path: Path,
+) -> None:
+    namespace = tmp_path / "memory"
+    writer = MemoryStore(namespace)
+    writer.checkpoint("TRUNCATE")
+    lock_path = namespace / ".memory-store.lock"
+    lock_path.unlink()
+    before = {
+        path.relative_to(namespace).as_posix(): (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+        )
+        for path in namespace.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(MemoryStoreUnavailableError, match="coordination lock"):
+        MemoryStore(namespace, read_only=True)
+
+    after = {
+        path.relative_to(namespace).as_posix(): (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+        )
+        for path in namespace.rglob("*")
+        if path.is_file()
+    }
+    assert before == after
+    assert not lock_path.exists()
+
+
 def test_blob_promotion_before_database_failure_is_collected_as_orphan(
     tmp_path: Path,
 ) -> None:
@@ -823,7 +1154,7 @@ def test_blob_promotion_before_database_failure_is_collected_as_orphan(
 
     with store._maintenance_connection() as connection:
         connection.execute("DROP TRIGGER reject_test_blob")
-    result = store.gc_blobs(dry_run=False)
+    result = store.apply_blob_gc(store.gc_blobs(dry_run=True))
     assert str(store.blob_path(digest)) in result.deleted_orphan_paths
     assert not store.blob_path(digest).exists()
 
@@ -858,8 +1189,7 @@ def test_blob_promotion_and_gc_are_serialized_across_store_instances(
     thread.start()
     assert entered.wait(timeout=2)
     try:
-        with pytest.raises(MemoryStoreBusyError):
-            collector.gc_blobs(dry_run=True)
+        assert collector.gc_blobs(dry_run=True).candidate_hashes == ()
     finally:
         release.set()
         thread.join(timeout=2)
@@ -872,13 +1202,16 @@ def test_blob_gc_preserves_session_and_source_bundle_pins(tmp_path: Path) -> Non
     store = MemoryStore(tmp_path / "memory")
     orphan = store.put_blob(b"orphan", media_type="application/octet-stream")
     store.pin_blob(orphan.blob_hash, pin_type="session", pin_id="review-001")
-    assert store.gc_blobs(dry_run=False).deleted_hashes == ()
+    assert store.apply_blob_gc(store.gc_blobs(dry_run=True)).deleted_hashes == ()
     store.unpin_blob(orphan.blob_hash, pin_type="session", pin_id="review-001")
-    assert store.gc_blobs(dry_run=False).deleted_hashes == (orphan.blob_hash,)
+    assert store.apply_blob_gc(store.gc_blobs(dry_run=True)).deleted_hashes == (
+        orphan.blob_hash,
+    )
 
     candidate = _candidate()
     store.put_candidate(
         candidate,
+        _authority_receipt(candidate),
         request_id=stable_request_id("candidate", candidate.candidate_id),
     )
     content = b"source bundle"
@@ -890,11 +1223,200 @@ def test_blob_gc_preserves_session_and_source_bundle_pins(tmp_path: Path) -> Non
     store.put_source_bundle(
         bundle,
         request_id=stable_request_id("bundle", bundle.bundle_hash),
+        authority_resolution_hash=AUTHORITY_RESOLUTION,
     )
 
-    result = store.gc_blobs(dry_run=False)
+    result = store.apply_blob_gc(store.gc_blobs(dry_run=True))
     assert bundle.blob_hash not in result.deleted_hashes
     assert store.read_blob(bundle.blob_hash) == content
+
+
+def test_blob_gc_apply_is_preview_bounded_and_rechecks_live_pins(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    previewed = store.put_blob(
+        b"previewed orphan",
+        media_type="application/octet-stream",
+    )
+    preview = store.gc_blobs(dry_run=True)
+    assert preview.candidate_hashes == (previewed.blob_hash,)
+
+    created_after_preview = store.put_blob(
+        b"new orphan after preview",
+        media_type="application/octet-stream",
+    )
+    store.pin_blob(
+        previewed.blob_hash,
+        pin_type="session",
+        pin_id="review-raced-with-gc",
+    )
+    result = store.apply_blob_gc(preview)
+
+    assert result.deleted_hashes == ()
+    assert store.read_blob(previewed.blob_hash) == b"previewed orphan"
+    assert store.read_blob(created_after_preview.blob_hash) == (
+        b"new orphan after preview"
+    )
+    store.unpin_blob(
+        previewed.blob_hash,
+        pin_type="session",
+        pin_id="review-raced-with-gc",
+    )
+    refreshed = store.gc_blobs(dry_run=True)
+    assert set(refreshed.candidate_hashes) == {
+        previewed.blob_hash,
+        created_after_preview.blob_hash,
+    }
+
+
+def test_blob_gc_rejects_forged_and_cross_store_previews(tmp_path: Path) -> None:
+    first = MemoryStore(tmp_path / "first")
+    second = MemoryStore(tmp_path / "second")
+    content = b"same unreferenced content"
+    first_blob = first.put_blob(content, media_type="application/octet-stream")
+    second_blob = second.put_blob(content, media_type="application/octet-stream")
+    assert first_blob.blob_hash == second_blob.blob_hash
+
+    first_preview = first.gc_blobs(dry_run=True)
+    with pytest.raises(MemoryStoreValidationError, match="not issued"):
+        second.apply_blob_gc(first_preview)
+    assert second.read_blob(second_blob.blob_hash) == content
+
+    forged = BlobGCResult(
+        candidate_hashes=(second_blob.blob_hash,),
+        deleted_hashes=(),
+        orphan_paths=(),
+        deleted_orphan_paths=(),
+        reclaimed_bytes=len(content),
+        dry_run=True,
+        cutoff=first_preview.cutoff,
+        preview_token="0" * 64,
+    )
+    with pytest.raises(MemoryStoreValidationError, match="not issued"):
+        second.apply_blob_gc(forged)
+    assert second.read_blob(second_blob.blob_hash) == content
+
+
+def test_blob_gc_dry_run_is_filesystem_read_only(tmp_path: Path) -> None:
+    namespace = tmp_path / "memory"
+    writer = MemoryStore(namespace)
+    orphan = writer.put_blob(
+        b"read-only GC candidate",
+        media_type="application/octet-stream",
+    )
+
+    def file_snapshot() -> dict[str, tuple[int, int]]:
+        return {
+            path.relative_to(namespace).as_posix(): (
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+            )
+            for path in namespace.rglob("*")
+            if path.is_file()
+        }
+
+    before = file_snapshot()
+    preview = MemoryStore(namespace, read_only=True).gc_blobs(dry_run=True)
+    after = file_snapshot()
+
+    assert preview.candidate_hashes == (orphan.blob_hash,)
+    assert before == after
+
+
+def test_read_only_store_reads_committed_frames_from_a_live_wal(
+    tmp_path: Path,
+) -> None:
+    namespace = tmp_path / "memory"
+    writer = MemoryStore(namespace)
+    snapshot_reader = sqlite3.connect(
+        str(writer.database_path),
+        isolation_level=None,
+    )
+    try:
+        snapshot_reader.execute("BEGIN")
+        snapshot_reader.execute("SELECT COUNT(*) FROM candidates").fetchone()
+        candidate = _candidate(statement="Committed WAL frames remain visible.")
+        writer.put_candidate(
+            candidate,
+            request_id=stable_request_id("live-wal-reader", candidate.candidate_id),
+        )
+        wal_path = Path(str(writer.database_path) + "-wal")
+        assert wal_path.is_file() and wal_path.stat().st_size > 0
+
+        read_only = MemoryStore(namespace, read_only=True)
+
+        assert read_only.get_candidate(candidate.candidate_id) == candidate
+    finally:
+        snapshot_reader.rollback()
+        snapshot_reader.close()
+
+
+def test_immutable_read_serializes_a_writer_that_would_create_the_first_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = tmp_path / "memory"
+    writer = MemoryStore(namespace, busy_timeout_ms=2_000)
+    writer.checkpoint("TRUNCATE")
+    read_only = MemoryStore(namespace, read_only=True, busy_timeout_ms=2_000)
+    candidate = _candidate(statement="The first WAL write is serialized.")
+    probed = threading.Event()
+    release_reader = threading.Event()
+    reader_result: list[MemoryCandidate | None] = []
+    reader_errors: list[Exception] = []
+    writer_errors: list[Exception] = []
+    real_has_live_wal = memory_store_module._database_has_live_wal
+    calls = 0
+
+    def pause_after_second_probe(path: Path) -> bool:
+        nonlocal calls
+        result = real_has_live_wal(path)
+        if threading.current_thread().name == "immutable-reader":
+            calls += 1
+            if calls == 2:
+                probed.set()
+                if not release_reader.wait(timeout=2):
+                    raise RuntimeError("test did not release immutable reader")
+        return result
+
+    monkeypatch.setattr(
+        memory_store_module,
+        "_database_has_live_wal",
+        pause_after_second_probe,
+    )
+
+    def read() -> None:
+        try:
+            reader_result.append(read_only.find_candidate(candidate.candidate_id))
+        except Exception as error:  # pragma: no cover - asserted below
+            reader_errors.append(error)
+
+    def write() -> None:
+        try:
+            writer.put_candidate(
+                candidate,
+                request_id=stable_request_id("first-wal", candidate.candidate_id),
+            )
+        except Exception as error:  # pragma: no cover - asserted below
+            writer_errors.append(error)
+
+    reader_thread = threading.Thread(target=read, name="immutable-reader")
+    writer_thread = threading.Thread(target=write, name="first-wal-writer")
+    reader_thread.start()
+    assert probed.wait(timeout=2)
+    writer_thread.start()
+    try:
+        assert writer_thread.is_alive()
+    finally:
+        release_reader.set()
+        reader_thread.join(timeout=3)
+        writer_thread.join(timeout=3)
+
+    assert not reader_thread.is_alive() and not writer_thread.is_alive()
+    assert reader_errors == [] and writer_errors == []
+    assert reader_result == [None]
+    assert read_only.get_candidate(candidate.candidate_id) == candidate
 
 
 def test_feedback_and_knowledge_update_only_their_generations(tmp_path: Path) -> None:
@@ -979,6 +1501,235 @@ def test_export_is_canonical_hashed_and_import_dry_run_never_writes(
     tampered["manifest_hash"] = HASH_1
     with pytest.raises(MemoryStoreValidationError):
         target.import_manifest(tampered, dry_run=True)
+
+
+def test_prepared_import_is_detached_from_a_replaced_manifest_path(
+    tmp_path: Path,
+) -> None:
+    first_source = MemoryStore(tmp_path / "first-source")
+    first = _candidate(statement="The prepared manifest is authoritative.")
+    first_source.put_candidate(
+        first,
+        request_id=stable_request_id("first", first.candidate_id),
+    )
+    manifest_path = tmp_path / "portable.json"
+    first_manifest = first_source.export_manifest(
+        manifest_path,
+        redact=False,
+        created_at=CREATED_AT,
+    )
+
+    target = MemoryStore(tmp_path / "target")
+    prepared = target.prepare_import_manifest(manifest_path)
+
+    second_source = MemoryStore(tmp_path / "second-source")
+    second = _candidate(statement="A later path replacement must not be imported.")
+    second_source.put_candidate(
+        second,
+        request_id=stable_request_id("second", second.candidate_id),
+    )
+    second_manifest = second_source.export_manifest(
+        manifest_path,
+        redact=False,
+        created_at="2026-07-14T12:00:01Z",
+    )
+    assert first_manifest["manifest_hash"] != second_manifest["manifest_hash"]
+
+    plan = target.apply_prepared_import(prepared)
+
+    assert plan.applied
+    assert target.get_candidate(first.candidate_id) == first
+    assert target.find_candidate(second.candidate_id) is None
+
+
+def test_import_rejects_projection_and_receipt_relationship_tampering_before_write(
+    tmp_path: Path,
+) -> None:
+    source = MemoryStore(tmp_path / "source")
+    candidate = _candidate()
+    source.put_candidate(
+        candidate,
+        request_id=stable_request_id("candidate", candidate.candidate_id),
+    )
+    manifest = source.build_export_manifest(redact=False, created_at=CREATED_AT)
+
+    def rehash(payload: dict[str, object]) -> dict[str, object]:
+        body = {key: value for key, value in payload.items() if key != "manifest_hash"}
+        payload["manifest_hash"] = hashlib.sha256(
+            canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        return payload
+
+    projection_tampered = json.loads(canonical_json(manifest))
+    projection_tampered["candidates"][0]["current_status"] = (
+        CandidateStatus.VALIDATED.value
+    )
+    rehash(projection_tampered)
+    target = MemoryStore(tmp_path / "target")
+    with pytest.raises(MemoryStoreValidationError, match="projection"):
+        target.import_manifest(projection_tampered, dry_run=True)
+    with pytest.raises(MemoryStoreValidationError, match="projection"):
+        target.import_manifest(projection_tampered, dry_run=False)
+    assert target.find_candidate(candidate.candidate_id) is None
+    assert target.get_generations(REPOSITORY_KEY).memory_generation == 0
+
+    receipt_tampered = json.loads(canonical_json(manifest))
+    receipt_tampered["outbox_receipts"][0]["request_id"] = stable_request_id(
+        "different-import-receipt",
+        candidate.candidate_id,
+    )
+    rehash(receipt_tampered)
+    with pytest.raises(MemoryStoreValidationError, match="receipt event relationship"):
+        target.import_manifest(receipt_tampered, dry_run=True)
+    assert target.find_candidate(candidate.candidate_id) is None
+
+
+def test_redacted_import_binds_initial_record_projection_to_approval_receipt(
+    tmp_path: Path,
+) -> None:
+    source = MemoryStore(tmp_path / "source")
+    candidate = _candidate(status=CandidateStatus.VALIDATED)
+    source.put_candidate(
+        candidate,
+        _authority_receipt(candidate),
+        request_id=stable_request_id("candidate", candidate.candidate_id),
+    )
+    content = b'{"sources":["payments/money.py:10-18"]}'
+    source.put_blob(
+        content,
+        media_type="application/vnd.review-agent.source-bundle+json",
+        created_at=CREATED_AT,
+    )
+    bundle = _bundle(candidate, content)
+    source.put_source_bundle(
+        bundle,
+        request_id=stable_request_id("bundle", bundle.bundle_hash),
+        authority_resolution_hash=AUTHORITY_RESOLUTION,
+    )
+    approval_request = stable_request_id("approve", candidate.candidate_id)
+    source.approve_candidate(
+        _record(candidate, bundle, approval_request),
+        request_id=approval_request,
+        expected_candidate_status=CandidateStatus.VALIDATED,
+        authority_resolution_hash=AUTHORITY_RESOLUTION,
+    )
+    manifest = source.build_export_manifest(redact=True, created_at=CREATED_AT)
+    tampered = json.loads(canonical_json(manifest))
+    tampered["records"][0]["current_status"] = RecordStatus.REVOKED.value
+    body = {key: value for key, value in tampered.items() if key != "manifest_hash"}
+    tampered["manifest_hash"] = hashlib.sha256(
+        canonical_json(body).encode("utf-8")
+    ).hexdigest()
+
+    with pytest.raises(MemoryStoreValidationError, match="candidate approval"):
+        MemoryStore(tmp_path / "target").import_manifest(tampered, dry_run=True)
+
+
+def test_import_transaction_failure_restores_empty_target_and_new_blob_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = MemoryStore(tmp_path / "source")
+    content = b'{"symbols":["payments.money.calculate_total"]}'
+    source.put_blob(content, media_type="application/json", created_at=CREATED_AT)
+    knowledge = _knowledge(content)
+    source.put_knowledge_entry(
+        knowledge,
+        request_id=stable_request_id("knowledge", knowledge.entry_id),
+    )
+    export_directory = tmp_path / "portable-export"
+    source.export_to_directory(
+        export_directory,
+        redact=False,
+        include_blobs=True,
+        created_at=CREATED_AT,
+    )
+    target = MemoryStore(tmp_path / "target")
+
+    def reject_projection(
+        connection: sqlite3.Connection,
+        repository_key: str,
+    ) -> None:
+        raise MemoryStoreCorruptionError("injected import projection failure")
+
+    monkeypatch.setattr(target, "_verify_projection_connection", reject_projection)
+    with pytest.raises(MemoryStoreCorruptionError, match="injected"):
+        target.import_manifest(
+            export_directory / "manifest.json",
+            dry_run=False,
+            blob_source_root=export_directory,
+        )
+
+    with target.open_connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM repositories").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM blobs").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM knowledge_entries").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+    assert not target.blob_path(knowledge.blob_hash).exists()
+
+
+def test_import_blob_registration_failure_removes_newly_promoted_file(
+    tmp_path: Path,
+) -> None:
+    source = MemoryStore(tmp_path / "source")
+    content = b'{"symbols":["payments.money.calculate_total"]}'
+    source.put_blob(content, media_type="application/json", created_at=CREATED_AT)
+    knowledge = _knowledge(content)
+    source.put_knowledge_entry(
+        knowledge,
+        request_id=stable_request_id("knowledge", knowledge.entry_id),
+    )
+    export_directory = tmp_path / "portable-export"
+    source.export_to_directory(
+        export_directory,
+        redact=False,
+        include_blobs=True,
+        created_at=CREATED_AT,
+    )
+    target = MemoryStore(tmp_path / "target")
+    with target._maintenance_connection() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_import_blob BEFORE INSERT ON blobs
+            BEGIN SELECT RAISE(ABORT, 'injected blob registration failure'); END
+            """
+        )
+
+    with pytest.raises(MemoryStoreConflictError):
+        target.import_manifest(
+            export_directory / "manifest.json",
+            dry_run=False,
+            blob_source_root=export_directory,
+        )
+
+    with target.open_connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM blobs").fetchone()[0] == 0
+    assert not target.blob_path(knowledge.blob_hash).exists()
+
+
+def test_manifest_file_read_is_bounded_on_one_open_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = MemoryStore(tmp_path / "target")
+    requested_sizes: list[int] = []
+
+    class BoundedStream(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            requested_sizes.append(size)
+            return super().read(size)
+
+    monkeypatch.setattr(memory_store_module, "MAX_IMPORT_MANIFEST_BYTES", 8)
+    monkeypatch.setattr(
+        Path,
+        "open",
+        lambda self, mode="r", *args, **kwargs: BoundedStream(b"123456789"),
+    )
+
+    with pytest.raises(MemoryStoreValidationError, match="too large"):
+        target.prepare_import_manifest(tmp_path / "swappable-manifest.json")
+
+    assert requested_sizes == [9]
 
 
 def test_redacted_registered_identity_is_validated_without_fabricated_paths(
@@ -1095,6 +1846,559 @@ def test_nonredacted_import_restores_events_blobs_and_request_receipts(
     assert replay.replayed and not replay.applied
 
 
+def test_export_import_round_trips_multiple_candidate_authority_contexts(
+    tmp_path: Path,
+) -> None:
+    source = MemoryStore(tmp_path / "source")
+    candidate = _candidate()
+    first = _authority_receipt(candidate)
+    second = _authority_receipt(
+        candidate,
+        authority_resolution_hash="9" * 64,
+        created_at="2026-07-14T12:00:01Z",
+    )
+    source.put_candidate(
+        candidate,
+        first,
+        request_id=stable_request_id("candidate-authority", first.receipt_id),
+    )
+    source.put_candidate(
+        candidate,
+        second,
+        request_id=stable_request_id("candidate-authority", second.receipt_id),
+        expected_generation=1,
+    )
+
+    redacted = source.build_export_manifest(redact=True, created_at=CREATED_AT)
+    redacted_plan = MemoryStore(tmp_path / "redacted-target").import_manifest(
+        redacted,
+        dry_run=True,
+    )
+    assert redacted_plan.authority_receipt_count == 2
+    assert not redacted_plan.restorable
+    assert all(
+        envelope["model"] is None
+        for envelope in redacted["candidate_authority_receipts"]
+    )
+
+    export_directory = tmp_path / "portable-export"
+    source.export_to_directory(
+        export_directory,
+        redact=False,
+        created_at=CREATED_AT,
+    )
+    target = MemoryStore(tmp_path / "target")
+    plan = target.import_manifest(
+        export_directory / "manifest.json",
+        dry_run=False,
+    )
+
+    assert plan.applied and plan.authority_receipt_count == 2
+    assert target.list_candidate_authority_receipts(candidate.candidate_id) == (
+        first,
+        second,
+    )
+    assert target.validate_integrity().candidate_count == 1
+
+
+def test_v1_to_v2_migration_preserves_authority_data_and_event_bytes(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate(status=CandidateStatus.PENDING_APPROVAL)
+    receipt = _authority_receipt(candidate)
+    store.put_candidate(
+        candidate,
+        receipt,
+        request_id=stable_request_id("migration-candidate", candidate.candidate_id),
+    )
+    source_content = b'{"schema":"memory_source_bundle_v1","sources":[]}'
+    store.put_blob(
+        source_content,
+        media_type="application/vnd.review-agent.source-bundle+json",
+        created_at=CREATED_AT,
+    )
+    bundle = _bundle(candidate, source_content)
+    approval_request = stable_request_id("migration-approve", candidate.candidate_id)
+    record = _record(candidate, bundle, approval_request)
+    store.approve_candidate_with_source_bundle(
+        record,
+        bundle,
+        request_id=approval_request,
+        expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
+        expected_generation=1,
+        authority_resolution_hash=receipt.authority_resolution_hash,
+    )
+    feedback = _feedback()
+    store.put_feedback(
+        feedback,
+        request_id=stable_request_id("migration-feedback", feedback.feedback_id),
+    )
+    knowledge_content = b'{"symbols":[]}'
+    store.put_blob(knowledge_content, media_type="application/json", created_at=CREATED_AT)
+    knowledge = _knowledge(knowledge_content)
+    store.put_knowledge_entry(
+        knowledge,
+        request_id=stable_request_id("migration-knowledge", knowledge.entry_id),
+    )
+    pinned = store.put_blob(
+        b"manual pin",
+        media_type="application/octet-stream",
+        created_at=CREATED_AT,
+    )
+    store.pin_blob(
+        pinned.blob_hash,
+        pin_type="manual",
+        pin_id="migration-pin",
+        created_at=CREATED_AT,
+    )
+    legacy_unapproved = _candidate(
+        statement="Legacy candidates require renewed authority before approval.",
+        status=CandidateStatus.PENDING_APPROVAL,
+    )
+    store.put_candidate(
+        legacy_unapproved,
+        request_id=stable_request_id(
+            "migration-legacy-candidate",
+            legacy_unapproved.candidate_id,
+        ),
+    )
+    _downgrade_store_to_frozen_v1(store)
+
+    preserved_tables = (
+        "repositories",
+        "generations",
+        "blobs",
+        "blob_pins",
+        "candidates",
+        "source_bundles",
+        "records",
+        "feedback",
+        "knowledge_entries",
+        "events",
+        "event_chain_heads",
+        "sqlite_sequence",
+    )
+    before = {
+        table: _table_snapshot(store.database_path, table)
+        for table in preserved_tables
+    }
+    receipts_before = _table_snapshot(store.database_path, "outbox_receipts")
+    v1_migration = _table_snapshot(store.database_path, "schema_migrations")
+
+    migrated = MemoryStore(store.database_path)
+
+    assert migrated.metadata()["schema_name"] == "memory_store_schema_v2"
+    assert migrated.metadata()["schema_version"] == "2"
+    assert all(
+        _table_snapshot(store.database_path, table) == rows
+        for table, rows in before.items()
+    )
+    with migrated.open_connection() as connection:
+        receipt_rows = connection.execute(
+            """
+            SELECT request_id, repository_key, operation, request_hash,
+                   subject_id, event_id, result_json, created_at,
+                   request_hash_version
+            FROM outbox_receipts
+            """
+        ).fetchall()
+        assert tuple(tuple(row[:8]) for row in receipt_rows) == receipts_before
+        assert {row[8] for row in receipt_rows} == {1}
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_authority_receipts"
+        ).fetchone()[0] == 0
+        assert tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM schema_migrations WHERE schema_version = 1"
+            )
+        ) == v1_migration
+    assert migrated.get_record(record.memory_id) == record
+    assert migrated.get_candidate(candidate.candidate_id).status is CandidateStatus.APPROVED
+    assert migrated.get_candidate(legacy_unapproved.candidate_id) == legacy_unapproved
+    assert migrated.list_candidate_authority_receipts(
+        legacy_unapproved.candidate_id
+    ) == ()
+    legacy_content = b'{"schema":"memory_source_bundle_v1","legacy":true}'
+    migrated.put_blob(
+        legacy_content,
+        media_type="application/vnd.review-agent.source-bundle+json",
+        created_at=CREATED_AT,
+    )
+    legacy_bundle = _bundle(legacy_unapproved, legacy_content)
+    legacy_request = stable_request_id(
+        "migration-legacy-approval",
+        legacy_unapproved.candidate_id,
+    )
+    legacy_record = _record(legacy_unapproved, legacy_bundle, legacy_request)
+    with pytest.raises(MemoryStoreValidationError, match="exact current-context"):
+        migrated.approve_candidate_with_source_bundle(
+            legacy_record,
+            legacy_bundle,
+            request_id=legacy_request,
+            expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
+        )
+    with pytest.raises(MemoryStoreConflictError, match="not stored"):
+        migrated.approve_candidate_with_source_bundle(
+            legacy_record,
+            legacy_bundle,
+            request_id=legacy_request,
+            expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
+            authority_resolution_hash="f" * 64,
+        )
+    migrated.validate_integrity()
+
+
+def test_v1_migration_failure_leaves_original_database_intact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate()
+    store.put_candidate(
+        candidate,
+        request_id=stable_request_id("migration-failure", candidate.candidate_id),
+    )
+    _downgrade_store_to_frozen_v1(store)
+    before_bytes = store.database_path.read_bytes()
+    before_events = _table_snapshot(store.database_path, "events")
+
+    def fail_migration(connection: sqlite3.Connection) -> None:
+        connection.execute("CREATE TABLE must_not_escape(value TEXT)")
+        raise RuntimeError("injected migration failure")
+
+    monkeypatch.setattr(
+        MemoryStore,
+        "_migrate_v1_connection",
+        staticmethod(fail_migration),
+    )
+    with pytest.raises(MemoryStoreMigrationError):
+        MemoryStore(store.database_path)
+
+    assert store.database_path.read_bytes() == before_bytes
+    assert _table_snapshot(store.database_path, "events") == before_events
+    connection = sqlite3.connect(str(store.database_path))
+    connection.row_factory = sqlite3.Row
+    try:
+        assert memory_store_module._is_v1_schema_connection(connection)
+        assert "must_not_escape" not in {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        connection.close()
+
+
+def test_v1_migration_rejects_semantically_corrupt_staging_before_replace(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate()
+    store.put_candidate(
+        candidate,
+        request_id=stable_request_id("corrupt-v1", candidate.candidate_id),
+    )
+    _downgrade_store_to_frozen_v1(store)
+    connection = sqlite3.connect(str(store.database_path), isolation_level=None)
+    try:
+        connection.execute(
+            "UPDATE generations SET memory_generation = memory_generation + 1 "
+            "WHERE repository_key = ?",
+            (REPOSITORY_KEY,),
+        )
+    finally:
+        connection.close()
+    before = store.database_path.read_bytes()
+
+    with pytest.raises(MemoryStoreMigrationError):
+        MemoryStore(store.database_path)
+
+    assert store.database_path.read_bytes() == before
+    connection = sqlite3.connect(str(store.database_path))
+    connection.row_factory = sqlite3.Row
+    try:
+        assert memory_store_module._is_v1_schema_connection(connection)
+        assert connection.execute(
+            "SELECT memory_generation FROM generations WHERE repository_key = ?",
+            (REPOSITORY_KEY,),
+        ).fetchone()[0] == 2
+    finally:
+        connection.close()
+
+
+def test_concurrent_v1_migration_openers_converge_on_the_same_v2_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(tmp_path / "memory", busy_timeout_ms=2_000)
+    candidate = _candidate()
+    store.put_candidate(
+        candidate,
+        request_id=stable_request_id("concurrent-migration", candidate.candidate_id),
+    )
+    _downgrade_store_to_frozen_v1(store)
+    entered = threading.Event()
+    release = threading.Event()
+    original = MemoryStore._migrate_v1_connection
+
+    def paused_migration(connection: sqlite3.Connection) -> None:
+        original(connection)
+        entered.set()
+        if not release.wait(timeout=2):
+            raise RuntimeError("test did not release migration")
+
+    monkeypatch.setattr(
+        MemoryStore,
+        "_migrate_v1_connection",
+        staticmethod(paused_migration),
+    )
+    opened: list[MemoryStore] = []
+    errors: list[Exception] = []
+
+    def open_store() -> None:
+        try:
+            opened.append(MemoryStore(store.database_path, busy_timeout_ms=2_000))
+        except Exception as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    first = threading.Thread(target=open_store)
+    second = threading.Thread(target=open_store)
+    first.start()
+    assert entered.wait(timeout=2)
+    second.start()
+    try:
+        assert second.is_alive()
+    finally:
+        release.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert len(opened) == 2
+    assert all(item.metadata()["schema_version"] == "2" for item in opened)
+    assert opened[0].get_candidate(candidate.candidate_id) == candidate
+
+
+def test_authority_writer_waits_for_migration_and_is_not_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(tmp_path / "memory", busy_timeout_ms=2_000)
+    initial = _candidate()
+    store.put_candidate(
+        initial,
+        request_id=stable_request_id("initial", initial.candidate_id),
+    )
+    _downgrade_store_to_frozen_v1(store)
+    entered = threading.Event()
+    release = threading.Event()
+    original = MemoryStore._migrate_v1_connection
+
+    def paused_migration(connection: sqlite3.Connection) -> None:
+        original(connection)
+        entered.set()
+        if not release.wait(timeout=2):
+            raise RuntimeError("test did not release migration")
+
+    monkeypatch.setattr(
+        MemoryStore,
+        "_migrate_v1_connection",
+        staticmethod(paused_migration),
+    )
+    migrated: list[MemoryStore] = []
+    migration_errors: list[Exception] = []
+    writer_errors: list[Exception] = []
+    late = _candidate(statement="A writer committed after migration began.")
+
+    def migrate() -> None:
+        try:
+            migrated.append(MemoryStore(store.database_path, busy_timeout_ms=2_000))
+        except Exception as error:  # pragma: no cover - asserted below
+            migration_errors.append(error)
+
+    def write() -> None:
+        try:
+            store.put_candidate(
+                late,
+                request_id=stable_request_id("late", late.candidate_id),
+            )
+        except Exception as error:  # pragma: no cover - asserted below
+            writer_errors.append(error)
+
+    migration_thread = threading.Thread(target=migrate)
+    writer_thread = threading.Thread(target=write)
+    migration_thread.start()
+    assert entered.wait(timeout=2)
+    writer_thread.start()
+    try:
+        assert writer_thread.is_alive()
+    finally:
+        release.set()
+        migration_thread.join(timeout=3)
+        writer_thread.join(timeout=3)
+
+    assert not migration_thread.is_alive() and not writer_thread.is_alive()
+    assert migration_errors == [] and writer_errors == []
+    assert migrated[0].get_candidate(initial.candidate_id) == initial
+    assert migrated[0].get_candidate(late.candidate_id) == late
+
+
+def test_failed_v1_migration_does_not_checkpoint_an_existing_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate()
+    store.put_candidate(
+        candidate,
+        request_id=stable_request_id("live-wal", candidate.candidate_id),
+    )
+    _downgrade_store_to_frozen_v1(store)
+
+    reader = sqlite3.connect(str(store.database_path), isolation_level=None)
+    try:
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM candidates").fetchone()
+        writer = sqlite3.connect(str(store.database_path), isolation_level=None)
+        try:
+            writer.execute(
+                "UPDATE repositories SET last_accessed_at = ? WHERE repository_key = ?",
+                ("2026-07-14T12:00:01Z", REPOSITORY_KEY),
+            )
+        finally:
+            writer.close()
+        wal_path = Path(str(store.database_path) + "-wal")
+        assert wal_path.is_file() and wal_path.stat().st_size > 0
+        before_database = store.database_path.read_bytes()
+        before_wal = wal_path.read_bytes()
+
+        def fail_migration(connection: sqlite3.Connection) -> None:
+            connection.execute("CREATE TABLE must_not_escape(value TEXT)")
+            raise RuntimeError("injected migration failure")
+
+        monkeypatch.setattr(
+            MemoryStore,
+            "_migrate_v1_connection",
+            staticmethod(fail_migration),
+        )
+        with pytest.raises(MemoryStoreMigrationError):
+            MemoryStore(store.database_path)
+
+        assert store.database_path.read_bytes() == before_database
+        assert wal_path.read_bytes() == before_wal
+    finally:
+        reader.rollback()
+        reader.close()
+
+
+def test_failed_v1_migration_preflight_does_not_checkpoint_crash_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate()
+    store.put_candidate(
+        candidate,
+        request_id=stable_request_id("crash-wal", candidate.candidate_id),
+    )
+    _downgrade_store_to_frozen_v1(store)
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, sqlite3, sys; "
+                "connection = sqlite3.connect(sys.argv[1], isolation_level=None); "
+                "connection.execute('PRAGMA wal_autocheckpoint = 0'); "
+                "connection.execute(\"UPDATE repositories SET last_accessed_at = "
+                "'2026-07-14T12:00:02Z'\"); "
+                "os._exit(0)"
+            ),
+            str(store.database_path),
+        ],
+        check=True,
+    )
+    wal_path = Path(str(store.database_path) + "-wal")
+    assert wal_path.is_file() and wal_path.stat().st_size > 0
+    before_database = store.database_path.read_bytes()
+    before_wal = wal_path.read_bytes()
+
+    def fail_before_migration(self: MemoryStore) -> None:
+        raise MemoryStoreMigrationError("injected migration failure")
+
+    monkeypatch.setattr(MemoryStore, "_migrate_v1_store", fail_before_migration)
+    with pytest.raises(MemoryStoreMigrationError, match="injected"):
+        MemoryStore(store.database_path)
+
+    assert store.database_path.read_bytes() == before_database
+    assert wal_path.read_bytes() == before_wal
+
+
+def test_migrated_v1_request_receipt_keeps_legacy_replay_semantics(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate()
+    request_id = stable_request_id("legacy-v1-replay", candidate.candidate_id)
+    store.put_candidate(
+        candidate,
+        request_id=request_id,
+        expected_generation=0,
+    )
+    legacy_hash = canonical_sha256(
+        {
+            "operation": "put_candidate",
+            "candidate": candidate.to_dict(),
+            "expected_generation": 0,
+            "actor_type": candidate.producer.producer_type.value,
+            "actor_id": candidate.producer.name,
+            "reason_code": "candidate_submitted",
+            "reason": None,
+        }
+    )
+    with store._maintenance_connection() as connection:
+        connection.execute("DROP TRIGGER outbox_receipts_no_update")
+        connection.execute(
+            "UPDATE outbox_receipts SET request_hash = ? WHERE request_id = ?",
+            (legacy_hash, request_id),
+        )
+    _downgrade_store_to_frozen_v1(store)
+    migrated = MemoryStore(store.database_path)
+
+    advanced = _candidate(statement="Advance the migrated memory generation.")
+    migrated.put_candidate(
+        advanced,
+        request_id=stable_request_id("legacy-v1-advance", advanced.candidate_id),
+    )
+    replay = migrated.put_candidate(
+        candidate,
+        request_id=request_id,
+        expected_generation=0,
+    )
+    assert replay.replayed and not replay.applied
+    with pytest.raises(MemoryStoreConflictError, match="reused"):
+        migrated.put_candidate(
+            candidate,
+            request_id=request_id,
+            expected_generation=1,
+        )
+    with pytest.raises(MemoryStoreValidationError, match="expected generation"):
+        migrated.put_candidate(
+            candidate,
+            request_id=request_id,
+            expected_generation=True,
+        )
+    with migrated.open_connection() as connection:
+        assert connection.execute(
+            "SELECT request_hash_version FROM outbox_receipts WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()[0] == 1
+
+
 def test_staged_migration_failure_preserves_original_and_success_replaces_it(
     tmp_path: Path,
 ) -> None:
@@ -1124,6 +2428,62 @@ def test_staged_migration_failure_preserves_original_and_success_replaces_it(
     store.replace_with_staged_copy(successful_migration)
     assert store.metadata()["migration_marker"] == "ok"
     assert store.get_candidate(candidate.candidate_id) == candidate
+
+
+def test_staged_migration_callback_can_read_blob_while_blob_writer_is_paused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(tmp_path / "memory", busy_timeout_ms=1_000)
+    content = b"blob read by a staged migration callback"
+    existing = store.put_blob(content, media_type="application/octet-stream")
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    callback_read = threading.Event()
+    writer_errors: list[Exception] = []
+    migration_errors: list[Exception] = []
+    original_put_blob_locked = store._put_blob_locked
+
+    def paused_put_blob(*args, **kwargs):
+        writer_entered.set()
+        if not release_writer.wait(timeout=3):
+            raise RuntimeError("test did not release blob writer")
+        return original_put_blob_locked(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_put_blob_locked", paused_put_blob)
+
+    def write_blob() -> None:
+        try:
+            store.put_blob(b"concurrent blob", media_type="application/octet-stream")
+        except Exception as error:  # pragma: no cover - asserted below
+            writer_errors.append(error)
+
+    def migration(connection: sqlite3.Connection) -> None:
+        assert store.read_blob(existing.blob_hash) == content
+        callback_read.set()
+
+    def replace_store() -> None:
+        try:
+            store.replace_with_staged_copy(migration)
+        except Exception as error:  # pragma: no cover - asserted below
+            migration_errors.append(error)
+
+    writer_thread = threading.Thread(target=write_blob)
+    migration_thread = threading.Thread(target=replace_store)
+    writer_thread.start()
+    assert writer_entered.wait(timeout=2)
+    migration_thread.start()
+    try:
+        assert callback_read.wait(timeout=2)
+        migration_thread.join(timeout=3)
+        assert not migration_thread.is_alive()
+    finally:
+        release_writer.set()
+        writer_thread.join(timeout=3)
+        migration_thread.join(timeout=3)
+
+    assert writer_errors == [] and migration_errors == []
+    assert store.read_blob(existing.blob_hash) == content
 
 
 def test_database_backup_is_atomic_and_auditable_without_copying_blob_tree(

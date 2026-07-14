@@ -832,7 +832,7 @@ def test_stable_event_and_request_ids_use_full_sha256_and_validate_prefix() -> N
 
 def test_generation_selection_input_and_decision_are_strict_round_trips() -> None:
     generations = GenerationMetadata(
-        store_schema_version=1,
+        store_schema_version=2,
         memory_generation=3,
         feedback_generation=4,
         knowledge_generation=5,
@@ -861,6 +861,29 @@ def test_generation_selection_input_and_decision_are_strict_round_trips() -> Non
     assert MemorySelectionInput.from_dict(selection_input.to_dict()) == selection_input
     assert selection_input.changed_paths == ("payments/money.py",)
     assert MemorySelectionDecision.from_dict(decision.to_dict()) == decision
+
+
+@pytest.mark.parametrize("store_schema_version", (1, 2))
+def test_generation_metadata_accepts_current_and_legacy_store_versions(
+    store_schema_version: int,
+) -> None:
+    generations = GenerationMetadata(
+        store_schema_version=store_schema_version,
+        memory_generation=0,
+        feedback_generation=0,
+        knowledge_generation=0,
+    )
+
+    assert GenerationMetadata.from_dict(generations.to_dict()) == generations
+
+    for invalid in (0, 3, True):
+        with pytest.raises(ValueError, match="supported version"):
+            GenerationMetadata(
+                store_schema_version=invalid,
+                memory_generation=0,
+                feedback_generation=0,
+                knowledge_generation=0,
+            )
 
 
 def test_repository_knowledge_key_and_entry_bind_every_cache_dimension() -> None:

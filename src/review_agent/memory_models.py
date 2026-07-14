@@ -25,6 +25,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 MODEL_SCHEMA_VERSION = 1
+CURRENT_MEMORY_STORE_SCHEMA_VERSION = 2
+SUPPORTED_MEMORY_STORE_SCHEMA_VERSIONS = frozenset({1, 2})
 MEMORY_SELECTION_POLICY_VERSION = "memory_selection_v1"
 FEEDBACK_AGGREGATION_POLICY_VERSION = "feedback_aggregation_v1"
 
@@ -2293,8 +2295,11 @@ class GenerationMetadata(_JsonModel):
 
     def __post_init__(self) -> None:
         _validate_schema(self.schema_version, "generation_metadata")
-        if type(self.store_schema_version) is not int or self.store_schema_version != 1:
-            raise ValueError("store_schema_version must be 1")
+        if (
+            type(self.store_schema_version) is not int
+            or self.store_schema_version not in SUPPORTED_MEMORY_STORE_SCHEMA_VERSIONS
+        ):
+            raise ValueError("store_schema_version must be a supported version")
         for name in (
             "memory_generation",
             "feedback_generation",
