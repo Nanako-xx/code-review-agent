@@ -9,7 +9,7 @@ identity descriptors.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -42,6 +42,7 @@ from typing import (
 import uuid
 
 from review_agent.memory_identity import (
+    MemoryIdentityError,
     REPOSITORY_IDENTITY_SCHEMA,
     RepositoryIdentityCore,
     RepositoryIdentityDescriptor,
@@ -86,6 +87,9 @@ MAX_BLOB_SIZE_BYTES = 512 * 1024 * 1024
 MAX_IMPORT_MANIFEST_BYTES = 64 * 1024 * 1024
 _GC_PREVIEW_SECRET = os.urandom(32)
 _FILE_LOCK_STATE = threading.local()
+_PROCESS_FILE_LOCKS_GUARD = threading.Lock()
+_PROCESS_FILE_LOCKS: Dict[str, Any] = {}
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 ZERO_EVENT_HASH = "0" * 64
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -707,6 +711,18 @@ class IntegrityReport:
     knowledge_count: int
 
 
+@dataclass(frozen=True)
+class RepositoryAuthoritySnapshot:
+    repository_identity: RepositoryIdentityDescriptor
+    generations: GenerationMetadata
+    event_count: int
+    event_head_sequence: Optional[int]
+    event_head_hash: str
+    candidate_authority_receipt_count: int
+    candidate_authority_receipt_set_hash: str
+    state_token: str
+
+
 PathInput = Union[str, os.PathLike]
 NamespaceInput = Union[PathInput, RepositoryMemoryNamespace]
 
@@ -811,6 +827,132 @@ class MemoryStore:
     @property
     def read_only(self) -> bool:
         return self._read_only
+
+    @staticmethod
+    @contextmanager
+    def lock_namespaces(
+        *namespaces: NamespaceInput,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+    ) -> Iterator[Tuple[Path, ...]]:
+        """Hold the authority-mutation lock for one or more namespaces.
+
+        Namespace paths are canonicalized, de-duplicated, and acquired in a
+        deterministic order.  The context is reentrant in the owning thread
+        and excludes other threads and processes.  It may create namespace
+        directories and their coordination files, but never a Store database.
+        """
+
+        if type(busy_timeout_ms) is not int or not (
+            0 <= busy_timeout_ms <= MAX_BUSY_TIMEOUT_MS
+        ):
+            raise MemoryStoreValidationError(
+                "busy timeout is outside the supported range"
+            )
+        if not namespaces:
+            raise MemoryStoreValidationError(
+                "at least one memory namespace lock is required"
+            )
+
+        canonical: Dict[str, Path] = {}
+        for namespace in namespaces:
+            if isinstance(namespace, RepositoryMemoryNamespace):
+                validate_repository_memory_namespace(namespace)
+                raw_path = Path(namespace.namespace_path)
+            else:
+                try:
+                    raw_path = Path(namespace)
+                except TypeError:
+                    raise MemoryStoreValidationError(
+                        "memory namespace path is invalid"
+                    ) from None
+            try:
+                namespace_path = raw_path.resolve(strict=False)
+                if namespace_path.exists() and not namespace_path.is_dir():
+                    raise MemoryStoreUnavailableError(
+                        "memory namespace is unavailable"
+                    )
+            except MemoryStoreError:
+                raise
+            except OSError:
+                raise MemoryStoreUnavailableError(
+                    "memory namespace is unavailable"
+                ) from None
+            lock_key = os.path.normcase(
+                os.path.abspath(os.fspath(namespace_path / ".memory-store.lock"))
+            )
+            canonical[lock_key] = namespace_path
+
+        ordered = tuple(canonical[key] for key in sorted(canonical))
+        deadline = time.monotonic() + busy_timeout_ms / 1000.0
+        with ExitStack() as locks:
+            for namespace_path in ordered:
+                remaining_ms = max(
+                    0,
+                    math.ceil((deadline - time.monotonic()) * 1000.0),
+                )
+                locks.enter_context(
+                    _exclusive_file_lock(
+                        namespace_path / ".memory-store.lock",
+                        remaining_ms,
+                    )
+                )
+            yield ordered
+
+    @staticmethod
+    def namespace_has_no_store_state(namespace: NamespaceInput) -> bool:
+        """Return whether a relink target has no state beyond its lock file.
+
+        The check is read-only.  ``lock_namespaces`` necessarily materializes
+        ``.memory-store.lock`` for an absent target, so that one regular file is
+        the only entry treated as empty.
+        """
+
+        if isinstance(namespace, RepositoryMemoryNamespace):
+            validate_repository_memory_namespace(namespace)
+            path = Path(namespace.namespace_path)
+        else:
+            try:
+                path = Path(namespace)
+            except TypeError:
+                raise MemoryStoreValidationError(
+                    "memory namespace path is invalid"
+                ) from None
+        try:
+            if not path.exists() and not path.is_symlink():
+                return True
+            metadata = path.lstat()
+            attributes = getattr(metadata, "st_file_attributes", 0)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise MemoryStoreUnavailableError(
+                    "memory namespace is unavailable"
+                )
+            entries = tuple(path.iterdir())
+            if not entries:
+                return True
+            if len(entries) != 1 or entries[0].name != ".memory-store.lock":
+                return False
+            lock_metadata = entries[0].lstat()
+            lock_attributes = getattr(lock_metadata, "st_file_attributes", 0)
+            if (
+                not stat.S_ISREG(lock_metadata.st_mode)
+                or stat.S_ISLNK(lock_metadata.st_mode)
+                or lock_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+                or lock_metadata.st_size < 1
+            ):
+                raise MemoryStoreUnavailableError(
+                    "memory namespace coordination lock is unavailable"
+                )
+            return True
+        except MemoryStoreError:
+            raise
+        except OSError:
+            raise MemoryStoreUnavailableError(
+                "memory namespace is unavailable"
+            ) from None
 
     def close(self) -> None:
         """Compatibility no-op; operations use short-lived connections."""
@@ -942,7 +1084,10 @@ class MemoryStore:
     def _authority(self) -> Iterator[sqlite3.Connection]:
         if self._read_only:
             raise MemoryStoreReadOnlyError()
-        with _exclusive_file_lock(self._memory_lock_path, self._busy_timeout_ms):
+        with self.lock_namespaces(
+            self.namespace_path,
+            busy_timeout_ms=self._busy_timeout_ms,
+        ):
             connection = self._connect(read_only=False)
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -1235,6 +1380,110 @@ class MemoryStore:
                 )
             }
 
+    def get_repository_descriptor(
+        self,
+        repository_key: str,
+    ) -> RepositoryIdentityDescriptor:
+        """Return one canonical descriptor registered in this Store."""
+
+        key = _repository_key(repository_key)
+        with self._reader() as connection:
+            return self._repository_descriptor_from_connection(connection, key)
+
+    def repository_authority_state_token(self, repository_key: str) -> str:
+        """Hash the logical authority state used by explicit relink CAS.
+
+        The token binds the Store schema, exact registered identity,
+        generations, and verified event-chain head.  Access timestamps and
+        unreferenced blob housekeeping are intentionally excluded because they
+        do not change repository Memory authority.
+        """
+
+        return self.repository_authority_snapshot(repository_key).state_token
+
+    def repository_authority_snapshot(
+        self,
+        repository_key: str,
+    ) -> RepositoryAuthoritySnapshot:
+        """Read descriptor, generations, event head, and CAS token atomically."""
+
+        key = _repository_key(repository_key)
+        with self.lock_namespaces(
+            self.namespace_path,
+            busy_timeout_ms=self._busy_timeout_ms,
+        ):
+            with self._reader_connection() as connection:
+                descriptor = self._repository_descriptor_from_connection(
+                    connection,
+                    key,
+                )
+                event_count = self._verify_event_chain_connection(connection, key)
+                generations = self._generations_from_connection(connection, key)
+                head = connection.execute(
+                    """
+                    SELECT event_count, head_sequence, head_hash
+                    FROM event_chain_heads WHERE repository_key = ?
+                    """,
+                    (key,),
+                ).fetchone()
+                if head is None or head["event_count"] != event_count:
+                    raise MemoryStoreCorruptionError(
+                        "memory event chain head is invalid"
+                    )
+                authority_receipts = tuple(
+                    _candidate_authority_receipt_from_row(connection, row)
+                    for row in connection.execute(
+                        """
+                        SELECT receipt.*
+                        FROM candidate_authority_receipts AS receipt
+                        JOIN candidates AS candidate
+                          ON candidate.candidate_id = receipt.candidate_id
+                        WHERE candidate.repository_key = ?
+                        ORDER BY receipt.receipt_id
+                        """,
+                        (key,),
+                    )
+                )
+                authority_receipt_set_hash = canonical_sha256(
+                    [receipt.to_dict() for receipt in authority_receipts]
+                )
+                state_token = canonical_sha256(
+                    {
+                        "schema": "repository_authority_state_v1",
+                        "store_schema": {
+                            "name": STORE_SCHEMA_NAME,
+                            "version": STORE_SCHEMA_VERSION,
+                            "definition_hash": SCHEMA_DEFINITION_HASH,
+                        },
+                        "repository_key": key,
+                        "repository_descriptor_hash": canonical_sha256(
+                            descriptor.to_payload()
+                        ),
+                        "generations": generations.to_dict(),
+                        "event_chain_head": {
+                            "event_count": event_count,
+                            "head_sequence": head["head_sequence"],
+                            "head_hash": str(head["head_hash"]),
+                        },
+                        "candidate_authority_receipts": {
+                            "count": len(authority_receipts),
+                            "set_hash": authority_receipt_set_hash,
+                        },
+                    }
+                )
+                return RepositoryAuthoritySnapshot(
+                    repository_identity=descriptor,
+                    generations=generations,
+                    event_count=event_count,
+                    event_head_sequence=head["head_sequence"],
+                    event_head_hash=str(head["head_hash"]),
+                    candidate_authority_receipt_count=len(authority_receipts),
+                    candidate_authority_receipt_set_hash=(
+                        authority_receipt_set_hash
+                    ),
+                    state_token=state_token,
+                )
+
     def register_repository(
         self,
         descriptor: RepositoryIdentityDescriptor,
@@ -1311,6 +1560,44 @@ class MemoryStore:
             descriptor,
             allow_unbound=False,
         )
+
+    @staticmethod
+    def _repository_descriptor_from_connection(
+        connection: sqlite3.Connection,
+        repository_key: str,
+    ) -> RepositoryIdentityDescriptor:
+        row = connection.execute(
+            """
+            SELECT repository_key, identity_schema, canonical_path,
+                   git_common_dir, origin_url, identity_json
+            FROM repositories WHERE repository_key = ?
+            """,
+            (repository_key,),
+        ).fetchone()
+        if row is None or row["identity_json"] is None:
+            raise MemoryStoreNotFoundError(
+                "repository identity is not registered in this store"
+            )
+        try:
+            payload = json.loads(row["identity_json"])
+            descriptor = RepositoryIdentityDescriptor.from_payload(payload)
+        except (json.JSONDecodeError, MemoryIdentityError, TypeError, ValueError):
+            raise MemoryStoreCorruptionError(
+                "registered repository identity is invalid"
+            ) from None
+        if (
+            canonical_json(payload) != row["identity_json"]
+            or descriptor.repository_key != repository_key
+            or row["repository_key"] != descriptor.repository_key
+            or row["identity_schema"] != descriptor.schema
+            or row["canonical_path"] != descriptor.canonical_path
+            or row["git_common_dir"] != descriptor.git_common_dir
+            or row["origin_url"] != descriptor.origin_url
+        ):
+            raise MemoryStoreCorruptionError(
+                "registered repository identity is invalid"
+            )
+        return descriptor
 
     @staticmethod
     def _assert_repository_identity_core(
@@ -7503,31 +7790,39 @@ def _exclusive_file_lock(path: Path, timeout_ms: int) -> Iterator[None]:
                 held[lock_key] -= 1
         return
 
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.is_symlink():
-            raise OSError("lock path is a symbolic link")
-        descriptor = os.open(
-            str(path),
-            os.O_RDWR
-            | os.O_CREAT
-            | getattr(os, "O_BINARY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        stream = os.fdopen(descriptor, "r+b", buffering=0)
-        stream.seek(0, os.SEEK_END)
-        if stream.tell() == 0:
-            stream.write(b"\0")
-            stream.flush()
-        stream.seek(0)
-    except OSError:
-        raise MemoryStoreUnavailableError("memory migration lock is unavailable") from None
-
-    acquired = False
     deadline = time.monotonic() + timeout_ms / 1000.0
+    with _PROCESS_FILE_LOCKS_GUARD:
+        process_lock = _PROCESS_FILE_LOCKS.setdefault(lock_key, threading.Lock())
+    if not process_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise MemoryStoreBusyError("memory store namespace lock is busy")
+
+    stream = None
+    acquired = False
     try:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_symlink():
+                raise OSError("lock path is a symbolic link")
+            descriptor = os.open(
+                str(path),
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            stream = os.fdopen(descriptor, "r+b", buffering=0)
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+        except OSError:
+            raise MemoryStoreUnavailableError(
+                "memory store namespace lock is unavailable"
+            ) from None
+
         while not acquired:
             try:
                 if os.name == "nt":
@@ -7542,7 +7837,9 @@ def _exclusive_file_lock(path: Path, timeout_ms: int) -> Iterator[None]:
                 acquired = True
             except (OSError, IOError):
                 if time.monotonic() >= deadline:
-                    raise MemoryStoreBusyError("memory migration lock is busy") from None
+                    raise MemoryStoreBusyError(
+                        "memory store namespace lock is busy"
+                    ) from None
                 time.sleep(0.01)
         held[lock_key] = 1
         yield
@@ -7561,7 +7858,11 @@ def _exclusive_file_lock(path: Path, timeout_ms: int) -> Iterator[None]:
                     fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
             except (OSError, IOError):
                 pass
-        stream.close()
+        try:
+            if stream is not None:
+                stream.close()
+        finally:
+            process_lock.release()
 
 
 def _escape_like(value: str) -> str:
@@ -7593,6 +7894,7 @@ __all__ = [
     "MemoryStoreUnavailableError",
     "MemoryStoreValidationError",
     "PreparedImport",
+    "RepositoryAuthoritySnapshot",
     "SCHEMA_DEFINITION_HASH",
     "STORE_SCHEMA_NAME",
     "STORE_SCHEMA_VERSION",

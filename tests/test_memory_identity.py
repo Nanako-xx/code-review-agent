@@ -21,6 +21,7 @@ from review_agent.memory_identity import (
     RepositoryIdentityCore,
     RepositoryIdentityDescriptor,
     RepositoryMemoryNamespace,
+    RepositoryRelinkDescriptor,
     VerifiedRepositoryIdentity,
     build_path_budget_report,
     build_relink_descriptor,
@@ -28,6 +29,7 @@ from review_agent.memory_identity import (
     build_repository_identity_descriptor,
     build_repository_memory_namespace,
     hydrate_repository_identity_descriptor,
+    hydrate_repository_relink_descriptor,
     materialize_repository_memory_namespace,
     plan_repository_memory_namespace,
     repository_identity_core_hash,
@@ -407,6 +409,77 @@ def test_relink_descriptor_rejects_same_repository_namespace(
 
     with pytest.raises(MemoryIdentityError, match="different repository keys"):
         build_relink_descriptor(namespace.metadata, namespace.metadata)
+
+
+def test_relink_descriptor_strict_round_trip_and_role_semantics(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    clone = tmp_path / "strict-relink-clone"
+    run_git(tmp_path, "clone", str(git_repo), str(clone))
+    old = build_repository_identity_descriptor(
+        RevisionResolver().repository_identity(git_repo)
+    )
+    new = build_repository_identity_descriptor(
+        RevisionResolver().repository_identity(clone)
+    )
+
+    descriptor = build_relink_descriptor(old, new)
+    hydrated = hydrate_repository_relink_descriptor(descriptor.to_payload())
+
+    assert isinstance(hydrated, RepositoryRelinkDescriptor)
+    assert hydrated.to_payload() == descriptor.to_payload()
+    assert hydrated.descriptor_hash == descriptor.descriptor_hash
+    assert hydrated.authority_identity.to_payload() == old.to_payload()
+    assert hydrated.locator_identity.to_payload() == new.to_payload()
+    assert hydrated.authority_repository_key == old.repository_key
+    assert hydrated.locator_repository_key == new.repository_key
+
+
+def test_relink_descriptor_hydration_rejects_unknown_fields_at_every_level(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    clone = tmp_path / "strict-fields-clone"
+    run_git(tmp_path, "clone", str(git_repo), str(clone))
+    descriptor = build_relink_descriptor(
+        build_repository_identity_descriptor(
+            RevisionResolver().repository_identity(git_repo)
+        ),
+        build_repository_identity_descriptor(
+            RevisionResolver().repository_identity(clone)
+        ),
+    )
+    outer = descriptor.to_payload()
+    outer["unexpected"] = True
+    nested = descriptor.to_payload()
+    nested["old_identity"]["unexpected"] = True
+
+    with pytest.raises(MemoryIdentityError, match="relink payload"):
+        hydrate_repository_relink_descriptor(outer)
+    with pytest.raises(MemoryIdentityError, match="identity payload"):
+        hydrate_repository_relink_descriptor(nested)
+
+
+def test_relink_descriptor_swapping_roles_changes_canonical_identity(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    clone = tmp_path / "swapped-relink-clone"
+    run_git(tmp_path, "clone", str(git_repo), str(clone))
+    old = build_repository_identity_descriptor(
+        RevisionResolver().repository_identity(git_repo)
+    )
+    new = build_repository_identity_descriptor(
+        RevisionResolver().repository_identity(clone)
+    )
+
+    forward = build_relink_descriptor(old, new)
+    swapped = build_relink_descriptor(new, old)
+
+    assert forward.descriptor_hash != swapped.descriptor_hash
+    assert forward.authority_repository_key == swapped.locator_repository_key
+    assert forward.locator_repository_key == swapped.authority_repository_key
 
 
 def test_descriptor_constructor_and_strict_hydration_reject_forged_key(

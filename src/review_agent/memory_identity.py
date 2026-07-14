@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import hmac
+import json
 import os
 from pathlib import Path
 import re
@@ -419,28 +420,131 @@ class RepositoryMemoryNamespace:
 
 @dataclass(frozen=True)
 class RepositoryRelinkDescriptor:
+    """Canonical explicit binding from a new locator to an old authority.
+
+    ``old_identity`` is always the durable Memory authority whose existing
+    repository namespace remains authoritative.  ``new_identity`` is always
+    the live repository locator that will be bound to that authority.  Origin
+    metadata is descriptive only and is never used to choose either side.
+    """
+
     old_identity: RepositoryIdentityDescriptor
     new_identity: RepositoryIdentityDescriptor
     operation: str = "explicit_relink"
     schema: str = REPOSITORY_RELINK_SCHEMA
+    descriptor_hash: str = field(init=False, compare=True)
 
     def __post_init__(self) -> None:
         if self.schema != REPOSITORY_RELINK_SCHEMA:
             raise MemoryIdentityError("unsupported repository relink schema")
         if self.operation != "explicit_relink":
             raise MemoryIdentityError("repository relink must be explicit")
+        if not isinstance(self.old_identity, RepositoryIdentityDescriptor):
+            raise MemoryIdentityError("repository relink authority is invalid")
+        if not isinstance(self.new_identity, RepositoryIdentityDescriptor):
+            raise MemoryIdentityError("repository relink locator is invalid")
         if self.old_identity.repository_key == self.new_identity.repository_key:
             raise MemoryIdentityError(
                 "repository relink requires different repository keys"
             )
 
-    def to_payload(self) -> Dict[str, object]:
+        # Rehydrate both sides so subclasses or forged dataclass instances do
+        # not cross the identity boundary.  The hash deliberately contains no
+        # request actor or reason; those belong to the transactional request.
+        try:
+            authority = RepositoryIdentityDescriptor.from_payload(
+                self.old_identity.to_payload()
+            )
+            locator = RepositoryIdentityDescriptor.from_payload(
+                self.new_identity.to_payload()
+            )
+        except (AttributeError, MemoryIdentityError, TypeError, ValueError):
+            raise MemoryIdentityError("repository relink descriptor is invalid") from None
+        if authority.to_payload() != self.old_identity.to_payload():
+            raise MemoryIdentityError("repository relink authority is not canonical")
+        if locator.to_payload() != self.new_identity.to_payload():
+            raise MemoryIdentityError("repository relink locator is not canonical")
+        object.__setattr__(self, "old_identity", authority)
+        object.__setattr__(self, "new_identity", locator)
+        object.__setattr__(
+            self,
+            "descriptor_hash",
+            hashlib.sha256(
+                json.dumps(
+                    self._identity_payload(),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+
+    @property
+    def authority_identity(self) -> RepositoryIdentityDescriptor:
+        """The old descriptor whose namespace remains authoritative."""
+
+        return self.old_identity
+
+    @property
+    def locator_identity(self) -> RepositoryIdentityDescriptor:
+        """The new, live descriptor that locates the authority."""
+
+        return self.new_identity
+
+    @property
+    def authority_repository_key(self) -> str:
+        return self.old_identity.repository_key
+
+    @property
+    def locator_repository_key(self) -> str:
+        return self.new_identity.repository_key
+
+    def _identity_payload(self) -> Dict[str, object]:
         return {
             "schema": self.schema,
             "operation": self.operation,
             "old_identity": self.old_identity.to_payload(),
             "new_identity": self.new_identity.to_payload(),
         }
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, object],
+    ) -> "RepositoryRelinkDescriptor":
+        expected = {
+            "schema",
+            "operation",
+            "old_identity",
+            "new_identity",
+        }
+        if not isinstance(payload, Mapping) or set(payload) != expected:
+            raise MemoryIdentityError("repository relink payload is invalid")
+        if not isinstance(payload["schema"], str) or not isinstance(
+            payload["operation"], str
+        ):
+            raise MemoryIdentityError("repository relink payload is invalid")
+        old_payload = payload["old_identity"]
+        new_payload = payload["new_identity"]
+        if not isinstance(old_payload, Mapping) or not isinstance(
+            new_payload, Mapping
+        ):
+            raise MemoryIdentityError("repository relink payload is invalid")
+        try:
+            return cls(
+                old_identity=RepositoryIdentityDescriptor.from_payload(old_payload),
+                new_identity=RepositoryIdentityDescriptor.from_payload(new_payload),
+                operation=payload["operation"],
+                schema=payload["schema"],
+            )
+        except MemoryIdentityError:
+            raise
+        except (TypeError, ValueError):
+            raise MemoryIdentityError("repository relink payload is invalid") from None
+
+    def to_payload(self) -> Dict[str, object]:
+        return self._identity_payload()
 
 
 @dataclass(frozen=True)
@@ -989,6 +1093,19 @@ def build_relink_descriptor(
         old_identity=old_descriptor,
         new_identity=new_descriptor,
     )
+
+
+def hydrate_repository_relink_descriptor(
+    payload: Mapping[str, object],
+) -> RepositoryRelinkDescriptor:
+    """Strictly hydrate an old-authority/new-locator relink descriptor."""
+
+    return RepositoryRelinkDescriptor.from_payload(payload)
+
+
+# Retain the concise naming style used by the original builder while exposing
+# the more explicit public name above.
+hydrate_relink_descriptor = hydrate_repository_relink_descriptor
 
 
 def _coerce_identity_descriptor(identity: IdentityInput) -> RepositoryIdentityDescriptor:
@@ -1604,6 +1721,7 @@ __all__ = [
     "MEMORY_ROOT_ENVIRONMENT_VARIABLE",
     "REPOSITORY_IDENTITY_CORE_SCHEMA",
     "REPOSITORY_IDENTITY_SCHEMA",
+    "REPOSITORY_RELINK_SCHEMA",
     "WINDOWS_DIRECTORY_PATH_LIMIT",
     "WINDOWS_FILE_PATH_LIMIT",
     "MemoryIdentityError",
@@ -1628,6 +1746,8 @@ __all__ = [
     "build_repository_memory_namespace",
     "canonical_repository_identity_core_hash",
     "hydrate_repository_identity_descriptor",
+    "hydrate_repository_relink_descriptor",
+    "hydrate_relink_descriptor",
     "materialize_repository_memory_namespace",
     "plan_repository_memory_namespace",
     "repository_identity_core_hash",

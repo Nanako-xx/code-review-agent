@@ -1134,6 +1134,187 @@ def test_read_only_store_rejects_a_missing_coordination_lock_without_writing(
     assert not lock_path.exists()
 
 
+def test_public_namespace_locks_are_ordered_reentrant_and_database_free(
+    tmp_path: Path,
+) -> None:
+    later = tmp_path / "z-namespace"
+    earlier = tmp_path / "a-namespace"
+
+    with MemoryStore.lock_namespaces(later, earlier, later) as locked:
+        assert locked == (earlier.resolve(), later.resolve())
+        with MemoryStore.lock_namespaces(earlier, later) as nested:
+            assert nested == locked
+        assert all(
+            (namespace / ".memory-store.lock").is_file()
+            for namespace in locked
+        )
+        assert all(
+            not (namespace / "memory.sqlite3").exists()
+            for namespace in locked
+        )
+
+
+def test_public_namespace_lock_is_the_reentrant_authority_mutation_lock(
+    tmp_path: Path,
+) -> None:
+    namespace = tmp_path / "memory"
+    store = MemoryStore(namespace, busy_timeout_ms=80)
+    reentrant = _candidate(statement="The owning thread can mutate reentrantly.")
+    blocked = _candidate(statement="A different thread must wait for authority.")
+    writer_started = threading.Event()
+    writer_errors: list[Exception] = []
+
+    def write_from_another_thread() -> None:
+        writer_started.set()
+        try:
+            store.put_candidate(
+                blocked,
+                request_id=stable_request_id(
+                    "blocked-by-public-namespace-lock",
+                    blocked.candidate_id,
+                ),
+            )
+        except Exception as error:  # pragma: no cover - asserted below
+            writer_errors.append(error)
+
+    with MemoryStore.lock_namespaces(namespace):
+        store.put_candidate(
+            reentrant,
+            request_id=stable_request_id(
+                "reentrant-public-namespace-lock",
+                reentrant.candidate_id,
+            ),
+        )
+        writer = threading.Thread(target=write_from_another_thread)
+        writer.start()
+        assert writer_started.wait(timeout=1)
+        writer.join(timeout=2)
+
+        assert not writer.is_alive()
+        assert len(writer_errors) == 1
+        assert isinstance(writer_errors[0], MemoryStoreBusyError)
+        assert store.find_candidate(blocked.candidate_id) is None
+
+    assert store.put_candidate(
+        blocked,
+        request_id=stable_request_id(
+            "blocked-by-public-namespace-lock",
+            blocked.candidate_id,
+        ),
+    ).applied
+
+
+def test_namespace_empty_check_allows_only_the_coordination_lock(
+    tmp_path: Path,
+) -> None:
+    namespace = tmp_path / "memory"
+
+    assert MemoryStore.namespace_has_no_store_state(namespace)
+    assert not namespace.exists()
+    with MemoryStore.lock_namespaces(namespace):
+        assert MemoryStore.namespace_has_no_store_state(namespace)
+    assert MemoryStore.namespace_has_no_store_state(namespace)
+
+    (namespace / "unexpected-state").write_text("state", encoding="ascii")
+    assert not MemoryStore.namespace_has_no_store_state(namespace)
+
+
+def test_repository_authority_state_token_binds_descriptor_and_event_head(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    resolver = RevisionResolver()
+    namespace = materialize_repository_memory_namespace(
+        plan_repository_memory_namespace(
+            resolver.repository_identity(git_repo),
+            tmp_path / "memory-root",
+            revision_resolver=resolver,
+        ),
+        revision_resolver=resolver,
+    )
+    store = MemoryStore(namespace)
+
+    snapshot = store.repository_authority_snapshot(namespace.repository_key)
+    assert snapshot.repository_identity == namespace.metadata
+    assert snapshot.generations == store.get_generations(namespace.repository_key)
+    assert snapshot.event_count == 0
+    assert snapshot.event_head_sequence is None
+    assert snapshot.event_head_hash == "0" * 64
+    assert snapshot.candidate_authority_receipt_count == 0
+    assert store.get_repository_descriptor(namespace.repository_key) == namespace.metadata
+    initial = snapshot.state_token
+    assert initial == store.repository_authority_state_token(
+        namespace.repository_key
+    )
+
+    # Blob housekeeping does not change logical repository authority.
+    store.put_blob(b"unreferenced", media_type="application/octet-stream")
+    assert store.repository_authority_state_token(namespace.repository_key) == initial
+
+    candidate = replace(_candidate(), repository_key=namespace.repository_key)
+    store.put_candidate(
+        candidate,
+        request_id=stable_request_id(
+            "authority-state-token",
+            candidate.candidate_id,
+        ),
+    )
+    changed = store.repository_authority_state_token(namespace.repository_key)
+    assert changed != initial
+    after_candidate = store.repository_authority_snapshot(
+        namespace.repository_key
+    )
+    assert after_candidate.state_token == changed
+    assert after_candidate.candidate_authority_receipt_count == 0
+
+    first_receipt = _authority_receipt(
+        candidate,
+        authority_resolution_hash="7" * 64,
+    )
+    store.put_candidate(
+        candidate,
+        first_receipt,
+        request_id=stable_request_id(
+            "authority-state-token-receipt-1",
+            candidate.candidate_id,
+        ),
+    )
+    after_first_receipt = store.repository_authority_snapshot(
+        namespace.repository_key
+    )
+    assert after_first_receipt.generations == after_candidate.generations
+    assert after_first_receipt.event_count == after_candidate.event_count
+    assert after_first_receipt.candidate_authority_receipt_count == 1
+    assert after_first_receipt.state_token != after_candidate.state_token
+
+    second_receipt = _authority_receipt(
+        candidate,
+        authority_resolution_hash="9" * 64,
+    )
+    store.put_candidate(
+        candidate,
+        second_receipt,
+        request_id=stable_request_id(
+            "authority-state-token-receipt-2",
+            candidate.candidate_id,
+        ),
+    )
+    after_second_receipt = store.repository_authority_snapshot(
+        namespace.repository_key
+    )
+    assert after_second_receipt.generations == after_candidate.generations
+    assert after_second_receipt.event_count == after_candidate.event_count
+    assert after_second_receipt.candidate_authority_receipt_count == 2
+    assert (
+        after_second_receipt.candidate_authority_receipt_set_hash
+        != after_first_receipt.candidate_authority_receipt_set_hash
+    )
+    assert after_second_receipt.state_token != after_first_receipt.state_token
+    assert MemoryStore(namespace, read_only=True).repository_authority_state_token(
+        namespace.repository_key
+    ) == after_second_receipt.state_token
+
+
 def test_blob_promotion_before_database_failure_is_collected_as_orphan(
     tmp_path: Path,
 ) -> None:
