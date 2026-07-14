@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+import review_agent.memory_store as memory_store_module
+
 from review_agent.memory_models import (
     CandidateStatus,
     DurableMemoryRecord,
@@ -620,6 +622,37 @@ def test_blob_repair_is_serialized_store_owned_and_preserves_metadata(
             content,
             media_type=blob.media_type,
         )
+
+
+def test_blob_atomic_staging_uses_bounded_random_components(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    content = b"bounded temporary blob name"
+    digest = hashlib.sha256(content).hexdigest()
+    opened_staging_names: list[str] = []
+    real_open = memory_store_module.os.open
+
+    def tracking_open(*args, **kwargs):
+        path = Path(args[0])
+        if path.parent.name == ".tmp":
+            opened_staging_names.append(path.name)
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(memory_store_module.os, "open", tracking_open)
+    blob = store.put_blob(content, media_type="application/octet-stream")
+    Path(blob.path).write_bytes(b"corrupt")
+    store.repair_blob(
+        content,
+        media_type="application/octet-stream",
+        expected_hash=digest,
+        expected_size=len(content),
+    )
+
+    assert len(opened_staging_names) == 2
+    assert all(digest not in name for name in opened_staging_names)
+    assert all(len(name) <= 40 for name in opened_staging_names)
 
 
 def test_read_only_store_never_promotes_a_blob_before_rejecting_write(

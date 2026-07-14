@@ -2016,7 +2016,7 @@ class MemoryStore:
             if destination.exists() or destination.is_symlink():
                 self._validate_blob_file_values(destination, digest, size)
                 return
-            temporary = self._blob_temp_root / (".%s.%s.tmp" % (digest, uuid.uuid4().hex))
+            temporary = self._blob_temp_root / _temporary_name(".tmp")
             flags = (
                 os.O_WRONLY
                 | os.O_CREAT
@@ -2060,7 +2060,7 @@ class MemoryStore:
     ) -> None:
         """Replace one known corrupt blob while the process lock is held."""
 
-        temporary = self._blob_temp_root / (".%s.%s.repair" % (digest, uuid.uuid4().hex))
+        temporary = self._blob_temp_root / _temporary_name(".repair")
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
             self._blob_temp_root.mkdir(parents=True, exist_ok=True)
@@ -4240,7 +4240,7 @@ class MemoryStore:
                 target = destination / "blobs" / "sha256" / digest[:2] / digest
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = target.with_name(".%s.%s.tmp" % (digest, uuid.uuid4().hex))
+                    temporary = target.with_name(_temporary_name(".tmp"))
                     shutil.copyfile(info.path, str(temporary))
                     self._validate_blob_file_values(
                         temporary, digest, int(blob["size_bytes"])
@@ -4830,7 +4830,7 @@ class MemoryStore:
             target.parent.mkdir(parents=True, exist_ok=True)
         except OSError:
             raise MemoryStoreUnavailableError("memory backup destination is unavailable") from None
-        staging = target.with_name(".%s.%s.backup" % (target.name, uuid.uuid4().hex))
+        staging = target.with_name(_temporary_name(".backup"))
         try:
             self.validate_integrity()
             source = self._connect(read_only=True)
@@ -4869,10 +4869,7 @@ class MemoryStore:
             raise MemoryStoreReadOnlyError()
         if not callable(migration) or (validator is not None and not callable(validator)):
             raise MemoryStoreValidationError("migration callbacks must be callable")
-        staging = self.database_path.with_name(
-            ".%s.%s.migration.sqlite3"
-            % (self.database_path.name, uuid.uuid4().hex)
-        )
+        staging = self.database_path.with_name(_temporary_name(".migration.sqlite3"))
         with _exclusive_file_lock(
             self.namespace_path / ".memory-store.lock", self._busy_timeout_ms
         ):
@@ -5787,7 +5784,7 @@ def _load_manifest(
 
 
 def _atomic_write_bytes(path: Path, content: bytes) -> None:
-    temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
+    temporary = path.with_name(_temporary_name(".tmp"))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(
@@ -5819,6 +5816,18 @@ def _atomic_write_bytes(path: Path, content: bytes) -> None:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _temporary_name(suffix: str) -> str:
+    """Return a collision-resistant bounded component for atomic staging.
+
+    Content digests and destination names are deliberately excluded.  Repeating
+    either in a temporary filename can push otherwise valid Windows paths past
+    the legacy filesystem limit before the final content-addressed path is
+    reached.
+    """
+
+    return ".%s%s" % (uuid.uuid4().hex, suffix)
 
 
 def _fsync_directory(path: Path) -> None:
