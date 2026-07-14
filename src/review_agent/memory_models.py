@@ -3112,7 +3112,10 @@ class MemorySnapshot(_JsonModel):
             "repository_key": self.repository_key,
             "base_sha": self.base_sha,
             "head_sha": self.head_sha,
-            "generations": self.generations.to_dict(),
+            "store_schema_version": self.generations.store_schema_version,
+            "memory_generation": self.generations.memory_generation,
+            "feedback_generation": self.generations.feedback_generation,
+            "knowledge_generation": self.generations.knowledge_generation,
             "selection_policy_version": self.selection_policy_version,
             "eligible_records": [record.to_dict() for record in self.eligible_records],
             "applicability_decisions": [
@@ -3146,7 +3149,10 @@ class MemorySnapshot(_JsonModel):
                 "repository_key",
                 "base_sha",
                 "head_sha",
-                "generations",
+                "store_schema_version",
+                "memory_generation",
+                "feedback_generation",
+                "knowledge_generation",
                 "selection_policy_version",
                 "eligible_records",
                 "applicability_decisions",
@@ -3167,7 +3173,12 @@ class MemorySnapshot(_JsonModel):
             repository_key=root["repository_key"],
             base_sha=root["base_sha"],
             head_sha=root["head_sha"],
-            generations=GenerationMetadata.from_dict(root["generations"]),
+            generations=GenerationMetadata(
+                store_schema_version=root["store_schema_version"],
+                memory_generation=root["memory_generation"],
+                feedback_generation=root["feedback_generation"],
+                knowledge_generation=root["knowledge_generation"],
+            ),
             selection_policy_version=root["selection_policy_version"],
             eligible_records=tuple(
                 DurableMemoryRecord.from_dict(item) for item in root["eligible_records"]
@@ -3218,17 +3229,18 @@ class MemoryExecutionConfig(_JsonModel):
             collapse_whitespace=False,
         )
         normalized_path = raw_path.replace("\\", "/")
-        if not (
-            PureWindowsPath(raw_path).is_absolute()
-            or PurePosixPath(normalized_path).is_absolute()
-        ):
+        windows_path = PureWindowsPath(raw_path)
+        posix_path = PurePosixPath(normalized_path)
+        if not (windows_path.is_absolute() or posix_path.is_absolute()):
             raise ValueError("root_path must be an absolute path")
-        if ".." in PurePosixPath(normalized_path).parts:
+        if ".." in posix_path.parts:
             raise ValueError("root_path must be a canonical absolute path")
-        if re.fullmatch(r"[A-Za-z]:/", normalized_path):
-            canonical_root = normalized_path
+        if windows_path.is_absolute():
+            canonical_root = windows_path.as_posix()
         else:
-            canonical_root = normalized_path.rstrip("/") or "/"
+            canonical_root = posix_path.as_posix()
+        if not re.fullmatch(r"[A-Za-z]:/", canonical_root):
+            canonical_root = canonical_root.rstrip("/") or "/"
         object.__setattr__(self, "root_path", canonical_root)
         if type(self.required) is not bool:
             raise ValueError("required must be a boolean")
@@ -3288,7 +3300,7 @@ class MemoryExecutionConfig(_JsonModel):
             },
             "memory_execution_config",
         )
-        return cls(
+        config = cls(
             mode=_enum_value(MemoryMode, root["mode"], "memory_execution_config.mode"),
             root_path=root["root_path"],
             required=root["required"],
@@ -3300,3 +3312,8 @@ class MemoryExecutionConfig(_JsonModel):
             max_query_results=root["max_query_results"],
             schema_version=root["schema_version"],
         )
+        if root["root_path"] != config.root_path:
+            raise ValueError(
+                "memory_execution_config.root_path must be a canonical absolute path"
+            )
+        return config

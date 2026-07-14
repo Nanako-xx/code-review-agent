@@ -17,6 +17,12 @@ from review_agent.incremental import (
     incremental_priority_from_dict,
     incremental_priority_to_dict,
 )
+from review_agent.memory_models import (
+    FeedbackCalibrationSummary,
+    MemorySelectionDecision,
+    MemorySelectionInput,
+    MemorySnapshot,
+)
 from review_agent.model_protocol import ModelResponse
 from review_agent.models import (
     Assignment,
@@ -71,6 +77,36 @@ def semantic_reconciliation_from_dict(
     """Hydrate the authoritative semantic reconciliation artifact strictly."""
 
     return _semantic_reconciliation_from_dict(payload)
+
+
+def memory_selection_input_from_dict(
+    payload: Mapping[str, Any],
+) -> MemorySelectionInput:
+    """Hydrate a Memory Selection input through its strict model boundary."""
+
+    return MemorySelectionInput.from_dict(payload)
+
+
+def memory_snapshot_from_dict(payload: Mapping[str, Any]) -> MemorySnapshot:
+    """Hydrate a pinned Memory Snapshot through its strict model boundary."""
+
+    return MemorySnapshot.from_dict(payload)
+
+
+def memory_selection_decision_from_dict(
+    payload: Mapping[str, Any],
+) -> MemorySelectionDecision:
+    """Hydrate a Memory Selection decision through its strict model boundary."""
+
+    return MemorySelectionDecision.from_dict(payload)
+
+
+def feedback_calibration_summary_from_dict(
+    payload: Mapping[str, Any],
+) -> FeedbackCalibrationSummary:
+    """Hydrate feedback calibration through its strict model boundary."""
+
+    return FeedbackCalibrationSummary.from_dict(payload)
 
 
 def review_request_from_dict(payload: Mapping[str, Any]) -> ReviewRequest:

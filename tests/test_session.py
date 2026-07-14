@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import pytest
 
+from review_agent.memory_models import MemoryExecutionConfig, MemoryMode
 from review_agent.revision import RepositoryIdentity, ResolvedRevisions
 from review_agent.run_state import (
     RunPhase,
@@ -19,6 +20,8 @@ from review_agent.session import (
     MODEL_STAGE_SESSION_SCHEMA_VERSION,
     PREVIOUS_SESSION_SCHEMA_VERSION,
     PREVIOUS_SESSION_PHASES,
+    SEMANTIC_RECONCILIATION_SESSION_PHASES,
+    SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION,
     SESSION_PHASES,
     SESSION_SCHEMA_VERSION,
     ArtifactDescriptor,
@@ -36,6 +39,7 @@ from review_agent.session import (
     SupplementalTaskStatus,
     child_session_manifest,
     initial_session_manifest,
+    session_phases_for_schema,
     session_manifest_from_dict,
     session_manifest_to_dict,
 )
@@ -85,6 +89,24 @@ def execution_config() -> ReviewExecutionConfig:
             max_elapsed_seconds=75,
         ),
         supplemental_policy=SupplementalPolicy.for_risk("high"),
+        memory=MemoryExecutionConfig(
+            mode=MemoryMode.READ_WRITE,
+            root_path="C:/review-agent-memory",
+            required=False,
+            max_snapshot_records=1500,
+            max_snapshot_bytes=4_194_304,
+            max_context_records=10,
+            max_query_results=6,
+        ),
+        memory_curator=ModelStageConfig(
+            mode="model",
+            provider="fake",
+            model="memory-curator-model",
+            api_key_env="MEMORY_CURATOR_API_KEY",
+            max_output_tokens=2048,
+            max_provider_attempts=3,
+            max_elapsed_seconds=40,
+        ),
     )
 
 
@@ -176,11 +198,25 @@ def test_session_manifest_round_trips_with_pending_phases() -> None:
         "max_total_tokens": 147456,
         "max_elapsed_seconds": 480.0,
     }
+    assert payload["execution"]["memory"] == {
+        "schema_version": 1,
+        "mode": "read-write",
+        "root_path": "C:/review-agent-memory",
+        "required": False,
+        "selection_policy_version": "memory_selection_v1",
+        "feedback_policy_version": "feedback_aggregation_v1",
+        "max_snapshot_records": 1500,
+        "max_snapshot_bytes": 4_194_304,
+        "max_context_records": 10,
+        "max_query_results": 6,
+    }
+    assert payload["execution"]["memory_curator"]["provider"] == "fake"
     assert payload["supplemental_waves"] == {}
     assert SESSION_PHASES == (
         RunPhase.PREFLIGHT,
         RunPhase.QUALITY_GATES,
         RunPhase.REPOSITORY_INTELLIGENCE,
+        RunPhase.MEMORY_SELECTION,
         RunPhase.INTENT_DISCOVERY,
         RunPhase.INTENT_RESOLUTION,
         RunPhase.PLANNING,
@@ -190,6 +226,7 @@ def test_session_manifest_round_trips_with_pending_phases() -> None:
         RunPhase.RECONCILIATION,
         RunPhase.COMPLETION,
         RunPhase.FINAL_RISK,
+        RunPhase.MEMORY_PROPOSAL,
         RunPhase.REPORTING,
     )
 
@@ -236,7 +273,7 @@ def test_session_manifest_round_trips_reviewer_task_checkpoints() -> None:
     assert payload["phases"]["reviewers"]["tasks"]["reviewer-1"]["attempts"] == 2
 
 
-def test_session_manifest_v4_round_trips_supplemental_wave_checkpoints() -> None:
+def test_session_manifest_v5_round_trips_supplemental_wave_checkpoints() -> None:
     budget = SupplementalBudget(
         tasks=1,
         tool_calls=8,
@@ -445,6 +482,8 @@ def test_session_manifest_loads_v1_layout_without_synthesizing_new_results() -> 
     payload["execution"].pop("portfolio_planner")
     payload["execution"].pop("semantic_reconciler")
     payload["execution"].pop("supplemental_policy")
+    payload["execution"].pop("memory")
+    payload["execution"].pop("memory_curator")
     payload.pop("supplemental_waves")
     payload["phases"] = {
         phase.value: payload["phases"][phase.value]
@@ -468,6 +507,8 @@ def test_session_manifest_loads_v1_layout_without_synthesizing_new_results() -> 
     assert loaded.execution.portfolio_planner == ModelStageConfig()
     assert loaded.execution.semantic_reconciler == ModelStageConfig()
     assert loaded.execution.supplemental_policy == SupplementalPolicy()
+    assert loaded.execution.memory is None
+    assert loaded.execution.memory_curator == ModelStageConfig()
     assert loaded.supplemental_waves == {}
     assert session_manifest_to_dict(loaded)["schema_version"] == 1
 
@@ -479,6 +520,8 @@ def test_session_manifest_loads_v2_model_stages_as_local_for_safe_resume() -> No
     payload["execution"].pop("portfolio_planner")
     payload["execution"].pop("semantic_reconciler")
     payload["execution"].pop("supplemental_policy")
+    payload["execution"].pop("memory")
+    payload["execution"].pop("memory_curator")
     payload.pop("supplemental_waves")
     payload["phases"] = {
         phase.value: payload["phases"][phase.value]
@@ -495,6 +538,8 @@ def test_session_manifest_loads_v2_model_stages_as_local_for_safe_resume() -> No
     assert loaded.execution.portfolio_planner == ModelStageConfig()
     assert loaded.execution.semantic_reconciler == ModelStageConfig()
     assert loaded.execution.supplemental_policy == SupplementalPolicy()
+    assert loaded.execution.memory is None
+    assert loaded.execution.memory_curator == ModelStageConfig()
     assert "risk_assessor" not in serialized["execution"]
     assert "portfolio_planner" not in serialized["execution"]
     assert "semantic_reconciler" not in serialized["execution"]
@@ -507,6 +552,8 @@ def test_session_manifest_loads_v3_with_original_layout_and_model_stages() -> No
     payload["schema_version"] = MODEL_STAGE_SESSION_SCHEMA_VERSION
     payload["execution"].pop("semantic_reconciler")
     payload["execution"].pop("supplemental_policy")
+    payload["execution"].pop("memory")
+    payload["execution"].pop("memory_curator")
     payload.pop("supplemental_waves")
     payload["phases"] = {
         phase.value: payload["phases"][phase.value]
@@ -522,11 +569,98 @@ def test_session_manifest_loads_v3_with_original_layout_and_model_stages() -> No
     assert loaded.execution.portfolio_planner.mode == "model"
     assert loaded.execution.semantic_reconciler == ModelStageConfig()
     assert loaded.execution.supplemental_policy == SupplementalPolicy()
+    assert loaded.execution.memory is None
+    assert loaded.execution.memory_curator == ModelStageConfig()
     assert "reconciliation_analysis" not in loaded.phases
     assert "supplemental_investigation" not in loaded.phases
     assert "semantic_reconciler" not in serialized["execution"]
     assert "supplemental_policy" not in serialized["execution"]
     assert "supplemental_waves" not in serialized
+
+
+def test_session_manifest_loads_v4_without_memory_or_phase_upgrade() -> None:
+    payload = session_manifest_to_dict(manifest())
+    payload["schema_version"] = SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
+    payload["execution"].pop("memory")
+    payload["execution"].pop("memory_curator")
+    payload["phases"] = {
+        phase.value: payload["phases"][phase.value]
+        for phase in SEMANTIC_RECONCILIATION_SESSION_PHASES
+    }
+
+    loaded = session_manifest_from_dict(payload)
+    serialized = session_manifest_to_dict(loaded)
+
+    assert loaded.schema_version == SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
+    assert list(loaded.phases) == [
+        phase.value for phase in SEMANTIC_RECONCILIATION_SESSION_PHASES
+    ]
+    assert loaded.execution.semantic_reconciler.mode == "model"
+    assert loaded.execution.supplemental_policy == SupplementalPolicy.for_risk("high")
+    assert loaded.execution.memory is None
+    assert loaded.execution.memory_curator == ModelStageConfig()
+    assert RunPhase.MEMORY_SELECTION.value not in loaded.phases
+    assert RunPhase.MEMORY_PROPOSAL.value not in loaded.phases
+    assert "memory" not in serialized["execution"]
+    assert "memory_curator" not in serialized["execution"]
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "expected_phases"),
+    [
+        (LEGACY_SESSION_SCHEMA_VERSION, LEGACY_SESSION_PHASES),
+        (PREVIOUS_SESSION_SCHEMA_VERSION, PREVIOUS_SESSION_PHASES),
+        (MODEL_STAGE_SESSION_SCHEMA_VERSION, PREVIOUS_SESSION_PHASES),
+        (
+            SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION,
+            SEMANTIC_RECONCILIATION_SESSION_PHASES,
+        ),
+    ],
+)
+def test_legacy_session_phase_layouts_remain_exact(
+    schema_version: int,
+    expected_phases: tuple[RunPhase, ...],
+) -> None:
+    assert session_phases_for_schema(schema_version) == expected_phases
+    assert RunPhase.MEMORY_SELECTION not in expected_phases
+    assert RunPhase.MEMORY_PROPOSAL not in expected_phases
+
+
+def test_session_v5_requires_fixed_memory_execution_config() -> None:
+    original = manifest()
+
+    with pytest.raises(ValueError, match="MemoryExecutionConfig"):
+        replace(
+            original,
+            execution=replace(original.execution, memory=None),
+        )
+
+
+def test_session_v5_strictly_hydrates_embedded_memory_config() -> None:
+    payload = session_manifest_to_dict(manifest())
+    payload["execution"]["memory"]["unexpected"] = True
+
+    with pytest.raises(ValueError, match="unexpected"):
+        session_manifest_from_dict(payload)
+
+    payload = session_manifest_to_dict(manifest())
+    payload["execution"]["memory"]["mode"] = "off"
+    payload["execution"]["memory"]["required"] = True
+
+    with pytest.raises(ValueError, match="required=true"):
+        session_manifest_from_dict(payload)
+
+
+def test_legacy_session_rejects_v5_memory_execution_fields() -> None:
+    payload = session_manifest_to_dict(manifest())
+    payload["schema_version"] = SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
+    payload["phases"] = {
+        phase.value: payload["phases"][phase.value]
+        for phase in SEMANTIC_RECONCILIATION_SESSION_PHASES
+    }
+
+    with pytest.raises(ValueError, match="memory"):
+        session_manifest_from_dict(payload)
 
 
 def test_awaiting_user_manifest_round_trips_with_committed_artifacts() -> None:
@@ -789,6 +923,28 @@ def test_session_manifest_never_serializes_api_key_values() -> None:
             "max_total_tokens": 147456,
             "max_elapsed_seconds": 480.0,
         },
+        "memory": {
+            "schema_version": 1,
+            "mode": "read-write",
+            "root_path": "C:/review-agent-memory",
+            "required": False,
+            "selection_policy_version": "memory_selection_v1",
+            "feedback_policy_version": "feedback_aggregation_v1",
+            "max_snapshot_records": 1500,
+            "max_snapshot_bytes": 4_194_304,
+            "max_context_records": 10,
+            "max_query_results": 6,
+        },
+        "memory_curator": {
+            "mode": "model",
+            "provider": "fake",
+            "model": "memory-curator-model",
+            "base_url": None,
+            "api_key_env": "MEMORY_CURATOR_API_KEY",
+            "max_output_tokens": 2048,
+            "max_provider_attempts": 3,
+            "max_elapsed_seconds": 40.0,
+        },
     }
     assert "api_key" not in execution
     assert "authorization" not in str(payload).casefold()
@@ -805,7 +961,12 @@ def test_session_manifest_rejects_secret_execution_fields(secret_field: str) -> 
 
 @pytest.mark.parametrize(
     "stage",
-    ["risk_assessor", "portfolio_planner", "semantic_reconciler"],
+    [
+        "risk_assessor",
+        "portfolio_planner",
+        "semantic_reconciler",
+        "memory_curator",
+    ],
 )
 def test_session_manifest_rejects_secret_model_stage_fields(stage: str) -> None:
     payload = session_manifest_to_dict(manifest())
@@ -968,6 +1129,76 @@ def test_child_session_manifest_starts_isolated_and_preserves_root_lineage(
         checkpoint.status is PhaseStatus.PENDING
         for checkpoint in child.phases.values()
     )
+
+
+def test_revision_drift_child_requires_explicit_v5_config_for_legacy_parent() -> None:
+    payload = session_manifest_to_dict(manifest())
+    payload["schema_version"] = SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
+    payload["execution"].pop("memory")
+    payload["execution"].pop("memory_curator")
+    payload["phases"] = {
+        phase.value: payload["phases"][phase.value]
+        for phase in SEMANTIC_RECONCILIATION_SESSION_PHASES
+    }
+    legacy_parent = session_manifest_from_dict(payload)
+    revisions = ResolvedRevisions("main", "HEAD", "c" * 40, "d" * 40)
+
+    with pytest.raises(ValueError, match="explicit v5 execution config"):
+        child_session_manifest(
+            review_id="review-child",
+            parent=legacy_parent,
+            repository=legacy_parent.repository,
+            revisions=revisions,
+            change_kind=RevisionChangeKind.BASE_AND_HEAD_MOVED,
+            now="2026-07-12T01:00:00Z",
+        )
+    with pytest.raises(ValueError, match="preserve.*non-memory execution config"):
+        child_session_manifest(
+            review_id="review-child",
+            parent=legacy_parent,
+            repository=legacy_parent.repository,
+            revisions=revisions,
+            change_kind=RevisionChangeKind.BASE_AND_HEAD_MOVED,
+            now="2026-07-12T01:00:00Z",
+            execution=replace(execution_config(), reviewer_mode="single"),
+        )
+
+    child = child_session_manifest(
+        review_id="review-child",
+        parent=legacy_parent,
+        repository=legacy_parent.repository,
+        revisions=revisions,
+        change_kind=RevisionChangeKind.BASE_AND_HEAD_MOVED,
+        now="2026-07-12T01:00:00Z",
+        execution=execution_config(),
+    )
+
+    assert child.schema_version == SESSION_SCHEMA_VERSION
+    assert child.execution.memory == execution_config().memory
+    assert child.artifacts == {}
+    assert child.supplemental_waves == {}
+
+
+def test_v5_revision_drift_child_cannot_change_pinned_execution_config() -> None:
+    parent = manifest()
+    changed_execution = replace(
+        parent.execution,
+        memory=MemoryExecutionConfig(
+            mode=MemoryMode.READ,
+            root_path="C:/review-agent-memory",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="preserve.*fixed execution config"):
+        child_session_manifest(
+            review_id="review-child",
+            parent=parent,
+            repository=parent.repository,
+            revisions=ResolvedRevisions("main", "HEAD", "c" * 40, "d" * 40),
+            change_kind=RevisionChangeKind.BASE_AND_HEAD_MOVED,
+            now="2026-07-12T01:00:00Z",
+            execution=changed_execution,
+        )
 
 
 @pytest.mark.parametrize(

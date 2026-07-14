@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from enum import Enum
 import json
+from typing import Any
 
 import pytest
 
@@ -19,8 +21,12 @@ from review_agent.final_risk import FinalRiskAssessment, final_risk_to_dict
 from review_agent.hydration import (
     assignments_from_dict,
     completion_from_dict,
+    feedback_calibration_summary_from_dict,
     final_risk_from_dict,
     intent_from_dict,
+    memory_selection_decision_from_dict,
+    memory_selection_input_from_dict,
+    memory_snapshot_from_dict,
     quality_gate_plan_from_dict,
     quality_results_from_dict,
     reconciliation_from_dict,
@@ -32,6 +38,15 @@ from review_agent.hydration import (
     risk_assessment_from_dict,
     risk_packet_from_dict,
     semantic_reconciliation_from_dict,
+)
+from review_agent.memory_models import (
+    Applicability,
+    FeedbackCalibrationSummary,
+    GenerationMetadata,
+    MemoryScope,
+    MemorySelectionDecision,
+    MemorySelectionInput,
+    MemorySnapshot,
 )
 from review_agent.model_protocol import ModelResponse
 from review_agent.models import (
@@ -82,6 +97,94 @@ def _json(value: object) -> object:
     return json.loads(
         json.dumps(value, default=lambda item: item.value if isinstance(item, Enum) else item)
     )
+
+
+def _memory_hydration_cases() -> list[
+    tuple[Callable[[Mapping[str, Any]], object], dict[str, Any], object]
+]:
+    generations = GenerationMetadata(
+        store_schema_version=1,
+        memory_generation=2,
+        feedback_generation=3,
+        knowledge_generation=4,
+    )
+    selection_input = MemorySelectionInput(
+        review_id="review-memory-hydration",
+        repository_key="4" * 64,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        changed_paths=("src/review_agent/artifacts.py",),
+        changed_symbols=("review_agent.artifacts.artifact_schema",),
+        contracts=("artifact_integrity",),
+        languages=("python",),
+        generations=generations,
+    )
+    decision = MemorySelectionDecision(
+        memory_id="MEM-" + "c" * 64,
+        applicability=Applicability.OUT_OF_SCOPE,
+        matched_scope=MemoryScope(paths=("src/legacy/**",)),
+        reason_codes=("path_mismatch",),
+        rank=0,
+    )
+    feedback_summary = FeedbackCalibrationSummary(
+        repository_key="4" * 64,
+        feedback_generation=generations.feedback_generation,
+        policy_version="feedback_aggregation_v1",
+        eligible=False,
+        source_feedback_ids=(),
+        source_review_ids=(),
+        decision_counts=(),
+        signals=(),
+        created_at="2026-07-15T00:00:00Z",
+    )
+    snapshot = MemorySnapshot(
+        repository_key="4" * 64,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        generations=generations,
+        selection_policy_version="memory_selection_v1",
+        eligible_records=(),
+        applicability_decisions=(decision,),
+        feedback_calibration_summary=feedback_summary,
+        repository_knowledge_refs=(),
+        created_at="2026-07-15T00:00:00Z",
+    )
+    return [
+        (
+            memory_selection_input_from_dict,
+            selection_input.to_dict(),
+            selection_input,
+        ),
+        (memory_snapshot_from_dict, snapshot.to_dict(), snapshot),
+        (memory_selection_decision_from_dict, decision.to_dict(), decision),
+        (
+            feedback_calibration_summary_from_dict,
+            feedback_summary.to_dict(),
+            feedback_summary,
+        ),
+    ]
+
+
+def test_memory_hydration_boundaries_round_trip_strict_models() -> None:
+    for loader, payload, model in _memory_hydration_cases():
+        assert loader(payload) == model
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_memory_hydration_boundaries_do_not_guess_or_default_fields(
+    mutation: str,
+) -> None:
+    for loader, serialized, _ in _memory_hydration_cases():
+        payload = dict(serialized)
+        if mutation == "missing":
+            del payload["schema_version"]
+            message = "missing required field"
+        else:
+            payload["legacy_default"] = True
+            message = "unsupported field"
+
+        with pytest.raises(ValueError, match=message):
+            loader(payload)
 
 
 def _assignment() -> Assignment:

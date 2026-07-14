@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from types import MappingProxyType
 
 
 ARTIFACT_SCHEMAS = {
@@ -33,6 +34,16 @@ ARTIFACT_SCHEMAS = {
     "incremental_priority": "incremental_priority_map_v1",
     "repository_intelligence": "repository_intelligence_v1",
     "repository_observations": "observation_log_jsonl_v1",
+    "memory_selection_input": "memory_selection_input_v1",
+    "memory_snapshot": "memory_snapshot_v1",
+    "memory_selection_decision": "memory_selection_decision_v1",
+    "memory_feedback_summary": "feedback_calibration_summary_v1",
+    "memory_curator_envelope": "memory_curator_envelope_v1",
+    "memory_curator_raw_response": "memory_curator_raw_response_v1",
+    "memory_curator_decision": "memory_curator_decision_v1",
+    "memory_candidates": "memory_candidate_batch_v1",
+    "memory_outbox": "memory_candidate_outbox_v1",
+    "memory_persistence_receipt": "memory_persistence_receipt_v1",
     "multi_reviewer": "multi_reviewer_result_v1",
     "reviewer_envelope": "model_request_envelope_v1",
     "reviewer_raw_response": "model_raw_response_v1",
@@ -51,6 +62,29 @@ ARTIFACT_SCHEMAS = {
     "report": "review_report_markdown_v1",
     "observations": "observation_log_jsonl_v1",
 }
+
+# This contract intentionally contains only stable wire strings so SessionStore
+# can enforce phase ownership without importing Session or RunPhase here.
+MEMORY_ARTIFACT_PHASES = MappingProxyType(
+    {
+        "memory_selection_input": "memory_selection",
+        "memory_snapshot": "memory_selection",
+        "memory_selection_decision": "memory_selection",
+        "memory_feedback_summary": "memory_selection",
+        "memory_curator_envelope": "memory_proposal",
+        "memory_curator_raw_response": "memory_proposal",
+        "memory_curator_decision": "memory_proposal",
+        "memory_candidates": "memory_proposal",
+        "memory_outbox": "memory_proposal",
+        "memory_persistence_receipt": "memory_proposal",
+    }
+)
+MEMORY_ARTIFACT_SCHEMAS = MappingProxyType(
+    {
+        name: ARTIFACT_SCHEMAS[name]
+        for name in MEMORY_ARTIFACT_PHASES
+    }
+)
 
 PER_REVIEWER_SCHEMAS = {
     "_envelope": "model_request_envelope_v1",

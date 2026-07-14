@@ -1010,9 +1010,22 @@ def test_memory_snapshot_pins_canonical_records_decisions_feedback_and_knowledge
     assert snapshot.snapshot_id.startswith("MSNAP-")
     assert len(snapshot.snapshot_id) == 70
     assert len(snapshot.snapshot_hash) == 64
-    assert MemorySnapshot.from_dict(snapshot.to_dict()) == snapshot
+    payload = snapshot.to_dict()
+    assert payload["store_schema_version"] == 1
+    assert payload["memory_generation"] == 3
+    assert payload["feedback_generation"] == 4
+    assert payload["knowledge_generation"] == 5
+    assert "generations" not in payload
+    assert MemorySnapshot.from_dict(payload) == snapshot
     with pytest.raises(ValueError, match="snapshot_hash"):
         MemorySnapshot.from_dict({**snapshot.to_dict(), "snapshot_hash": HASH_1})
+    with pytest.raises(ValueError, match="generations"):
+        MemorySnapshot.from_dict(
+            {
+                **payload,
+                "generations": snapshot.generations.to_dict(),
+            }
+        )
 
 
 def test_memory_snapshot_requires_a_selected_decision_for_each_record() -> None:
@@ -1099,3 +1112,24 @@ def test_memory_execution_config_matches_final_session_v5_contract() -> None:
                 "selection_policy_version": "memory_selection_v2",
             }
         )
+
+
+def test_memory_execution_config_canonicalizes_construction_and_rejects_noncanonical_wire_paths() -> None:
+    config = MemoryExecutionConfig(
+        mode=MemoryMode.READ,
+        root_path=r"C:\memory\.\nested",
+    )
+
+    assert config.root_path == "C:/memory/nested"
+    for noncanonical in (
+        "C:/memory/./nested",
+        "C://memory//nested",
+        r"C:\memory\nested",
+    ):
+        with pytest.raises(ValueError, match="canonical absolute path"):
+            MemoryExecutionConfig.from_dict(
+                {
+                    **config.to_dict(),
+                    "root_path": noncanonical,
+                }
+            )

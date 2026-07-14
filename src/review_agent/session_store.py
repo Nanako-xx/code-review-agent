@@ -13,10 +13,15 @@ import unicodedata
 import uuid
 from typing import Iterable, Mapping
 
+from review_agent.artifacts import (
+    MEMORY_ARTIFACT_PHASES,
+    MEMORY_ARTIFACT_SCHEMAS,
+)
 from review_agent.checkpoint import _atomic_write_text, _fsync_parent_directory
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
     RESUMABLE_SESSION_SCHEMA_VERSIONS,
+    SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION,
     SESSION_PHASES,
     SESSION_SCHEMA_VERSION,
     ArtifactDescriptor,
@@ -127,7 +132,7 @@ class SessionStore:
         if manifest.schema_version not in RESUMABLE_SESSION_SCHEMA_VERSIONS:
             raise ValueError(
                 "schema v1 Session is available for read-only audit; start a new "
-                "schema v4 Session to use state transitions"
+                "schema v5 Session to use state transitions"
             )
 
     @staticmethod
@@ -167,6 +172,7 @@ class SessionStore:
         phase = _require_session_phase(phase)
         current = self.load()
         self._require_current_layout(current)
+        _require_manifest_phase(current, phase)
         existing = current.artifacts.get(name)
         if current.status is RunStatus.COMPLETED and existing is None:
             raise ValueError("cannot register a new artifact on a completed Session")
@@ -228,6 +234,7 @@ class SessionStore:
         phase = _require_session_phase(phase)
         try:
             current = self.load()
+            _require_manifest_phase(current, phase)
             checkpoint = current.phases[phase.value]
             if checkpoint.status is not PhaseStatus.COMPLETED:
                 raise ValueError(
@@ -489,6 +496,7 @@ class SessionStore:
         phase = _require_session_phase(phase)
         current = self.load()
         self._require_current_layout(current)
+        _require_manifest_phase(current, phase)
         checkpoint = current.phases[phase.value]
         if checkpoint.status is not PhaseStatus.RUNNING:
             raise ValueError(f"phase {phase.value} is not running")
@@ -524,6 +532,7 @@ class SessionStore:
         preserve = set(_unique_artifact_names(preserve_names))
         current = self.load()
         self._require_current_layout(current)
+        _require_manifest_phase(current, phase)
         checkpoint = current.phases[phase.value]
         if checkpoint.status is PhaseStatus.COMPLETED:
             raise ValueError("cannot discard artifacts from a completed phase")
@@ -1702,6 +1711,7 @@ class SessionStore:
         phase = _require_session_phase(phase)
         current = self.load()
         self._require_current_layout(current)
+        _require_manifest_phase(current, phase)
         checkpoint = current.phases[phase.value]
         requested_artifacts = _unique_artifact_names(artifact_names)
         if checkpoint.status is PhaseStatus.COMPLETED:
@@ -1835,6 +1845,7 @@ class SessionStore:
             raise ValueError("error must be a non-empty string")
         current = self.load()
         self._require_current_layout(current)
+        _require_manifest_phase(current, phase)
         checkpoint = current.phases[phase.value]
         if current.status is RunStatus.COMPLETED:
             raise ValueError("cannot fail a completed Session")
@@ -1947,10 +1958,13 @@ class SessionStore:
 
     @staticmethod
     def _require_supplemental_layout(manifest: SessionManifest) -> PhaseCheckpoint:
-        if manifest.schema_version != SESSION_SCHEMA_VERSION:
+        if (
+            manifest.schema_version
+            < SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
+        ):
             raise ValueError(
-                "supplemental investigation is available only for current "
-                "Session schema Sessions"
+                "supplemental investigation is available only for Session "
+                "schema v4 or later"
             )
         checkpoint = manifest.phases.get(
             RunPhase.SUPPLEMENTAL_INVESTIGATION.value
@@ -2362,6 +2376,17 @@ def _require_session_phase(phase: RunPhase) -> RunPhase:
     return phase
 
 
+def _require_manifest_phase(
+    manifest: SessionManifest,
+    phase: RunPhase,
+) -> RunPhase:
+    if phase not in session_phases_for_schema(manifest.schema_version):
+        raise ValueError(
+            f"phase {phase.value} is not part of this Session schema layout"
+        )
+    return phase
+
+
 def _require_non_empty_string(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
@@ -2437,6 +2462,32 @@ def _require_revision_binding(
     phase: RunPhase,
     revision_binding: str | None,
 ) -> None:
+    _require_manifest_phase(manifest, phase)
+    expected_phase = MEMORY_ARTIFACT_PHASES.get(name)
+    schema_owner = next(
+        (
+            artifact_name
+            for artifact_name, artifact_schema in MEMORY_ARTIFACT_SCHEMAS.items()
+            if artifact_schema == schema
+        ),
+        None,
+    )
+    if expected_phase is not None or schema_owner is not None:
+        if manifest.schema_version != SESSION_SCHEMA_VERSION:
+            raise ValueError("Memory artifacts are allowed only in schema v5 Sessions")
+        if expected_phase is None:
+            raise ValueError(
+                f"memory artifact schema {schema!r} requires name {schema_owner!r}"
+            )
+        expected_schema = MEMORY_ARTIFACT_SCHEMAS[name]
+        if schema != expected_schema:
+            raise ValueError(
+                f"memory artifact {name!r} schema must be {expected_schema!r}"
+            )
+        if phase.value != expected_phase:
+            raise ValueError(
+                f"memory artifact {name!r} phase must be {expected_phase!r}"
+            )
     if revision_binding == "":
         raise ValueError("revision_binding must not be empty")
     unbound_request = (

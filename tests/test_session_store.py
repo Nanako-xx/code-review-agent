@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import review_agent.session_store as session_store_module
+from review_agent.memory_models import MemoryExecutionConfig, MemoryMode
 from review_agent.revision import RepositoryIdentity, ResolvedRevisions
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
@@ -18,6 +19,8 @@ from review_agent.session import (
     MODEL_STAGE_SESSION_SCHEMA_VERSION,
     PREVIOUS_SESSION_SCHEMA_VERSION,
     PREVIOUS_SESSION_PHASES,
+    SEMANTIC_RECONCILIATION_SESSION_PHASES,
+    SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION,
     SESSION_PHASES,
     SESSION_SCHEMA_VERSION,
     ArtifactDescriptor,
@@ -67,6 +70,10 @@ def manifest(review_id: str = "review-1") -> SessionManifest:
             reviewer_mode="single",
             reviewer_loop="single-shot",
             non_interactive=True,
+            memory=MemoryExecutionConfig(
+                mode=MemoryMode.READ_WRITE,
+                root_path="C:/review-agent-memory",
+            ),
         ),
         now=NOW,
     )
@@ -88,22 +95,33 @@ def create_store(run_dir: Path) -> SessionStore:
     return store
 
 
-def _downgrade_v4_payload(payload: dict[str, object], schema_version: int) -> None:
+def _downgrade_v5_payload(payload: dict[str, object], schema_version: int) -> None:
     payload["schema_version"] = schema_version
     execution = payload["execution"]
     assert isinstance(execution, dict)
-    execution.pop("semantic_reconciler")
-    execution.pop("supplemental_policy")
-    payload.pop("supplemental_waves")
+    execution.pop("memory")
+    execution.pop("memory_curator")
+    phases = payload["phases"]
+    assert isinstance(phases, dict)
+    if schema_version < SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION:
+        execution.pop("semantic_reconciler")
+        execution.pop("supplemental_policy")
+        payload.pop("supplemental_waves")
     if schema_version < MODEL_STAGE_SESSION_SCHEMA_VERSION:
         execution.pop("risk_assessor")
         execution.pop("portfolio_planner")
-    if schema_version != LEGACY_SESSION_SCHEMA_VERSION:
-        phases = payload["phases"]
-        assert isinstance(phases, dict)
+    if schema_version in {
+        PREVIOUS_SESSION_SCHEMA_VERSION,
+        MODEL_STAGE_SESSION_SCHEMA_VERSION,
+    }:
         payload["phases"] = {
             phase.value: phases[phase.value]
             for phase in PREVIOUS_SESSION_PHASES
+        }
+    elif schema_version == SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION:
+        payload["phases"] = {
+            phase.value: phases[phase.value]
+            for phase in SEMANTIC_RECONCILIATION_SESSION_PHASES
         }
 
 
@@ -168,7 +186,7 @@ def test_session_store_loads_v1_for_audit_without_synthesizing_results(
     tmp_path: Path,
 ) -> None:
     payload = session_manifest_to_dict(manifest())
-    _downgrade_v4_payload(payload, LEGACY_SESSION_SCHEMA_VERSION)
+    _downgrade_v5_payload(payload, LEGACY_SESSION_SCHEMA_VERSION)
     payload["phases"] = {
         phase.value: payload["phases"][phase.value]
         for phase in LEGACY_SESSION_PHASES
@@ -191,6 +209,8 @@ def test_session_store_loads_v1_for_audit_without_synthesizing_results(
     assert loaded.execution.portfolio_planner == ModelStageConfig()
     assert loaded.execution.semantic_reconciler == ModelStageConfig()
     assert loaded.execution.supplemental_policy == SupplementalPolicy()
+    assert loaded.execution.memory is None
+    assert loaded.execution.memory_curator == ModelStageConfig()
     assert loaded.supplemental_waves == {}
     with pytest.raises(ValueError, match="read-only audit|schema v1"):
         store.mark_phase_running(RunPhase.PREFLIGHT, "2026-07-10T00:01:00Z")
@@ -198,7 +218,7 @@ def test_session_store_loads_v1_for_audit_without_synthesizing_results(
 
 def test_session_store_refuses_to_create_a_new_v1_session(tmp_path: Path) -> None:
     payload = session_manifest_to_dict(manifest())
-    _downgrade_v4_payload(payload, LEGACY_SESSION_SCHEMA_VERSION)
+    _downgrade_v5_payload(payload, LEGACY_SESSION_SCHEMA_VERSION)
     payload["phases"] = {
         phase.value: payload["phases"][phase.value]
         for phase in LEGACY_SESSION_PHASES
@@ -213,7 +233,7 @@ def test_session_store_refuses_to_create_a_new_v1_session(tmp_path: Path) -> Non
 
 def test_session_store_loads_v2_with_local_model_stages(tmp_path: Path) -> None:
     payload = session_manifest_to_dict(manifest())
-    _downgrade_v4_payload(payload, PREVIOUS_SESSION_SCHEMA_VERSION)
+    _downgrade_v5_payload(payload, PREVIOUS_SESSION_SCHEMA_VERSION)
     (tmp_path / "session.json").write_text(json.dumps(payload), encoding="utf-8")
 
     loaded = SessionStore(tmp_path).load()
@@ -228,7 +248,7 @@ def test_session_store_loads_v2_with_local_model_stages(tmp_path: Path) -> None:
 
 def test_session_store_resumes_v2_without_enabling_model_stages(tmp_path: Path) -> None:
     payload = session_manifest_to_dict(manifest())
-    _downgrade_v4_payload(payload, PREVIOUS_SESSION_SCHEMA_VERSION)
+    _downgrade_v5_payload(payload, PREVIOUS_SESSION_SCHEMA_VERSION)
     (tmp_path / "session.json").write_text(json.dumps(payload), encoding="utf-8")
     store = SessionStore(tmp_path)
 
@@ -244,7 +264,7 @@ def test_session_store_resumes_v3_with_original_layout_and_model_semantics(
     tmp_path: Path,
 ) -> None:
     payload = session_manifest_to_dict(manifest())
-    _downgrade_v4_payload(payload, MODEL_STAGE_SESSION_SCHEMA_VERSION)
+    _downgrade_v5_payload(payload, MODEL_STAGE_SESSION_SCHEMA_VERSION)
     (tmp_path / "session.json").write_text(json.dumps(payload), encoding="utf-8")
     store = SessionStore(tmp_path)
 
@@ -260,6 +280,131 @@ def test_session_store_resumes_v3_with_original_layout_and_model_semantics(
             RunPhase.RECONCILIATION_ANALYSIS,
             "2026-07-10T00:01:00Z",
         )
+
+
+def test_session_store_resumes_v4_without_enabling_memory(tmp_path: Path) -> None:
+    payload = session_manifest_to_dict(manifest())
+    _downgrade_v5_payload(
+        payload,
+        SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION,
+    )
+    (tmp_path / "session.json").write_text(json.dumps(payload), encoding="utf-8")
+    store = SessionStore(tmp_path)
+
+    updated = store.mark_phase_running(RunPhase.PREFLIGHT, NOW)
+
+    assert updated.schema_version == SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
+    assert list(updated.phases) == [
+        phase.value for phase in SEMANTIC_RECONCILIATION_SESSION_PHASES
+    ]
+    assert updated.execution.semantic_reconciler == manifest().execution.semantic_reconciler
+    assert updated.execution.supplemental_policy == manifest().execution.supplemental_policy
+    assert updated.execution.memory is None
+    assert updated.execution.memory_curator == ModelStageConfig()
+    assert RunPhase.MEMORY_SELECTION.value not in updated.phases
+    assert RunPhase.MEMORY_PROPOSAL.value not in updated.phases
+
+    for index, phase in enumerate(
+        SEMANTIC_RECONCILIATION_SESSION_PHASES[
+            : SEMANTIC_RECONCILIATION_SESSION_PHASES.index(
+                RunPhase.SUPPLEMENTAL_INVESTIGATION
+            )
+        ],
+        start=1,
+    ):
+        store.mark_phase_completed(
+            phase,
+            [],
+            f"2026-07-10T00:{index:02d}:00Z",
+        )
+    store.mark_phase_running(
+        RunPhase.SUPPLEMENTAL_INVESTIGATION,
+        "2026-07-10T00:08:00Z",
+    )
+    resumed = store.initialize_wave(
+        WAVE_1,
+        {TASK_1: ASSIGNMENT_1},
+        "2026-07-10T00:08:10Z",
+        trigger_digest=TRIGGER_1,
+    )
+
+    assert resumed.supplemental_waves[WAVE_1].status is PhaseStatus.RUNNING
+
+
+def test_legacy_session_memory_phase_apis_fail_closed_without_mutation(
+    tmp_path: Path,
+) -> None:
+    payload = session_manifest_to_dict(manifest())
+    _downgrade_v5_payload(
+        payload,
+        SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION,
+    )
+    session_path = tmp_path / "session.json"
+    session_path.write_text(json.dumps(payload), encoding="utf-8")
+    artifact_path = tmp_path / "memory_snapshot.json"
+    artifact_path.write_text("{}", encoding="utf-8")
+    store = SessionStore(tmp_path)
+    original_bytes = session_path.read_bytes()
+    descriptor = ArtifactDescriptor(
+        name="memory_snapshot",
+        path="memory_snapshot.json",
+        sha256=sha256(b"{}").hexdigest(),
+        schema="memory_snapshot_v1",
+        phase=RunPhase.MEMORY_SELECTION,
+        revision_binding=REVISION_BINDING,
+    )
+
+    validation = store.validate_phase(RunPhase.MEMORY_SELECTION)
+    assert validation.valid is False
+    assert "schema layout" in str(validation.reason)
+    assert store.validate_artifact(descriptor) is False
+    with pytest.raises(ValueError, match="schema v5"):
+        store.register_existing_artifact(
+            name="legacy_memory_alias",
+            relative_path="memory_snapshot.json",
+            schema="memory_snapshot_v1",
+            phase=RunPhase.PREFLIGHT,
+            revision_binding=REVISION_BINDING,
+            now=NOW,
+        )
+    assert session_path.read_bytes() == original_bytes
+
+    operations = [
+        lambda: store.register_existing_artifact(
+            name="memory_snapshot",
+            relative_path="memory_snapshot.json",
+            schema="memory_snapshot_v1",
+            phase=RunPhase.MEMORY_SELECTION,
+            revision_binding=REVISION_BINDING,
+            now=NOW,
+        ),
+        lambda: store.mark_phase_running(RunPhase.MEMORY_SELECTION, NOW),
+        lambda: store.restart_running_phase(RunPhase.MEMORY_SELECTION, NOW),
+        lambda: store.discard_uncommitted_phase_artifacts(
+            RunPhase.MEMORY_SELECTION,
+            [],
+            NOW,
+        ),
+        lambda: store.mark_phase_completed(
+            RunPhase.MEMORY_SELECTION,
+            [],
+            NOW,
+        ),
+        lambda: store.mark_session_failed(
+            RunPhase.MEMORY_SELECTION,
+            "memory failure",
+            NOW,
+        ),
+        lambda: store.invalidate_from(
+            RunPhase.MEMORY_SELECTION,
+            "memory invalid",
+            NOW,
+        ),
+    ]
+    for operation in operations:
+        with pytest.raises(ValueError, match="schema layout"):
+            operation()
+        assert session_path.read_bytes() == original_bytes
 
 
 def test_session_store_create_never_overwrites_existing_session(tmp_path: Path) -> None:
@@ -464,8 +609,11 @@ def test_session_store_load_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     store = create_store(tmp_path)
     original = store.session_path.read_text(encoding="utf-8")
     duplicate = original.replace(
-        '"schema_version": 4,',
-        '"schema_version": 4,\n  "schema_version": 4,',
+        f'"schema_version": {SESSION_SCHEMA_VERSION},',
+        (
+            f'"schema_version": {SESSION_SCHEMA_VERSION},\n'
+            f'  "schema_version": {SESSION_SCHEMA_VERSION},'
+        ),
         1,
     )
     store.session_path.write_text(duplicate, encoding="utf-8")
@@ -495,6 +643,87 @@ def test_session_store_registers_raw_byte_hash_and_exact_revision_binding(
     assert descriptor.revision_binding == REVISION_BINDING
     assert updated.updated_at == "2026-07-10T00:01:00Z"
     assert store.validate_artifact(descriptor) is True
+
+
+@pytest.mark.parametrize(
+    ("name", "schema", "phase", "wrong_phase"),
+    [
+        (
+            "memory_snapshot",
+            "memory_snapshot_v1",
+            RunPhase.MEMORY_SELECTION,
+            RunPhase.REPOSITORY_INTELLIGENCE,
+        ),
+        (
+            "memory_candidates",
+            "memory_candidate_batch_v1",
+            RunPhase.MEMORY_PROPOSAL,
+            RunPhase.FINAL_RISK,
+        ),
+    ],
+)
+def test_memory_artifact_registration_enforces_schema_phase_revision_and_hash(
+    tmp_path: Path,
+    name: str,
+    schema: str,
+    phase: RunPhase,
+    wrong_phase: RunPhase,
+) -> None:
+    store = create_store(tmp_path)
+    relative_path = f"{name}.json"
+    artifact_path = tmp_path / relative_path
+    artifact_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema"):
+        store.register_existing_artifact(
+            name=name,
+            relative_path=relative_path,
+            schema="wrong_schema_v1",
+            phase=phase,
+            revision_binding=REVISION_BINDING,
+            now="2026-07-10T00:01:00Z",
+        )
+    with pytest.raises(ValueError, match="requires name"):
+        store.register_existing_artifact(
+            name=f"alias_{name}",
+            relative_path=relative_path,
+            schema=schema,
+            phase=phase,
+            revision_binding=REVISION_BINDING,
+            now="2026-07-10T00:01:00Z",
+        )
+    with pytest.raises(ValueError, match="phase"):
+        store.register_existing_artifact(
+            name=name,
+            relative_path=relative_path,
+            schema=schema,
+            phase=wrong_phase,
+            revision_binding=REVISION_BINDING,
+            now="2026-07-10T00:01:00Z",
+        )
+    with pytest.raises(ValueError, match="revision_binding"):
+        store.register_existing_artifact(
+            name=name,
+            relative_path=relative_path,
+            schema=schema,
+            phase=phase,
+            revision_binding=f"{'c' * 40}..{HEAD_SHA}",
+            now="2026-07-10T00:01:00Z",
+        )
+
+    registered = store.register_existing_artifact(
+        name=name,
+        relative_path=relative_path,
+        schema=schema,
+        phase=phase,
+        revision_binding=REVISION_BINDING,
+        now="2026-07-10T00:01:00Z",
+    )
+    descriptor = registered.artifacts[name]
+    assert store.validate_artifact(descriptor) is True
+
+    artifact_path.write_text('{"tampered":true}', encoding="utf-8")
+    assert store.validate_artifact(descriptor) is False
 
 
 def test_session_store_rejects_mismatched_non_empty_revision_binding(
@@ -1532,6 +1761,40 @@ def test_invalidate_from_can_reopen_completed_session_only_through_recovery_api(
     assert recovered.phases["preflight"].status is PhaseStatus.COMPLETED
     assert recovered.phases["planning"].status is PhaseStatus.COMPLETED
     assert recovered.phases["reviewers"].status is PhaseStatus.INVALIDATED
+
+
+@pytest.mark.parametrize(
+    ("phase", "last_preserved"),
+    [
+        (RunPhase.MEMORY_SELECTION, RunPhase.REPOSITORY_INTELLIGENCE),
+        (RunPhase.MEMORY_PROPOSAL, RunPhase.FINAL_RISK),
+    ],
+)
+def test_memory_phase_invalidation_starts_at_minimal_v5_boundary(
+    tmp_path: Path,
+    phase: RunPhase,
+    last_preserved: RunPhase,
+) -> None:
+    store = create_store(tmp_path)
+    mark_all_phases(store)
+
+    invalidated = store.invalidate_from(
+        phase,
+        "memory artifact validation failed",
+        "2026-07-10T01:11:00Z",
+    )
+
+    boundary = SESSION_PHASES.index(phase)
+    assert all(
+        invalidated.phases[item.value].status is PhaseStatus.COMPLETED
+        for item in SESSION_PHASES[:boundary]
+    )
+    assert all(
+        invalidated.phases[item.value].status is PhaseStatus.INVALIDATED
+        for item in SESSION_PHASES[boundary:]
+    )
+    assert invalidated.last_successful_phase is last_preserved
+    assert invalidated.current_phase is phase
 
 
 def test_invalidate_from_is_idempotent_for_same_phase_and_reason(

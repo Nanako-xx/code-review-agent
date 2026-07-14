@@ -1,6 +1,45 @@
 import pytest
 
-from review_agent.artifacts import artifact_schema
+from review_agent.artifacts import (
+    MEMORY_ARTIFACT_PHASES,
+    MEMORY_ARTIFACT_SCHEMAS,
+    artifact_schema,
+)
+
+
+MEMORY_ARTIFACT_CONTRACT = {
+    "memory_selection_input": (
+        "memory_selection_input_v1",
+        "memory_selection",
+    ),
+    "memory_snapshot": ("memory_snapshot_v1", "memory_selection"),
+    "memory_selection_decision": (
+        "memory_selection_decision_v1",
+        "memory_selection",
+    ),
+    "memory_feedback_summary": (
+        "feedback_calibration_summary_v1",
+        "memory_selection",
+    ),
+    "memory_curator_envelope": (
+        "memory_curator_envelope_v1",
+        "memory_proposal",
+    ),
+    "memory_curator_raw_response": (
+        "memory_curator_raw_response_v1",
+        "memory_proposal",
+    ),
+    "memory_curator_decision": (
+        "memory_curator_decision_v1",
+        "memory_proposal",
+    ),
+    "memory_candidates": ("memory_candidate_batch_v1", "memory_proposal"),
+    "memory_outbox": ("memory_candidate_outbox_v1", "memory_proposal"),
+    "memory_persistence_receipt": (
+        "memory_persistence_receipt_v1",
+        "memory_proposal",
+    ),
+}
 
 
 def test_artifact_schema_resolves_stage_and_per_reviewer_artifacts() -> None:
@@ -30,6 +69,20 @@ def test_artifact_schema_resolves_semantic_reconciliation_artifacts() -> None:
     assert artifact_schema("semantic_reconciliation") == "semantic_reconciliation_v1"
     assert artifact_schema("reconciliation") == "evidence_reconciliation_v1"
     assert artifact_schema("supplemental_summary") == "supplemental_summary_v1"
+
+
+def test_memory_artifact_schemas_and_phase_contract_are_fixed() -> None:
+    assert {
+        name: artifact_schema(name)
+        for name in MEMORY_ARTIFACT_CONTRACT
+    } == dict(MEMORY_ARTIFACT_SCHEMAS) == {
+        name: schema
+        for name, (schema, _) in MEMORY_ARTIFACT_CONTRACT.items()
+    }
+    assert dict(MEMORY_ARTIFACT_PHASES) == {
+        name: phase
+        for name, (_, phase) in MEMORY_ARTIFACT_CONTRACT.items()
+    }
 
 
 def test_artifact_schema_resolves_strict_batch_wave_and_task_artifacts() -> None:
