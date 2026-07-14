@@ -1,3 +1,5 @@
+import pytest
+
 from review_agent.models import (
     Assignment,
     ContractItemStatus,
@@ -8,6 +10,8 @@ from review_agent.models import (
     QualityGateResult,
     ReviewProfile,
     ReviewRequest,
+    ReviewerRuntimeMetadata,
+    ReviewerTerminationReason,
     RiskAssessment,
     RiskLevel,
 )
@@ -58,6 +62,25 @@ def test_quality_gate_uses_observation_ref_name():
     assert result.observation_ref == "O-quality-python-compile"
 
 
+def test_quality_gate_rejects_unknown_status_and_non_finite_duration():
+    with pytest.raises(ValueError, match="status"):
+        QualityGateResult(
+            name="compile",
+            status="running",
+            command=["python", "-m", "compileall"],
+            summary="not terminal",
+        )
+
+    with pytest.raises(ValueError, match="duration_seconds"):
+        QualityGateResult(
+            name="compile",
+            status="passed",
+            command=["python", "-m", "compileall"],
+            summary="ok",
+            duration_seconds=float("nan"),
+        )
+
+
 def test_risk_assessment_uses_signal_refs_and_uncertainties():
     assessment = RiskAssessment(
         level=RiskLevel.HIGH,
@@ -100,6 +123,135 @@ def test_review_profile_maps_risk_to_depth():
     assert profile.reviewer_count == 3
     assert profile.max_turns_per_reviewer == 16
     assert "dynamic_specialist" in profile.reviewer_roles
+
+
+def test_assignment_persists_runtime_compiled_identity() -> None:
+    assignment = Assignment(
+        role="Async Lifecycle Reviewer",
+        mission="Inspect cancellation and retry lifecycle",
+        assignment_reason=["risk_reason:0"],
+        assigned_contract=["regression_safety", "unresolved_uncertainties"],
+        required_checks=["inspect cancellation paths"],
+        initial_context=InitialContext(),
+        max_turns=16,
+        max_tool_calls=40,
+        assignment_id="assignment-2",
+        role_kind="specialist",
+        perspective_key="async_lifecycle",
+        planner_source="model",
+    )
+
+    assert assignment.assignment_id == "assignment-2"
+    assert assignment.role_kind == "specialist"
+    assert assignment.repository_permission == "read_only"
+    assert assignment.command_permission == "safe_checks_only"
+
+
+def test_assignment_accepts_semantic_reconciler_planner_source() -> None:
+    assignment = Assignment(
+        role="Supplemental Concurrency Reviewer",
+        mission="Resolve one disagreement",
+        assignment_reason=["D-retry requires targeted evidence"],
+        assigned_contract=["supplemental_investigation:D-retry"],
+        required_checks=["inspect the retry path"],
+        initial_context=InitialContext(observation_refs=["O-retry"]),
+        max_turns=4,
+        max_tool_calls=8,
+        assignment_id="SASSIGN-retry",
+        role_kind="specialist",
+        perspective_key="supplemental:concurrency",
+        planner_source="semantic_reconciler",
+    )
+
+    assert assignment.planner_source == "semantic_reconciler"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "message"),
+    [
+        ("max_turns", 0, "max_turns"),
+        ("max_tool_calls", -1, "max_tool_calls"),
+        ("role_kind", "judge", "role_kind"),
+        ("repository_permission", "write", "repository_permission"),
+        ("command_permission", "shell", "command_permission"),
+    ],
+)
+def test_assignment_rejects_runtime_authority_escalation(
+    field_name: str,
+    invalid_value: object,
+    message: str,
+) -> None:
+    values = {
+        "role": "Core Reviewer",
+        "mission": "Review the change",
+        "assignment_reason": [],
+        "assigned_contract": [],
+        "required_checks": [],
+        "initial_context": InitialContext(),
+        "max_turns": 1,
+        "max_tool_calls": 1,
+        field_name: invalid_value,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        Assignment(**values)
+
+
+def test_review_profiles_expand_every_runtime_budget_by_risk():
+    profiles = [ReviewProfile.for_risk(level) for level in RiskLevel]
+
+    assert [profile.max_total_tokens for profile in profiles] == sorted(
+        profile.max_total_tokens for profile in profiles
+    )
+    assert [profile.max_elapsed_seconds for profile in profiles] == sorted(
+        profile.max_elapsed_seconds for profile in profiles
+    )
+    for profile in profiles:
+        assert profile.max_output_tokens > 0
+        assert profile.max_total_tokens > 0
+        assert profile.max_elapsed_seconds > 0
+        assert profile.max_provider_attempts > 0
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "message"),
+    [
+        ("max_output_tokens", 0, "max_output_tokens"),
+        ("max_total_tokens", -1, "max_total_tokens"),
+        ("max_elapsed_seconds", 0.0, "max_elapsed_seconds"),
+        ("max_elapsed_seconds", float("nan"), "max_elapsed_seconds"),
+        ("max_provider_attempts", True, "max_provider_attempts"),
+    ],
+)
+def test_assignment_requires_strictly_positive_runtime_budgets(
+    field_name: str,
+    invalid_value: object,
+    message: str,
+):
+    values = {
+        "role": "core",
+        "mission": "review",
+        "assignment_reason": [],
+        "assigned_contract": [],
+        "required_checks": [],
+        "initial_context": InitialContext(),
+        "max_turns": 1,
+        "max_tool_calls": 1,
+        field_name: invalid_value,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        Assignment(**values)
+
+
+def test_reviewer_runtime_metadata_has_legacy_unknown_defaults():
+    runtime = ReviewerRuntimeMetadata()
+
+    assert runtime.provider_attempts == 0
+    assert runtime.total_tokens == 0
+    assert runtime.usage_available is False
+    assert runtime.elapsed_seconds == 0.0
+    assert runtime.termination_reason is ReviewerTerminationReason.LEGACY_UNKNOWN
 
 
 def test_contract_status_values_are_stable():

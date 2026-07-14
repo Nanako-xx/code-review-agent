@@ -25,6 +25,7 @@ class ModelAdapterConfig:
     model: str | None
     base_url: str | None
     api_key_env: str
+    stage_label: str = "reviewer"
 
 
 class ModelAdapterFactory(Protocol):
@@ -52,7 +53,11 @@ class _FactoryFakeToolCallingAdapter(FakeToolCallingAdapter):
 
 def build_model_adapter_factory_from_config(
     config: ModelAdapterConfig,
+    *,
+    stage_label: str | None = None,
 ) -> ModelAdapterFactory | None:
+    stage_label = config.stage_label if stage_label is None else stage_label
+    option_prefix = _option_prefix(stage_label)
     provider_name = config.provider_name or "none"
     if provider_name == "none":
         return None
@@ -61,11 +66,19 @@ def build_model_adapter_factory_from_config(
     if provider_name == "openai-compatible":
         api_key = os.environ.get(config.api_key_env)
         if not api_key:
-            raise AdapterConfigError(f"missing API key environment variable: {config.api_key_env}")
+            stage_prefix = "" if option_prefix == "reviewer" else f"{option_prefix} "
+            raise AdapterConfigError(
+                f"missing {stage_prefix}API key environment variable: "
+                f"{config.api_key_env}"
+            )
         if not config.model:
-            raise AdapterConfigError("--reviewer-model is required for openai-compatible provider")
+            raise AdapterConfigError(
+                f"--{option_prefix}-model is required for openai-compatible provider"
+            )
         if not config.base_url:
-            raise AdapterConfigError("--reviewer-base-url is required for openai-compatible provider")
+            raise AdapterConfigError(
+                f"--{option_prefix}-base-url is required for openai-compatible provider"
+            )
         return OpenAICompatibleModelAdapterFactory(
             OpenAICompatibleConfig(
                 base_url=config.base_url,
@@ -73,7 +86,16 @@ def build_model_adapter_factory_from_config(
                 model=config.model,
             )
         )
-    raise AdapterConfigError(f"unsupported reviewer provider: {provider_name}")
+    raise AdapterConfigError(f"unsupported {option_prefix} provider: {provider_name}")
+
+
+def _option_prefix(stage_label: str) -> str:
+    if not isinstance(stage_label, str) or not stage_label:
+        raise ValueError("stage_label must be a non-empty string")
+    option_prefix = stage_label.replace("_", "-")
+    if any(character.isspace() for character in option_prefix):
+        raise ValueError("stage_label must not contain whitespace")
+    return option_prefix
 
 
 def _factory_fake_adapter() -> FakeToolCallingAdapter:
@@ -86,12 +108,21 @@ def _factory_fake_adapter() -> FakeToolCallingAdapter:
 
 
 def _fake_response_for_request(request: ModelTurnRequest) -> ModelTurnResponse:
+    response_schema = request.parameters.get("response_schema")
+    if response_schema == "intent_inference_result_v1":
+        return _fake_intent_inference_response()
+    if response_schema == "risk_proposal_v1":
+        return _fake_risk_proposal_response()
+    if response_schema == "portfolio_proposal_v1":
+        return _fake_portfolio_proposal_response()
+    if response_schema == "semantic_reconciliation_proposal_v1":
+        return _fake_semantic_reconciliation_response(request)
     if not request.tools or request.parameters.get("tool_choice") == "none":
         return _fake_single_shot_response()
 
     observation_id = _latest_observation_id(request)
     if observation_id:
-        return _fake_completed_agent_loop_response(observation_id)
+        return _fake_completed_agent_loop_response(observation_id, request)
 
     changed_file = _first_changed_file(request)
     if changed_file:
@@ -102,7 +133,158 @@ def _fake_response_for_request(request: ModelTurnRequest) -> ModelTurnResponse:
             model="fake-reviewer",
         )
 
-    return _fake_completed_agent_loop_response("")
+    return _fake_completed_agent_loop_response("", request)
+
+
+def _fake_intent_inference_response() -> ModelTurnResponse:
+    return ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "candidates": [
+                    {
+                        "field": "goal",
+                        "value": "Review the behavior changed between the resolved base and head revisions.",
+                        "origin": "llm_inference",
+                        "confidence": "low",
+                        "source_refs": [],
+                        "evidence_refs": [],
+                        "rationale": "The fake provider exercises intent inference without claiming repository evidence.",
+                        "conclusion_impact": "material",
+                    }
+                ],
+                "uncertainties": [
+                    "Fake provider does not perform semantic intent analysis."
+                ],
+                "summary": "Fake intent inference executed.",
+            }
+        ),
+        provider_name="fake",
+        model="fake-intent-analyst",
+        raw={"fake": True, "response_schema": "intent_inference_result_v1"},
+    )
+
+
+def _fake_risk_proposal_response() -> ModelTurnResponse:
+    return ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "level": "medium",
+                "dimensions": {
+                    "impact": "Fake provider identified bounded behavioral impact.",
+                    "blast_radius": "Fake provider assumes a localized blast radius.",
+                    "reversibility": "The reviewed revision can be reverted.",
+                    "uncertainty": "Fake provider does not perform semantic risk analysis.",
+                    "verification_strength": "Runtime-owned checks remain authoritative.",
+                },
+                "reasons": [
+                    "Fake provider exercises the model-assisted risk path."
+                ],
+                "signal_refs": [],
+                "uncertainties": [
+                    "Fake provider does not perform semantic risk analysis."
+                ],
+                "suggested_focus": [
+                    "Verify changed behavior against the review contract."
+                ],
+            }
+        ),
+        provider_name="fake",
+        model="fake-risk-assessor",
+        raw={"fake": True, "response_schema": "risk_proposal_v1"},
+    )
+
+
+def _fake_portfolio_proposal_response() -> ModelTurnResponse:
+    return ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "candidates": [
+                    {
+                        "candidate_id": "fake-core",
+                        "role_kind": "core",
+                        "role_name": "Fake Core Reviewer",
+                        "perspective_key": "fake_core",
+                        "mission": "Exercise the model-assisted portfolio path.",
+                        "reason_refs": [],
+                        "context_refs": [],
+                        "extra_contract": [],
+                        "required_checks": [
+                            "Verify the Runtime-compiled review contract."
+                        ],
+                        "priority": 50,
+                    }
+                ],
+                "summary": "Fake portfolio proposal executed.",
+                "uncertainties": [
+                    "Fake provider does not select repository-specific specialists."
+                ],
+            }
+        ),
+        provider_name="fake",
+        model="fake-portfolio-planner",
+        raw={"fake": True, "response_schema": "portfolio_proposal_v1"},
+    )
+
+
+def _fake_semantic_reconciliation_response(
+    request: ModelTurnRequest,
+) -> ModelTurnResponse:
+    packet: dict[str, object] = {}
+    for message in request.messages:
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            candidate = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and isinstance(
+            candidate.get("candidate_catalog"),
+            dict,
+        ):
+            packet = candidate
+            break
+    catalog = packet.get("candidate_catalog", {})
+    catalog = catalog if isinstance(catalog, dict) else {}
+    groups = []
+    for candidate_id in sorted(catalog):
+        row = catalog[candidate_id]
+        if not isinstance(row, dict):
+            continue
+        refs = row.get("evidence_refs", [])
+        refs = refs if isinstance(refs, list) else []
+        groups.append(
+            {
+                "member_ids": [candidate_id],
+                "representative_id": candidate_id,
+                "canonical_claim": str(row.get("claim", "Verified finding")),
+                "rationale": "Fake provider preserves each Runtime candidate independently.",
+                "supporting_refs": refs,
+                "proposed_confidence": str(row.get("confidence", "low")),
+            }
+        )
+    return ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "canonical_groups": groups,
+                "rejections": [],
+                "disagreements": [],
+                "supplemental_requests": [],
+                "uncertainties": [],
+                "summary": "Fake semantic reconciliation preserved Runtime candidates.",
+            }
+        ),
+        provider_name="fake",
+        model="fake-semantic-reconciler",
+        raw={
+            "fake": True,
+            "response_schema": "semantic_reconciliation_proposal_v1",
+        },
+    )
 
 
 def _fake_single_shot_response() -> ModelTurnResponse:
@@ -125,20 +307,20 @@ def _fake_single_shot_response() -> ModelTurnResponse:
     )
 
 
-def _fake_completed_agent_loop_response(observation_id: str) -> ModelTurnResponse:
+def _fake_completed_agent_loop_response(
+    observation_id: str,
+    request: ModelTurnRequest,
+) -> ModelTurnResponse:
     evidence_refs = [observation_id] if observation_id else []
-    contract_assessments = (
-        [
-            {
-                "contract": "regression_safety",
-                "status": "covered",
-                "summary": "Fake agent loop used a tool observation.",
-                "evidence_refs": evidence_refs,
-            }
-        ]
-        if evidence_refs
-        else []
-    )
+    contract_assessments = [
+        {
+            "contract": contract,
+            "status": "covered",
+            "summary": "Fake agent loop exercised the configured Runtime path.",
+            "evidence_refs": evidence_refs,
+        }
+        for contract in _assigned_contracts(request)
+    ]
     return ModelTurnResponse(
         kind=ModelResponseKind.FINAL,
         final_text=json.dumps(
@@ -156,6 +338,22 @@ def _fake_completed_agent_loop_response(observation_id: str) -> ModelTurnRespons
         model="fake-reviewer",
         raw={"fake": True},
     )
+
+
+def _assigned_contracts(request: ModelTurnRequest) -> list[str]:
+    prefix = "Assigned Contract:"
+    for message in request.messages:
+        content = message.get("content", "")
+        if not isinstance(content, str):
+            continue
+        for line in content.splitlines():
+            if line.startswith(prefix):
+                return [
+                    item.strip()
+                    for item in line.removeprefix(prefix).split(",")
+                    if item.strip()
+                ]
+    return ["regression_safety"]
 
 
 def _latest_observation_id(request: ModelTurnRequest) -> str:

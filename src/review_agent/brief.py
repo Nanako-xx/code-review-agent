@@ -4,7 +4,17 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from typing import Any
 
-from review_agent.models import IntentPacket, QualityGateResult, ReviewerResult, RiskAssessment
+from review_agent.models import (
+    ClarificationQuestion,
+    ClarificationStatus,
+    IntentClaim,
+    IntentClaimState,
+    IntentPacket,
+    IntentSource,
+    QualityGateResult,
+    ReviewerResult,
+    RiskAssessment,
+)
 
 
 @dataclass(frozen=True)
@@ -16,6 +26,10 @@ class BriefFinding:
     reviewer_indices: list[int] = field(default_factory=list)
     roles: list[str] = field(default_factory=list)
     suggested_action: str | None = None
+    path: str | None = None
+    line: int | None = None
+    impact: str = ""
+    verification_performed: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -45,6 +59,8 @@ class ReviewBrief:
     verification_evidence: list[dict[str, Any]]
     human_review_checklist_and_reading_order: list[str]
     non_binding_recommendation: str
+    orchestration: dict[str, Any] = field(default_factory=dict)
+    semantic_reconciliation: dict[str, Any] = field(default_factory=dict)
 
 
 def build_review_brief(
@@ -63,6 +79,9 @@ def build_review_brief(
     reconciliation_payload: dict[str, Any] | None = None,
     completion_summary: dict[str, Any] | None = None,
     final_risk_assessment: dict[str, Any] | None = None,
+    incremental_priority: dict[str, Any] | None = None,
+    planning_summary: dict[str, Any] | None = None,
+    semantic_reconciliation_payload: dict[str, Any] | None = None,
 ) -> ReviewBrief:
     observations = observation_summaries or {}
     reconciliation = reconciliation_payload or {}
@@ -70,6 +89,28 @@ def build_review_brief(
     verified_findings = _verified_findings(reconciliation)
     rejected_hypotheses = _rejected_hypotheses(reconciliation, reviewer_result)
     uncertainties = _uncertainties(intent_packet, risk_assessment, reviewer_result, completion)
+    if planning_summary is not None:
+        planning_uncertainties = planning_summary.get("uncertainties", [])
+        if isinstance(planning_uncertainties, list):
+            uncertainties = _dedupe(
+                [
+                    *uncertainties,
+                    *(
+                        str(item)
+                        for item in planning_uncertainties
+                        if str(item).strip()
+                    ),
+                ]
+            )
+
+    change_map: dict[str, Any] = {
+        "changed_files": list(changed_files),
+        "repository_intelligence_summary": repository_intelligence_summary or "",
+        "observation_count": len(observations),
+        "reviewer_summary": _reviewer_summary(multi_reviewer_summary, reviewer_result),
+    }
+    if incremental_priority is not None:
+        change_map["incremental_priority"] = dict(incremental_priority)
 
     return ReviewBrief(
         review_id=review_id,
@@ -81,11 +122,30 @@ def build_review_brief(
             "scope": list(intent_packet.scope),
             "constraints": list(intent_packet.constraints),
             "sources": {key: value.value for key, value in intent_packet.sources.items()},
+            "provenance": [
+                _intent_claim_to_dict(claim) for claim in intent_packet.provenance
+            ],
         },
         intent_assessment={
             "status": intent_packet.status.value,
             "uncertainties": list(intent_packet.uncertainties),
             "source_counts": _source_counts(intent_packet),
+            "clarification_history": [
+                _clarification_to_dict(question)
+                for question in intent_packet.clarifications
+            ],
+            "unresolved_questions": [
+                _clarification_to_dict(question)
+                for question in intent_packet.clarifications
+                if question.status
+                in {ClarificationStatus.PENDING, ClarificationStatus.OPEN}
+            ],
+            "unconfirmed_inferred_claims": [
+                _intent_claim_to_dict(claim)
+                for claim in intent_packet.provenance
+                if claim.source is IntentSource.INFERRED
+                and claim.claim_state is IntentClaimState.ACTIVE
+            ],
         },
         initial_and_final_risk_assessment={
             "initial": _risk_to_dict(risk_assessment),
@@ -97,12 +157,7 @@ def build_review_brief(
             },
         },
         quality_gates=[_quality_result_to_dict(result) for result in quality_results],
-        change_map_and_repository_impact={
-            "changed_files": list(changed_files),
-            "repository_intelligence_summary": repository_intelligence_summary or "",
-            "observation_count": len(observations),
-            "reviewer_summary": _reviewer_summary(multi_reviewer_summary, reviewer_result),
-        },
+        change_map_and_repository_impact=change_map,
         verified_findings=verified_findings,
         rejected_hypotheses=rejected_hypotheses,
         uncertainties=uncertainties,
@@ -116,11 +171,16 @@ def build_review_brief(
             uncertainties=uncertainties,
         ),
         non_binding_recommendation=str(completion.get("recommendation", "manual_review")),
+        orchestration=dict(planning_summary or {}),
+        semantic_reconciliation=dict(semantic_reconciliation_payload or {}),
     )
 
 
 def review_brief_to_dict(brief: ReviewBrief) -> dict[str, Any]:
-    return _json_ready(asdict(brief))
+    payload = _json_ready(asdict(brief))
+    if not brief.semantic_reconciliation:
+        payload.pop("semantic_reconciliation", None)
+    return payload
 
 
 def _verified_findings(reconciliation: dict[str, Any]) -> list[BriefFinding]:
@@ -136,6 +196,12 @@ def _verified_findings(reconciliation: dict[str, Any]) -> list[BriefFinding]:
                 reviewer_indices=[int(index) for index in row.get("reviewer_indices", [])],
                 roles=[str(role) for role in row.get("roles", [])],
                 suggested_action=str(row["suggested_action"]) if row.get("suggested_action") is not None else None,
+                path=str(row["path"]) if row.get("path") is not None else None,
+                line=int(row["line"]) if row.get("line") is not None else None,
+                impact=str(row.get("impact", "")),
+                verification_performed=[
+                    str(item) for item in row.get("verification_performed", [])
+                ],
             )
         )
     return findings
@@ -213,6 +279,12 @@ def _verification_evidence(
             "summary": result.summary,
             "command": list(result.command),
             "observation_ref": result.observation_ref,
+            "category": result.category,
+            "cost": result.cost,
+            "source": result.source,
+            "blocking": result.blocking,
+            "reason": result.reason,
+            "duration_seconds": result.duration_seconds,
         }
         for result in quality_results
     ]
@@ -264,6 +336,37 @@ def _source_counts(intent_packet: IntentPacket) -> dict[str, int]:
     return counts
 
 
+def _intent_claim_to_dict(claim: IntentClaim) -> dict[str, Any]:
+    return {
+        "claim_id": claim.claim_id,
+        "field": claim.field.value,
+        "value": claim.value,
+        "source": claim.source.value,
+        "origin": claim.origin.value,
+        "confidence": claim.confidence.value,
+        "source_refs": list(claim.source_refs),
+        "evidence_refs": list(claim.evidence_refs),
+        "claim_state": claim.claim_state.value,
+        "conclusion_impact": claim.conclusion_impact.value,
+    }
+
+
+def _clarification_to_dict(question: ClarificationQuestion) -> dict[str, Any]:
+    return {
+        "question_id": question.question_id,
+        "field": question.field.value,
+        "question": question.question,
+        "rationale": question.rationale,
+        "proposed_values": list(question.proposed_values),
+        "claim_ids": list(question.claim_ids),
+        "status": question.status.value,
+        "user_response": question.user_response,
+        "continuation_basis": question.continuation_basis,
+        "resolved_values": list(question.resolved_values),
+        "decision_id": question.decision_id,
+    }
+
+
 def _risk_to_dict(risk_assessment: RiskAssessment) -> dict[str, Any]:
     return {
         "level": risk_assessment.level.value,
@@ -282,6 +385,15 @@ def _quality_result_to_dict(result: QualityGateResult) -> dict[str, Any]:
         "command": list(result.command),
         "summary": result.summary,
         "observation_ref": result.observation_ref,
+        "category": result.category,
+        "cost": result.cost,
+        "source": result.source,
+        "blocking": result.blocking,
+        "reason": result.reason,
+        "exit_code": result.exit_code,
+        "duration_seconds": result.duration_seconds,
+        "output_truncated": result.output_truncated,
+        "sandbox": result.sandbox,
     }
 
 

@@ -1,7 +1,7 @@
 # Evidence-Driven Multi-Agent Code Review Agent 设计
 
 - 日期：2026-06-22
-- 状态：已确认，待实施计划
+- 状态：已确认，M1 本地核心实现进行中（Eval 与 GitHub/PR 集成延期）
 - 项目根目录：`D:\Agent\code review agent`
 - M1 形态：面向 Python Git 仓库的本地交互式 CLI
 
@@ -179,7 +179,11 @@ LLM 可以从 `head_revision` 的实现形态推断“这次修改似乎想达�
 如果 `inferred` 意图与 `base_revision` 的既有行为、明确文档、测试或用户声明冲突，该冲突本身就是审查线索；
 系统应把它记录为 `uncertainty`、风险理由或候选 finding，而不是把错误实现直接当作真实需求。
 
+Commit message 中的字面需求声明可以作为 `explicit` 来源；模型基于提交历史模式作出的解释仍是 `inferred`。测试中的明确说明可以作为 `explicit` 来源，但普通测试实现、当前断言或 Head 中新增测试的行为不能仅因存在于测试文件就自动成为真实需求。
+
 Intent Packet 的主要作用是让系统判断“当前意图理解是否足够支持可靠审查”。只有当缺失信息可能改变审查结论时，系统才向用户提出具体问题。
+
+Intent 来源和确认状态按具体 claim 记录，而不是只靠字段级标签。同一个列表字段可以同时包含 `explicit`、`inferred`、已否定和已替换的条目；字段级 `sources` 只是最终有效值的兼容摘要。`scope` 表示预期修改边界，不能直接把 `changed_files` 当作已经确认的 scope；changed files 只能提供 inferred 候选和调查起点。
 
 最小核心内容：
 
@@ -245,6 +249,8 @@ Agent 只提出可能改变审查结论的具体问题，例如：
 
 `Uncertainties` 只记录经过 `explicit` 收集、`inferred` 推断和必要用户确认之后，仍然没有可用结论的意图项或运行条件。已经形成可用推断的项标记为 `inferred`；被用户确认后升级为 `explicit`；被用户否定、跳过、无法确认，且系统也无法形成稳定推断的项，进入 `Uncertainties`。
 
+用户“否定”和“跳过”具有不同语义：否定会使对应 inferred claim 失效，不能继续作为有效意图；跳过或无法确认时，稳定推断可以保留为 `inferred`，但必须记录 continuation basis 并使 IntentStatus 保持 `partial` 或 `insufficient`。交互问题等待用户时，Session 进入可恢复的 `awaiting_user`，而不是失败或长期保持普通 `running`；已提交的候选、问题和用户决策在恢复时不得重复生成或重复询问。
+
 ## 7. Deterministic Quality Gates
 
 确定性问题不交给 LLM 猜测：
@@ -279,6 +285,10 @@ M1 默认只读，不自动修改被审查代码。后续可以增加显式 `fix
 对确定性小错误生成修复补丁、记录修复 diff，再基于修复后的状态继续审查。该模式不属于默认 Review 流程。
 
 Quality Gates 的完整输出进入 Observation Store；模型先看到结构化摘要，需要时再按范围读取原始日志。
+
+M1 的已实现运行协议如下：Runtime 在固定 `resolved_head_sha` 上生成 `QualityGatePlan`，从 Python 文件与仓库配置发现 compile、ruff、mypy/pyright、pytest，并解析 `pyproject.toml` 中显式声明的 `[[tool.review-agent.quality-gates]]`。仓库命令必须是通过 category/module 白名单验证的 `python -m ...` argv，禁止 shell、变更型参数、绝对路径和父目录穿越。
+
+廉价门禁在 `QUALITY_GATES` checkpoint 运行并进入初始风险信号；昂贵门禁在本地 Risk 与 Reviewer portfolio 形成后，于 `PLANNING` checkpoint 按策略执行或以带原因的 `skipped` 终态记录。外部门禁只在安全物化的 Head snapshot 中运行，使用最小环境、Python 网络 guard、wall-clock timeout、输出上限、进程树终止和日志脱敏。`passed | failed | skipped | unavailable | timed_out | error` 均形成结构化 Result 与 Observation；Completion 核对 plan coverage，普通失败作为 uncertainty，仓库显式声明的 blocking gate 非通过时成为 blocker。旧 Session 没有 plan 或新增字段时按 legacy 语义 hydrate。
 
 ## 8. Review Contract
 
@@ -1299,6 +1309,22 @@ M1 完成时，应能在一个本地 Python Git 仓库中：
 10. 支持中断恢复、失败降级和预算耗尽。
 11. 生成人类可审计的 Markdown/JSON Review Brief。
 12. 不修改代码、不自动发布评论、不自动合并。
+
+### 23.1 实现状态（2026-07-14）
+
+Runtime Review Contract Enforcement 已落地：合法 Observation revision allowlist、严格新 Finding 输出、assigned Contract completion validator、Agent Loop completion 拒绝/重试、single/multi/no-provider 统一 reconciliation/completion，以及无 Core Reviewer 时 `blocked` 均已进入主路径。`Session.status=completed` 仅表示执行生命周期结束，审查结论以 `completion.json` 为准。
+
+Intent Clarification 与 LLM Intent Inference 已落地：claim 级 provenance、受控 Tool Gateway 推断、Runtime 来源与 Observation authority 校验、material question 生成、confirm/correct/reject/skip、非交互降级、`awaiting_user` Session、幂等 decision artifact 与 resume、revision drift child Session 重新推断，以及 JSON/Markdown Brief 和 Reviewer Context 传播均已进入主路径。
+
+Reviewer Execution Hardening 已落地：风险等级在本地展开为 turn、tool、单次输出 token、累计 token、wall-clock 和 Provider attempt 预算；single-shot 与 Agent Loop 对 Provider exception/INVALID 做同一逻辑 turn 内的有限重试；OpenAI-compatible HTTP timeout 受剩余时间约束；预算耗尽返回保留已授权 Observation 的 `partial`。多个 Reviewer 的调查和模型调用在独立 AttemptWorkspace/ObservationStore 中并行，authoritative artifact 提升与 Session task 更新由主线程按 reviewer index 串行完成。Provider、解析和 Reviewer Runtime 失败形成结构化 `failed` artifact，不再中断其他 Reviewer；控制层提交、hash 和 Session 失败仍阻断 phase。runtime/termination metadata 已进入 raw response、Agent Loop trace、multi reviewer summary 和 JSON/Markdown Brief，旧 artifact 缺少新字段时继续按 legacy defaults hydrate。
+
+Deterministic Quality Gates 已落地：固定 Head 的 Gate Plan 与安全发现、cheap/deep 两阶段策略、隔离 snapshot runner、完整终态 Observation、Risk/Assignment/Completion/Final Risk/Brief 传播、checkpoint resume 和 legacy hydration 均进入主路径。普通门禁失败继续 Reviewer 并形成 uncertainty，显式 blocking 门禁由 Completion 硬约束。
+
+Model-Assisted Risk Assessor 与 Portfolio Planner 已落地：Session schema v3 为 Risk、Portfolio 和 Reviewer 保存独立模型阶段配置，旧 v1/v2 Session 严格 hydrate 为 local planning 并保留原调度语义。Risk Assessor 只读取最小 Risk Packet，模型 proposal 经严格解析、有限重试、`signal_refs` allowlist 和本地风险下限编译后才成为权威 Risk；模型失败会确定性降级，并把不确定性暴露到 Planning Summary 与 Brief。Portfolio Planner 的 candidate proposal 同样不具调度权，Runtime 负责角色数量、Core Contract、权限和风险预算，必要时补齐 Core、Adversarial 与 Specialist。新 Session 的 `single`/`multi` 分别顺序/并行执行完整 portfolio；envelope、raw response、decision、authoritative plan 和稳定 invocation metadata 均作为可恢复、可审计 artifact 保存。
+
+Semantic Evidence Reconciler 与有界补充调查已落地：Session schema v4 增加独立语义分析和补充调查阶段；确定性 pre-pass、严格模型 proposal 编译、严重 Finding 保守保留、stable request/wave/task/invocation ID、按风险编译且持久化的 effective policy、全局预算与有限波次、single/limited-multi 稳定调度、失败证据隔离、unknown consumption、最小范围恢复和 revision-drift 重算均进入主路径。权威 `semantic_reconciliation.json` 同时投影兼容的 `reconciliation.json`，Completion、Final Risk 与 JSON/Markdown Brief 会完整消费 fallback、冲突、补充状态、预算和 policy action。v1/v2/v3 Session 保持原 phase 与 resume 语义，不会隐式调用 Semantic Reconciler。
+
+仍待后续独立批次实现：Durable Project/Review Feedback Memory、Eval Harness，以及 GitHub/PR 集成。自动修复、自动发布评论和自动合并继续不在当前本地审查路径内。
 
 ## 24. 实现同步原则
 

@@ -114,3 +114,44 @@ def test_final_risk_uses_single_reviewer_findings_when_no_reconciliation_exists(
 
     assert result.level is RiskLevel.MEDIUM
     assert "single reviewer medium finding: Missing rollback path" in result.reasons
+
+
+def test_final_risk_propagates_semantic_fallback_conflicts_and_stop_reason() -> None:
+    result = reassess_final_risk(
+        initial_risk=initial(RiskLevel.LOW),
+        intent_packet=intent(),
+        quality_results=[],
+        reviewer_result=None,
+        reconciliation_payload={
+            "canonical_findings": [],
+            "rejected_findings": [],
+            "remaining_disagreements": [],
+        },
+        completion_summary={
+            "status": "budget_exhausted",
+            "recommendation": "manual_review",
+        },
+        semantic_reconciliation={
+            "status": "partial",
+            "model": {"status": "fallback"},
+            "conflicts_resolved": [{"issue": "duplicate wording"}],
+            "remaining_disagreements": [{"issue": "runtime behavior"}],
+            "supplemental": {
+                "status": "budget_exhausted",
+                "stop_reason": "max_waves",
+                "budget": {
+                    "unknown_consumed": {"tasks": 1, "tokens": 100},
+                },
+            },
+            "uncertainties": ["Provider response was malformed."],
+        },
+    )
+
+    assert result.level is RiskLevel.MEDIUM
+    assert "semantic reconciliation fell back to deterministic reconciliation" in result.reasons
+    assert "semantic reconciliation resolved 1 conflict(s)" in result.reasons
+    assert "supplemental investigation reached its maximum wave count" in result.reasons
+    assert "semantic_reconciliation:fallback" in result.signal_refs
+    assert "semantic_reconciliation:remaining_disagreements:1" in result.signal_refs
+    assert "supplemental_stop:max_waves" in result.signal_refs
+    assert "semantic reconciliation uncertainty: Provider response was malformed." in result.uncertainties

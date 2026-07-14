@@ -1,6 +1,10 @@
 from pathlib import Path
+import errno
 import json
 
+import pytest
+
+import review_agent.checkpoint as checkpoint_module
 from review_agent.checkpoint import CheckpointStore
 from review_agent.models import IntentStatus, ReviewerResult, ReviewerResultStatus, RiskAssessment, RiskLevel
 from review_agent.reporting import render_markdown_report
@@ -44,6 +48,120 @@ def test_checkpoint_store_writes_and_reads_run_state(tmp_path: Path) -> None:
     store.write_state(state)
 
     assert store.read_state() == state
+
+
+def test_checkpoint_store_json_write_uses_unique_same_directory_temps_and_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = CheckpointStore(tmp_path, "review-atomic")
+    temporary_paths: list[Path] = []
+    fsync_calls: list[int] = []
+    real_replace = checkpoint_module.os.replace
+    real_fsync = checkpoint_module.os.fsync
+
+    def recording_replace(source: object, destination: object) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        assert source_path.parent == destination_path.parent
+        assert source_path.exists()
+        temporary_paths.append(source_path)
+        real_replace(source, destination)
+
+    def recording_fsync(file_descriptor: int) -> None:
+        fsync_calls.append(file_descriptor)
+        real_fsync(file_descriptor)
+
+    monkeypatch.setattr(checkpoint_module.os, "replace", recording_replace)
+    monkeypatch.setattr(checkpoint_module.os, "fsync", recording_fsync)
+
+    store.write_json("request.json", {"head": "HEAD"})
+    store.write_json("request.json", {"head": "feature"})
+
+    assert len(temporary_paths) == 2
+    assert temporary_paths[0] != temporary_paths[1]
+    assert all(path.name.endswith(".tmp") for path in temporary_paths)
+    assert all(not path.exists() for path in temporary_paths)
+    assert len(fsync_calls) >= 2
+    assert json.loads((store.run_dir / "request.json").read_text(encoding="utf-8")) == {
+        "head": "feature"
+    }
+
+
+def test_checkpoint_store_cleans_temp_and_preserves_destination_when_replace_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = CheckpointStore(tmp_path, "review-atomic-failure")
+    destination = store.run_dir / "request.json"
+    destination.write_text('{"head":"old"}', encoding="utf-8")
+    temporary_paths: list[Path] = []
+
+    def failing_replace(source: object, destination_path: object) -> None:
+        temporary_paths.append(Path(source))
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(checkpoint_module.os, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        store.write_json("request.json", {"head": "new"})
+
+    assert json.loads(destination.read_text(encoding="utf-8")) == {"head": "old"}
+    assert len(temporary_paths) == 1
+    assert not temporary_paths[0].exists()
+    assert [path for path in store.run_dir.iterdir() if path.name.endswith(".tmp")] == []
+
+
+def test_checkpoint_store_fsyncs_parent_directory_after_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = CheckpointStore(tmp_path, "review-directory-fsync")
+    directory_descriptor = 987654
+    opened_directories: list[Path] = []
+    fsync_calls: list[int] = []
+    closed_descriptors: list[int] = []
+    real_fsync = checkpoint_module.os.fsync
+
+    def opening_directory(path: object, flags: int) -> int:
+        opened_directories.append(Path(path))
+        return directory_descriptor
+
+    def recording_fsync(file_descriptor: int) -> None:
+        fsync_calls.append(file_descriptor)
+        if file_descriptor != directory_descriptor:
+            real_fsync(file_descriptor)
+
+    def recording_close(file_descriptor: int) -> None:
+        closed_descriptors.append(file_descriptor)
+
+    monkeypatch.setattr(checkpoint_module.os, "open", opening_directory)
+    monkeypatch.setattr(checkpoint_module.os, "fsync", recording_fsync)
+    monkeypatch.setattr(checkpoint_module.os, "close", recording_close)
+
+    store.write_json("request.json", {"head": "HEAD"})
+
+    assert opened_directories == [store.run_dir]
+    assert fsync_calls[-1] == directory_descriptor
+    assert closed_descriptors == [directory_descriptor]
+
+
+def test_checkpoint_store_safely_degrades_when_directory_fsync_is_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = CheckpointStore(tmp_path, "review-directory-fsync-unsupported")
+
+    def unsupported_directory_open(path: object, flags: int) -> int:
+        raise OSError(errno.EACCES, "directory handles are unsupported")
+
+    monkeypatch.setattr(checkpoint_module.os, "open", unsupported_directory_open)
+
+    store.write_json("request.json", {"head": "HEAD"})
+
+    assert json.loads((store.run_dir / "request.json").read_text(encoding="utf-8")) == {
+        "head": "HEAD"
+    }
 
 
 def test_markdown_report_contains_risk_signals_and_uncertainties():

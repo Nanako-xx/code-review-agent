@@ -27,6 +27,10 @@ def render_review_brief_markdown(brief: ReviewBrief) -> str:
             "",
             _risk_section(brief),
             "",
+            "## Risk And Portfolio Orchestration",
+            "",
+            _orchestration_section(brief),
+            "",
             "## Quality Gates",
             "",
             _quality_gates_section(brief),
@@ -51,6 +55,16 @@ def render_review_brief_markdown(brief: ReviewBrief) -> str:
             "",
             _string_list(brief.reviewer_disagreements, "No reviewer disagreements recorded"),
             "",
+            *(
+                [
+                    "## Semantic Reconciliation And Supplemental Investigation",
+                    "",
+                    _semantic_reconciliation_section(brief),
+                    "",
+                ]
+                if brief.semantic_reconciliation
+                else []
+            ),
             "## Review Contract Coverage",
             "",
             _contract_coverage_section(brief),
@@ -88,6 +102,8 @@ def render_markdown_report(
     completion_summary: dict[str, object] | None = None,
     intent_packet: IntentPacket | None = None,
     quality_results: list[QualityGateResult] | None = None,
+    planning_summary: dict[str, object] | None = None,
+    semantic_reconciliation_summary: dict[str, object] | None = None,
 ) -> str:
     brief = build_review_brief(
         review_id=review_id,
@@ -103,6 +119,8 @@ def render_markdown_report(
         multi_reviewer_summary=multi_reviewer_summary,
         reconciliation_payload=reconciliation_summary,
         completion_summary=completion_summary,
+        planning_summary=planning_summary,
+        semantic_reconciliation_payload=semantic_reconciliation_summary,
     )
     return render_review_brief_markdown(brief)
 
@@ -121,6 +139,9 @@ def _change_intent_section(brief: ReviewBrief) -> str:
             "",
             "Constraints:",
             _string_list(intent.get("constraints", []), "No constraints recorded"),
+            "",
+            "Claim-level provenance:",
+            _intent_provenance_section(intent.get("provenance", [])),
         ]
     )
 
@@ -136,9 +157,120 @@ def _intent_assessment_section(brief: ReviewBrief) -> str:
             "Source counts:",
             _string_list(source_lines, "No intent sources recorded"),
             "",
+            "Clarification and decision history:",
+            _clarification_history_section(
+                assessment.get("clarification_history", [])
+            ),
+            "",
+            "Unresolved clarification questions:",
+            _unresolved_questions_section(
+                assessment.get("unresolved_questions", [])
+            ),
+            "",
+            "Unconfirmed inferred claims:",
+            _unconfirmed_claims_section(
+                assessment.get("unconfirmed_inferred_claims", [])
+            ),
+            "",
             "Intent uncertainties:",
             _string_list(assessment.get("uncertainties", []), "No intent uncertainties recorded"),
         ]
+    )
+
+
+def _intent_provenance_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No claim-level provenance recorded"
+
+    lines: list[str] = []
+    for row in rows:
+        field = row.get("field", "unknown")
+        claim_value = row.get("value", "No value recorded")
+        lines.append(f"- `{field}`: {claim_value}")
+        lines.append(
+            "  - Provenance: "
+            f"{row.get('source', 'unknown')} via {row.get('origin', 'unknown')}; "
+            f"confidence {row.get('confidence', 'unknown')}; "
+            f"state {row.get('claim_state', 'unknown')}; "
+            f"conclusion impact {row.get('conclusion_impact', 'unknown')}"
+        )
+        lines.append(f"  - Claim ID: {row.get('claim_id', 'unknown')}")
+        source_refs = row.get("source_refs", [])
+        if source_refs:
+            lines.append(f"  - Source refs: {_inline_value(source_refs)}")
+        evidence_refs = row.get("evidence_refs", [])
+        if evidence_refs:
+            lines.append(f"  - Evidence refs: {_inline_value(evidence_refs)}")
+    return "\n".join(lines)
+
+
+def _clarification_history_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No clarification decisions recorded"
+
+    lines: list[str] = []
+    for row in rows:
+        lines.append(
+            f"- [{row.get('status', 'unknown')}] "
+            f"`{row.get('field', 'unknown')}`: {row.get('question', '')}"
+        )
+        lines.append(f"  - Question ID: {row.get('question_id', 'unknown')}")
+        lines.append(f"  - Rationale: {row.get('rationale', 'Not recorded')}")
+        claim_ids = row.get("claim_ids", [])
+        if claim_ids:
+            lines.append(f"  - Related claim IDs: {_inline_value(claim_ids)}")
+        proposed_values = row.get("proposed_values", [])
+        if proposed_values:
+            lines.append(f"  - Proposed values: {_inline_value(proposed_values)}")
+        resolved_values = row.get("resolved_values", [])
+        if resolved_values:
+            lines.append(f"  - Resolved values: {_inline_value(resolved_values)}")
+        user_response = row.get("user_response")
+        if user_response:
+            lines.append(f"  - User response: {user_response}")
+        continuation_basis = row.get("continuation_basis")
+        if continuation_basis:
+            lines.append(f"  - Continuation basis: {continuation_basis}")
+        decision_id = row.get("decision_id")
+        if decision_id:
+            lines.append(f"  - Decision ID: {decision_id}")
+    return "\n".join(lines)
+
+
+def _unresolved_questions_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No unresolved clarification questions"
+
+    lines: list[str] = []
+    for row in rows:
+        lines.append(
+            f"- `{row.get('field', 'unknown')}`: {row.get('question', '')} "
+            f"(status: {row.get('status', 'unknown')}; "
+            f"question ID: {row.get('question_id', 'unknown')})"
+        )
+        lines.append(f"  - Rationale: {row.get('rationale', 'Not recorded')}")
+        claim_ids = row.get("claim_ids", [])
+        if claim_ids:
+            lines.append(f"  - Related claim IDs: {_inline_value(claim_ids)}")
+        proposed_values = row.get("proposed_values", [])
+        if proposed_values:
+            lines.append(f"  - Proposed values: {_inline_value(proposed_values)}")
+    return "\n".join(lines)
+
+
+def _unconfirmed_claims_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No unconfirmed inferred claims"
+    return "\n".join(
+        f"- `{row.get('field', 'unknown')}`: {row.get('value', '')} "
+        f"(confidence: {row.get('confidence', 'unknown')}; "
+        f"origin: {row.get('origin', 'unknown')}; "
+        f"claim ID: {row.get('claim_id', 'unknown')})"
+        for row in rows
     )
 
 
@@ -164,13 +296,38 @@ def _risk_section(brief: ReviewBrief) -> str:
     )
 
 
+def _orchestration_section(brief: ReviewBrief) -> str:
+    if not brief.orchestration:
+        return "- No model-assisted planning metadata recorded"
+    return _dict_lines(dict(brief.orchestration))
+
+
 def _quality_gates_section(brief: ReviewBrief) -> str:
     if not brief.quality_gates:
         return "- No quality gates recorded"
-    return "\n".join(
-        f"- {gate.get('name', 'unknown')}: {gate.get('status', 'unknown')} - {gate.get('summary', '')}".rstrip()
-        for gate in brief.quality_gates
-    )
+    rows: list[str] = []
+    for gate in brief.quality_gates:
+        rows.extend(
+            [
+                (
+                    f"- {gate.get('name', 'unknown')} "
+                    f"[{gate.get('category', 'unknown')}/"
+                    f"{gate.get('cost', 'unknown')}; "
+                    f"{gate.get('source', 'unknown')}; "
+                    f"{'blocking' if gate.get('blocking') else 'non-blocking'}]: "
+                    f"{gate.get('status', 'unknown')} "
+                    f"({float(gate.get('duration_seconds', 0.0)):.2f}s) - "
+                    f"{gate.get('summary', '')}"
+                ).rstrip(),
+                f"  - Command: {gate.get('command', [])}",
+                f"  - Reason: {gate.get('reason') or 'none'}",
+                f"  - Exit code: {gate.get('exit_code')}",
+                f"  - Output truncated: {bool(gate.get('output_truncated', False))}",
+                f"  - Sandbox: {gate.get('sandbox', 'unknown')}",
+                f"  - Observation: {gate.get('observation_ref') or 'none'}",
+            ]
+        )
+    return "\n".join(rows)
 
 
 def _change_map_section(brief: ReviewBrief) -> str:
@@ -184,6 +341,19 @@ def _change_map_section(brief: ReviewBrief) -> str:
     summary = str(change_map.get("repository_intelligence_summary", "")).strip()
     if summary:
         lines.extend(["", "Repository intelligence:", summary])
+    incremental = change_map.get("incremental_priority")
+    if isinstance(incremental, dict):
+        lines.extend(
+            [
+                "",
+                "Incremental priority map:",
+                f"- Range: {incremental.get('from_revision', '')}..{incremental.get('to_revision', '')}",
+                _string_list(
+                    incremental.get("changed_files", []),
+                    "No incremental files detected",
+                ),
+            ]
+        )
     reviewer_summary = change_map.get("reviewer_summary", {})
     if reviewer_summary:
         lines.extend(["", "Reviewer summary:", _dict_lines(dict(reviewer_summary))])
@@ -196,8 +366,20 @@ def _verified_findings_section(brief: ReviewBrief) -> str:
     lines = []
     for finding in brief.verified_findings:
         line = f"- [{finding.severity}/{finding.confidence}] {finding.claim}"
+        if finding.path:
+            location = finding.path
+            if finding.line is not None:
+                location += f":{finding.line}"
+            line += f" Location: {location}"
         if finding.evidence_refs:
             line += f" Evidence: {', '.join(finding.evidence_refs)}"
+        if finding.impact:
+            line += f" Impact: {finding.impact}"
+        if finding.verification_performed:
+            line += (
+                " Verification: "
+                + "; ".join(finding.verification_performed)
+            )
         if finding.suggested_action:
             line += f" Suggested action: {finding.suggested_action}"
         lines.append(line)
@@ -212,6 +394,176 @@ def _rejected_hypotheses_section(brief: ReviewBrief) -> str:
         role = f" ({item.role})" if item.role else ""
         lines.append(f"-{role} {item.claim}: {item.reason}")
     return "\n".join(lines)
+
+
+def _semantic_reconciliation_section(brief: ReviewBrief) -> str:
+    semantic = brief.semantic_reconciliation
+    model = semantic.get("model", {})
+    model = model if isinstance(model, dict) else {}
+    supplemental = semantic.get("supplemental", {})
+    supplemental = supplemental if isinstance(supplemental, dict) else {}
+    budget = supplemental.get("budget", {})
+    budget = budget if isinstance(budget, dict) else {}
+    lines = [
+        f"Status: {semantic.get('status', 'unknown')}",
+        f"Evidence quality: {semantic.get('evidence_quality', 'unknown')}",
+        f"Model status: {model.get('status', 'unknown')}",
+        "",
+        "Resolved conflicts:",
+        _semantic_conflicts(
+            semantic.get("conflicts_resolved", []),
+            "No semantic conflicts were resolved",
+        ),
+        "",
+        "Remaining disagreements:",
+        _semantic_conflicts(
+            semantic.get("remaining_disagreements", []),
+            "No semantic disagreements remain",
+        ),
+        "",
+        "Rejected findings:",
+        _semantic_rejected_findings(semantic.get("rejected_findings", [])),
+        "",
+        "Supplemental investigation:",
+        (
+            "- "
+            f"status={supplemental.get('status', 'unknown')}, "
+            f"stop_reason={supplemental.get('stop_reason', 'unknown')}, "
+            f"waves={supplemental.get('waves', 0)}, "
+            f"tasks={supplemental.get('tasks', 0)}, "
+            f"completed={supplemental.get('completed', 0)}, "
+            f"partial={supplemental.get('partial', 0)}, "
+            f"failed={supplemental.get('failed', 0)}, "
+            f"unavailable={supplemental.get('unavailable', 0)}"
+        ),
+        "",
+        "Supplemental budget:",
+        _semantic_budget_section(budget),
+        "",
+        "Runtime policy actions:",
+        _string_list(
+            semantic.get("policy_actions", []),
+            "No Runtime policy actions recorded",
+        ),
+        "",
+        "Semantic uncertainties:",
+        _string_list(
+            semantic.get("uncertainties", []),
+            "No semantic uncertainties recorded",
+        ),
+        "",
+        "Semantic manual-review triggers:",
+        _string_list(
+            _semantic_manual_review_reasons(semantic, model, supplemental),
+            "No semantic manual-review trigger recorded",
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def _semantic_conflicts(value: object, fallback: str) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return f"- {fallback}"
+    lines: list[str] = []
+    for row in rows:
+        lines.append(
+            f"- [{row.get('status', 'unknown')}] "
+            f"{row.get('issue', 'No issue recorded')}"
+        )
+        resolution = str(row.get("resolution", "")).strip()
+        if resolution:
+            lines.append(f"  - Resolution: {resolution}")
+        lines.append(
+            "  - Decision: "
+            f"source={row.get('decision_source', 'unknown')}; "
+            f"refs={_inline_value(row.get('decision_refs', [])) or 'none'}"
+        )
+        lines.append(
+            "  - Candidates: "
+            f"{_inline_value(row.get('candidate_ids', [])) or 'none'}"
+        )
+    return "\n".join(lines)
+
+
+def _semantic_rejected_findings(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No findings were rejected by semantic reconciliation"
+    lines: list[str] = []
+    for row in rows:
+        source = (
+            f"reviewer={row.get('reviewer_index', 'unknown')}, "
+            f"role={row.get('role', 'unknown')}, "
+            f"candidate={row.get('candidate_id', 'unknown')}"
+        )
+        lines.append(
+            f"- {row.get('claim', 'No claim recorded')}: "
+            f"{row.get('reason', 'unknown')} ({source})"
+        )
+        lines.append(
+            f"  - Rationale: {row.get('rationale', 'Not recorded')}"
+        )
+        lines.append(
+            "  - Refs: "
+            f"evidence={_inline_value(row.get('evidence_refs', [])) or 'none'}; "
+            f"missing={_inline_value(row.get('missing_evidence_refs', [])) or 'none'}; "
+            f"decision={_inline_value(row.get('decision_refs', [])) or 'none'}; "
+            f"decision_source={row.get('decision_source', 'unknown')}"
+        )
+    return "\n".join(lines)
+
+
+def _semantic_budget_section(budget: dict[str, Any]) -> str:
+    if not budget:
+        return "- No supplemental budget accounting recorded"
+    rows: list[str] = []
+    for key in (
+        "limits",
+        "charged",
+        "unknown_consumed",
+        "reserved",
+        "remaining",
+    ):
+        if key in budget:
+            rows.append(f"- {key}: {_inline_value(budget[key])}")
+    for key in sorted(set(budget) - {"limits", "charged", "unknown_consumed", "reserved", "remaining"}):
+        rows.append(f"- {key}: {_inline_value(budget[key])}")
+    return "\n".join(rows) or "- No supplemental budget accounting recorded"
+
+
+def _semantic_manual_review_reasons(
+    semantic: dict[str, Any],
+    model: dict[str, Any],
+    supplemental: dict[str, Any],
+) -> list[str]:
+    reasons: list[str] = []
+    status = str(semantic.get("status", "")).casefold()
+    model_status = str(model.get("status", "")).casefold()
+    supplemental_status = str(supplemental.get("status", "")).casefold()
+    stop_reason = str(supplemental.get("stop_reason", "")).casefold()
+    if status in {"fallback", "partial"} or model_status == "fallback":
+        reasons.append("Semantic reconciliation used fallback or is partial")
+    if _mapping_rows(semantic.get("remaining_disagreements", [])):
+        reasons.append("Semantic disagreements remain unresolved")
+    if supplemental_status in {
+        "partial",
+        "failed",
+        "unavailable",
+        "budget_exhausted",
+    }:
+        reasons.append(
+            f"Supplemental investigation status is {supplemental_status}"
+        )
+    if stop_reason in {
+        "model_fallback",
+        "task_failure",
+        "budget_exhausted",
+        "max_waves",
+        "unavailable",
+    }:
+        reasons.append(f"Supplemental investigation stopped because {stop_reason}")
+    return list(dict.fromkeys(reasons))
 
 
 def _contract_coverage_section(brief: ReviewBrief) -> str:
@@ -257,10 +609,41 @@ def _string_list(items: object, fallback: str) -> str:
     return "\n".join(f"- {item}" for item in items)
 
 
+def _mapping_rows(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(row) for row in value if isinstance(row, dict)]
+
+
 def _dict_lines(payload: dict[str, Any]) -> str:
     if not payload:
         return "- No reviewer summary recorded"
-    return "\n".join(f"- {key}: {_inline_value(value)}" for key, value in payload.items())
+    lines: list[str] = []
+    for key, value in payload.items():
+        if key == "executions" and isinstance(value, list):
+            lines.append("- executions:")
+            for item in value:
+                if not isinstance(item, dict):
+                    lines.append(f"  - {_inline_value(item)}")
+                    continue
+                runtime = item.get("runtime", {})
+                runtime = runtime if isinstance(runtime, dict) else {}
+                lines.append(
+                    "  - "
+                    f"reviewer {item.get('reviewer_index', 'unknown')} "
+                    f"({item.get('role', 'unknown')}): "
+                    f"status={item.get('status', 'unknown')}, "
+                    f"termination={runtime.get('termination_reason', 'unknown')}, "
+                    f"provider_attempts={runtime.get('provider_attempts', 0)}, "
+                    f"model_turns={runtime.get('model_turns', 0)}, "
+                    f"tool_calls={runtime.get('tool_calls', 0)}, "
+                    f"total_tokens={runtime.get('total_tokens', 0)}, "
+                    f"usage_available={runtime.get('usage_available', False)}, "
+                    f"elapsed_seconds={runtime.get('elapsed_seconds', 0)}"
+                )
+            continue
+        lines.append(f"- {key}: {_inline_value(value)}")
+    return "\n".join(lines)
 
 
 def _inline_value(value: object) -> str:
