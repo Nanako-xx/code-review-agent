@@ -40,6 +40,7 @@ from typing import (
 import uuid
 
 from review_agent.memory_identity import (
+    REPOSITORY_IDENTITY_SCHEMA,
     RepositoryIdentityCore,
     RepositoryIdentityDescriptor,
     RepositoryMemoryNamespace,
@@ -63,6 +64,7 @@ from review_agent.memory_models import (
     stable_request_id,
     validate_stable_id,
 )
+from review_agent.revision import sanitize_origin_url
 
 
 STORE_SCHEMA_NAME = "memory_store_schema_v1"
@@ -4403,21 +4405,22 @@ class MemoryStore:
                     raise MemoryStoreValidationError(
                         "memory import repository identity is incomplete"
                     )
+            elif redacted:
+                origin_url = repository["origin_url"]
+                if (
+                    identity_schema != REPOSITORY_IDENTITY_SCHEMA
+                    or (origin_url is not None and not isinstance(origin_url, str))
+                    or origin_url != sanitize_origin_url(origin_url)
+                ):
+                    raise MemoryStoreValidationError(
+                        "memory import repository identity is invalid"
+                    )
             else:
-                audit_path = str(self.namespace_path)
                 try:
                     RepositoryIdentityDescriptor(
                         repository_key=repository_key,
-                        canonical_path=(
-                            audit_path
-                            if repository["canonical_path"] is None
-                            else repository["canonical_path"]
-                        ),
-                        git_common_dir=(
-                            audit_path
-                            if repository["git_common_dir"] is None
-                            else repository["git_common_dir"]
-                        ),
+                        canonical_path=repository["canonical_path"],
+                        git_common_dir=repository["git_common_dir"],
                         origin_url=repository["origin_url"],
                         schema=identity_schema,
                     )

@@ -981,6 +981,83 @@ def test_export_is_canonical_hashed_and_import_dry_run_never_writes(
         target.import_manifest(tampered, dry_run=True)
 
 
+def test_redacted_registered_identity_is_validated_without_fabricated_paths(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    run_git(
+        git_repo,
+        "remote",
+        "add",
+        "origin",
+        "https://user:token@example.test/org/repo.git?secret=yes#fragment",
+    )
+    resolver = RevisionResolver()
+    namespace = materialize_repository_memory_namespace(
+        plan_repository_memory_namespace(
+            resolver.repository_identity(git_repo),
+            tmp_path / "memory-root",
+            revision_resolver=resolver,
+        ),
+        revision_resolver=resolver,
+    )
+    source = MemoryStore(namespace)
+    manifest = source.build_export_manifest(redact=True, created_at=CREATED_AT)
+
+    target = MemoryStore(tmp_path / "target")
+    plan = target.import_manifest(manifest, dry_run=True)
+
+    assert plan.repository_keys == (namespace.repository_key,)
+    assert plan.redacted is True
+    assert plan.restorable is False
+    assert manifest["repositories"][0]["origin_url"] == (
+        "https://example.test/org/repo.git"
+    )
+
+    def tamper_repository(**updates: object) -> dict[str, object]:
+        tampered = dict(manifest)
+        tampered["repositories"] = [
+            {**manifest["repositories"][0], **updates}
+        ]
+        body = {
+            key: value for key, value in tampered.items() if key != "manifest_hash"
+        }
+        tampered["manifest_hash"] = hashlib.sha256(
+            canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        return tampered
+
+    invalid_updates = (
+        {"identity_schema": "repository_identity_v0"},
+        {"origin_url": "https://user:token@example.test/org/repo.git"},
+        {"origin_url": "https://example.test/org/repo.git?secret=yes#fragment"},
+        {"origin_url": " https://example.test/org/repo.git"},
+        {"origin_url": 7},
+    )
+    for updates in invalid_updates:
+        with pytest.raises(MemoryStoreValidationError):
+            target.import_manifest(tamper_repository(**updates), dry_run=True)
+
+    portable = source.build_export_manifest(redact=False, created_at=CREATED_AT)
+    portable_plan = target.import_manifest(portable, dry_run=True)
+    assert portable_plan.repository_keys == (namespace.repository_key,)
+    assert portable_plan.redacted is False
+    assert portable_plan.restorable is True
+
+    for field in ("canonical_path", "git_common_dir"):
+        tampered = dict(portable)
+        tampered["repositories"] = [dict(portable["repositories"][0])]
+        tampered["repositories"][0][field] = None
+        body = {
+            key: value for key, value in tampered.items() if key != "manifest_hash"
+        }
+        tampered["manifest_hash"] = hashlib.sha256(
+            canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        with pytest.raises(MemoryStoreValidationError):
+            target.import_manifest(tampered, dry_run=True)
+
+
 def test_nonredacted_import_restores_events_blobs_and_request_receipts(
     tmp_path: Path,
 ) -> None:
