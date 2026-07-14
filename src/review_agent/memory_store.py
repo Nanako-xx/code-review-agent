@@ -40,6 +40,7 @@ from typing import (
 import uuid
 
 from review_agent.memory_identity import (
+    RepositoryIdentityCore,
     RepositoryIdentityDescriptor,
     RepositoryMemoryNamespace,
 )
@@ -661,7 +662,7 @@ class MemoryStore:
                 raise MemoryStoreUnavailableError() from None
         if descriptor is not None:
             if read_only:
-                self._require_registered_repository(descriptor.repository_key)
+                self._require_registered_repository(descriptor)
             else:
                 self.register_repository(descriptor)
 
@@ -901,15 +902,17 @@ class MemoryStore:
         identity_json = canonical_json(descriptor.to_payload())
         with self._authority() as connection:
             existing = connection.execute(
-                "SELECT identity_json FROM repositories WHERE repository_key = ?",
+                """
+                SELECT identity_schema, git_common_dir, origin_url
+                FROM repositories WHERE repository_key = ?
+                """,
                 (descriptor.repository_key,),
             ).fetchone()
-            if existing is not None and existing["identity_json"] not in (
-                None,
-                identity_json,
-            ):
-                raise MemoryStoreConflictError(
-                    "repository identity does not match the registered namespace"
+            if existing is not None:
+                self._assert_repository_identity_core(
+                    existing,
+                    descriptor,
+                    allow_unbound=True,
                 )
             connection.execute(
                 """
@@ -938,14 +941,62 @@ class MemoryStore:
             )
             self._ensure_repository_rows(connection, descriptor.repository_key, now)
 
-    def _require_registered_repository(self, repository_key: str) -> None:
-        key = _repository_key(repository_key)
+    def _require_registered_repository(
+        self,
+        descriptor: RepositoryIdentityDescriptor,
+    ) -> None:
+        if not isinstance(descriptor, RepositoryIdentityDescriptor):
+            raise MemoryStoreValidationError(
+                "repository metadata must be a canonical identity descriptor"
+            )
         with self._reader() as connection:
             row = connection.execute(
-                "SELECT 1 FROM repositories WHERE repository_key = ?", (key,)
+                """
+                SELECT identity_schema, git_common_dir, origin_url
+                FROM repositories WHERE repository_key = ?
+                """,
+                (descriptor.repository_key,),
             ).fetchone()
         if row is None:
             raise MemoryStoreNotFoundError("repository is not registered in this store")
+        self._assert_repository_identity_core(
+            row,
+            descriptor,
+            allow_unbound=False,
+        )
+
+    @staticmethod
+    def _assert_repository_identity_core(
+        row: sqlite3.Row,
+        descriptor: RepositoryIdentityDescriptor,
+        *,
+        allow_unbound: bool,
+    ) -> None:
+        if allow_unbound and all(
+            row[field] is None
+            for field in ("identity_schema", "git_common_dir", "origin_url")
+        ):
+            return
+        if (
+            row["identity_schema"] != descriptor.schema
+            or row["git_common_dir"] is None
+        ):
+            raise MemoryStoreConflictError(
+                "repository identity does not match the registered namespace"
+            )
+        try:
+            stored_core = RepositoryIdentityCore.from_components(
+                row["git_common_dir"],
+                row["origin_url"],
+            )
+        except (TypeError, ValueError):
+            raise MemoryStoreCorruptionError(
+                "registered repository identity is invalid"
+            ) from None
+        if stored_core != descriptor.core:
+            raise MemoryStoreConflictError(
+                "repository identity does not match the registered namespace"
+            )
 
     @staticmethod
     def _ensure_repository_rows(

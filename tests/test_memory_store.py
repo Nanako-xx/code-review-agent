@@ -11,6 +11,11 @@ import pytest
 
 import review_agent.memory_store as memory_store_module
 
+from conftest import run_git
+from review_agent.memory_identity import (
+    materialize_repository_memory_namespace,
+    plan_repository_memory_namespace,
+)
 from review_agent.memory_models import (
     CandidateStatus,
     DurableMemoryRecord,
@@ -52,6 +57,7 @@ from review_agent.memory_store import (
     MemoryStoreSchemaError,
     MemoryStoreValidationError,
 )
+from review_agent.revision import RevisionResolver
 
 
 SHA_A = "a" * 40
@@ -248,6 +254,72 @@ def test_open_creates_final_schema_once_and_enables_required_pragmas(
     with pytest.raises(MemoryStoreReadOnlyError, match="raw writable"):
         with store.open_connection(read_only=False):
             pass
+
+
+def test_linked_worktrees_share_registered_identity_and_store_state(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    linked_worktree = tmp_path / "linked-worktree"
+    run_git(
+        git_repo,
+        "worktree",
+        "add",
+        "-b",
+        "memory-store-linked-worktree",
+        str(linked_worktree),
+        "HEAD",
+    )
+    resolver = RevisionResolver()
+    memory_root = tmp_path / "memory-root"
+    primary_namespace = materialize_repository_memory_namespace(
+        plan_repository_memory_namespace(
+            resolver.repository_identity(git_repo),
+            memory_root,
+            revision_resolver=resolver,
+        ),
+        revision_resolver=resolver,
+    )
+    linked_namespace = materialize_repository_memory_namespace(
+        plan_repository_memory_namespace(
+            resolver.repository_identity(linked_worktree),
+            memory_root,
+            revision_resolver=resolver,
+        ),
+        revision_resolver=resolver,
+    )
+
+    assert primary_namespace.namespace_path == linked_namespace.namespace_path
+    assert primary_namespace.metadata.core == linked_namespace.metadata.core
+    assert (
+        primary_namespace.metadata.canonical_path
+        != linked_namespace.metadata.canonical_path
+    )
+
+    primary_store = MemoryStore(primary_namespace)
+    linked_store = MemoryStore(linked_namespace)
+    candidate = replace(
+        _candidate(),
+        repository_key=primary_namespace.repository_key,
+    )
+    result = linked_store.put_candidate(
+        candidate,
+        request_id=stable_request_id("linked-worktree", candidate.candidate_id),
+    )
+
+    assert result.applied
+    assert primary_store.get_candidate(candidate.candidate_id) == candidate
+    assert (
+        primary_store.get_generations(primary_namespace.repository_key)
+        == linked_store.get_generations(linked_namespace.repository_key)
+    )
+    assert primary_store.verify_event_chain(primary_namespace.repository_key) == 1
+    assert linked_store.verify_event_chain(linked_namespace.repository_key) == 1
+
+    primary_read_only = MemoryStore(primary_namespace, read_only=True)
+    linked_read_only = MemoryStore(linked_namespace, read_only=True)
+    assert primary_read_only.get_candidate(candidate.candidate_id) == candidate
+    assert linked_read_only.get_candidate(candidate.candidate_id) == candidate
 
 
 def test_unknown_schema_fails_closed_without_rewriting_database(tmp_path: Path) -> None:
