@@ -16,7 +16,7 @@ authority by themselves.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import hashlib
 import hmac
@@ -35,6 +35,7 @@ from review_agent.artifacts import artifact_schema
 from review_agent.memory_identity import repository_key as canonical_repository_key
 from review_agent.memory_models import (
     CandidateAuthorityReceipt,
+    CandidateStatus,
     GitCommitSourceRef,
     HumanDeclarationAuthority,
     HumanDeclarationOrigin,
@@ -2225,11 +2226,12 @@ def _candidate_validation_context_hash(
     candidate: MemoryCandidate,
     runtime_provenance: TrustedCandidateProvenance,
 ) -> str:
+    proposal = replace(candidate, status=CandidateStatus.PROPOSED)
     return canonical_sha256(
         {
             "schema_version": SOURCE_VALIDATION_SCHEMA_VERSION,
-            "candidate_id": candidate.candidate_id,
-            "candidate_hash": canonical_sha256(candidate.to_dict()),
+            "candidate_id": proposal.candidate_id,
+            "candidate_hash": canonical_sha256(proposal.to_dict()),
             "origin": runtime_provenance.origin.value,
             "review_id": runtime_provenance.review_id,
             "proposal_head_sha": runtime_provenance.target_head_sha,
@@ -2244,7 +2246,7 @@ def _candidate_validation_context_hash(
             ),
             "binding_id": runtime_provenance.binding_id,
             "authorized_source_refs_hash": canonical_sha256(
-                [item.to_dict() for item in candidate.source_refs]
+                [item.to_dict() for item in proposal.source_refs]
             ),
         }
     )

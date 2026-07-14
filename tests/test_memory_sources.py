@@ -1124,6 +1124,54 @@ def test_direct_candidate_authority_receipts_round_trip_for_all_origins(
         assert receipt.human_declarations == ()
 
 
+@pytest.mark.parametrize(
+    "projected_status",
+    (CandidateStatus.VALIDATED, CandidateStatus.PENDING_APPROVAL),
+)
+def test_candidate_authority_receipt_survives_mutable_status_projection(
+    git_repo: Path,
+    projected_status: CandidateStatus,
+) -> None:
+    sha = run_git(git_repo, "rev-parse", "HEAD")
+    candidate = _candidate(
+        git_repo,
+        sha,
+        GitCommitSourceRef(commit_sha=sha),
+    )
+    provenance = _runtime_provenance(
+        git_repo,
+        sha,
+        allowed_source_refs=candidate.source_refs,
+    )
+    validator = SourceValidator(git_repo)
+    initial_report = validator.validate_candidate(
+        candidate,
+        runtime_provenance=provenance,
+    )
+    receipt = validator.build_candidate_authority_receipt(
+        candidate,
+        provenance,
+        initial_report,
+        current_target_head_sha=sha,
+        created_at=NOW,
+    )
+    projected = replace(candidate, status=projected_status)
+
+    projected_report = validator.validate_candidate(
+        projected,
+        runtime_provenance=provenance,
+    )
+    restored = validator.restore_candidate_authority(
+        receipt,
+        projected,
+        current_provenance=provenance,
+        current_target_head_sha=sha,
+    )
+
+    assert projected_report.report_hash == initial_report.report_hash
+    assert restored.provenance == provenance
+
+
 def test_bound_candidate_authority_uses_live_locator_and_candidate_authority(
     git_repo: Path,
 ) -> None:
