@@ -1221,7 +1221,6 @@ class MemoryCandidate(_JsonModel):
             "kind": self.kind.value,
             "statement": self.statement,
             "scope": self.scope.to_dict(),
-            "valid_from_sha": self.valid_from_sha,
             "validity_policies": [item.value for item in self.validity_policies],
             "sensitivity": self.sensitivity.value,
             "policy_effect": (
@@ -1491,7 +1490,11 @@ class DurableMemoryRecord(_JsonModel):
         if not isinstance(self.status, RecordStatus):
             raise ValueError("status must be a RecordStatus")
         object.__setattr__(self, "created_at", _utc_timestamp(self.created_at, "created_at"))
-        object.__setattr__(self, "memory_id", stable_id("MEM", self.candidate_id))
+        object.__setattr__(
+            self,
+            "memory_id",
+            "MEM-" + hashlib.sha256(self.candidate_id.encode("utf-8")).hexdigest(),
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -2784,7 +2787,11 @@ class MemoryExecutionConfig(_JsonModel):
             raise ValueError("root_path must be an absolute path")
         if ".." in PurePosixPath(normalized_path).parts:
             raise ValueError("root_path must be a canonical absolute path")
-        object.__setattr__(self, "root_path", normalized_path.rstrip("/") or "/")
+        if re.fullmatch(r"[A-Za-z]:/", normalized_path):
+            canonical_root = normalized_path
+        else:
+            canonical_root = normalized_path.rstrip("/") or "/"
+        object.__setattr__(self, "root_path", canonical_root)
         if type(self.required) is not bool:
             raise ValueError("required must be a boolean")
         if self.mode is MemoryMode.OFF and self.required:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import hashlib
 
 import pytest
 
@@ -376,6 +377,7 @@ def test_content_fingerprint_ignores_provenance_but_keeps_policy_semantics() -> 
     original = _candidate()
     changed_provenance = _candidate(
         source_refs=(_range_source(content_hash=HASH_2), _human_source("bob")),
+        valid_from_sha=SHA_B,
         origin_review_id="review-999",
         producer=_producer(schema_version=2, version="2.0.0"),
         confidence=MemoryConfidence.LOW,
@@ -439,6 +441,9 @@ def test_record_and_source_bundle_have_full_stable_ids_and_round_trip() -> None:
     assert SourceBundleDescriptor.from_dict(bundle.to_dict()) == bundle
     assert record.memory_id.startswith("MEM-")
     assert len(record.memory_id) == 68
+    assert record.memory_id == "MEM-" + hashlib.sha256(
+        candidate.candidate_id.encode("utf-8")
+    ).hexdigest()
     assert DurableMemoryRecord.from_dict(record.to_dict()) == record
 
     tampered = {**record.to_dict(), "memory_id": "MEM-" + "a" * 32}
@@ -671,6 +676,12 @@ def test_memory_execution_config_matches_final_session_v5_contract() -> None:
     assert config.max_snapshot_bytes == 8_388_608
     assert config.max_context_records == 12
     assert config.max_query_results == 8
+    drive_root = MemoryExecutionConfig(
+        mode=MemoryMode.READ,
+        root_path="C:/",
+    )
+    assert drive_root.root_path == "C:/"
+    assert MemoryExecutionConfig.from_dict(drive_root.to_dict()) == drive_root
     with pytest.raises(ValueError, match="required=true"):
         MemoryExecutionConfig(
             mode=MemoryMode.OFF,
