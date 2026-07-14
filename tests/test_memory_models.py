@@ -60,7 +60,7 @@ HASH_1 = "1" * 64
 HASH_2 = "2" * 64
 HASH_3 = "3" * 64
 CREATED_AT = "2026-07-14T12:00:00Z"
-REPOSITORY_KEY = "repo-" + "4" * 64
+REPOSITORY_KEY = "4" * 64
 
 
 def _human_source(actor: str = "amy") -> HumanDeclarationSourceRef:
@@ -286,6 +286,13 @@ def test_source_ref_rejects_empty_identifiers_and_incomplete_symbol_hash() -> No
             revision_binding="head@" + SHA_A,
             content_hash=HASH_1,
         )
+
+    class UnapprovedSourceRef(SourceRef):
+        def to_dict(self) -> dict:
+            return _range_source().to_dict()
+
+    with pytest.raises(ValueError, match="allowlisted SourceRef variant"):
+        _candidate(source_refs=(UnapprovedSourceRef(),))
     with pytest.raises(ValueError, match="request_id"):
         HumanDeclarationSourceRef(
             request_id="",
@@ -407,6 +414,8 @@ def test_candidate_hydration_is_strict_and_recomputes_identity() -> None:
         MemoryCandidate.from_dict({**payload, "status": "future"})
     with pytest.raises(ValueError, match="candidate_id"):
         MemoryCandidate.from_dict({**payload, "candidate_id": "MC-" + "0" * 64})
+    with pytest.raises(ValueError, match="repository_key"):
+        _candidate(repository_key="repo-" + "4" * 64)
 
 
 def test_candidate_rejects_unbounded_statement_and_collections() -> None:
@@ -456,6 +465,7 @@ def test_finding_and_feedback_round_trip_and_enforce_decision_semantics() -> Non
     feedback = _feedback()
 
     assert FindingSnapshot.from_dict(finding.to_dict()) == finding
+    assert len(finding.finding_hash) == 64
     assert feedback.feedback_id.startswith("FB-")
     assert len(feedback.feedback_id) == 67
     assert FeedbackRecord.from_dict(feedback.to_dict()) == feedback
@@ -464,6 +474,10 @@ def test_finding_and_feedback_round_trip_and_enforce_decision_semantics() -> Non
     payload["decision"] = FeedbackDecision.SEVERITY_CHANGED.value
     with pytest.raises(ValueError, match="final_severity"):
         FeedbackRecord.from_dict(payload)
+
+    tampered_finding = {**finding.to_dict(), "claim": "Different claim."}
+    with pytest.raises(ValueError, match="finding_hash"):
+        FindingSnapshot.from_dict(tampered_finding)
 
 
 def test_stable_event_and_request_ids_use_full_sha256_and_validate_prefix() -> None:
@@ -658,6 +672,32 @@ def test_memory_snapshot_requires_a_selected_decision_for_each_record() -> None:
             selection_policy_version="memory_selection_v1",
             eligible_records=(record,),
             applicability_decisions=(),
+            feedback_calibration_summary=None,
+            repository_knowledge_refs=(),
+            created_at=CREATED_AT,
+        )
+
+    selected_without_record = MemorySelectionDecision(
+        memory_id=record.memory_id,
+        applicability=Applicability.SELECTED,
+        matched_scope=record.scope,
+        reason_codes=("path_match",),
+        rank=0,
+    )
+    with pytest.raises(ValueError, match="selected applicability decisions"):
+        MemorySnapshot(
+            repository_key=REPOSITORY_KEY,
+            base_sha=SHA_B,
+            head_sha=SHA_A,
+            generations=GenerationMetadata(
+                store_schema_version=1,
+                memory_generation=1,
+                feedback_generation=1,
+                knowledge_generation=1,
+            ),
+            selection_policy_version="memory_selection_v1",
+            eligible_records=(),
+            applicability_decisions=(selected_without_record,),
             feedback_calibration_summary=None,
             repository_knowledge_refs=(),
             created_at=CREATED_AT,

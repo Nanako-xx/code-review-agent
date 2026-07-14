@@ -424,10 +424,7 @@ def _optional_text(value: Any, context: str, *, max_length: int) -> Optional[str
 
 
 def _normalize_repository_key(value: Any, context: str = "repository_key") -> str:
-    normalized = _normalize_identifier(value, context)
-    if any(character.isspace() for character in normalized):
-        raise ValueError("%s must not contain whitespace" % context)
-    return normalized
+    return _sha256_digest(value, context)
 
 
 def _normalize_repo_path(value: Any, context: str, *, allow_glob: bool) -> str:
@@ -891,10 +888,20 @@ def _canonical_source_refs(
         raise ValueError("%s must be a list or tuple of SourceRef values" % context)
     if len(values) > MAX_SOURCE_REFS:
         raise ValueError("%s exceeds the maximum item count of %d" % (context, MAX_SOURCE_REFS))
+    allowed_types = {
+        RepositoryRangeSourceRef,
+        RepositorySymbolSourceRef,
+        GitCommitSourceRef,
+        ObservationSourceRef,
+        SessionArtifactSourceRef,
+        HumanDeclarationSourceRef,
+    }
     by_json: Dict[str, SourceRef] = {}
     for value in values:
-        if not isinstance(value, SourceRef):
-            raise ValueError("%s items must be SourceRef values" % context)
+        if type(value) not in allowed_types:
+            raise ValueError(
+                "%s items must be an exact allowlisted SourceRef variant" % context
+            )
         by_json[value.to_json()] = value
     result = tuple(by_json[key] for key in sorted(by_json))
     if not result and not allow_empty:
@@ -1601,6 +1608,7 @@ class FindingSnapshot(_JsonModel):
     original_severity: FindingSeverity
     evidence_refs: Tuple[str, ...]
     schema_version: int = MODEL_SCHEMA_VERSION
+    finding_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
         _validate_schema(self.schema_version, "finding_snapshot")
@@ -1636,7 +1644,9 @@ class FindingSnapshot(_JsonModel):
             ),
         )
 
-    def to_dict(self) -> Dict[str, Any]:
+        object.__setattr__(self, "finding_hash", canonical_sha256(self._identity_dict()))
+
+    def _identity_dict(self) -> Dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             "finding_id": self.finding_id,
@@ -1647,6 +1657,9 @@ class FindingSnapshot(_JsonModel):
             "original_severity": self.original_severity.value,
             "evidence_refs": list(self.evidence_refs),
         }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"finding_hash": self.finding_hash, **self._identity_dict()}
 
     @classmethod
     def from_dict(cls, payload: Any) -> "FindingSnapshot":
@@ -1662,13 +1675,14 @@ class FindingSnapshot(_JsonModel):
                 "contracts",
                 "original_severity",
                 "evidence_refs",
+                "finding_hash",
             },
             "finding_snapshot",
         )
         for name in ("contracts", "evidence_refs"):
             if not isinstance(root[name], list):
                 raise ValueError("finding_snapshot.%s must be a list" % name)
-        return cls(
+        finding = cls(
             finding_id=root["finding_id"],
             claim=root["claim"],
             path=root["path"],
@@ -1682,6 +1696,9 @@ class FindingSnapshot(_JsonModel):
             evidence_refs=tuple(root["evidence_refs"]),
             schema_version=root["schema_version"],
         )
+        if root["finding_hash"] != finding.finding_hash:
+            raise ValueError("finding_snapshot.finding_hash does not match canonical content")
+        return finding
 
 
 @dataclass(frozen=True)
@@ -2636,6 +2653,15 @@ class MemorySnapshot(_JsonModel):
                 raise ValueError(
                     "every eligible record requires a selected applicability decision"
                 )
+        selected_ids = {
+            decision.memory_id
+            for decision in decisions.values()
+            if decision.applicability is Applicability.SELECTED
+        }
+        if selected_ids != set(records):
+            raise ValueError(
+                "selected applicability decisions must exactly match eligible records"
+            )
 
         if self.feedback_calibration_summary is not None:
             if not isinstance(
