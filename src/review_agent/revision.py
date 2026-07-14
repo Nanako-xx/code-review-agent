@@ -26,6 +26,15 @@ class RepositoryIdentity:
 
 
 @dataclass(frozen=True)
+class RepositoryLayout:
+    """Canonical worktree and Git-directory locations for one common dir."""
+
+    git_common_dir: str
+    worktree_paths: tuple[str, ...]
+    git_dirs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ResolvedRevisions:
     requested_base: str
     requested_head: str
@@ -50,6 +59,64 @@ class RevisionResolver:
             canonical_path=str(top_level),
             git_common_dir=str(common_path.resolve()),
             origin_url=origin_url,
+        )
+
+    def repository_layout(self, repo: Path) -> RepositoryLayout:
+        """Enumerate all worktrees and real Git dirs sharing one common dir.
+
+        ``--porcelain -z`` avoids Git's path quoting and newline ambiguity.  A
+        live worktree's real Git directory is resolved by Git itself; linked
+        worktree administrative directories are also enumerated from the
+        common dir so stale/prunable entries remain protected.
+        """
+
+        repository = Path(repo).resolve()
+        identity = self.repository_identity(repository)
+        common_dir = Path(identity.git_common_dir).resolve()
+        worktree_output = self._git(
+            repository,
+            ["worktree", "list", "--porcelain", "-z"],
+        )
+        worktree_paths = _parse_worktree_paths(worktree_output)
+        current_path = str(Path(identity.canonical_path).resolve())
+        if current_path not in worktree_paths:
+            raise ValueError("current repository is missing from Git worktree metadata")
+
+        git_dirs = {str(common_dir)}
+        for worktree_value in worktree_paths:
+            worktree = Path(worktree_value)
+            if not worktree.is_dir():
+                continue
+            result = self._run_git(
+                worktree,
+                ["rev-parse", "--absolute-git-dir"],
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                raise ValueError("unable to enumerate repository Git directories")
+            git_dir = Path(result.stdout.strip())
+            if not git_dir.is_absolute():
+                git_dir = worktree / git_dir
+            git_dirs.add(str(git_dir.resolve(strict=False)))
+
+        administrative_root = common_dir / "worktrees"
+        if administrative_root.exists() or administrative_root.is_symlink():
+            if administrative_root.is_symlink() or not administrative_root.is_dir():
+                raise ValueError("repository worktree metadata layout is invalid")
+            try:
+                administrative_entries = tuple(administrative_root.iterdir())
+            except OSError as error:
+                raise ValueError(
+                    "unable to enumerate repository worktree metadata"
+                ) from error
+            for entry in administrative_entries:
+                git_dirs.add(str(entry.resolve(strict=False)))
+
+        return RepositoryLayout(
+            git_common_dir=str(common_dir),
+            worktree_paths=tuple(
+                sorted(worktree_paths, key=normalize_repository_identity_path)
+            ),
+            git_dirs=tuple(sorted(git_dirs, key=normalize_repository_identity_path)),
         )
 
     def resolve_pair(
@@ -314,6 +381,37 @@ def normalize_repository_identity_path(path: str | Path) -> str:
         raise ValueError("unable to canonicalize repository identity path") from error
     normalized = os.path.normcase(os.path.normpath(str(resolved)))
     return normalized.replace("\\", "/")
+
+
+def _parse_worktree_paths(output: str) -> tuple[str, ...]:
+    if not output:
+        raise ValueError("Git returned empty worktree metadata")
+
+    paths: dict[str, str] = {}
+    for raw_record in output.split("\0\0"):
+        if not raw_record:
+            continue
+        fields = raw_record.split("\0")
+        if not fields or not fields[0].startswith("worktree "):
+            raise ValueError("Git returned invalid worktree metadata")
+        raw_path = fields[0][len("worktree ") :]
+        if not raw_path or "\0" in raw_path:
+            raise ValueError("Git returned invalid worktree metadata")
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            raise ValueError("Git returned a non-absolute worktree path")
+        try:
+            canonical = str(candidate.resolve(strict=False))
+            normalized = normalize_repository_identity_path(canonical)
+        except (OSError, ValueError) as error:
+            raise ValueError("unable to canonicalize Git worktree metadata") from error
+        if normalized in paths:
+            raise ValueError("Git returned duplicate worktree metadata")
+        paths[normalized] = canonical
+
+    if not paths:
+        raise ValueError("Git returned empty worktree metadata")
+    return tuple(paths.values())
 
 
 def _sanitize_scp_like_origin(origin: str) -> str | None:

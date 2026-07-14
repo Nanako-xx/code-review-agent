@@ -169,6 +169,35 @@ def test_repository_identity_path_normalization_is_stable(
     )
 
 
+def test_repository_layout_enumerates_linked_worktrees_and_real_git_dirs(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    linked = tmp_path / "revision-layout-linked"
+    run_git(
+        git_repo,
+        "worktree",
+        "add",
+        "-b",
+        "revision-layout-linked",
+        str(linked),
+        "HEAD",
+    )
+
+    layout = RevisionResolver().repository_layout(git_repo)
+
+    assert layout.git_common_dir == str((git_repo / ".git").resolve())
+    assert set(layout.worktree_paths) == {
+        str(git_repo.resolve()),
+        str(linked.resolve()),
+    }
+    assert layout.git_common_dir in layout.git_dirs
+    assert any(
+        Path(git_dir).parent == Path(layout.git_common_dir) / "worktrees"
+        for git_dir in layout.git_dirs
+    )
+
+
 def test_revision_resolver_reports_invalid_revision(git_repo: Path) -> None:
     with pytest.raises(ValueError, match="missing-revision") as captured:
         RevisionResolver().resolve_commit(git_repo, "missing-revision")
