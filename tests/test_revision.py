@@ -256,3 +256,74 @@ def test_commit_exists_supports_sha256_repository_object_ids(tmp_path: Path) -> 
     assert resolver.commit_exists(repo, "0" * 64) is False
     with pytest.raises(ValueError, match="full sha256 object ID"):
         resolver.commit_exists(repo, head_sha[:16])
+
+
+def test_revision_resolver_strips_inherited_git_routing_and_object_environment(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head_sha = run_git(git_repo, "rev-parse", "HEAD")
+    inherited = {
+        "GIT_DIR": str(git_repo / "other.git"),
+        "GIT_WORK_TREE": str(git_repo / "other-worktree"),
+        "GIT_COMMON_DIR": str(git_repo / "other-common"),
+        "GIT_OBJECT_DIRECTORY": str(git_repo / "other-objects"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(git_repo / "alternates"),
+        "GIT_NAMESPACE": "attacker",
+        "GIT_REPLACE_REF_BASE": "refs/attacker/",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.repositoryformatversion",
+        "GIT_CONFIG_VALUE_0": "999",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+
+    calls: list[tuple[list[str], dict[str, str]]] = []
+    real_run = subprocess.run
+
+    def recording_run(
+        command: list[str],
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[object]:
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        calls.append((command, environment))
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+
+    resolver = RevisionResolver()
+    assert resolver.resolve_commit(git_repo, head_sha) == head_sha
+    assert resolver.commit_exists(git_repo, head_sha)
+
+    assert calls
+    for command, environment in calls:
+        assert command[:2] == ["git", "--no-replace-objects"]
+        assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+        for key in inherited:
+            assert key not in environment
+
+
+def test_revision_resolver_authorizes_only_exact_commit_ancestry(
+    git_repo: Path,
+) -> None:
+    ancestor = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "app.py").write_text("print('next')\n", encoding="utf-8")
+    run_git(git_repo, "add", "app.py")
+    run_git(git_repo, "commit", "-m", "next commit")
+    descendant = run_git(git_repo, "rev-parse", "HEAD")
+    tree_sha = run_git(git_repo, "rev-parse", "HEAD^{tree}")
+    unrelated = run_git(
+        git_repo,
+        "commit-tree",
+        tree_sha,
+        "-m",
+        "unrelated commit",
+    )
+    resolver = RevisionResolver()
+
+    assert resolver.is_ancestor(git_repo, ancestor, descendant)
+    assert not resolver.is_ancestor(git_repo, unrelated, descendant)
+    with pytest.raises(ValueError, match="full sha1 object ID"):
+        resolver.is_ancestor(git_repo, "HEAD", descendant)

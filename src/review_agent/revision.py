@@ -116,6 +116,48 @@ class RevisionResolver:
             f"{result.stdout.strip()!r}"
         )
 
+    def is_ancestor(
+        self,
+        repo: Path,
+        ancestor_sha: str,
+        descendant_sha: str,
+    ) -> bool:
+        """Return whether two exact commit IDs share the authorized ancestry.
+
+        Symbolic names and abbreviated IDs are deliberately rejected.  Callers
+        that make a trust decision from lineage must not let Git resolve a name
+        through mutable refs or replacement objects.
+        """
+
+        repository = Path(repo).resolve()
+        object_format = self._object_format(repository)
+        object_id_length = self._object_id_length(object_format)
+        object_id_pattern = rf"[0-9a-fA-F]{{{object_id_length}}}"
+        for label, value in (
+            ("ancestor", ancestor_sha),
+            ("descendant", descendant_sha),
+        ):
+            if not isinstance(value, str) or not re.fullmatch(
+                object_id_pattern,
+                value,
+            ):
+                raise ValueError(
+                    f"{label} must be a full {object_format} object ID"
+                )
+            if not self.commit_exists(repository, value):
+                raise ValueError(f"{label} commit does not exist")
+
+        result = self._run_git(
+            repository,
+            ["merge-base", "--is-ancestor", ancestor_sha, descendant_sha],
+        )
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        reason = result.stderr.strip() or result.stdout.strip() or "git merge-base failed"
+        raise ValueError(f"unable to inspect commit ancestry: {reason}")
+
     def _object_format(self, repo: Path) -> str:
         result = self._run_git(repo, ["rev-parse", "--show-object-format=storage"])
         if result.returncode != 0:
@@ -160,8 +202,9 @@ class RevisionResolver:
     ) -> subprocess.CompletedProcess[str]:
         try:
             return subprocess.run(
-                ["git", *args],
+                ["git", "--no-replace-objects", *args],
                 cwd=repo,
+                env=sanitized_git_environment(),
                 input=input_text,
                 text=True,
                 encoding="utf-8",
@@ -171,6 +214,32 @@ class RevisionResolver:
             )
         except OSError as error:
             raise RuntimeError(f"failed to execute Git in {repo}: {error}") from error
+
+
+def sanitized_git_environment() -> dict[str, str]:
+    """Return an environment that cannot redirect local Git object authority.
+
+    Git honors a broad family of inherited ``GIT_*`` variables for repository,
+    worktree, namespace, object database, replacement-ref, and config routing.
+    Source validation always derives those locations from its explicit ``cwd``,
+    so inherited Git controls are removed wholesale and only fail-closed local
+    behavior is added back.
+    """
+
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_LITERAL_PATHSPECS": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
 
 
 def sanitize_origin_url(origin_url: str | None) -> str | None:

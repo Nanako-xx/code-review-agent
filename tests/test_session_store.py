@@ -394,6 +394,86 @@ def test_session_store_load_applies_strict_session_schema_validation(
         store.load()
 
 
+def test_session_store_load_reads_one_no_follow_fstat_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = create_store(tmp_path)
+    session_path = store.session_path.resolve()
+    open_calls: list[tuple[int, int]] = []
+    fstat_descriptors: list[int] = []
+    read_descriptors: list[int] = []
+    descriptor_paths: dict[int, Path] = {}
+    real_open = session_store_module.os.open
+    real_fstat = session_store_module.os.fstat
+    real_read = session_store_module.os.read
+
+    def recording_open(path: object, flags: int, *args: object) -> int:
+        descriptor = real_open(path, flags, *args)
+        descriptor_paths[descriptor] = Path(path).resolve()
+        if descriptor_paths[descriptor] == session_path:
+            open_calls.append((descriptor, flags))
+        return descriptor
+
+    def recording_fstat(descriptor: int):
+        if descriptor_paths.get(descriptor) == session_path:
+            fstat_descriptors.append(descriptor)
+        return real_fstat(descriptor)
+
+    def recording_read(descriptor: int, size: int) -> bytes:
+        if descriptor_paths.get(descriptor) == session_path:
+            read_descriptors.append(descriptor)
+        return real_read(descriptor, size)
+
+    def forbid_path_read(*args: object, **kwargs: object) -> str:
+        raise AssertionError((args, kwargs))
+
+    monkeypatch.setattr(session_store_module.os, "open", recording_open)
+    monkeypatch.setattr(session_store_module.os, "fstat", recording_fstat)
+    monkeypatch.setattr(session_store_module.os, "read", recording_read)
+    monkeypatch.setattr(Path, "read_text", forbid_path_read)
+
+    assert store.load() == manifest()
+
+    assert len(open_calls) == 1
+    descriptor, flags = open_calls[0]
+    assert fstat_descriptors == [descriptor, descriptor]
+    assert read_descriptors
+    assert set(read_descriptors) == {descriptor}
+    if getattr(os, "O_NOFOLLOW", 0):
+        assert flags & os.O_NOFOLLOW
+
+
+def test_session_store_load_rejects_symlink_manifest_authority(
+    tmp_path: Path,
+) -> None:
+    store = create_store(tmp_path / "run")
+    target = tmp_path / "outside-session.json"
+    target.write_bytes(store.session_path.read_bytes())
+    store.session_path.unlink()
+    try:
+        store.session_path.symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    with pytest.raises(ValueError, match="regular file"):
+        store.load()
+
+
+def test_session_store_load_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    store = create_store(tmp_path)
+    original = store.session_path.read_text(encoding="utf-8")
+    duplicate = original.replace(
+        '"schema_version": 4,',
+        '"schema_version": 4,\n  "schema_version": 4,',
+        1,
+    )
+    store.session_path.write_text(duplicate, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate"):
+        store.load()
+
+
 def test_session_store_registers_raw_byte_hash_and_exact_revision_binding(
     tmp_path: Path,
 ) -> None:
@@ -501,6 +581,13 @@ def test_session_store_validation_enforces_revision_binding_policy(
         "/absolute.bin",
         "C:/absolute.bin",
         "C:\\absolute.bin",
+        "artifact.json:stream",
+        "CON",
+        "aux.txt",
+        "trailing.",
+        "directory/trailing. ",
+        "PROGRA~1/artifact.json",
+        "cafe\u0301.json",
     ],
 )
 def test_session_store_rejects_non_relative_or_traversing_artifact_paths(
@@ -566,22 +653,26 @@ def test_session_store_hashes_with_one_open_and_the_same_fstat_read_descriptor(
     artifact_open_calls: list[tuple[int, int]] = []
     fstat_descriptors: list[int] = []
     read_descriptors: list[int] = []
+    descriptor_paths: dict[int, Path] = {}
     real_open = session_store_module.os.open
     real_fstat = session_store_module.os.fstat
     real_read = session_store_module.os.read
 
     def recording_open(path: object, flags: int, *args: object) -> int:
         file_descriptor = real_open(path, flags, *args)
+        descriptor_paths[file_descriptor] = Path(path)
         if Path(path) == resolved_artifact:
             artifact_open_calls.append((file_descriptor, flags))
         return file_descriptor
 
     def recording_fstat(file_descriptor: int):
-        fstat_descriptors.append(file_descriptor)
+        if descriptor_paths.get(file_descriptor) == resolved_artifact:
+            fstat_descriptors.append(file_descriptor)
         return real_fstat(file_descriptor)
 
     def recording_read(file_descriptor: int, size: int) -> bytes:
-        read_descriptors.append(file_descriptor)
+        if descriptor_paths.get(file_descriptor) == resolved_artifact:
+            read_descriptors.append(file_descriptor)
         return real_read(file_descriptor, size)
 
     monkeypatch.setattr(session_store_module.os, "open", recording_open)

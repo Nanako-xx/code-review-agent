@@ -7,7 +7,9 @@ import hmac
 import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
 import stat
+import unicodedata
 import uuid
 from typing import Iterable, Mapping
 
@@ -30,6 +32,31 @@ from review_agent.session import (
     session_phases_for_schema,
     session_manifest_from_dict,
     session_manifest_to_dict,
+)
+
+
+MAX_SESSION_MANIFEST_BYTES = 16 * 1024 * 1024
+_WINDOWS_RESERVED_COMPONENTS = frozenset(
+    {
+        "aux",
+        "clock$",
+        "con",
+        "nul",
+        "prn",
+        *("com%d" % index for index in range(1, 10)),
+        *("lpt%d" % index for index in range(1, 10)),
+        "com¹",
+        "com²",
+        "com³",
+        "lpt¹",
+        "lpt²",
+        "lpt³",
+    }
+)
+_WINDOWS_INVALID_PATH_CHARACTERS = frozenset('<>:"|?*')
+_WINDOWS_SHORT_NAME_PATTERN = re.compile(
+    r"^[^.]{1,6}~[1-9][0-9]*(?:\..*)?$",
+    re.IGNORECASE,
 )
 
 
@@ -74,7 +101,12 @@ class SessionStore:
         return self.session_path
 
     def load(self) -> SessionManifest:
-        payload = json.loads(self.session_path.read_text(encoding="utf-8"))
+        content = self._read_session_snapshot()
+        try:
+            text = content.decode("utf-8")
+        except UnicodeError as error:
+            raise ValueError("session.json must be valid UTF-8 JSON") from error
+        payload = json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)
         if not isinstance(payload, dict):
             raise ValueError("session.json must contain a JSON object")
         return session_manifest_from_dict(payload)
@@ -1982,11 +2014,95 @@ class SessionStore:
             ensure_ascii=False,
         )
 
+    def _read_session_snapshot(self) -> bytes:
+        """Read one no-follow, fstat-verified Session authority snapshot."""
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            file_descriptor = os.open(self.session_path, flags)
+        except FileNotFoundError:
+            raise
+        except OSError as error:
+            raise ValueError("session.json must be a regular file") from error
+        try:
+            try:
+                opened = os.fstat(file_descriptor)
+                path_metadata = self.session_path.lstat()
+            except OSError as error:
+                raise ValueError("unable to inspect session.json") from error
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(path_metadata.st_mode)
+                or stat.S_ISLNK(path_metadata.st_mode)
+                or not os.path.samestat(opened, path_metadata)
+            ):
+                raise ValueError("session.json must be a regular file")
+            if opened.st_size > MAX_SESSION_MANIFEST_BYTES:
+                raise ValueError("session.json exceeds the bounded manifest size")
+
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                try:
+                    chunk = os.read(
+                        file_descriptor,
+                        min(
+                            1024 * 1024,
+                            MAX_SESSION_MANIFEST_BYTES + 1 - total,
+                        ),
+                    )
+                except OSError as error:
+                    raise ValueError("unable to read session.json") from error
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_SESSION_MANIFEST_BYTES:
+                    raise ValueError("session.json exceeds the bounded manifest size")
+                chunks.append(chunk)
+
+            try:
+                final_opened = os.fstat(file_descriptor)
+                final_path = self.session_path.lstat()
+            except OSError as error:
+                raise ValueError("unable to inspect session.json") from error
+            if (
+                not _same_file_snapshot(opened, final_opened)
+                or not stat.S_ISREG(final_path.st_mode)
+                or stat.S_ISLNK(final_path.st_mode)
+                or not os.path.samestat(final_opened, final_path)
+            ):
+                raise ValueError("session.json changed while reading")
+            return b"".join(chunks)
+        finally:
+            os.close(file_descriptor)
+
     def _hash_regular_artifact(self, relative_path: str) -> str:
         canonical_path = _canonical_relative_path(relative_path)
         try:
             root = self.run_dir.resolve(strict=True)
-            candidate = self.run_dir.joinpath(*PurePosixPath(canonical_path).parts)
+            candidate = root.joinpath(*PurePosixPath(canonical_path).parts)
+            current = root
+            parts = PurePosixPath(canonical_path).parts
+            for index, part in enumerate(parts):
+                current = current / part
+                component_status = current.lstat()
+                if stat.S_ISLNK(component_status.st_mode):
+                    raise ValueError(
+                        "artifact path resolves outside the Session run directory: "
+                        f"{relative_path}"
+                    )
+                if (
+                    index < len(parts) - 1
+                    and not stat.S_ISDIR(component_status.st_mode)
+                ):
+                    raise ValueError(
+                        f"artifact does not exist or is not a regular file: {relative_path}"
+                    )
             resolved = candidate.resolve(strict=True)
         except FileNotFoundError as error:
             raise ValueError(
@@ -2009,7 +2125,7 @@ class SessionStore:
             | getattr(os, "O_NOFOLLOW", 0)
         )
         try:
-            file_descriptor = os.open(resolved, flags)
+            file_descriptor = os.open(candidate, flags)
         except OSError as error:
             raise ValueError(
                 f"artifact does not exist or is not a regular file: {relative_path}"
@@ -2021,7 +2137,13 @@ class SessionStore:
                 raise ValueError(
                     f"unable to inspect artifact file: {relative_path}"
                 ) from error
-            if not stat.S_ISREG(file_status.st_mode):
+            current_status = candidate.lstat()
+            if (
+                not stat.S_ISREG(file_status.st_mode)
+                or not stat.S_ISREG(current_status.st_mode)
+                or stat.S_ISLNK(current_status.st_mode)
+                or not os.path.samestat(file_status, current_status)
+            ):
                 raise ValueError(f"artifact must be a regular file: {relative_path}")
 
             digest = sha256()
@@ -2035,6 +2157,13 @@ class SessionStore:
                 if not chunk:
                     break
                 digest.update(chunk)
+            final_status = candidate.lstat()
+            if (
+                not stat.S_ISREG(final_status.st_mode)
+                or stat.S_ISLNK(final_status.st_mode)
+                or not os.path.samestat(file_status, final_status)
+            ):
+                raise ValueError(f"artifact changed while reading: {relative_path}")
             return digest.hexdigest()
         finally:
             os.close(file_descriptor)
@@ -2253,9 +2382,51 @@ def _canonical_relative_path(relative_path: str) -> str:
         or bool(windows_path.drive)
         or any(part in {"", ".", ".."} for part in parts)
         or posix_path.as_posix() != relative_path
+        or any(not _is_safe_portable_path_component(part) for part in parts)
     ):
         raise ValueError("artifact path must be a canonical relative path inside run_dir")
     return relative_path
+
+
+def _is_safe_portable_path_component(component: str) -> bool:
+    if (
+        not isinstance(component, str)
+        or not component
+        or component != unicodedata.normalize("NFC", component)
+        or component[-1] in {".", " "}
+        or any(ord(character) < 32 or ord(character) == 127 for character in component)
+        or any(
+            character in _WINDOWS_INVALID_PATH_CHARACTERS
+            for character in component
+        )
+    ):
+        return False
+    basename = component.split(".", 1)[0].casefold()
+    if basename in _WINDOWS_RESERVED_COMPONENTS:
+        return False
+    if _WINDOWS_SHORT_NAME_PATTERN.fullmatch(component):
+        return False
+    return True
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, child in pairs:
+        if key in value:
+            raise ValueError("session.json must not contain duplicate object keys")
+        value[key] = child
+    return value
+
+
+def _same_file_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        os.path.samestat(left, right)
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ctime_ns == right.st_ctime_ns
+    )
 
 
 def _require_revision_binding(

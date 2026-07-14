@@ -12,6 +12,12 @@ from typing import Any, Mapping
 from review_agent.checkpoint import _fsync_parent_directory
 
 
+DEFAULT_MAX_OBSERVATION_LOG_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_OBSERVATIONS = 4096
+DEFAULT_MAX_RAW_ARTIFACT_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_TOTAL_RAW_ARTIFACT_BYTES = 64 * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class Observation:
     observation_id: str
@@ -46,28 +52,61 @@ class ObservationStore:
         cls,
         run_dir: Path,
         expected_revisions: set[str],
+        *,
+        max_log_bytes: int = DEFAULT_MAX_OBSERVATION_LOG_BYTES,
+        max_observations: int = DEFAULT_MAX_OBSERVATIONS,
+        max_raw_artifact_bytes: int = DEFAULT_MAX_RAW_ARTIFACT_BYTES,
+        max_total_raw_bytes: int = DEFAULT_MAX_TOTAL_RAW_ARTIFACT_BYTES,
     ) -> "ObservationStore":
         revisions = _expected_revisions(expected_revisions)
+        _bounded_positive_int(
+            max_log_bytes,
+            "max_log_bytes",
+            maximum=64 * 1024 * 1024,
+        )
+        _bounded_positive_int(
+            max_observations,
+            "max_observations",
+            maximum=100_000,
+        )
+        _bounded_positive_int(
+            max_raw_artifact_bytes,
+            "max_raw_artifact_bytes",
+            maximum=64 * 1024 * 1024,
+        )
+        _bounded_positive_int(
+            max_total_raw_bytes,
+            "max_total_raw_bytes",
+            maximum=512 * 1024 * 1024,
+        )
         store = cls(run_dir, _create=False)
-        if not store.jsonl_path.exists():
-            raise ValueError("observations.jsonl does not exist")
-        if not _is_regular_file(store.jsonl_path):
-            raise ValueError("observations.jsonl must be a regular file")
         _validate_observations_directory(store.run_dir)
 
         observations: list[Observation] = []
         by_id: dict[str, Observation] = {}
         try:
-            lines = store.jsonl_path.read_text(encoding="utf-8").splitlines()
+            log_bytes = _read_regular_file_bytes(
+                store.jsonl_path,
+                "observations.jsonl",
+                max_bytes=max_log_bytes,
+            )
+            lines = log_bytes.decode("utf-8").splitlines()
         except (OSError, UnicodeError) as error:
             raise ValueError(f"unable to read observations.jsonl: {error}") from error
+        if len(lines) > max_observations:
+            raise ValueError("observations.jsonl exceeds the bounded record count")
+
+        hydration_plan: list[tuple[Observation, Path, bool]] = []
         for line_number, line in enumerate(lines, start=1):
             if not line.strip():
                 raise ValueError(
                     f"observations.jsonl line {line_number} must not be blank"
                 )
             try:
-                payload = json.loads(line)
+                payload = json.loads(
+                    line,
+                    object_pairs_hook=_reject_duplicate_json_keys,
+                )
             except json.JSONDecodeError as error:
                 raise ValueError(
                     f"observations.jsonl line {line_number} is invalid JSON: "
@@ -83,17 +122,6 @@ class ObservationStore:
                     f"revision binding: {observation.revision}"
                 )
             legacy_id = _validate_observation_id(observation)
-            raw_path = _safe_raw_artifact_path(
-                store.run_dir,
-                observation.raw_artifact_ref,
-                observation.observation_id,
-            )
-            raw_bytes = _read_regular_file_bytes(raw_path, observation.raw_artifact_ref)
-            _validate_raw_artifact_hash(
-                raw_bytes,
-                observation,
-                allow_legacy_newline_translation=legacy_id,
-            )
             existing = by_id.get(observation.observation_id)
             if existing is not None:
                 if existing != observation:
@@ -102,8 +130,45 @@ class ObservationStore:
                         f"{observation.observation_id}"
                     )
                 continue
+            raw_path = _safe_raw_artifact_path(
+                store.run_dir,
+                observation.raw_artifact_ref,
+                observation.observation_id,
+            )
             observations.append(observation)
             by_id[observation.observation_id] = observation
+            hydration_plan.append((observation, raw_path, legacy_id))
+
+        # Complete count and declared-size authorization before materializing
+        # any raw artifact.  The descriptor reads below remain independently
+        # bounded to close growth races after this preflight.
+        total_declared_bytes = 0
+        for observation, raw_path, _legacy_id in hydration_plan:
+            raw_size = _regular_file_size(
+                raw_path,
+                observation.raw_artifact_ref,
+            )
+            if raw_size > max_raw_artifact_bytes:
+                raise ValueError("raw observation artifact exceeds its byte bound")
+            total_declared_bytes += raw_size
+            if total_declared_bytes > max_total_raw_bytes:
+                raise ValueError("raw observation artifacts exceed the total byte bound")
+
+        total_read_bytes = 0
+        for observation, raw_path, legacy_id in hydration_plan:
+            raw_bytes = _read_regular_file_bytes(
+                raw_path,
+                observation.raw_artifact_ref,
+                max_bytes=max_raw_artifact_bytes,
+            )
+            total_read_bytes += len(raw_bytes)
+            if total_read_bytes > max_total_raw_bytes:
+                raise ValueError("raw observation artifacts exceed the total byte bound")
+            _validate_raw_artifact_hash(
+                raw_bytes,
+                observation,
+                allow_legacy_newline_translation=legacy_id,
+            )
 
         store._observations = observations
         store._by_id = by_id
@@ -424,27 +489,132 @@ def _validate_observations_directory(run_dir: Path) -> Path:
     return observations_dir
 
 
-def _read_regular_file_bytes(path: Path, artifact_ref: str) -> bytes:
+def _read_regular_file_bytes(
+    path: Path,
+    artifact_ref: str,
+    *,
+    max_bytes: int | None = None,
+) -> bytes:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
-        metadata = path.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(
+            f"raw observation artifact is missing or not regular: {artifact_ref}"
+        ) from error
+    try:
+        try:
+            opened_metadata = os.fstat(descriptor)
+            path_metadata = path.lstat()
+        except OSError as error:
+            raise ValueError(
+                f"unable to inspect raw observation artifact: {artifact_ref}"
+            ) from error
+        if (
+            not stat.S_ISREG(opened_metadata.st_mode)
+            or not stat.S_ISREG(path_metadata.st_mode)
+            or stat.S_ISLNK(path_metadata.st_mode)
+            or path.is_symlink()
+            or not os.path.samestat(path_metadata, opened_metadata)
+        ):
             raise ValueError(
                 f"raw observation artifact is missing or not regular: {artifact_ref}"
             )
-        with path.open("rb") as handle:
-            opened_metadata = os.fstat(handle.fileno())
-            if (
-                not stat.S_ISREG(opened_metadata.st_mode)
-                or not os.path.samestat(metadata, opened_metadata)
-            ):
+        if max_bytes is not None and opened_metadata.st_size > max_bytes:
+            raise ValueError(
+                f"raw observation artifact exceeds the byte bound: {artifact_ref}"
+            )
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            read_size = 1024 * 1024
+            if max_bytes is not None:
+                read_size = min(read_size, max_bytes + 1 - total)
+            try:
+                chunk = os.read(descriptor, read_size)
+            except OSError as error:
                 raise ValueError(
-                    f"raw observation artifact changed while opening: {artifact_ref}"
+                    f"unable to read raw observation artifact: {artifact_ref}"
+                ) from error
+            if not chunk:
+                break
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise ValueError(
+                    f"raw observation artifact exceeds the byte bound: {artifact_ref}"
                 )
-            return handle.read()
-    except ValueError:
-        raise
+            chunks.append(chunk)
+
+        try:
+            final_opened = os.fstat(descriptor)
+            final_path = path.lstat()
+        except OSError as error:
+            raise ValueError(
+                f"unable to inspect raw observation artifact: {artifact_ref}"
+            ) from error
+        if (
+            not _same_file_snapshot(opened_metadata, final_opened)
+            or not stat.S_ISREG(final_path.st_mode)
+            or stat.S_ISLNK(final_path.st_mode)
+            or path.is_symlink()
+            or not os.path.samestat(final_opened, final_path)
+        ):
+            raise ValueError(
+                f"raw observation artifact changed while reading: {artifact_ref}"
+            )
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _regular_file_size(path: Path, artifact_ref: str) -> int:
+    try:
+        metadata = path.lstat()
     except OSError as error:
-        raise ValueError(f"unable to read raw observation artifact: {artifact_ref}") from error
+        raise ValueError(
+            f"raw observation artifact is missing or not regular: {artifact_ref}"
+        ) from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or path.is_symlink()
+    ):
+        raise ValueError(
+            f"raw observation artifact is missing or not regular: {artifact_ref}"
+        )
+    return metadata.st_size
+
+
+def _same_file_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        os.path.samestat(left, right)
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ctime_ns == right.st_ctime_ns
+    )
+
+
+def _bounded_positive_int(value: Any, field_name: str, *, maximum: int) -> int:
+    if type(value) is not int or value < 1 or value > maximum:
+        raise ValueError(f"{field_name} must be a positive bounded integer")
+    return value
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, child in pairs:
+        if key in value:
+            raise ValueError("JSON objects must not contain duplicate keys")
+        value[key] = child
+    return value
 
 
 def _validate_raw_artifact_hash(
