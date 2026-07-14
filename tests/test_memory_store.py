@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import os
 import sqlite3
+import subprocess
 import threading
 from pathlib import Path
 
@@ -320,6 +322,65 @@ def test_linked_worktrees_share_registered_identity_and_store_state(
     linked_read_only = MemoryStore(linked_namespace, read_only=True)
     assert primary_read_only.get_candidate(candidate.candidate_id) == candidate
     assert linked_read_only.get_candidate(candidate.candidate_id) == candidate
+
+
+def test_store_revalidates_a_namespace_after_a_symlink_swap(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    resolver = RevisionResolver()
+    memory_root = tmp_path / "stale-namespace-root"
+    plan = plan_repository_memory_namespace(
+        resolver.repository_identity(git_repo),
+        memory_root,
+        revision_resolver=resolver,
+    )
+    namespace = plan.namespace
+    memory_root.mkdir()
+    outside = tmp_path / "stale-namespace-outside"
+    outside.mkdir()
+    repositories = memory_root / "repositories"
+    created_junction = False
+    try:
+        repositories.symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+    except OSError as error:
+        if os.name != "nt":
+            pytest.skip(f"directory symlinks unavailable: {error}")
+        result = subprocess.run(
+            [
+                "cmd.exe",
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(repositories),
+                str(outside),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip("Windows junction creation is unavailable")
+        created_junction = True
+
+    try:
+        with pytest.raises(
+            ValueError,
+            match="symbolic link or reparse point",
+        ):
+            MemoryStore(namespace)
+
+        assert list(outside.iterdir()) == []
+    finally:
+        if created_junction:
+            repositories.rmdir()
+        else:
+            repositories.unlink()
 
 
 def test_unknown_schema_fails_closed_without_rewriting_database(tmp_path: Path) -> None:

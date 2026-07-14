@@ -3,10 +3,15 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import traceback
 from typing import Mapping
 
 import pytest
+
+import review_agent.memory_identity as memory_identity_module
 
 from conftest import run_git
 from review_agent.memory_identity import (
@@ -15,6 +20,7 @@ from review_agent.memory_identity import (
     MemoryRootSource,
     RepositoryIdentityCore,
     RepositoryIdentityDescriptor,
+    RepositoryMemoryNamespace,
     VerifiedRepositoryIdentity,
     build_path_budget_report,
     build_relink_descriptor,
@@ -28,6 +34,7 @@ from review_agent.memory_identity import (
     repository_key,
     repository_namespace_path,
     resolve_memory_root,
+    verify_repository_identity,
 )
 from review_agent.revision import (
     RepositoryIdentity,
@@ -502,6 +509,34 @@ def test_namespace_planner_rejects_worktree_overlap_in_every_direction(
         plan_repository_memory_namespace(identity, root)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows device-path alias")
+def test_namespace_planner_rejects_extended_device_path_alias(
+    git_repo: Path,
+) -> None:
+    identity = RevisionResolver().repository_identity(git_repo)
+    alias = Path("\\\\?\\" + str(git_repo))
+
+    with pytest.raises(MemoryIdentityError, match="overlaps protected repository paths"):
+        plan_repository_memory_namespace(identity, alias)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows component normalization")
+@pytest.mark.parametrize(
+    "component",
+    ["ambiguous.", "ambiguous ", "CON", "nul.txt", "name:stream"],
+)
+def test_windows_memory_root_rejects_ambiguous_native_components(
+    tmp_path: Path,
+    component: str,
+) -> None:
+    requested = tmp_path / component / "memory"
+
+    with pytest.raises(MemoryIdentityError, match="component is invalid"):
+        MemoryRootResolver().resolve(requested, create=False)
+
+    assert not requested.exists()
+
+
 def test_namespace_planner_rejects_git_common_git_dir_and_review_agent_paths(
     git_repo: Path,
 ) -> None:
@@ -598,30 +633,73 @@ def test_namespace_planner_rejects_unrelated_symlink_escape(
     assert list(outside.iterdir()) == []
 
 
+def test_namespace_planner_rejects_a_regular_file_in_the_root_prefix(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    blocking_file = tmp_path / "not-a-directory"
+    blocking_file.write_text("blocked", encoding="utf-8")
+
+    with pytest.raises(MemoryIdentityError, match="component is not a directory"):
+        plan_repository_memory_namespace(
+            RevisionResolver().repository_identity(git_repo),
+            blocking_file / "memory",
+        )
+
+
+def test_locator_verification_traceback_does_not_leak_repository_paths(
+    git_repo: Path,
+) -> None:
+    descriptor = build_repository_identity_descriptor(
+        RevisionResolver().repository_identity(git_repo)
+    )
+    secret = "customer-secret-repository-path"
+
+    class FailingResolver:
+        def repository_identity(self, repo: Path) -> object:
+            raise RuntimeError(f"failed to execute Git in {secret}")
+
+    with pytest.raises(MemoryIdentityError) as captured:
+        verify_repository_identity(
+            descriptor,
+            revision_resolver=FailingResolver(),  # type: ignore[arg-type]
+        )
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(captured.value),
+            captured.value,
+            captured.value.__traceback__,
+        )
+    )
+    assert secret not in rendered
+    assert captured.value.__cause__ is None
+
+
 def _utf16_units(value: str) -> int:
     return len(value.encode("utf-16-le")) // 2
 
 
-def _windows_path_with_units(target_units: int) -> Path:
-    prefix = "C:\\"
+def _absolute_path_with_units(target_units: int) -> Path:
+    prefix = Path.cwd().anchor
     assert target_units >= _utf16_units(prefix)
     return Path(prefix + ("a" * (target_units - _utf16_units(prefix))))
 
 
 def test_windows_path_budget_accepts_exact_file_boundary_and_rejects_plus_one(
 ) -> None:
-    baseline_namespace = Path("C:\\m")
+    baseline_namespace = Path(Path.cwd().anchor + "m")
     baseline = build_path_budget_report(
         baseline_namespace,
         platform_name="win32",
     )
     namespace_units = _utf16_units(str(baseline_namespace))
     file_suffix_units = baseline.maximum_file_units - namespace_units
-    exact_namespace = _windows_path_with_units(259 - file_suffix_units)
+    exact_namespace = _absolute_path_with_units(259 - file_suffix_units)
 
     exact = build_path_budget_report(exact_namespace, platform_name="win32")
     over = build_path_budget_report(
-        _windows_path_with_units(_utf16_units(str(exact_namespace)) + 1),
+        _absolute_path_with_units(_utf16_units(str(exact_namespace)) + 1),
         platform_name="win32",
     )
 
@@ -635,8 +713,9 @@ def test_windows_path_budget_accepts_exact_file_boundary_and_rejects_plus_one(
 
 
 def test_windows_path_budget_counts_non_bmp_characters_as_two_utf16_units() -> None:
-    ascii_namespace = Path("C:\\" + ("a" * 100))
-    emoji_namespace = Path("C:\\" + ("a" * 99) + "\U0001f600")
+    prefix = Path.cwd().anchor
+    ascii_namespace = Path(prefix + ("a" * 100))
+    emoji_namespace = Path(prefix + ("a" * 99) + "\U0001f600")
 
     ascii_report = build_path_budget_report(
         ascii_namespace,
@@ -702,6 +781,64 @@ def test_planner_is_immutable_and_materialization_is_the_only_creation_step(
     assert not (Path(namespace.namespace_path) / "memory.sqlite3").exists()
 
 
+def test_secure_materialization_rejects_a_changed_existing_anchor(
+    tmp_path: Path,
+) -> None:
+    planned_parent = tmp_path / "planned-parent"
+    replaced_parent = tmp_path / "replacement-parent"
+    planned_parent.mkdir()
+    replaced_parent.mkdir()
+    expected = memory_identity_module._physical_path_descriptor(
+        planned_parent / "memory"
+    )
+
+    with pytest.raises(MemoryIdentityError, match="changed during secure validation"):
+        memory_identity_module._secure_materialize_directory(
+            replaced_parent / "memory",
+            expected=expected,
+        )
+
+    assert not (replaced_parent / "memory").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+def test_secure_materialization_never_follows_a_windows_junction(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "junction-target"
+    outside.mkdir()
+    junction = tmp_path / "junction"
+    result = subprocess.run(
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(junction),
+            str(outside),
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("Windows junction creation is unavailable")
+
+    try:
+        target = junction / "memory"
+        expected = memory_identity_module._physical_path_descriptor(target)
+        with pytest.raises(MemoryIdentityError, match="reparse point"):
+            memory_identity_module._secure_materialize_directory(
+                target,
+                expected=expected,
+            )
+        assert not (outside / "memory").exists()
+    finally:
+        junction.rmdir()
+
+
 def test_legacy_direct_namespace_builder_remains_unbound_and_non_materializing(
     git_repo: Path,
     tmp_path: Path,
@@ -715,6 +852,42 @@ def test_legacy_direct_namespace_builder_remains_unbound_and_non_materializing(
 
     assert Path(namespace.memory_root) == root.resolve()
     assert not root.exists()
+
+
+def test_public_namespace_rejects_noncanonical_and_symlinked_locations(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    descriptor = build_repository_identity_descriptor(
+        RevisionResolver().repository_identity(git_repo)
+    )
+    root = tmp_path / "public-namespace-root"
+
+    with pytest.raises(MemoryIdentityError, match="canonical repository location"):
+        RepositoryMemoryNamespace(
+            repository_key=descriptor.repository_key,
+            memory_root=str(root),
+            namespace_path=str(root / "outside" / descriptor.repository_key),
+            metadata=descriptor,
+        )
+
+    root.mkdir()
+    outside = tmp_path / "public-namespace-outside"
+    outside.mkdir()
+    try:
+        (root / "repositories").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks unavailable: {error}")
+
+    with pytest.raises(MemoryIdentityError, match="symbolic link or reparse point"):
+        RepositoryMemoryNamespace(
+            repository_key=descriptor.repository_key,
+            memory_root=str(root),
+            namespace_path=str(
+                root / "repositories" / descriptor.repository_key
+            ),
+            metadata=descriptor,
+        )
 
 
 def test_planner_errors_and_plan_repr_never_expose_origin_credentials(

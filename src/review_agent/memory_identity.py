@@ -11,6 +11,10 @@ import stat
 import sys
 from typing import Dict, Mapping, Optional, Tuple, Union
 
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
 from review_agent.revision import (
     RepositoryIdentity,
     RepositoryLayout,
@@ -35,6 +39,68 @@ _REPOSITORY_KEY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _SHORT_RANDOM_TOKEN = "r" * 32
 _SHA256_PLACEHOLDER = "0" * 64
+_WINDOWS_RESERVED_COMPONENTS = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+)
+
+if os.name == "nt":
+    _WIN_FILE_ATTRIBUTE_DIRECTORY = 0x10
+    _WIN_FILE_ATTRIBUTE_NORMAL = 0x80
+    _WIN_FILE_SHARE_ALL = 0x1 | 0x2 | 0x4
+    _WIN_FILE_LIST_DIRECTORY = 0x1
+    _WIN_FILE_TRAVERSE = 0x20
+    _WIN_FILE_READ_ATTRIBUTES = 0x80
+    _WIN_SYNCHRONIZE = 0x00100000
+    _WIN_OPEN_EXISTING = 3
+    _WIN_FILE_OPEN = 1
+    _WIN_FILE_OPEN_IF = 3
+    _WIN_FILE_DIRECTORY_FILE = 0x1
+    _WIN_FILE_SYNCHRONOUS_IO_NONALERT = 0x20
+    _WIN_FILE_OPEN_FOR_BACKUP_INTENT = 0x4000
+    _WIN_FILE_OPEN_REPARSE_POINT = 0x00200000
+    _WIN_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _WIN_OBJ_CASE_INSENSITIVE = 0x40
+    _WIN_ERROR_FILE_NOT_FOUND = 2
+    _WIN_ERROR_PATH_NOT_FOUND = 3
+
+    class _WindowsUnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", wintypes.LPWSTR),
+        ]
+
+    class _WindowsObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.ULONG),
+            ("RootDirectory", wintypes.HANDLE),
+            ("ObjectName", ctypes.POINTER(_WindowsUnicodeString)),
+            ("Attributes", wintypes.ULONG),
+            ("SecurityDescriptor", wintypes.LPVOID),
+            ("SecurityQualityOfService", wintypes.LPVOID),
+        ]
+
+    class _WindowsIoStatusBlock(ctypes.Structure):
+        _fields_ = [
+            ("Status", wintypes.LPVOID),
+            ("Information", ctypes.c_size_t),
+        ]
+
+    class _WindowsByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
 
 PathInput = Union[str, os.PathLike]
 IdentityInput = Union[
@@ -61,6 +127,22 @@ class PathBudgetKind(str, Enum):
 
 
 @dataclass(frozen=True)
+class _PhysicalPathAncestor:
+    identity: Tuple[int, int]
+    suffix_parts: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _PhysicalPathDescriptor:
+    ancestors: Tuple[_PhysicalPathAncestor, ...]
+    missing_parts: Tuple[str, ...]
+
+    @property
+    def deepest_identity(self) -> Tuple[int, int]:
+        return self.ancestors[0].identity
+
+
+@dataclass(frozen=True)
 class ResolvedMemoryRoot:
     path: str
     source: MemoryRootSource
@@ -84,8 +166,8 @@ class RepositoryIdentityCore:
             normalized_common = normalize_repository_identity_path(
                 self.normalized_git_common_dir
             )
-        except (OSError, ValueError) as error:
-            raise MemoryIdentityError("invalid repository identity core") from error
+        except (OSError, ValueError):
+            raise MemoryIdentityError("invalid repository identity core") from None
         normalized_origin = normalize_repository_origin(self.normalized_origin_url)
         if (
             normalized_common != self.normalized_git_common_dir
@@ -101,8 +183,8 @@ class RepositoryIdentityCore:
     ) -> "RepositoryIdentityCore":
         try:
             normalized_common = normalize_repository_identity_path(git_common_dir)
-        except (OSError, ValueError) as error:
-            raise MemoryIdentityError("invalid Git common directory identity") from error
+        except (OSError, ValueError):
+            raise MemoryIdentityError("invalid Git common directory identity") from None
         return cls(
             normalized_git_common_dir=normalized_common,
             normalized_origin_url=normalize_repository_origin(origin_url),
@@ -321,15 +403,18 @@ class RepositoryMemoryNamespace:
     metadata: RepositoryIdentityDescriptor
 
     def __post_init__(self) -> None:
+        if not isinstance(self.metadata, RepositoryIdentityDescriptor):
+            raise MemoryIdentityError("namespace metadata is invalid")
         _validate_repository_key(self.repository_key)
         if self.metadata.repository_key != self.repository_key:
             raise MemoryIdentityError("namespace and metadata repository keys differ")
-        root = Path(self.memory_root)
-        namespace = Path(self.namespace_path)
-        if not root.is_absolute() or not namespace.is_absolute():
-            raise MemoryIdentityError("memory namespace paths must be absolute")
-        if not _path_is_within(namespace, root):
-            raise MemoryIdentityError("memory namespace escapes the configured root")
+        root, namespace = _validated_repository_namespace_paths(
+            self.repository_key,
+            self.memory_root,
+            self.namespace_path,
+        )
+        object.__setattr__(self, "memory_root", str(root))
+        object.__setattr__(self, "namespace_path", str(namespace))
 
 
 @dataclass(frozen=True)
@@ -630,8 +715,8 @@ def verify_repository_locator(
             resolver.repository_identity(Path(claimed.canonical_path))
         )
         layout = resolver.repository_layout(Path(observed.canonical_path))
-    except (OSError, RuntimeError, ValueError) as error:
-        raise MemoryIdentityError("unable to verify repository locator") from error
+    except (OSError, RuntimeError, ValueError):
+        raise MemoryIdentityError("unable to verify repository locator") from None
 
     if (
         claimed.core != observed.core
@@ -672,6 +757,51 @@ def repository_namespace_path(
     if not _path_is_within(canonical_candidate, root):
         raise MemoryIdentityError("memory namespace escapes the configured root")
     return canonical_candidate
+
+
+def validate_repository_memory_namespace(
+    namespace: RepositoryMemoryNamespace,
+) -> RepositoryMemoryNamespace:
+    """Revalidate a namespace immediately before filesystem authority use."""
+
+    if not isinstance(namespace, RepositoryMemoryNamespace):
+        raise MemoryIdentityError("repository memory namespace is invalid")
+    root, path = _validated_repository_namespace_paths(
+        namespace.repository_key,
+        namespace.memory_root,
+        namespace.namespace_path,
+    )
+    if str(root) != namespace.memory_root or str(path) != namespace.namespace_path:
+        raise MemoryIdentityError("repository memory namespace is not canonical")
+    if namespace.metadata.repository_key != namespace.repository_key:
+        raise MemoryIdentityError("namespace and metadata repository keys differ")
+    return namespace
+
+
+def _validated_repository_namespace_paths(
+    key: str,
+    memory_root: PathInput,
+    namespace_path: PathInput,
+) -> Tuple[Path, Path]:
+    root = _canonicalize_root(
+        memory_root,
+        create=False,
+        require_directory=False,
+    )
+    raw_namespace = _absolute_platform_base(
+        namespace_path,
+        "memory namespace",
+    )
+    if ".." in raw_namespace.parts:
+        raise MemoryIdentityError("memory namespace escapes the configured root")
+    _assert_no_symlink_or_reparse_components(raw_namespace)
+    canonical_namespace = Path(os.path.normpath(str(raw_namespace)))
+    expected = repository_namespace_path(root, key)
+    if _normalized_path(canonical_namespace) != _normalized_path(expected):
+        raise MemoryIdentityError(
+            "memory namespace must use its canonical repository location"
+        )
+    return root, expected
 
 
 def build_repository_memory_namespace(
@@ -729,7 +859,6 @@ def materialize_repository_memory_namespace(
         create=False,
         require_directory=False,
     )
-    _reject_protected_path_overlap(root, current_locator.protected_paths)
     if root.exists() and not root.is_dir():
         raise MemoryIdentityError("memory root exists but is not a directory")
     namespace = repository_namespace_path(root, plan.repository_key)
@@ -744,18 +873,28 @@ def materialize_repository_memory_namespace(
             "memory namespace exceeds the bounded Windows path policy"
         )
 
+    root_descriptor = _physical_path_descriptor(root)
+    namespace_descriptor = _physical_path_descriptor(namespace)
+    if not _physical_path_is_ancestor(root_descriptor, namespace_descriptor):
+        raise MemoryIdentityError("memory namespace plan path changed")
+    _reject_protected_path_overlap(
+        root,
+        current_locator.protected_paths,
+        root_descriptor=root_descriptor,
+    )
+
     try:
-        root.mkdir(parents=True, exist_ok=True)
+        _secure_materialize_directory(
+            namespace,
+            expected=namespace_descriptor,
+        )
         _assert_materialized_directory(root)
-        repositories = root / _REPOSITORIES_DIRECTORY
-        repositories.mkdir(exist_ok=True)
-        _assert_materialized_directory(repositories)
-        namespace.mkdir(exist_ok=True)
+        _assert_materialized_directory(root / _REPOSITORIES_DIRECTORY)
         _assert_materialized_directory(namespace)
     except MemoryIdentityError:
         raise
-    except OSError as error:
-        raise MemoryIdentityError("memory namespace cannot be materialized safely") from error
+    except OSError:
+        raise MemoryIdentityError("memory namespace cannot be materialized safely") from None
     return plan.namespace
 
 
@@ -918,20 +1057,28 @@ def _canonicalize_root(
         or ".." in candidate.parts
     ):
         raise MemoryIdentityError("memory root must be a non-empty absolute path")
-    _assert_no_symlink_or_reparse_components(candidate)
+    _validate_memory_path_components(candidate)
+    _assert_no_symlink_or_reparse_components(
+        candidate,
+        blocked_component_message=(
+            "memory root cannot safely create its parent directories"
+            if create
+            else "memory path component is not a directory"
+        ),
+    )
     canonical = Path(os.path.normpath(str(candidate)))
     if require_directory and canonical.exists() and not canonical.is_dir():
         raise MemoryIdentityError("memory root exists but is not a directory")
     if create:
         try:
-            canonical.mkdir(parents=True, exist_ok=True)
+            _secure_materialize_directory(canonical)
             _assert_materialized_directory(canonical)
         except MemoryIdentityError:
             raise
-        except OSError as error:
+        except OSError:
             raise MemoryIdentityError(
                 "memory root cannot safely create its parent directories"
-            ) from error
+            ) from None
     return canonical
 
 
@@ -942,8 +1089,8 @@ def _canonical_identity_path(value: PathInput, *, field_name: str) -> str:
         raise MemoryIdentityError(f"{field_name} must be absolute")
     try:
         return str(candidate.resolve(strict=False))
-    except OSError as error:
-        raise MemoryIdentityError(f"unable to canonicalize {field_name}") from error
+    except OSError:
+        raise MemoryIdentityError(f"unable to canonicalize {field_name}") from None
 
 
 def _canonical_path_tuple(values: Tuple[str, ...]) -> Tuple[str, ...]:
@@ -961,19 +1108,23 @@ def _validate_repository_key(key: str) -> None:
         )
 
 
-def _assert_no_symlink_or_reparse_components(candidate: Path) -> None:
+def _assert_no_symlink_or_reparse_components(
+    candidate: Path,
+    *,
+    blocked_component_message: str = "memory path component is not a directory",
+) -> None:
     if not candidate.is_absolute():
         raise MemoryIdentityError("memory path must be absolute")
     current = Path(candidate.anchor)
     parts = candidate.parts[1:] if candidate.anchor else candidate.parts
-    for part in parts:
+    for index, part in enumerate(parts):
         current = current / part
         try:
             metadata = current.lstat()
         except FileNotFoundError:
             break
-        except OSError as error:
-            raise MemoryIdentityError("unable to inspect memory path safety") from error
+        except OSError:
+            raise MemoryIdentityError("unable to inspect memory path safety") from None
         attributes = getattr(metadata, "st_file_attributes", 0)
         if stat.S_ISLNK(metadata.st_mode) or (
             attributes & _FILE_ATTRIBUTE_REPARSE_POINT
@@ -981,6 +1132,8 @@ def _assert_no_symlink_or_reparse_components(candidate: Path) -> None:
             raise MemoryIdentityError(
                 "memory path cannot traverse a symbolic link or reparse point"
             )
+        if index < len(parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+            raise MemoryIdentityError(blocked_component_message)
 
 
 def _assert_materialized_directory(path: Path) -> None:
@@ -989,31 +1142,451 @@ def _assert_materialized_directory(path: Path) -> None:
         raise MemoryIdentityError("memory namespace component is not a directory")
 
 
-def _reject_protected_path_overlap(root: Path, protected_paths: Tuple[str, ...]) -> None:
+def _secure_materialize_directory(
+    path: Path,
+    expected: Optional[_PhysicalPathDescriptor] = None,
+) -> None:
+    """Create a directory chain relative to held, no-follow parent handles."""
+
+    if not path.is_absolute():
+        raise MemoryIdentityError("memory path must be absolute")
+    expected_descriptor = expected or _physical_path_descriptor(path)
+    if os.name == "nt":
+        _secure_materialize_directory_windows(path, expected_descriptor)
+    else:
+        _secure_materialize_directory_posix(path, expected_descriptor)
+
+
+def _secure_materialize_directory_posix(
+    path: Path,
+    expected: _PhysicalPathDescriptor,
+) -> None:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if (
+        not no_follow
+        or not directory
+        or os.open not in os.supports_dir_fd
+        or os.mkdir not in os.supports_dir_fd
+    ):
+        raise MemoryIdentityError("secure directory creation is unavailable")
+    flags = os.O_RDONLY | directory | no_follow | getattr(os, "O_CLOEXEC", 0)
+    parts = path.parts[1:] if path.anchor else path.parts
+    current_fd: Optional[int] = None
+    try:
+        current_fd = os.open(path.anchor, flags)
+        first_missing = len(parts)
+        for index, part in enumerate(parts):
+            try:
+                child_fd = os.open(part, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                first_missing = index
+                break
+            except OSError:
+                raise MemoryIdentityError(
+                    "memory path cannot traverse a symbolic link or invalid component"
+                ) from None
+            os.close(current_fd)
+            current_fd = child_fd
+
+        remaining = tuple(
+            _comparison_path_part(part) for part in parts[first_missing:]
+        )
+        _assert_secure_directory_anchor(
+            expected,
+            _posix_file_identity(current_fd),
+            remaining,
+        )
+
+        for part in parts[first_missing:]:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise MemoryIdentityError(
+                    "memory namespace cannot be materialized safely"
+                ) from None
+            try:
+                child_fd = os.open(part, flags, dir_fd=current_fd)
+            except OSError:
+                raise MemoryIdentityError(
+                    "memory path cannot traverse a symbolic link or invalid component"
+                ) from None
+            os.close(current_fd)
+            current_fd = child_fd
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
+
+
+def _posix_file_identity(handle: int) -> Tuple[int, int]:
+    try:
+        metadata = os.fstat(handle)
+    except OSError:
+        raise MemoryIdentityError("unable to inspect memory path safety") from None
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise MemoryIdentityError("memory path component is not a directory")
+    return int(metadata.st_dev), int(metadata.st_ino)
+
+
+def _assert_secure_directory_anchor(
+    expected: _PhysicalPathDescriptor,
+    observed_identity: Tuple[int, int],
+    remaining_parts: Tuple[str, ...],
+) -> None:
+    if (
+        observed_identity != expected.deepest_identity
+        or remaining_parts != expected.missing_parts
+    ):
+        raise MemoryIdentityError("memory path changed during secure validation")
+
+
+def _secure_materialize_directory_windows(
+    path: Path,
+    expected: _PhysicalPathDescriptor,
+) -> None:
+    if os.name != "nt":
+        raise MemoryIdentityError("secure Windows directory creation is unavailable")
+    parts = path.parts[1:] if path.anchor else path.parts
+    current_handle = _windows_open_directory_root(Path(path.anchor))
+    try:
+        first_missing = len(parts)
+        for index, part in enumerate(parts):
+            child_handle = _windows_open_directory_component(
+                current_handle,
+                part,
+                create=False,
+            )
+            if child_handle is None:
+                first_missing = index
+                break
+            _windows_close_handle(current_handle)
+            current_handle = child_handle
+
+        remaining = tuple(
+            _comparison_path_part(part) for part in parts[first_missing:]
+        )
+        _assert_secure_directory_anchor(
+            expected,
+            _windows_directory_identity(current_handle),
+            remaining,
+        )
+
+        for part in parts[first_missing:]:
+            child_handle = _windows_open_directory_component(
+                current_handle,
+                part,
+                create=True,
+            )
+            if child_handle is None:
+                raise MemoryIdentityError(
+                    "memory namespace cannot be materialized safely"
+                )
+            _windows_close_handle(current_handle)
+            current_handle = child_handle
+    finally:
+        _windows_close_handle(current_handle)
+
+
+def _windows_open_directory_root(path: Path):
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        _WIN_FILE_LIST_DIRECTORY
+        | _WIN_FILE_TRAVERSE
+        | _WIN_FILE_READ_ATTRIBUTES
+        | _WIN_SYNCHRONIZE,
+        _WIN_FILE_SHARE_ALL,
+        None,
+        _WIN_OPEN_EXISTING,
+        _WIN_FILE_FLAG_BACKUP_SEMANTICS | _WIN_FILE_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise MemoryIdentityError("unable to inspect memory path safety")
+    try:
+        _windows_directory_identity(handle)
+    except Exception:
+        _windows_close_handle(handle)
+        raise
+    return handle
+
+
+def _windows_open_directory_component(
+    parent_handle,
+    component: str,
+    *,
+    create: bool,
+):
+    _validate_windows_memory_component(component)
+    try:
+        encoded_length = len(component.encode("utf-16-le"))
+    except UnicodeEncodeError:
+        raise MemoryIdentityError("memory path component is invalid") from None
+    if encoded_length > 65_532:
+        raise MemoryIdentityError("memory path component is invalid")
+    name_buffer = ctypes.create_unicode_buffer(component)
+    name = _WindowsUnicodeString(
+        Length=encoded_length,
+        MaximumLength=encoded_length + 2,
+        Buffer=ctypes.cast(name_buffer, wintypes.LPWSTR),
+    )
+    attributes = _WindowsObjectAttributes(
+        Length=ctypes.sizeof(_WindowsObjectAttributes),
+        RootDirectory=parent_handle,
+        ObjectName=ctypes.pointer(name),
+        Attributes=_WIN_OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor=None,
+        SecurityQualityOfService=None,
+    )
+    io_status = _WindowsIoStatusBlock()
+    child_handle = wintypes.HANDLE()
+    ntdll = ctypes.WinDLL("ntdll")
+    nt_create_file = ntdll.NtCreateFile
+    nt_create_file.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(_WindowsObjectAttributes),
+        ctypes.POINTER(_WindowsIoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    nt_create_file.restype = ctypes.c_long
+    status = nt_create_file(
+        ctypes.byref(child_handle),
+        _WIN_FILE_LIST_DIRECTORY
+        | _WIN_FILE_TRAVERSE
+        | _WIN_FILE_READ_ATTRIBUTES
+        | _WIN_SYNCHRONIZE,
+        ctypes.byref(attributes),
+        ctypes.byref(io_status),
+        None,
+        _WIN_FILE_ATTRIBUTE_NORMAL,
+        _WIN_FILE_SHARE_ALL,
+        _WIN_FILE_OPEN_IF if create else _WIN_FILE_OPEN,
+        _WIN_FILE_DIRECTORY_FILE
+        | _WIN_FILE_SYNCHRONOUS_IO_NONALERT
+        | _WIN_FILE_OPEN_FOR_BACKUP_INTENT
+        | _WIN_FILE_OPEN_REPARSE_POINT,
+        None,
+        0,
+    )
+    if status < 0:
+        status_to_error = ntdll.RtlNtStatusToDosError
+        status_to_error.argtypes = (wintypes.ULONG,)
+        status_to_error.restype = wintypes.ULONG
+        error_code = int(status_to_error(ctypes.c_ulong(status).value))
+        if not create and error_code in (
+            _WIN_ERROR_FILE_NOT_FOUND,
+            _WIN_ERROR_PATH_NOT_FOUND,
+        ):
+            return None
+        raise MemoryIdentityError(
+            "memory namespace cannot be materialized safely"
+            if create
+            else "unable to inspect memory path safety"
+        )
+    try:
+        _windows_directory_identity(child_handle)
+    except Exception:
+        _windows_close_handle(child_handle)
+        raise
+    return child_handle
+
+
+def _windows_directory_identity(handle) -> Tuple[int, int]:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_WindowsByHandleFileInformation),
+    )
+    get_information.restype = wintypes.BOOL
+    information = _WindowsByHandleFileInformation()
+    if not get_information(handle, ctypes.byref(information)):
+        raise MemoryIdentityError("unable to inspect memory path safety")
+    if information.dwFileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+        raise MemoryIdentityError(
+            "memory path cannot traverse a symbolic link or reparse point"
+        )
+    if not information.dwFileAttributes & _WIN_FILE_ATTRIBUTE_DIRECTORY:
+        raise MemoryIdentityError("memory path component is not a directory")
+    return (
+        int(information.dwVolumeSerialNumber),
+        (int(information.nFileIndexHigh) << 32)
+        | int(information.nFileIndexLow),
+    )
+
+
+def _windows_close_handle(handle) -> None:
+    if os.name != "nt" or handle in (None, 0, wintypes.HANDLE(-1).value):
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    close_handle(handle)
+
+
+def _validate_memory_path_components(path: Path) -> None:
+    if os.name != "nt":
+        return
+    parts = path.parts[1:] if path.anchor else path.parts
+    for component in parts:
+        _validate_windows_memory_component(component)
+
+
+def _validate_windows_memory_component(component: str) -> None:
+    if os.name != "nt":
+        return
+    if (
+        not component
+        or component in (".", "..")
+        or "\\" in component
+        or "/" in component
+        or ":" in component
+        or component.rstrip(" .") != component
+    ):
+        raise MemoryIdentityError("memory path component is invalid")
+    stem = component.split(".", 1)[0].casefold()
+    if stem in _WINDOWS_RESERVED_COMPONENTS:
+        raise MemoryIdentityError("memory path component is invalid")
+    try:
+        component_units = len(component.encode("utf-16-le")) // 2
+    except UnicodeEncodeError:
+        raise MemoryIdentityError("memory path component is invalid") from None
+    if component_units > 255:
+        raise MemoryIdentityError("memory path component is invalid")
+
+
+def _reject_protected_path_overlap(
+    root: Path,
+    protected_paths: Tuple[str, ...],
+    *,
+    root_descriptor: Optional[_PhysicalPathDescriptor] = None,
+) -> None:
+    checked_root = root_descriptor or _physical_path_descriptor(root)
     for protected in protected_paths:
-        if _paths_overlap(root, Path(protected)):
+        protected_descriptor = _physical_path_descriptor(Path(protected))
+        if _physical_descriptors_overlap(checked_root, protected_descriptor):
             raise MemoryIdentityError(
                 "memory root overlaps protected repository paths"
             )
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
-    left_value = _normalized_path(left)
-    right_value = _normalized_path(right)
-    try:
-        common = os.path.commonpath((left_value, right_value))
-    except ValueError:
-        return False
-    return common == left_value or common == right_value
+    left_descriptor = _physical_path_descriptor(left)
+    right_descriptor = _physical_path_descriptor(right)
+    return _physical_descriptors_overlap(left_descriptor, right_descriptor)
+
+
+def _physical_descriptors_overlap(
+    left_descriptor: _PhysicalPathDescriptor,
+    right_descriptor: _PhysicalPathDescriptor,
+) -> bool:
+    return _physical_path_is_ancestor(
+        left_descriptor,
+        right_descriptor,
+    ) or _physical_path_is_ancestor(
+        right_descriptor,
+        left_descriptor,
+    )
 
 
 def _path_is_within(candidate: Path, root: Path) -> bool:
-    candidate_value = _normalized_path(candidate)
-    root_value = _normalized_path(root)
-    try:
-        return os.path.commonpath((candidate_value, root_value)) == root_value
-    except ValueError:
-        return False
+    return _physical_path_is_ancestor(
+        _physical_path_descriptor(root),
+        _physical_path_descriptor(candidate),
+    )
+
+
+def _physical_path_descriptor(path: Path) -> _PhysicalPathDescriptor:
+    if not path.is_absolute():
+        raise MemoryIdentityError("memory path must be absolute")
+    current = Path(os.path.normpath(str(path)))
+    missing_parts = []
+    while True:
+        try:
+            metadata = current.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            parent = current.parent
+            if parent == current:
+                raise MemoryIdentityError("unable to inspect memory path safety") from None
+            missing_parts.insert(0, _comparison_path_part(current.name))
+            current = parent
+            continue
+        except OSError:
+            raise MemoryIdentityError("unable to inspect memory path safety") from None
+        if missing_parts and not stat.S_ISDIR(metadata.st_mode):
+            raise MemoryIdentityError("memory path component is not a directory")
+        break
+
+    suffix = tuple(missing_parts)
+    ancestors = []
+    visited_paths = set()
+    while True:
+        normalized_current = _normalized_path(current)
+        if normalized_current in visited_paths:
+            raise MemoryIdentityError("unable to inspect memory path safety")
+        visited_paths.add(normalized_current)
+        try:
+            metadata = current.stat()
+        except OSError:
+            raise MemoryIdentityError("unable to inspect memory path safety") from None
+        ancestors.append(
+            _PhysicalPathAncestor(
+                identity=(int(metadata.st_dev), int(metadata.st_ino)),
+                suffix_parts=suffix,
+            )
+        )
+        parent = current.parent
+        if parent == current:
+            break
+        suffix = (_comparison_path_part(current.name),) + suffix
+        current = parent
+
+    return _PhysicalPathDescriptor(
+        ancestors=tuple(ancestors),
+        missing_parts=tuple(missing_parts),
+    )
+
+
+def _physical_path_is_ancestor(
+    ancestor: _PhysicalPathDescriptor,
+    candidate: _PhysicalPathDescriptor,
+) -> bool:
+    if not ancestor.missing_parts:
+        target = ancestor.deepest_identity
+        return any(item.identity == target for item in candidate.ancestors)
+
+    base = ancestor.deepest_identity
+    for item in candidate.ancestors:
+        if item.identity != base:
+            continue
+        expected = ancestor.missing_parts
+        return item.suffix_parts[: len(expected)] == expected
+    return False
+
+
+def _comparison_path_part(value: str) -> str:
+    return os.path.normcase(value)
 
 
 def _normalized_path(path: Path) -> str:
@@ -1023,8 +1596,8 @@ def _normalized_path(path: Path) -> str:
 def _utf16_code_units(value: str) -> int:
     try:
         return len(value.encode("utf-16-le")) // 2
-    except UnicodeEncodeError as error:
-        raise MemoryIdentityError("memory namespace contains unsupported path text") from error
+    except UnicodeEncodeError:
+        raise MemoryIdentityError("memory namespace contains unsupported path text") from None
 
 
 __all__ = [
@@ -1061,6 +1634,7 @@ __all__ = [
     "repository_key",
     "repository_namespace_path",
     "resolve_memory_root",
+    "validate_repository_memory_namespace",
     "verify_repository_identity",
     "verify_repository_locator",
 ]

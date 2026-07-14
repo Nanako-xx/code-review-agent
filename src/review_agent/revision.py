@@ -46,9 +46,12 @@ class RevisionResolver:
     def repository_identity(self, repo: Path) -> RepositoryIdentity:
         repository = Path(repo).resolve()
         top_level = Path(
-            self._git(repository, ["rev-parse", "--show-toplevel"])
+            self._git_path(repository, ["rev-parse", "--show-toplevel"])
         ).resolve()
-        common_raw = self._git(repository, ["rev-parse", "--git-common-dir"])
+        common_raw = self._git_path(
+            repository,
+            ["rev-parse", "--git-common-dir"],
+        )
         common_path = Path(common_raw)
         if not common_path.is_absolute():
             common_path = repository / common_path
@@ -73,11 +76,13 @@ class RevisionResolver:
         repository = Path(repo).resolve()
         identity = self.repository_identity(repository)
         common_dir = Path(identity.git_common_dir).resolve()
-        worktree_output = self._git(
+        worktree_result = self._run_git_bytes(
             repository,
             ["worktree", "list", "--porcelain", "-z"],
         )
-        worktree_paths = _parse_worktree_paths(worktree_output)
+        if worktree_result.returncode != 0:
+            raise ValueError("unable to enumerate repository worktrees")
+        worktree_paths = _parse_worktree_paths(worktree_result.stdout)
         current_path = str(Path(identity.canonical_path).resolve())
         if current_path not in worktree_paths:
             raise ValueError("current repository is missing from Git worktree metadata")
@@ -87,13 +92,14 @@ class RevisionResolver:
             worktree = Path(worktree_value)
             if not worktree.is_dir():
                 continue
-            result = self._run_git(
-                worktree,
-                ["rev-parse", "--absolute-git-dir"],
-            )
-            if result.returncode != 0 or not result.stdout.strip():
+            try:
+                git_dir_value = self._git_path(
+                    worktree,
+                    ["rev-parse", "--absolute-git-dir"],
+                )
+            except ValueError:
                 raise ValueError("unable to enumerate repository Git directories")
-            git_dir = Path(result.stdout.strip())
+            git_dir = Path(git_dir_value)
             if not git_dir.is_absolute():
                 git_dir = worktree / git_dir
             git_dirs.add(str(git_dir.resolve(strict=False)))
@@ -253,6 +259,12 @@ class RevisionResolver:
             raise ValueError(message)
         return result.stdout.strip()
 
+    def _git_path(self, repo: Path, args: list[str]) -> str:
+        result = self._run_git_bytes(repo, args)
+        if result.returncode != 0:
+            raise ValueError("Git path query failed")
+        return _decode_git_path_output(result.stdout)
+
     def _optional_git(self, repo: Path, args: list[str]) -> str | None:
         result = self._run_git(repo, args)
         if result.returncode != 0:
@@ -276,6 +288,25 @@ class RevisionResolver:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as error:
+            raise RuntimeError(f"failed to execute Git in {repo}: {error}") from error
+
+    def _run_git_bytes(
+        self,
+        repo: Path,
+        args: list[str],
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Run a Git command whose protocol contains filesystem path bytes."""
+
+        try:
+            return subprocess.run(
+                ["git", "--no-replace-objects", *args],
+                cwd=repo,
+                env=sanitized_git_environment(),
+                text=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -383,21 +414,23 @@ def normalize_repository_identity_path(path: str | Path) -> str:
     return normalized.replace("\\", "/")
 
 
-def _parse_worktree_paths(output: str) -> tuple[str, ...]:
+def _parse_worktree_paths(output: bytes) -> tuple[str, ...]:
+    if not isinstance(output, bytes):
+        raise ValueError("Git returned invalid worktree metadata")
     if not output:
         raise ValueError("Git returned empty worktree metadata")
 
     paths: dict[str, str] = {}
-    for raw_record in output.split("\0\0"):
+    for raw_record in output.split(b"\0\0"):
         if not raw_record:
             continue
-        fields = raw_record.split("\0")
-        if not fields or not fields[0].startswith("worktree "):
+        fields = raw_record.split(b"\0")
+        if not fields or not fields[0].startswith(b"worktree "):
             raise ValueError("Git returned invalid worktree metadata")
-        raw_path = fields[0][len("worktree ") :]
-        if not raw_path or "\0" in raw_path:
+        raw_path = fields[0][len(b"worktree ") :]
+        if not raw_path or b"\0" in raw_path:
             raise ValueError("Git returned invalid worktree metadata")
-        candidate = Path(raw_path)
+        candidate = Path(os.fsdecode(raw_path))
         if not candidate.is_absolute():
             raise ValueError("Git returned a non-absolute worktree path")
         try:
@@ -412,6 +445,17 @@ def _parse_worktree_paths(output: str) -> tuple[str, ...]:
     if not paths:
         raise ValueError("Git returned empty worktree metadata")
     return tuple(paths.values())
+
+
+def _decode_git_path_output(output: bytes) -> str:
+    if not isinstance(output, bytes) or not output or b"\0" in output:
+        raise ValueError("Git returned invalid path metadata")
+    value = output[:-1] if output.endswith(b"\n") else output
+    if value.endswith(b"\r"):
+        value = value[:-1]
+    if not value:
+        raise ValueError("Git returned empty path metadata")
+    return os.fsdecode(value)
 
 
 def _sanitize_scp_like_origin(origin: str) -> str | None:

@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import subprocess
 
 import pytest
@@ -196,6 +197,41 @@ def test_repository_layout_enumerates_linked_worktrees_and_real_git_dirs(
         Path(git_dir).parent == Path(layout.git_common_dir) / "worktrees"
         for git_dir in layout.git_dirs
     )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits non-UTF-8 path bytes")
+def test_worktree_parser_preserves_non_utf8_path_bytes(tmp_path: Path) -> None:
+    from review_agent.revision import _parse_worktree_paths
+
+    raw_path = os.fsencode(str(tmp_path)) + b"/worktree-\xff"
+    output = b"worktree " + raw_path + b"\0HEAD " + (b"a" * 40) + b"\0\0"
+
+    parsed = _parse_worktree_paths(output)
+
+    assert len(parsed) == 1
+    assert os.fsencode(parsed[0]) == raw_path
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits non-UTF-8 path bytes")
+def test_repository_layout_preserves_non_utf8_repository_path_bytes(
+    tmp_path: Path,
+) -> None:
+    raw_repository = os.fsencode(str(tmp_path)) + b"/repository-\xff"
+    os.mkdir(raw_repository)
+    repository = Path(os.fsdecode(raw_repository))
+    run_git(repository, "init")
+    run_git(repository, "config", "user.email", "review-agent@example.test")
+    run_git(repository, "config", "user.name", "Review Agent")
+    (repository / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    run_git(repository, "add", "app.py")
+    run_git(repository, "commit", "-m", "initial")
+
+    resolver = RevisionResolver()
+    identity = resolver.repository_identity(repository)
+    layout = resolver.repository_layout(repository)
+
+    assert os.fsencode(identity.canonical_path) == raw_repository
+    assert os.fsencode(layout.worktree_paths[0]) == raw_repository
 
 
 def test_revision_resolver_reports_invalid_revision(git_repo: Path) -> None:

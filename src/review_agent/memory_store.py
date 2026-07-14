@@ -43,6 +43,7 @@ from review_agent.memory_identity import (
     RepositoryIdentityCore,
     RepositoryIdentityDescriptor,
     RepositoryMemoryNamespace,
+    validate_repository_memory_namespace,
 )
 from review_agent.memory_models import (
     CandidateStatus,
@@ -622,6 +623,7 @@ class MemoryStore:
 
         descriptor: Optional[RepositoryIdentityDescriptor] = None
         if isinstance(namespace, RepositoryMemoryNamespace):
+            validate_repository_memory_namespace(namespace)
             raw_path = Path(namespace.namespace_path)
             descriptor = namespace.metadata
         else:
