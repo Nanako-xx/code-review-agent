@@ -270,6 +270,24 @@ def test_unknown_schema_fails_closed_without_rewriting_database(tmp_path: Path) 
     assert database.read_bytes() == before
 
 
+def test_live_schema_definition_cannot_hide_behind_valid_metadata(
+    tmp_path: Path,
+) -> None:
+    namespace = tmp_path / "memory"
+    store = MemoryStore(namespace)
+    with store._maintenance_connection() as connection:
+        connection.execute("DROP TRIGGER events_no_update")
+        connection.execute(
+            """
+            CREATE TRIGGER events_no_update BEFORE UPDATE ON events
+            BEGIN SELECT 1; END
+            """
+        )
+
+    with pytest.raises(MemoryStoreCorruptionError, match="live schema"):
+        MemoryStore(namespace)
+
+
 def test_candidate_write_generation_event_and_request_replay_are_atomic(
     tmp_path: Path,
 ) -> None:

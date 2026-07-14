@@ -4951,6 +4951,43 @@ def _table_names(connection: sqlite3.Connection) -> Set[str]:
     }
 
 
+def _schema_object_digest(connection: sqlite3.Connection) -> str:
+    objects = []
+    for row in connection.execute(
+        """
+        SELECT type, name, sql FROM sqlite_master
+        WHERE type IN ('table', 'index', 'trigger')
+          AND name NOT LIKE 'sqlite_%'
+          AND sql IS NOT NULL
+        ORDER BY type, name
+        """
+    ):
+        objects.append(
+            {
+                "type": str(row[0]),
+                "name": str(row[1]),
+                "sql": " ".join(str(row[2]).split()),
+            }
+        )
+    return canonical_sha256(objects)
+
+
+_EXPECTED_SCHEMA_OBJECT_DIGEST: Optional[str] = None
+
+
+def _expected_schema_object_digest() -> str:
+    global _EXPECTED_SCHEMA_OBJECT_DIGEST
+    if _EXPECTED_SCHEMA_OBJECT_DIGEST is None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            for statement in _SCHEMA_STATEMENTS:
+                connection.execute(statement)
+            _EXPECTED_SCHEMA_OBJECT_DIGEST = _schema_object_digest(connection)
+        finally:
+            connection.close()
+    return _EXPECTED_SCHEMA_OBJECT_DIGEST
+
+
 def _validate_schema_connection(connection: sqlite3.Connection) -> None:
     tables = _table_names(connection)
     if "metadata" not in tables:
@@ -4982,6 +5019,17 @@ def _validate_schema_connection(connection: sqlite3.Connection) -> None:
         raise MemoryStoreCorruptionError("memory store append-only guards are incomplete")
     if metadata.get("schema_definition_hash") != SCHEMA_DEFINITION_HASH:
         raise MemoryStoreCorruptionError("memory store schema definition is invalid")
+    try:
+        actual_schema_digest = _schema_object_digest(connection)
+        expected_schema_digest = _expected_schema_object_digest()
+    except sqlite3.Error:
+        raise MemoryStoreCorruptionError(
+            "memory store schema definition is unreadable"
+        ) from None
+    if not hmac.compare_digest(actual_schema_digest, expected_schema_digest):
+        raise MemoryStoreCorruptionError(
+            "memory store live schema does not match its fixed definition"
+        )
     migration = connection.execute(
         """
         SELECT schema_name, definition_hash FROM schema_migrations
