@@ -219,15 +219,16 @@ def test_submission_uses_trusted_runtime_origin_and_reaches_pending(
     # Persisted producer metadata says MODEL, but trusted Runtime origin is LOCAL.
     # Candidate metadata must not be allowed to choose validation authority.
     candidate = _candidate(git_repo, sha, producer_type=ProducerType.MODEL)
+    trusted_local = _provenance(
+        candidate,
+        sha,
+        origin=ProducerType.LOCAL,
+        allow_sources=False,
+    )
     result = _submit(
         lifecycle,
         candidate,
-        provenance=_provenance(
-            candidate,
-            sha,
-            origin=ProducerType.LOCAL,
-            allow_sources=False,
-        ),
+        provenance=trusted_local,
         label="trusted-local",
     )
 
@@ -236,6 +237,12 @@ def test_submission_uses_trusted_runtime_origin_and_reaches_pending(
     assert result.persisted
     assert result.dedupe.kind is CandidateDedupeKind.UNIQUE
     assert store.get_candidate(candidate.candidate_id).status is CandidateStatus.PENDING_APPROVAL
+    receipt = store.select_candidate_authority_receipt(
+        candidate.candidate_id,
+        authority_resolution_hash=trusted_local.authority_resolution_hash,
+    )
+    assert receipt.origin is ProducerType.LOCAL
+    assert receipt.proposal_head_sha == sha
     assert [event.action for event in store.list_events(candidate.repository_key)] == [
         "candidate_submitted",
         "validate",
@@ -265,6 +272,53 @@ def test_submission_uses_trusted_runtime_origin_and_reaches_pending(
         issue.code for issue in denied.validation.issues
     }
     assert store.get_candidate(model_authority_candidate.candidate_id).status is CandidateStatus.REJECTED
+
+
+def test_approval_restores_the_stored_runtime_authority_context(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    lifecycle, store = _lifecycle(git_repo, tmp_path)
+    sha = _head(git_repo)
+    candidate = _candidate(git_repo, sha, producer_type=ProducerType.MODEL)
+    trusted_local = _provenance(
+        candidate,
+        sha,
+        origin=ProducerType.LOCAL,
+        allow_sources=False,
+    )
+    _submit(
+        lifecycle,
+        candidate,
+        provenance=trusted_local,
+        label="authority-restore",
+    )
+
+    with pytest.raises(MemoryLifecycleError, match="authority"):
+        lifecycle.approve_candidate(
+            candidate.candidate_id,
+            runtime_provenance=_provenance(
+                candidate,
+                sha,
+                origin=ProducerType.MODEL,
+                allow_sources=True,
+            ),
+            actor="amy",
+            reason="Maintainer verified this durable project rule.",
+            request_id=stable_request_id("approve", "wrong-runtime-origin"),
+            created_at=LATER,
+        )
+
+    assert store.get_candidate(candidate.candidate_id).status is (
+        CandidateStatus.PENDING_APPROVAL
+    )
+    approved = _approve(
+        lifecycle,
+        candidate,
+        provenance=trusted_local,
+        label="authority-restore",
+    )
+    assert approved.record.status is RecordStatus.ACTIVE
 
 
 def test_invalid_is_rejected_but_blocked_content_is_never_persisted(

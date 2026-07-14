@@ -27,6 +27,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from review_agent.memory_models import (
     Applicability,
+    CandidateAuthorityReceipt,
     CandidateStatus,
     DurableMemoryRecord,
     GitCommitSourceRef,
@@ -45,6 +46,7 @@ from review_agent.memory_models import (
 )
 from review_agent.memory_sources import (
     SourceValidationCode,
+    SourceValidationError,
     SourceValidationReport,
     SourceValidator,
     TrustedCandidateProvenance,
@@ -304,14 +306,37 @@ class MemoryLifecycle:
                 runtime_provenance=runtime_provenance,
             )
 
+        authority_receipt = self._build_candidate_authority_receipt(
+            candidate,
+            runtime_provenance=runtime_provenance,
+            validation=validation,
+        )
+
         dedupe = self._dedupe_candidate(candidate, existing=existing)
         if existing is not None:
+            writes: Tuple[WriteResult, ...] = ()
+            if replace(existing, status=CandidateStatus.PROPOSED) == candidate:
+                writes = (
+                    self.store.put_candidate(
+                        candidate,
+                        authority_receipt,
+                        request_id=stable_request_id(
+                            "memory_lifecycle",
+                            "candidate_authority",
+                            authority_receipt.receipt_id,
+                        ),
+                        actor_type=runtime_provenance.origin.value,
+                        actor_id="memory_lifecycle",
+                        reason_code="candidate_authority_revalidated",
+                    ),
+                )
             return CandidateLifecycleResult(
                 candidate_id=existing.candidate_id,
                 status=existing.status,
                 validation=validation,
                 dedupe=dedupe,
                 persisted=True,
+                write_results=writes,
             )
 
         if dedupe.suppressed:
@@ -319,6 +344,7 @@ class MemoryLifecycle:
                 candidate,
                 request_id=request_id,
                 runtime_provenance=runtime_provenance,
+                authority_receipt=authority_receipt,
                 action="duplicate",
                 reason_code=dedupe.kind.value,
                 reason="Candidate content was deterministically suppressed as a duplicate.",
@@ -336,6 +362,7 @@ class MemoryLifecycle:
         writes.append(
             self.store.put_candidate(
                 candidate,
+                authority_receipt,
                 request_id=_child_request_id(request_id, candidate.candidate_id, "put"),
                 actor_type=runtime_provenance.origin.value,
                 actor_id="memory_lifecycle",
@@ -709,25 +736,48 @@ class MemoryLifecycle:
                 "trusted Runtime provenance is required",
                 MemoryLifecycleErrorCode.INVALID_INPUT,
             )
+        proposal = replace(candidate, status=CandidateStatus.PROPOSED)
+        try:
+            receipt = self.store.select_candidate_authority_receipt(
+                candidate.candidate_id,
+                authority_resolution_hash=(
+                    runtime_provenance.authority_resolution_hash
+                ),
+            )
+            current_target_head = self._resolve_runtime_target_head(
+                runtime_provenance
+            )
+            restoration = self.source_validator.restore_candidate_authority(
+                receipt,
+                proposal,
+                current_provenance=runtime_provenance,
+                current_target_head_sha=current_target_head,
+            )
+        except MemoryStoreNotFoundError:
+            raise MemoryLifecycleError(
+                "candidate authority receipt is unavailable for this Runtime context",
+                MemoryLifecycleErrorCode.SOURCE_VALIDATION_FAILED,
+            ) from None
+        except SourceValidationError as error:
+            if error.report is not None and not error.report.valid:
+                self._reject_failed_approval_validation(
+                    candidate,
+                    request_id=request_id,
+                    created_at=created_at,
+                    expected_generation=expected_generation,
+                )
+            raise MemoryLifecycleError(
+                "candidate authority failed approval-time restoration",
+                MemoryLifecycleErrorCode.SOURCE_VALIDATION_FAILED,
+            ) from None
         validation = self.source_validator.validate_candidate(
-            replace(candidate, status=CandidateStatus.PROPOSED),
-            runtime_provenance=runtime_provenance,
+            proposal,
+            runtime_provenance=restoration.provenance,
         )
         if not validation.valid:
-            self.store.transition_candidate(
-                candidate.candidate_id,
-                expected_status=CandidateStatus.PENDING_APPROVAL,
-                new_status=CandidateStatus.REJECTED,
-                action="reject",
-                actor_type="runtime",
-                actor_id="memory_lifecycle",
-                reason_code="approval_source_validation_failed",
-                reason=None,
-                request_id=_child_request_id(
-                    request_id,
-                    candidate.candidate_id,
-                    "approval-validation-failed",
-                ),
+            self._reject_failed_approval_validation(
+                candidate,
+                request_id=request_id,
                 created_at=created_at,
                 expected_generation=expected_generation,
             )
@@ -737,7 +787,7 @@ class MemoryLifecycle:
             )
 
         payload = build_canonical_source_bundle(
-            replace(candidate, status=CandidateStatus.PROPOSED),
+            proposal,
             validation,
         )
         timestamp = _timestamp_or_now(created_at)
@@ -787,6 +837,9 @@ class MemoryLifecycle:
             request_id=request_id,
             expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
             expected_generation=expected_generation,
+            authority_resolution_hash=(
+                restoration.provenance.authority_resolution_hash
+            ),
             actor_type="human",
             actor_id=actor,
             reason_code=reason_code,
@@ -800,6 +853,70 @@ class MemoryLifecycle:
             bundle_payload=payload,
             validation=validation,
             write_result=write,
+        )
+
+    def _build_candidate_authority_receipt(
+        self,
+        candidate: MemoryCandidate,
+        *,
+        runtime_provenance: TrustedCandidateProvenance,
+        validation: SourceValidationReport,
+    ) -> CandidateAuthorityReceipt:
+        try:
+            return self.source_validator.build_candidate_authority_receipt(
+                candidate,
+                runtime_provenance,
+                validation,
+                current_target_head_sha=self._resolve_runtime_target_head(
+                    runtime_provenance
+                ),
+                created_at=candidate.created_at,
+            )
+        except SourceValidationError:
+            raise MemoryLifecycleError(
+                "candidate authority could not be issued from the live Runtime context",
+                MemoryLifecycleErrorCode.SOURCE_VALIDATION_FAILED,
+            ) from None
+
+    def _resolve_runtime_target_head(
+        self,
+        runtime_provenance: TrustedCandidateProvenance,
+    ) -> str:
+        try:
+            return self.source_validator.revision_resolver.resolve_commit(
+                self.source_validator.repository,
+                runtime_provenance.target_head_sha,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise MemoryLifecycleError(
+                "Runtime target revision cannot be resolved in the live repository",
+                MemoryLifecycleErrorCode.SOURCE_VALIDATION_FAILED,
+            ) from None
+
+    def _reject_failed_approval_validation(
+        self,
+        candidate: MemoryCandidate,
+        *,
+        request_id: str,
+        created_at: Optional[str],
+        expected_generation: Optional[int],
+    ) -> None:
+        self.store.transition_candidate(
+            candidate.candidate_id,
+            expected_status=CandidateStatus.PENDING_APPROVAL,
+            new_status=CandidateStatus.REJECTED,
+            action="reject",
+            actor_type="runtime",
+            actor_id="memory_lifecycle",
+            reason_code="approval_source_validation_failed",
+            reason=None,
+            request_id=_child_request_id(
+                request_id,
+                candidate.candidate_id,
+                "approval-validation-failed",
+            ),
+            created_at=created_at,
+            expected_generation=expected_generation,
         )
 
     def _replay_approval(
@@ -984,6 +1101,7 @@ class MemoryLifecycle:
         *,
         request_id: str,
         runtime_provenance: TrustedCandidateProvenance,
+        authority_receipt: Optional[CandidateAuthorityReceipt] = None,
         action: str,
         reason_code: str,
         reason: Optional[str],
@@ -994,6 +1112,7 @@ class MemoryLifecycle:
             writes.append(
                 self.store.put_candidate(
                     candidate,
+                    authority_receipt,
                     request_id=_child_request_id(
                         request_id,
                         candidate.candidate_id,

@@ -723,7 +723,8 @@ class RepositoryKnowledgeCache:
             except MemoryStoreConflictError:
                 # A concurrent Session pin wins over ordinary cache collection.
                 retained.add(entry_id)
-        blob_result = self._store.gc_blobs(dry_run=False)
+        blob_preview = self._store.gc_blobs(dry_run=True)
+        blob_result = self._store.apply_blob_gc(blob_preview)
         return RepositoryCacheGCResult(
             candidate_entry_ids=candidates,
             deleted_entry_ids=tuple(sorted(deleted)),
