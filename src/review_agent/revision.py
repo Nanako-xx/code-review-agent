@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -42,7 +43,7 @@ class RevisionResolver:
         common_path = Path(common_raw)
         if not common_path.is_absolute():
             common_path = repository / common_path
-        origin_url = _sanitize_origin_url(
+        origin_url = sanitize_origin_url(
             self._optional_git(repository, ["remote", "get-url", "origin"])
         )
         return RepositoryIdentity(
@@ -172,7 +173,13 @@ class RevisionResolver:
             raise RuntimeError(f"failed to execute Git in {repo}: {error}") from error
 
 
-def _sanitize_origin_url(origin_url: str | None) -> str | None:
+def sanitize_origin_url(origin_url: str | None) -> str | None:
+    """Return a credential-free origin suitable for local identity metadata.
+
+    Unsafe or ambiguous remote helper syntax is omitted instead of being echoed
+    into manifests or error messages.
+    """
+
     if origin_url is None:
         return None
     origin = origin_url.strip()
@@ -197,6 +204,47 @@ def _sanitize_origin_url(origin_url: str | None) -> str | None:
     authority = hostname if port is None else f"{hostname}:{port}"
     sanitized = urlunsplit((scheme, authority, parsed.path, "", ""))
     return sanitized or None
+
+
+def normalize_repository_origin(origin_url: str | None) -> str | None:
+    """Normalize a sanitized origin for deterministic identity hashing."""
+
+    sanitized = sanitize_origin_url(origin_url)
+    if sanitized is None:
+        return None
+    if "://" not in sanitized:
+        host, path = sanitized.split(":", 1)
+        normalized_path = path.rstrip("/")
+        return f"{host.casefold()}:{normalized_path}"
+
+    parsed = urlsplit(sanitized)
+    normalized_path = parsed.path.rstrip("/")
+    return urlunsplit(
+        (
+            parsed.scheme.casefold(),
+            parsed.netloc.casefold(),
+            normalized_path,
+            "",
+            "",
+        )
+    )
+
+
+def normalize_repository_identity_path(path: str | Path) -> str:
+    """Return the local, canonical comparison form used in repository keys."""
+
+    raw_path = str(path)
+    if not raw_path or "\0" in raw_path:
+        raise ValueError("repository identity path must be a non-empty absolute path")
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        raise ValueError("repository identity path must be an absolute path")
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError as error:
+        raise ValueError("unable to canonicalize repository identity path") from error
+    normalized = os.path.normcase(os.path.normpath(str(resolved)))
+    return normalized.replace("\\", "/")
 
 
 def _sanitize_scp_like_origin(origin: str) -> str | None:

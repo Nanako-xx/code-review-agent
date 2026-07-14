@@ -4,7 +4,12 @@ import subprocess
 import pytest
 
 from conftest import run_git
-from review_agent.revision import RevisionResolver
+from review_agent.revision import (
+    RevisionResolver,
+    normalize_repository_identity_path,
+    normalize_repository_origin,
+    sanitize_origin_url,
+)
 
 
 def test_revision_resolver_resolves_symbolic_revisions_to_commit_shas(
@@ -134,6 +139,34 @@ def test_repository_identity_sanitizes_strict_scp_like_origin(
     identity = RevisionResolver().repository_identity(git_repo)
 
     assert identity.origin_url == "example.test:acme/review-target.git"
+
+
+def test_public_origin_sanitizer_matches_repository_identity_behavior(
+    git_repo: Path,
+) -> None:
+    raw_origin = (
+        "HTTPS://user:token@Example.Test/acme/review-target.git"
+        "?access_token=secret#credential"
+    )
+    run_git(git_repo, "remote", "add", "origin", raw_origin)
+
+    identity = RevisionResolver().repository_identity(git_repo)
+
+    assert identity.origin_url == sanitize_origin_url(raw_origin)
+    assert normalize_repository_origin(raw_origin) == (
+        "https://example.test/acme/review-target.git"
+    )
+
+
+def test_repository_identity_path_normalization_is_stable(
+    git_repo: Path,
+) -> None:
+    identity = RevisionResolver().repository_identity(git_repo)
+    common_dir = Path(identity.git_common_dir)
+
+    assert normalize_repository_identity_path(common_dir) == (
+        normalize_repository_identity_path(common_dir / "." / "nested" / "..")
+    )
 
 
 def test_revision_resolver_reports_invalid_revision(git_repo: Path) -> None:
