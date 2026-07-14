@@ -717,12 +717,38 @@ class MemoryStore:
         *,
         read_only: bool = True,
     ) -> Iterator[sqlite3.Connection]:
-        """Open a configured diagnostic connection and always close it."""
+        """Open a read-only diagnostic connection and always close it.
 
-        connection = self._connect(read_only=read_only)
+        Authority writes must go through Store transactions so events,
+        generations, receipts, and projections cannot diverge.
+        """
+
+        if read_only is not True:
+            raise MemoryStoreReadOnlyError(
+                "raw writable connections are not part of the MemoryStore API"
+            )
+        connection = self._connect(read_only=True)
         try:
             yield connection
-            if not read_only and connection.in_transaction:
+        except MemoryStoreError:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.Error as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise _translate_sqlite_error(error) from None
+        finally:
+            connection.close()
+
+    @contextmanager
+    def _maintenance_connection(self) -> Iterator[sqlite3.Connection]:
+        """Internal/test-only connection for checkpoints and fault injection."""
+
+        connection = self._connect(read_only=False)
+        try:
+            yield connection
+            if connection.in_transaction:
                 connection.commit()
         except MemoryStoreError:
             if connection.in_transaction:
@@ -1335,6 +1361,158 @@ class MemoryStore:
                 "memory generation does not match the event chain"
             )
         return len(rows)
+
+    def _verify_projection_connection(
+        self,
+        connection: sqlite3.Connection,
+        repository_key: str,
+    ) -> None:
+        """Verify mutable projections are exact derivatives of audited events."""
+
+        key = _repository_key(repository_key)
+        latest: Dict[Tuple[str, str], MemoryEvent] = {}
+        for row in connection.execute(
+            "SELECT * FROM events WHERE repository_key = ? ORDER BY sequence",
+            (key,),
+        ):
+            event = _event_from_row(row)
+            latest[(event.subject_type, event.subject_id)] = event
+
+        def require_projection_event(
+            *,
+            subject_type: str,
+            subject_id: str,
+            status: str,
+            generation: Any,
+            generation_kind: str,
+        ) -> MemoryEvent:
+            event = latest.get((subject_type, subject_id))
+            if (
+                event is None
+                or event.new_status != status
+                or event.generation_kind != generation_kind
+                or type(generation) is not int
+                or event.generation != generation
+            ):
+                raise MemoryStoreCorruptionError(
+                    "%s projection does not match its latest event" % subject_type
+                )
+            return event
+
+        candidate_rows = connection.execute(
+            "SELECT * FROM candidates WHERE repository_key = ?",
+            (key,),
+        ).fetchall()
+        candidate_ids: Set[str] = set()
+        for row in candidate_rows:
+            candidate = _candidate_from_row(row)
+            candidate_ids.add(candidate.candidate_id)
+            require_projection_event(
+                subject_type="candidate",
+                subject_id=candidate.candidate_id,
+                status=candidate.status.value,
+                generation=row["generation"],
+                generation_kind="memory",
+            )
+
+        bundle_rows = connection.execute(
+            "SELECT * FROM source_bundles WHERE repository_key = ?",
+            (key,),
+        ).fetchall()
+        bundle_ids: Set[str] = set()
+        for row in bundle_rows:
+            bundle = _source_bundle_from_row(row)
+            bundle_ids.add(bundle.bundle_hash)
+            require_projection_event(
+                subject_type="source_bundle",
+                subject_id=bundle.bundle_hash,
+                status="stored",
+                generation=row["generation"],
+                generation_kind="memory",
+            )
+
+        record_rows = connection.execute(
+            "SELECT * FROM records WHERE repository_key = ?",
+            (key,),
+        ).fetchall()
+        record_ids: Set[str] = set()
+        for row in record_rows:
+            record = _record_from_row(row)
+            record_ids.add(record.memory_id)
+            event = latest.get(("record", record.memory_id))
+            if event is None:
+                approval = latest.get(("candidate", record.candidate_id))
+                if (
+                    approval is None
+                    or approval.action != "approve"
+                    or approval.new_status != CandidateStatus.APPROVED.value
+                    or record.status is not RecordStatus.ACTIVE
+                    or approval.generation_kind != "memory"
+                    or type(row["generation"]) is not int
+                    or approval.generation != row["generation"]
+                ):
+                    raise MemoryStoreCorruptionError(
+                        "record projection does not match candidate approval"
+                    )
+            else:
+                require_projection_event(
+                    subject_type="record",
+                    subject_id=record.memory_id,
+                    status=record.status.value,
+                    generation=row["generation"],
+                    generation_kind="memory",
+                )
+
+        feedback_rows = connection.execute(
+            "SELECT * FROM feedback WHERE repository_key = ?",
+            (key,),
+        ).fetchall()
+        feedback_ids: Set[str] = set()
+        for row in feedback_rows:
+            feedback = _feedback_from_row(row)
+            feedback_ids.add(feedback.feedback_id)
+            require_projection_event(
+                subject_type="feedback",
+                subject_id=feedback.feedback_id,
+                status=feedback.status.value,
+                generation=row["generation"],
+                generation_kind="feedback",
+            )
+
+        knowledge_rows = connection.execute(
+            "SELECT * FROM knowledge_entries WHERE repository_key = ?",
+            (key,),
+        ).fetchall()
+        knowledge_ids: Set[str] = set()
+        for row in knowledge_rows:
+            entry = _knowledge_from_row(connection, row)
+            knowledge_ids.add(entry.entry_id)
+            require_projection_event(
+                subject_type="knowledge",
+                subject_id=entry.entry_id,
+                status="stored",
+                generation=row["generation"],
+                generation_kind="knowledge",
+            )
+
+        present = {
+            "candidate": candidate_ids,
+            "source_bundle": bundle_ids,
+            "record": record_ids,
+            "feedback": feedback_ids,
+            "knowledge": knowledge_ids,
+        }
+        for (subject_type, subject_id), event in latest.items():
+            if subject_type == "knowledge" and event.new_status == "deleted":
+                if subject_id in knowledge_ids:
+                    raise MemoryStoreCorruptionError(
+                        "deleted knowledge projection still exists"
+                    )
+                continue
+            if subject_id not in present[subject_type]:
+                raise MemoryStoreCorruptionError(
+                    "%s event has no matching projection" % subject_type
+                )
 
     def put_candidate(
         self,
@@ -3687,6 +3865,7 @@ class MemoryStore:
         try:
             connection.execute("BEGIN")
             self._verify_event_chain_connection(connection, key)
+            self._verify_projection_connection(connection, key)
             generations = self._generations_from_connection(connection, key)
             records = tuple(
                 _validated_record_from_row(connection, row)
@@ -3850,9 +4029,11 @@ class MemoryStore:
             for row in connection.execute(
                 "SELECT repository_key FROM event_chain_heads ORDER BY repository_key"
             ):
+                repository_key = str(row["repository_key"])
                 event_count += self._verify_event_chain_connection(
-                    connection, str(row["repository_key"])
+                    connection, repository_key
                 )
+                self._verify_projection_connection(connection, repository_key)
             return IntegrityReport(
                 repository_count=len(repositories),
                 event_count=event_count,
@@ -3867,7 +4048,7 @@ class MemoryStore:
         checked_mode = str(mode).upper()
         if checked_mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
             raise MemoryStoreValidationError("unsupported WAL checkpoint mode")
-        with self.open_connection(read_only=False) as connection:
+        with self._maintenance_connection() as connection:
             row = connection.execute(
                 "PRAGMA wal_checkpoint(%s)" % checked_mode
             ).fetchone()

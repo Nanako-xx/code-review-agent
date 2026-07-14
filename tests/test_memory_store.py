@@ -206,7 +206,7 @@ def test_open_creates_final_schema_once_and_enables_required_pragmas(
     assert first_metadata == reopened.metadata()
     assert first_metadata["schema_name"] == STORE_SCHEMA_NAME
     assert first_metadata["schema_version"] == str(STORE_SCHEMA_VERSION)
-    with store.open_connection(read_only=False) as connection:
+    with store._maintenance_connection() as connection:
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].casefold() == "wal"
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 275
@@ -230,7 +230,7 @@ def test_open_creates_final_schema_once_and_enables_required_pragmas(
         "outbox_receipts",
     }.issubset(tables)
 
-    with store.open_connection(read_only=False) as connection:
+    with store._maintenance_connection() as connection:
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 """
@@ -240,6 +240,12 @@ def test_open_creates_final_schema_once_and_enables_required_pragmas(
                 """,
                 (CREATED_AT, CREATED_AT),
             )
+
+    with store.open_connection() as connection:
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+    with pytest.raises(MemoryStoreReadOnlyError, match="raw writable"):
+        with store.open_connection(read_only=False):
+            pass
 
 
 def test_unknown_schema_fails_closed_without_rewriting_database(tmp_path: Path) -> None:
@@ -289,7 +295,7 @@ def test_candidate_write_generation_event_and_request_replay_are_atomic(
 def test_failed_event_insert_rolls_back_projection_and_generation(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path / "memory")
     candidate = _candidate()
-    with store.open_connection(read_only=False) as connection:
+    with store._maintenance_connection() as connection:
         connection.execute(
             """
             CREATE TRIGGER reject_test_events BEFORE INSERT ON events
@@ -363,7 +369,7 @@ def test_approval_uses_generation_and_status_cas_without_duplicate_record(
 
     tampered_record = replace(record, statement="Amounts must use integer cents.")
     tampered_json = canonical_json(tampered_record.to_dict())
-    with store.open_connection(read_only=False) as connection:
+    with store._maintenance_connection() as connection:
         connection.execute("DROP TRIGGER records_body_immutable")
         connection.execute(
             "UPDATE records SET model_json = ?, body_hash = ? WHERE memory_id = ?",
@@ -405,7 +411,7 @@ def test_atomic_lifecycle_approval_rolls_back_bundle_pin_and_authority(
     record = _record(candidate, bundle, request_id)
     generation = store.get_generations(REPOSITORY_KEY).memory_generation
 
-    with store.open_connection(read_only=False) as connection:
+    with store._maintenance_connection() as connection:
         connection.execute(
             """
             CREATE TRIGGER reject_atomic_record BEFORE INSERT ON records
@@ -433,7 +439,7 @@ def test_atomic_lifecycle_approval_rolls_back_bundle_pin_and_authority(
             "SELECT COUNT(*) FROM blob_pins WHERE pin_type = 'source_bundle'"
         ).fetchone()[0] == 0
 
-    with store.open_connection(read_only=False) as connection:
+    with store._maintenance_connection() as connection:
         connection.execute("DROP TRIGGER reject_atomic_record")
     result = store.approve_candidate_with_source_bundle(
         record,
@@ -479,7 +485,7 @@ def test_event_hash_chain_detects_tamper_delete_and_reorder(
         request_id=stable_request_id("event-chain", tamper_sql),
     )
     assert store.verify_event_chain(REPOSITORY_KEY) == 1
-    with store.open_connection(read_only=False) as connection:
+    with store._maintenance_connection() as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("DROP TRIGGER events_no_update")
         connection.execute("DROP TRIGGER events_no_delete")
@@ -496,12 +502,41 @@ def test_validated_read_view_rejects_a_tampered_event_chain(tmp_path: Path) -> N
         candidate,
         request_id=stable_request_id("read-view-chain", candidate.candidate_id),
     )
-    with store.open_connection(read_only=False) as connection:
+    with store._maintenance_connection() as connection:
         connection.execute("DROP TRIGGER events_no_update")
         connection.execute("UPDATE events SET action = 'tampered' WHERE sequence = 1")
 
     with pytest.raises(MemoryStoreCorruptionError):
         store.read_view(REPOSITORY_KEY)
+
+
+@pytest.mark.parametrize(
+    "tamper_sql",
+    [
+        "UPDATE candidates SET current_status = 'validated'",
+        "UPDATE candidates SET generation = generation + 1",
+    ],
+)
+def test_validated_reads_reject_projection_only_tampering(
+    tmp_path: Path,
+    tamper_sql: str,
+) -> None:
+    store = MemoryStore(tmp_path / hashlib.sha256(tamper_sql.encode()).hexdigest())
+    candidate = _candidate()
+    store.put_candidate(
+        candidate,
+        request_id=stable_request_id("projection-tamper", tamper_sql),
+    )
+    with store._maintenance_connection() as connection:
+        connection.execute(tamper_sql)
+
+    # The append-only event bytes were not touched; the projection/event join
+    # is what must detect this authority split.
+    assert store.verify_event_chain(REPOSITORY_KEY) == 1
+    with pytest.raises(MemoryStoreCorruptionError, match="projection"):
+        store.read_view(REPOSITORY_KEY)
+    with pytest.raises(MemoryStoreCorruptionError, match="projection"):
+        store.validate_integrity()
 
 
 def test_blob_hash_size_validation_atomic_promotion_and_fail_closed_read(
@@ -590,7 +625,7 @@ def test_blob_promotion_before_database_failure_is_collected_as_orphan(
     store = MemoryStore(tmp_path / "memory")
     content = b"promoted before a simulated database crash"
     digest = hashlib.sha256(content).hexdigest()
-    with store.open_connection(read_only=False) as connection:
+    with store._maintenance_connection() as connection:
         connection.execute(
             """
             CREATE TRIGGER reject_test_blob BEFORE INSERT ON blobs
@@ -602,7 +637,7 @@ def test_blob_promotion_before_database_failure_is_collected_as_orphan(
         store.put_blob(content, media_type="application/octet-stream")
     assert store.blob_path(digest).is_file()
 
-    with store.open_connection(read_only=False) as connection:
+    with store._maintenance_connection() as connection:
         connection.execute("DROP TRIGGER reject_test_blob")
     result = store.gc_blobs(dry_run=False)
     assert str(store.blob_path(digest)) in result.deleted_orphan_paths
