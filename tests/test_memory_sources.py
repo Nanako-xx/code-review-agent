@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 import hashlib
 import json
 from pathlib import Path
@@ -11,8 +11,11 @@ import pytest
 from conftest import run_git
 import review_agent.memory_sources as memory_sources_module
 from review_agent.memory_models import (
+    CandidateAuthorityReceipt,
     CandidateStatus,
     GitCommitSourceRef,
+    HumanDeclarationAuthority,
+    HumanDeclarationOrigin as CanonicalHumanDeclarationOrigin,
     HumanDeclarationSourceRef,
     MemoryCandidate,
     MemoryConfidence,
@@ -28,20 +31,25 @@ from review_agent.memory_models import (
     SourceRef,
     SymbolHashKind,
     ValidityPolicy,
+    stable_repository_binding_id,
     stable_request_id,
 )
 from review_agent.memory_identity import repository_key as derive_repository_key
 from review_agent.memory_sources import (
+    CandidateAuthorityRestoration,
     HumanDeclarationOrigin,
     SourceValidationCode,
     SourceValidationError,
     SourceValidator,
     TrustedCandidateProvenance,
     TrustedHumanDeclaration,
+    build_candidate_authority_receipt,
+    candidate_authority_resolution_hash,
     git_commit_metadata_hash,
     human_declaration_hash,
     repository_range_hash,
     repository_symbol_hash,
+    restore_candidate_authority,
     scan_sensitive_text,
 )
 from review_agent.observations import ObservationStore
@@ -183,10 +191,16 @@ def _declaration(
     )
 
 
+def _declaration_authority(
+    text: str = "All monetary totals are rounded only at the boundary.",
+) -> HumanDeclarationAuthority:
+    return _declaration(text).to_authority()
+
+
 def _candidate(
     repo: Path,
     sha: str,
-    source_ref: GitCommitSourceRef,
+    source_ref: SourceRef,
     *,
     statement: str = "Review arithmetic changes for boundary rounding.",
     sensitivity: Sensitivity = Sensitivity.NORMAL,
@@ -213,16 +227,36 @@ def _candidate(
 
 
 def _runtime_provenance(
+    repo: Path,
     sha: str,
     *,
     origin: ProducerType = ProducerType.LOCAL,
     review_id: str = REVIEW_ID,
+    locator_repository_key: str | None = None,
+    authority_repository_key: str | None = None,
+    binding_id: str | None = None,
+    authority_resolution_hash: str | None = None,
     allowed_source_refs: tuple[SourceRef, ...] = (),
 ) -> TrustedCandidateProvenance:
+    locator_key = locator_repository_key or derive_repository_key(
+        RevisionResolver().repository_identity(repo)
+    )
+    authority_key = authority_repository_key or locator_key
+    resolution_hash = authority_resolution_hash or (
+        candidate_authority_resolution_hash(
+            locator_key,
+            authority_key,
+            binding_id=binding_id,
+        )
+    )
     return TrustedCandidateProvenance(
         origin=origin,
         review_id=review_id,
         target_head_sha=sha,
+        locator_repository_key=locator_key,
+        authority_repository_key=authority_key,
+        authority_resolution_hash=resolution_hash,
+        binding_id=binding_id,
         allowed_source_refs=allowed_source_refs,
     )
 
@@ -706,7 +740,7 @@ def test_sensitivity_has_explicit_persistence_and_remote_sendability_result(
 
     report = SourceValidator(git_repo).validate_candidate(
         candidate,
-        runtime_provenance=_runtime_provenance(sha),
+        runtime_provenance=_runtime_provenance(git_repo, sha),
     )
 
     assert report.valid is valid
@@ -746,7 +780,7 @@ def test_sensitive_candidate_content_is_blocked_without_echoing_body(
 
     report = SourceValidator(git_repo).validate_candidate(
         candidate,
-        runtime_provenance=_runtime_provenance(sha),
+        runtime_provenance=_runtime_provenance(git_repo, sha),
     )
 
     assert not report.valid
@@ -814,6 +848,7 @@ def test_model_candidate_requires_exact_runtime_source_allowlist(
     denied = SourceValidator(git_repo).validate_candidate(
         candidate,
         runtime_provenance=_runtime_provenance(
+            git_repo,
             sha,
             origin=ProducerType.MODEL,
         ),
@@ -821,6 +856,7 @@ def test_model_candidate_requires_exact_runtime_source_allowlist(
     allowed = SourceValidator(git_repo).validate_candidate(
         candidate,
         runtime_provenance=_runtime_provenance(
+            git_repo,
             sha,
             origin=ProducerType.MODEL,
             allowed_source_refs=(source_ref,),
@@ -864,7 +900,7 @@ def test_candidate_uses_derived_repository_key_and_trusted_commit_lineage(
     head_sha = run_git(git_repo, "rev-parse", "HEAD")
     source_ref = GitCommitSourceRef(commit_sha=head_sha)
     valid = _candidate(git_repo, head_sha, source_ref)
-    provenance = _runtime_provenance(head_sha)
+    provenance = _runtime_provenance(git_repo, head_sha)
 
     assert SourceValidator(git_repo).validate_candidate(
         valid,
@@ -923,6 +959,7 @@ def test_runtime_origin_not_candidate_producer_controls_model_allowlisting(
     denied = SourceValidator(git_repo).validate_candidate(
         self_declared_local,
         runtime_provenance=_runtime_provenance(
+            git_repo,
             sha,
             origin=ProducerType.MODEL,
         ),
@@ -930,6 +967,7 @@ def test_runtime_origin_not_candidate_producer_controls_model_allowlisting(
     allowed = SourceValidator(git_repo).validate_candidate(
         self_declared_local,
         runtime_provenance=_runtime_provenance(
+            git_repo,
             sha,
             origin=ProducerType.MODEL,
             allowed_source_refs=(source_ref,),
@@ -938,6 +976,604 @@ def test_runtime_origin_not_candidate_producer_controls_model_allowlisting(
 
     assert SourceValidationCode.SOURCE_NOT_ALLOWLISTED in _issue_codes(denied)
     assert allowed.valid
+
+
+def test_memory_sources_reexports_the_canonical_human_declaration_origin() -> None:
+    assert HumanDeclarationOrigin is CanonicalHumanDeclarationOrigin
+    assert _declaration().origin is CanonicalHumanDeclarationOrigin.USER_REQUEST
+
+
+def test_trusted_candidate_provenance_strictly_binds_direct_and_bound_authority(
+    git_repo: Path,
+) -> None:
+    sha = run_git(git_repo, "rev-parse", "HEAD")
+    locator_key = derive_repository_key(
+        RevisionResolver().repository_identity(git_repo)
+    )
+    direct_hash = candidate_authority_resolution_hash(locator_key, locator_key)
+    direct = TrustedCandidateProvenance(
+        origin=ProducerType.LOCAL,
+        review_id=REVIEW_ID,
+        target_head_sha=sha.upper(),
+        locator_repository_key=locator_key.upper(),
+        authority_repository_key=locator_key.upper(),
+        authority_resolution_hash=direct_hash.upper(),
+    )
+
+    assert direct.target_head_sha == sha
+    assert direct.locator_repository_key == locator_key
+    assert direct.authority_repository_key == locator_key
+    assert direct.authority_resolution_hash == direct_hash
+    assert direct.binding_id is None
+    with pytest.raises(FrozenInstanceError):
+        direct.binding_id = stable_repository_binding_id("forged")
+
+    with pytest.raises(ValueError, match="direct.*binding_id"):
+        TrustedCandidateProvenance(
+            origin=ProducerType.LOCAL,
+            review_id=REVIEW_ID,
+            target_head_sha=sha,
+            locator_repository_key=locator_key,
+            authority_repository_key=locator_key,
+            authority_resolution_hash=direct_hash,
+            binding_id=stable_repository_binding_id("unexpected"),
+        )
+
+    authority_key = "f" * 64 if locator_key != "f" * 64 else "e" * 64
+    binding_id = stable_repository_binding_id(
+        "candidate-authority",
+        locator_key,
+        authority_key,
+    )
+    with pytest.raises(ValueError, match="bound.*binding_id"):
+        TrustedCandidateProvenance(
+            origin=ProducerType.LOCAL,
+            review_id=REVIEW_ID,
+            target_head_sha=sha,
+            locator_repository_key=locator_key,
+            authority_repository_key=authority_key,
+            authority_resolution_hash="0" * 64,
+        )
+    with pytest.raises(ValueError, match="authority_resolution_hash"):
+        TrustedCandidateProvenance(
+            origin=ProducerType.LOCAL,
+            review_id=REVIEW_ID,
+            target_head_sha=sha,
+            locator_repository_key=locator_key,
+            authority_repository_key=authority_key,
+            authority_resolution_hash="0" * 64,
+            binding_id=binding_id,
+        )
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [ProducerType.MODEL, ProducerType.LOCAL, ProducerType.HUMAN],
+)
+def test_direct_candidate_authority_receipts_round_trip_for_all_origins(
+    git_repo: Path,
+    origin: ProducerType,
+) -> None:
+    sha = run_git(git_repo, "rev-parse", "HEAD")
+    declaration = _declaration_authority()
+    source_ref: SourceRef = (
+        declaration.source_ref
+        if origin is ProducerType.HUMAN
+        else GitCommitSourceRef(commit_sha=sha)
+    )
+    candidate = _candidate(
+        git_repo,
+        sha,
+        source_ref,
+        producer_type=origin,
+    )
+    provenance = _runtime_provenance(
+        git_repo,
+        sha,
+        origin=origin,
+        allowed_source_refs=(
+            candidate.source_refs if origin is ProducerType.MODEL else ()
+        ),
+    )
+    validator = SourceValidator(
+        git_repo,
+        human_declarations=(declaration,),
+    )
+    report = validator.validate_candidate(
+        candidate,
+        runtime_provenance=provenance,
+    )
+
+    receipt = build_candidate_authority_receipt(
+        candidate,
+        provenance,
+        report,
+        validator=validator,
+        current_target_head_sha=sha,
+        created_at=NOW,
+    )
+    restored = restore_candidate_authority(
+        receipt,
+        candidate,
+        validator=validator,
+        current_provenance=provenance,
+        current_target_head_sha=sha,
+    )
+
+    assert report.valid
+    assert report.candidate_validation_context_hash is not None
+    assert report.authority_resolution_hash == provenance.authority_resolution_hash
+    assert receipt.initial_validation_report_hash == report.report_hash
+    assert receipt.authority_repository_key == candidate.repository_key
+    assert receipt.locator_repository_key == candidate.repository_key
+    assert receipt.binding_id is None
+    assert receipt.origin is origin
+    assert isinstance(restored, CandidateAuthorityRestoration)
+    assert restored.provenance.allowed_source_refs == provenance.allowed_source_refs
+    assert SourceValidator(
+        git_repo,
+        human_declarations=restored.human_declarations,
+    ).validate_candidate(
+        candidate,
+        runtime_provenance=restored.provenance,
+    ).valid
+    if origin is ProducerType.HUMAN:
+        assert receipt.human_declarations == (declaration,)
+        assert restored.human_declarations == (declaration,)
+    else:
+        assert receipt.human_declarations == ()
+
+
+def test_bound_candidate_authority_uses_live_locator_and_candidate_authority(
+    git_repo: Path,
+) -> None:
+    sha = run_git(git_repo, "rev-parse", "HEAD")
+    source_ref = GitCommitSourceRef(commit_sha=sha)
+    direct_candidate = _candidate(git_repo, sha, source_ref)
+    locator_key = direct_candidate.repository_key
+    authority_key = "d" * 64 if locator_key != "d" * 64 else "c" * 64
+    candidate = replace(direct_candidate, repository_key=authority_key)
+    binding_id = stable_repository_binding_id(
+        "bound-candidate-authority",
+        locator_key,
+        authority_key,
+    )
+    provenance = _runtime_provenance(
+        git_repo,
+        sha,
+        locator_repository_key=locator_key,
+        authority_repository_key=authority_key,
+        binding_id=binding_id,
+    )
+    validator = SourceValidator(git_repo)
+    report = validator.validate_candidate(
+        candidate,
+        runtime_provenance=provenance,
+    )
+    receipt = validator.build_candidate_authority_receipt(
+        candidate,
+        provenance,
+        report,
+        current_target_head_sha=sha,
+        created_at=NOW,
+    )
+    restored = validator.restore_candidate_authority(
+        receipt,
+        candidate,
+        current_provenance=provenance,
+        current_target_head_sha=sha,
+    )
+
+    assert report.valid
+    assert receipt.locator_repository_key == locator_key
+    assert receipt.authority_repository_key == authority_key
+    assert receipt.binding_id == binding_id
+    assert restored.provenance == provenance
+
+    wrong_locator_key = "b" * 64 if locator_key != "b" * 64 else "a" * 64
+    wrong_locator_binding = stable_repository_binding_id(
+        "wrong-locator",
+        wrong_locator_key,
+        authority_key,
+    )
+    wrong_locator = _runtime_provenance(
+        git_repo,
+        sha,
+        locator_repository_key=wrong_locator_key,
+        authority_repository_key=authority_key,
+        binding_id=wrong_locator_binding,
+    )
+    wrong_locator_report = validator.validate_candidate(
+        candidate,
+        runtime_provenance=wrong_locator,
+    )
+    assert SourceValidationCode.REPOSITORY_MISMATCH in _issue_codes(
+        wrong_locator_report
+    )
+    assert all(not item.valid for item in wrong_locator_report.source_results)
+
+    wrong_authority_key = "a" * 64 if authority_key != "a" * 64 else "9" * 64
+    wrong_authority_binding = stable_repository_binding_id(
+        "wrong-authority",
+        locator_key,
+        wrong_authority_key,
+    )
+    wrong_authority = _runtime_provenance(
+        git_repo,
+        sha,
+        locator_repository_key=locator_key,
+        authority_repository_key=wrong_authority_key,
+        binding_id=wrong_authority_binding,
+    )
+    assert SourceValidationCode.REPOSITORY_MISMATCH in _issue_codes(
+        validator.validate_candidate(
+            candidate,
+            runtime_provenance=wrong_authority,
+        )
+    )
+
+    substituted_binding = stable_repository_binding_id("substituted-binding")
+    substituted_provenance = _runtime_provenance(
+        git_repo,
+        sha,
+        locator_repository_key=locator_key,
+        authority_repository_key=authority_key,
+        binding_id=substituted_binding,
+    )
+    with pytest.raises(SourceValidationError) as binding_error:
+        validator.restore_candidate_authority(
+            receipt,
+            candidate,
+            current_provenance=substituted_provenance,
+            current_target_head_sha=sha,
+        )
+    assert (
+        binding_error.value.code
+        is SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH
+    )
+
+
+def test_receipt_builder_rejects_candidate_report_and_live_trust_substitution(
+    git_repo: Path,
+) -> None:
+    sha = run_git(git_repo, "rev-parse", "HEAD")
+    source_ref = GitCommitSourceRef(commit_sha=sha)
+    candidate = _candidate(git_repo, sha, source_ref)
+    local_provenance = _runtime_provenance(git_repo, sha)
+    validator = SourceValidator(git_repo)
+    report = validator.validate_candidate(
+        candidate,
+        runtime_provenance=local_provenance,
+    )
+
+    changed_candidate = replace(
+        candidate,
+        statement="Review arithmetic changes using a substituted statement.",
+    )
+    with pytest.raises(SourceValidationError) as candidate_error:
+        validator.build_candidate_authority_receipt(
+            changed_candidate,
+            local_provenance,
+            report,
+            current_target_head_sha=sha,
+            created_at=NOW,
+        )
+    assert candidate_error.value.code is SourceValidationCode.VALIDATION_REPORT_MISMATCH
+
+    metadata_substitution = replace(
+        candidate,
+        producer=Producer(ProducerType.LOCAL, "other-curator", "9.9"),
+    )
+    assert metadata_substitution.candidate_id == candidate.candidate_id
+    with pytest.raises(SourceValidationError) as metadata_error:
+        validator.build_candidate_authority_receipt(
+            metadata_substitution,
+            local_provenance,
+            report,
+            current_target_head_sha=sha,
+            created_at=NOW,
+        )
+    assert metadata_error.value.code is SourceValidationCode.VALIDATION_REPORT_MISMATCH
+
+    model_provenance = _runtime_provenance(
+        git_repo,
+        sha,
+        origin=ProducerType.MODEL,
+        allowed_source_refs=(source_ref,),
+    )
+    model_report = validator.validate_candidate(
+        candidate,
+        runtime_provenance=model_provenance,
+    )
+    with pytest.raises(SourceValidationError) as producer_error:
+        validator.build_candidate_authority_receipt(
+            candidate,
+            local_provenance,
+            model_report,
+            current_target_head_sha=sha,
+            created_at=NOW,
+        )
+    assert producer_error.value.code is SourceValidationCode.VALIDATION_REPORT_MISMATCH
+
+    declaration = _declaration_authority()
+    human_candidate = _candidate(git_repo, sha, declaration.source_ref)
+    human_provenance = _runtime_provenance(
+        git_repo,
+        sha,
+        origin=ProducerType.HUMAN,
+    )
+    trusted_validator = SourceValidator(
+        git_repo,
+        human_declarations=(declaration,),
+    )
+    trusted_report = trusted_validator.validate_candidate(
+        human_candidate,
+        runtime_provenance=human_provenance,
+    )
+    with pytest.raises(SourceValidationError) as trust_error:
+        SourceValidator(git_repo).build_candidate_authority_receipt(
+            human_candidate,
+            human_provenance,
+            trusted_report,
+            current_target_head_sha=sha,
+            created_at=NOW,
+        )
+    assert trust_error.value.code is SourceValidationCode.HUMAN_DECLARATION_UNAUTHORIZED
+
+
+def test_receipt_restoration_rejects_context_report_and_policy_substitutions(
+    git_repo: Path,
+) -> None:
+    sha = run_git(git_repo, "rev-parse", "HEAD")
+    source_ref = GitCommitSourceRef(commit_sha=sha)
+    candidate = _candidate(
+        git_repo,
+        sha,
+        source_ref,
+        producer_type=ProducerType.MODEL,
+    )
+    policy_extra_ref = GitCommitSourceRef(
+        commit_sha=sha,
+        metadata_hash=git_commit_metadata_hash(git_repo, sha),
+    )
+    provenance = _runtime_provenance(
+        git_repo,
+        sha,
+        origin=ProducerType.MODEL,
+        allowed_source_refs=(source_ref, policy_extra_ref),
+    )
+    validator = SourceValidator(git_repo)
+    report = validator.validate_candidate(
+        candidate,
+        runtime_provenance=provenance,
+    )
+    receipt = validator.build_candidate_authority_receipt(
+        candidate,
+        provenance,
+        report,
+        current_target_head_sha=sha,
+        created_at=NOW,
+    )
+    restored = validator.restore_candidate_authority(
+        receipt,
+        candidate,
+        current_provenance=provenance,
+        current_target_head_sha=sha,
+    )
+    assert restored.provenance == provenance
+    assert policy_extra_ref in restored.provenance.allowed_source_refs
+
+    def assert_rejected(
+        stored_receipt: CandidateAuthorityReceipt = receipt,
+        exact_candidate: MemoryCandidate = candidate,
+        current_provenance: TrustedCandidateProvenance = provenance,
+        current_target_head_sha: str = sha,
+    ) -> SourceValidationCode:
+        with pytest.raises(SourceValidationError) as error:
+            validator.restore_candidate_authority(
+                stored_receipt,
+                exact_candidate,
+                current_provenance=current_provenance,
+                current_target_head_sha=current_target_head_sha,
+            )
+        return error.value.code
+
+    other_candidate = replace(
+        candidate,
+        statement="A cross-candidate substitution must be rejected.",
+    )
+    assert assert_rejected(exact_candidate=other_candidate) is (
+        SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH
+    )
+
+    cross_review = _runtime_provenance(
+        git_repo,
+        sha,
+        origin=ProducerType.MODEL,
+        review_id="review-memory-substitution",
+        allowed_source_refs=(source_ref,),
+    )
+    assert assert_rejected(current_provenance=cross_review) is (
+        SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH
+    )
+
+    stale_sha = "f" * 40 if sha != "f" * 40 else "e" * 40
+    stale_context = _runtime_provenance(
+        git_repo,
+        stale_sha,
+        origin=ProducerType.MODEL,
+        allowed_source_refs=(source_ref,),
+    )
+    assert assert_rejected(
+        current_provenance=stale_context,
+        current_target_head_sha=stale_sha,
+    ) is SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH
+
+    local_policy = _runtime_provenance(git_repo, sha, origin=ProducerType.LOCAL)
+    assert assert_rejected(current_provenance=local_policy) is (
+        SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH
+    )
+
+    missing_model_allowlist = _runtime_provenance(
+        git_repo,
+        sha,
+        origin=ProducerType.MODEL,
+    )
+    assert assert_rejected(current_provenance=missing_model_allowlist) is (
+        SourceValidationCode.PRODUCER_POLICY_UNAUTHORIZED
+    )
+
+    report_substitution = replace(
+        receipt,
+        initial_validation_report_hash="f" * 64,
+    )
+    assert assert_rejected(stored_receipt=report_substitution) is (
+        SourceValidationCode.VALIDATION_REPORT_MISMATCH
+    )
+
+    source_substitution = replace(
+        receipt,
+        authorized_source_refs=(policy_extra_ref,),
+    )
+    assert assert_rejected(stored_receipt=source_substitution) is (
+        SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH
+    )
+
+    tampered_receipt = CandidateAuthorityReceipt.from_dict(receipt.to_dict())
+    object.__setattr__(
+        tampered_receipt,
+        "initial_validation_report_hash",
+        "e" * 64,
+    )
+    assert assert_rejected(stored_receipt=tampered_receipt) is (
+        SourceValidationCode.AUTHORITY_RECEIPT_INVALID
+    )
+
+
+def test_authority_boundaries_rehydrate_typed_inputs_before_trusting_them(
+    git_repo: Path,
+) -> None:
+    sha = run_git(git_repo, "rev-parse", "HEAD")
+    source_ref = GitCommitSourceRef(commit_sha=sha)
+    tampered_source = GitCommitSourceRef.from_dict(source_ref.to_dict())
+    object.__setattr__(tampered_source, "commit_sha", "not-a-commit")
+
+    with pytest.raises(ValueError, match="canonical SourceRef"):
+        _runtime_provenance(
+            git_repo,
+            sha,
+            origin=ProducerType.MODEL,
+            allowed_source_refs=(tampered_source,),
+        )
+
+    declaration = _declaration_authority()
+    tampered_declaration = HumanDeclarationAuthority.from_dict(
+        declaration.to_dict()
+    )
+    object.__setattr__(
+        tampered_declaration,
+        "declaration",
+        "A body that no longer matches the declaration hash.",
+    )
+    with pytest.raises(SourceValidationError) as declaration_error:
+        SourceValidator(
+            git_repo,
+            human_declarations=(tampered_declaration,),
+        )
+    assert (
+        declaration_error.value.code
+        is SourceValidationCode.INVALID_CONFIGURATION
+    )
+
+    candidate = _candidate(git_repo, sha, source_ref)
+    provenance = _runtime_provenance(git_repo, sha)
+    report = SourceValidator(git_repo).validate_candidate(
+        candidate,
+        runtime_provenance=provenance,
+    )
+    with pytest.raises(ValueError, match="results are invalid"):
+        replace(report, source_results=("forged",))
+
+
+@pytest.mark.parametrize(
+    "substitution",
+    ["request", "actor", "review", "hash", "origin"],
+)
+def test_human_receipt_restoration_rejects_declaration_substitution(
+    git_repo: Path,
+    substitution: str,
+) -> None:
+    sha = run_git(git_repo, "rev-parse", "HEAD")
+    declaration = _declaration_authority()
+    candidate = _candidate(git_repo, sha, declaration.source_ref)
+    provenance = _runtime_provenance(
+        git_repo,
+        sha,
+        origin=ProducerType.HUMAN,
+    )
+    validator = SourceValidator(
+        git_repo,
+        human_declarations=(declaration,),
+    )
+    report = validator.validate_candidate(
+        candidate,
+        runtime_provenance=provenance,
+    )
+    receipt = validator.build_candidate_authority_receipt(
+        candidate,
+        provenance,
+        report,
+        current_target_head_sha=sha,
+        created_at=NOW,
+    )
+
+    source = declaration.source_ref
+    declaration_text = declaration.declaration
+    request_id = source.request_id
+    actor = source.actor
+    review_id = source.review_id
+    origin = declaration.origin
+    if substitution == "request":
+        request_id = stable_request_id("substituted-human-request")
+    elif substitution == "actor":
+        actor = "mallory"
+    elif substitution == "review":
+        review_id = "review-memory-substitution"
+    elif substitution == "hash":
+        declaration_text = "A substituted declaration body."
+    else:
+        origin = HumanDeclarationOrigin.CLI_REQUEST
+    forged_source = HumanDeclarationSourceRef(
+        request_id=request_id,
+        actor=actor,
+        declaration_hash=_sha256(declaration_text),
+        created_at=source.created_at,
+        review_id=review_id,
+    )
+    forged_declaration = HumanDeclarationAuthority(
+        source_ref=forged_source,
+        origin=origin,
+        declaration=declaration_text,
+    )
+    receipt_overrides: dict[str, object] = {
+        "authorized_source_refs": (forged_source,),
+        "human_declarations": (forged_declaration,),
+    }
+    if substitution == "review":
+        receipt_overrides["review_id"] = review_id
+    forged_receipt = replace(receipt, **receipt_overrides)
+
+    with pytest.raises(SourceValidationError) as error:
+        validator.restore_candidate_authority(
+            forged_receipt,
+            candidate,
+            current_provenance=provenance,
+            current_target_head_sha=sha,
+        )
+    assert error.value.code in {
+        SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH,
+        SourceValidationCode.HUMAN_DECLARATION_UNAUTHORIZED,
+    }
 
 
 def test_secret_scanner_rejects_duplicate_json_keys_and_raw_dotted_assignments() -> None:

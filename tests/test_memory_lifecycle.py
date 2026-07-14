@@ -42,6 +42,7 @@ from review_agent.memory_sources import (
     SourceValidationCode,
     SourceValidator,
     TrustedCandidateProvenance,
+    candidate_authority_resolution_hash,
     repository_range_hash,
 )
 from review_agent.memory_store import (
@@ -130,10 +131,17 @@ def _provenance(
     origin: ProducerType = ProducerType.MODEL,
     allow_sources: bool = True,
 ) -> TrustedCandidateProvenance:
+    repository_key_value = candidate.repository_key
     return TrustedCandidateProvenance(
         origin=origin,
         review_id=candidate.origin_review_id,
         target_head_sha=target_head,
+        locator_repository_key=repository_key_value,
+        authority_repository_key=repository_key_value,
+        authority_resolution_hash=candidate_authority_resolution_hash(
+            repository_key_value,
+            repository_key_value,
+        ),
         allowed_source_refs=(candidate.source_refs if allow_sources else ()),
     )
 

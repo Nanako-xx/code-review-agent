@@ -34,7 +34,10 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from review_agent.artifacts import artifact_schema
 from review_agent.memory_identity import repository_key as canonical_repository_key
 from review_agent.memory_models import (
+    CandidateAuthorityReceipt,
     GitCommitSourceRef,
+    HumanDeclarationAuthority,
+    HumanDeclarationOrigin,
     HumanDeclarationSourceRef,
     MemoryCandidate,
     ObservationSourceRef,
@@ -48,6 +51,7 @@ from review_agent.memory_models import (
     SymbolHashKind,
     canonical_json,
     canonical_sha256,
+    validate_stable_id,
 )
 from review_agent.observations import Observation, ObservationStore
 from review_agent.revision import (
@@ -161,6 +165,57 @@ _SUPPLEMENTAL_TASK_ARTIFACT_PREFIX = "supplemental_task_"
 _SUPPLEMENTAL_WAVE_ARTIFACT_PREFIX = "supplemental_wave_"
 
 
+def _canonical_sha256_digest(value: Any, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("%s must be a SHA-256 digest" % field_name)
+    normalized = value.casefold()
+    if _SHA256_PATTERN.fullmatch(normalized) is None:
+        raise ValueError("%s must be a SHA-256 digest" % field_name)
+    return normalized
+
+
+def _canonical_authority_binding(
+    locator_repository_key: str,
+    authority_repository_key: str,
+    binding_id: Optional[str],
+) -> Optional[str]:
+    direct = locator_repository_key == authority_repository_key
+    if direct:
+        if binding_id is not None:
+            raise ValueError("direct authority requires binding_id to be None")
+        return None
+    if binding_id is None:
+        raise ValueError("bound authority requires a canonical binding_id")
+    return validate_stable_id(binding_id, "RB", "binding_id")
+
+
+def candidate_authority_resolution_hash(
+    locator_repository_key: str,
+    authority_repository_key: str,
+    *,
+    binding_id: Optional[str] = None,
+) -> str:
+    """Hash one canonical direct or bound repository-authority resolution."""
+
+    locator = _canonical_sha256_digest(
+        locator_repository_key,
+        "locator_repository_key",
+    )
+    authority = _canonical_sha256_digest(
+        authority_repository_key,
+        "authority_repository_key",
+    )
+    binding = _canonical_authority_binding(locator, authority, binding_id)
+    return canonical_sha256(
+        {
+            "schema_version": SOURCE_VALIDATION_SCHEMA_VERSION,
+            "locator_repository_key": locator,
+            "authority_repository_key": authority,
+            "binding_id": binding,
+        }
+    )
+
+
 class SourceValidationCode(str, Enum):
     INVALID_INPUT = "invalid_input"
     INVALID_CONFIGURATION = "invalid_configuration"
@@ -197,6 +252,10 @@ class SourceValidationCode(str, Enum):
     OBSERVATION_UNTRUSTED = "observation_untrusted"
     HUMAN_DECLARATION_UNAUTHORIZED = "human_declaration_unauthorized"
     HUMAN_DECLARATION_MISMATCH = "human_declaration_mismatch"
+    CANDIDATE_AUTHORITY_MISMATCH = "candidate_authority_mismatch"
+    VALIDATION_REPORT_MISMATCH = "validation_report_mismatch"
+    AUTHORITY_RECEIPT_INVALID = "authority_receipt_invalid"
+    PRODUCER_POLICY_UNAUTHORIZED = "producer_policy_unauthorized"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -236,6 +295,10 @@ _ISSUE_MESSAGES = {
     SourceValidationCode.OBSERVATION_UNTRUSTED: "Observation authority failed hydration or artifact validation",
     SourceValidationCode.HUMAN_DECLARATION_UNAUTHORIZED: "human declaration has no explicit trusted request",
     SourceValidationCode.HUMAN_DECLARATION_MISMATCH: "human declaration fields do not match the trusted request",
+    SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH: "candidate authority does not match the trusted Runtime context",
+    SourceValidationCode.VALIDATION_REPORT_MISMATCH: "source validation report does not match the exact candidate authority context",
+    SourceValidationCode.AUTHORITY_RECEIPT_INVALID: "candidate authority receipt failed canonical validation",
+    SourceValidationCode.PRODUCER_POLICY_UNAUTHORIZED: "candidate producer is outside the current Runtime source policy",
     SourceValidationCode.INTERNAL_ERROR: "source validation failed closed",
 }
 
@@ -247,11 +310,6 @@ class SensitiveContentKind(str, Enum):
     AUTHORIZATION_HEADER = "authorization_header"
     AUTHENTICATED_URL = "authenticated_url"
     DUPLICATE_JSON_KEY = "duplicate_json_key"
-
-
-class HumanDeclarationOrigin(str, Enum):
-    USER_REQUEST = "user_request"
-    CLI_REQUEST = "cli_request"
 
 
 @dataclass(frozen=True)
@@ -267,6 +325,10 @@ class TrustedCandidateProvenance:
     origin: ProducerType
     review_id: str
     target_head_sha: str
+    locator_repository_key: str
+    authority_repository_key: str
+    authority_resolution_hash: str
+    binding_id: Optional[str] = None
     allowed_source_refs: Tuple[SourceRef, ...] = field(
         default_factory=tuple,
         repr=False,
@@ -286,19 +348,65 @@ class TrustedCandidateProvenance:
             or not _GIT_OBJECT_ID_PATTERN.fullmatch(self.target_head_sha)
         ):
             raise ValueError("target_head_sha must be a full Git object ID")
+        locator_repository_key = _canonical_sha256_digest(
+            self.locator_repository_key,
+            "locator_repository_key",
+        )
+        authority_repository_key = _canonical_sha256_digest(
+            self.authority_repository_key,
+            "authority_repository_key",
+        )
+        binding_id = _canonical_authority_binding(
+            locator_repository_key,
+            authority_repository_key,
+            self.binding_id,
+        )
+        resolution_hash = _canonical_sha256_digest(
+            self.authority_resolution_hash,
+            "authority_resolution_hash",
+        )
+        expected_resolution_hash = candidate_authority_resolution_hash(
+            locator_repository_key,
+            authority_repository_key,
+            binding_id=binding_id,
+        )
+        if not hmac.compare_digest(resolution_hash, expected_resolution_hash):
+            raise ValueError(
+                "authority_resolution_hash does not match the canonical "
+                "locator authority resolution"
+            )
         try:
             values = tuple(self.allowed_source_refs)
         except TypeError as error:
             raise ValueError("allowed_source_refs must be typed SourceRef values") from error
         if any(type(item) not in _SOURCE_REF_TYPES for item in values):
             raise ValueError("allowed_source_refs must be typed SourceRef values")
+        for item in values:
+            try:
+                hydrated = SourceRef.from_dict(item.to_dict())
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "allowed_source_refs must be canonical SourceRef values"
+                ) from None
+            if type(hydrated) is not type(item) or hydrated != item:
+                raise ValueError(
+                    "allowed_source_refs must be canonical SourceRef values"
+                )
         if len(values) > MAX_VALIDATION_SOURCE_REFS:
             raise ValueError("allowed_source_refs exceeds the validation limit")
         keys = [_source_ref_key(item) for item in values]
         if len(keys) != len(set(keys)):
             raise ValueError("allowed_source_refs must not contain duplicates")
         object.__setattr__(self, "target_head_sha", self.target_head_sha.casefold())
-        object.__setattr__(self, "allowed_source_refs", values)
+        object.__setattr__(self, "locator_repository_key", locator_repository_key)
+        object.__setattr__(self, "authority_repository_key", authority_repository_key)
+        object.__setattr__(self, "authority_resolution_hash", resolution_hash)
+        object.__setattr__(self, "binding_id", binding_id)
+        object.__setattr__(
+            self,
+            "allowed_source_refs",
+            tuple(sorted(values, key=lambda item: item.to_json())),
+        )
 
 
 @dataclass(frozen=True)
@@ -401,7 +509,51 @@ class SourceValidationReport:
     source_results: Tuple[SourceValidationResult, ...]
     issues: Tuple[ValidationIssue, ...]
     subject_id: Optional[str] = None
+    candidate_validation_context_hash: Optional[str] = None
+    authority_resolution_hash: Optional[str] = None
     schema_version: int = SOURCE_VALIDATION_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != SOURCE_VALIDATION_SCHEMA_VERSION:
+            raise ValueError(
+                "source validation report schema_version must be %d"
+                % SOURCE_VALIDATION_SCHEMA_VERSION
+            )
+        if type(self.sensitivity) is not SensitivityDecision:
+            raise ValueError("source validation report sensitivity is invalid")
+        if not isinstance(self.source_results, tuple) or any(
+            type(item) is not SourceValidationResult
+            for item in self.source_results
+        ):
+            raise ValueError("source validation report results are invalid")
+        if not isinstance(self.issues, tuple) or any(
+            type(item) is not ValidationIssue for item in self.issues
+        ):
+            raise ValueError("source validation report issues are invalid")
+        context_hash = self.candidate_validation_context_hash
+        resolution_hash = self.authority_resolution_hash
+        if (context_hash is None) != (resolution_hash is None):
+            raise ValueError(
+                "candidate validation context and authority resolution hashes "
+                "must be present together"
+            )
+        if context_hash is not None:
+            object.__setattr__(
+                self,
+                "candidate_validation_context_hash",
+                _canonical_sha256_digest(
+                    context_hash,
+                    "candidate_validation_context_hash",
+                ),
+            )
+            object.__setattr__(
+                self,
+                "authority_resolution_hash",
+                _canonical_sha256_digest(
+                    resolution_hash,
+                    "authority_resolution_hash",
+                ),
+            )
 
     @property
     def valid(self) -> bool:
@@ -441,6 +593,10 @@ class SourceValidationReport:
         return {
             "schema_version": self.schema_version,
             "subject_id": self.subject_id,
+            "candidate_validation_context_hash": (
+                self.candidate_validation_context_hash
+            ),
+            "authority_resolution_hash": self.authority_resolution_hash,
             "valid": self.valid,
             "persistable": self.persistable,
             "remote_sendable": self.remote_sendable,
@@ -457,6 +613,44 @@ class SourceValidationReport:
 
     def to_json(self) -> str:
         return canonical_json(self.to_dict())
+
+
+@dataclass(frozen=True)
+class CandidateAuthorityRestoration:
+    """Runtime-owned authority recovered only after strict receipt revalidation."""
+
+    provenance: TrustedCandidateProvenance
+    human_declarations: Tuple[HumanDeclarationAuthority, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.provenance) is not TrustedCandidateProvenance:
+            raise ValueError("provenance must be TrustedCandidateProvenance")
+        values = tuple(self.human_declarations)
+        if any(type(item) is not HumanDeclarationAuthority for item in values):
+            raise ValueError(
+                "human_declarations must contain exact "
+                "HumanDeclarationAuthority values"
+            )
+        canonical = []
+        for item in values:
+            try:
+                hydrated = HumanDeclarationAuthority.from_dict(item.to_dict())
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "human_declarations must contain canonical authority values"
+                ) from None
+            if hydrated != item:
+                raise ValueError(
+                    "human_declarations must contain canonical authority values"
+                )
+            canonical.append(item)
+        if len({item.source_ref.to_json() for item in canonical}) != len(canonical):
+            raise ValueError("human_declarations must not contain duplicates")
+        object.__setattr__(
+            self,
+            "human_declarations",
+            tuple(sorted(canonical, key=lambda item: item.to_json())),
+        )
 
 
 class SourceValidationError(ValueError):
@@ -522,6 +716,13 @@ class TrustedHumanDeclaration:
             declaration_hash=self.declaration_hash,
             created_at=self.created_at,
             review_id=self.review_id,
+        )
+
+    def to_authority(self) -> HumanDeclarationAuthority:
+        return HumanDeclarationAuthority(
+            source_ref=self.to_source_ref(),
+            origin=self.origin,
+            declaration=self.declaration,
         )
 
 
@@ -651,7 +852,9 @@ class SourceValidator:
         repository: Path,
         *,
         sessions_root: Optional[Path] = None,
-        human_declarations: Iterable[TrustedHumanDeclaration] = (),
+        human_declarations: Iterable[
+            TrustedHumanDeclaration | HumanDeclarationAuthority
+        ] = (),
         allowed_source_refs: Optional[Iterable[SourceRef]] = None,
         revision_resolver: Optional[RevisionResolver] = None,
         max_source_bytes: int = DEFAULT_MAX_SOURCE_BYTES,
@@ -680,24 +883,45 @@ class SourceValidator:
         self._repository_common_dir_cache: Optional[str] = None
         self._repository_key_cache: Optional[str] = None
 
-        declarations: Dict[str, TrustedHumanDeclaration] = {}
+        declarations: Dict[str, HumanDeclarationAuthority] = {}
         try:
             declaration_values = tuple(human_declarations)
         except TypeError:
             raise SourceValidationError(
                 SourceValidationCode.INVALID_CONFIGURATION
             ) from None
-        for declaration in declaration_values:
-            if type(declaration) is not TrustedHumanDeclaration:
+        for value in declaration_values:
+            if type(value) is TrustedHumanDeclaration:
+                try:
+                    declaration = value.to_authority()
+                except ValueError:
+                    raise SourceValidationError(
+                        SourceValidationCode.INVALID_CONFIGURATION
+                    ) from None
+            elif type(value) is HumanDeclarationAuthority:
+                try:
+                    declaration = HumanDeclarationAuthority.from_dict(
+                        value.to_dict()
+                    )
+                except (TypeError, ValueError):
+                    raise SourceValidationError(
+                        SourceValidationCode.INVALID_CONFIGURATION
+                    ) from None
+                if declaration != value:
+                    raise SourceValidationError(
+                        SourceValidationCode.INVALID_CONFIGURATION
+                    )
+            else:
                 raise SourceValidationError(
                     SourceValidationCode.INVALID_CONFIGURATION
                 )
-            existing = declarations.get(declaration.request_id)
+            request_id = declaration.source_ref.request_id
+            existing = declarations.get(request_id)
             if existing is not None and existing != declaration:
                 raise SourceValidationError(
                     SourceValidationCode.INVALID_CONFIGURATION
                 )
-            declarations[declaration.request_id] = declaration
+            declarations[request_id] = declaration
         self._human_declarations = declarations
 
         self._allowed_source_ref_keys: Optional[frozenset] = None
@@ -711,6 +935,16 @@ class SourceValidator:
             keys = []
             for source_ref in values:
                 if type(source_ref) not in _SOURCE_REF_TYPES:
+                    raise SourceValidationError(
+                        SourceValidationCode.INVALID_CONFIGURATION
+                    )
+                try:
+                    hydrated = SourceRef.from_dict(source_ref.to_dict())
+                except (TypeError, ValueError):
+                    raise SourceValidationError(
+                        SourceValidationCode.INVALID_CONFIGURATION
+                    ) from None
+                if type(hydrated) is not type(source_ref) or hydrated != source_ref:
                     raise SourceValidationError(
                         SourceValidationCode.INVALID_CONFIGURATION
                     )
@@ -730,6 +964,14 @@ class SourceValidator:
         if type(runtime_provenance) is not TrustedCandidateProvenance:
             return _single_issue_report(
                 SourceValidationCode.RUNTIME_PROVENANCE_REQUIRED,
+                declared=candidate.sensitivity,
+                subject_id=candidate.candidate_id,
+            )
+        try:
+            _require_canonical_provenance(runtime_provenance)
+        except SourceValidationError:
+            return _single_issue_report(
+                SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH,
                 declared=candidate.sensitivity,
                 subject_id=candidate.candidate_id,
             )
@@ -765,7 +1007,226 @@ class SourceValidator:
                 for item in runtime_provenance.allowed_source_refs
             ),
             subject_id=candidate.candidate_id,
+            candidate_validation_context_hash=(
+                _candidate_validation_context_hash(
+                    candidate,
+                    runtime_provenance,
+                )
+            ),
+            authority_resolution_hash=(
+                runtime_provenance.authority_resolution_hash
+            ),
             initial_issues=initial_issues,
+        )
+
+    def build_candidate_authority_receipt(
+        self,
+        candidate: MemoryCandidate,
+        runtime_provenance: TrustedCandidateProvenance,
+        report: SourceValidationReport,
+        *,
+        current_target_head_sha: str,
+        created_at: str,
+    ) -> CandidateAuthorityReceipt:
+        """Issue a receipt only after repeating exact live source validation."""
+
+        _require_canonical_candidate(candidate)
+        _require_canonical_provenance(runtime_provenance)
+        current_target = _canonical_git_object_id(
+            current_target_head_sha,
+            "current_target_head_sha",
+        )
+        if not hmac.compare_digest(
+            current_target,
+            runtime_provenance.target_head_sha,
+        ):
+            raise SourceValidationError(
+                SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH
+            )
+
+        expected_context_hash = _candidate_validation_context_hash(
+            candidate,
+            runtime_provenance,
+        )
+        try:
+            report_matches = (
+                type(report) is SourceValidationReport
+                and report.valid
+                and report.subject_id == candidate.candidate_id
+                and report.candidate_validation_context_hash is not None
+                and report.authority_resolution_hash is not None
+                and hmac.compare_digest(
+                    report.candidate_validation_context_hash,
+                    expected_context_hash,
+                )
+                and hmac.compare_digest(
+                    report.authority_resolution_hash,
+                    runtime_provenance.authority_resolution_hash,
+                )
+            )
+        except (AttributeError, TypeError, ValueError):
+            report_matches = False
+        if not report_matches:
+            raise SourceValidationError(
+                SourceValidationCode.VALIDATION_REPORT_MISMATCH,
+                report=(
+                    report
+                    if type(report) is SourceValidationReport
+                    else None
+                ),
+            )
+
+        fresh_report = self.validate_candidate(
+            candidate,
+            runtime_provenance=runtime_provenance,
+        )
+        fresh_report.require_valid()
+        try:
+            report_hash_matches = hmac.compare_digest(
+                report.report_hash,
+                fresh_report.report_hash,
+            )
+        except (AttributeError, TypeError, ValueError):
+            report_hash_matches = False
+        if not report_hash_matches:
+            raise SourceValidationError(
+                SourceValidationCode.VALIDATION_REPORT_MISMATCH,
+                report=fresh_report,
+            )
+
+        trusted_declarations = self._trusted_candidate_declarations(
+            candidate,
+            runtime_provenance.review_id,
+        )
+        receipt_declarations: Tuple[HumanDeclarationAuthority, ...] = ()
+        if runtime_provenance.origin is ProducerType.HUMAN:
+            if not trusted_declarations:
+                raise SourceValidationError(
+                    SourceValidationCode.HUMAN_DECLARATION_UNAUTHORIZED
+                )
+            receipt_declarations = trusted_declarations
+
+        return CandidateAuthorityReceipt(
+            candidate_id=candidate.candidate_id,
+            authority_repository_key=(
+                runtime_provenance.authority_repository_key
+            ),
+            locator_repository_key=runtime_provenance.locator_repository_key,
+            origin=runtime_provenance.origin,
+            review_id=runtime_provenance.review_id,
+            proposal_head_sha=current_target,
+            authorized_source_refs=candidate.source_refs,
+            human_declarations=receipt_declarations,
+            initial_validation_report_hash=fresh_report.report_hash,
+            authority_resolution_hash=(
+                runtime_provenance.authority_resolution_hash
+            ),
+            binding_id=runtime_provenance.binding_id,
+            created_at=created_at,
+        )
+
+    def restore_candidate_authority(
+        self,
+        receipt: CandidateAuthorityReceipt,
+        candidate: MemoryCandidate,
+        *,
+        current_provenance: TrustedCandidateProvenance,
+        current_target_head_sha: str,
+    ) -> CandidateAuthorityRestoration:
+        """Restore authority only from an independently trusted live context."""
+
+        _require_canonical_receipt(receipt)
+        _require_canonical_candidate(candidate)
+        _require_canonical_provenance(current_provenance)
+        current_target = _canonical_git_object_id(
+            current_target_head_sha,
+            "current_target_head_sha",
+        )
+        if not hmac.compare_digest(
+            current_target,
+            current_provenance.target_head_sha,
+        ):
+            raise SourceValidationError(
+                SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH
+            )
+
+        exact_authority = (
+            receipt.candidate_id == candidate.candidate_id
+            and receipt.origin is current_provenance.origin
+            and receipt.review_id == current_provenance.review_id
+            and hmac.compare_digest(receipt.proposal_head_sha, current_target)
+            and hmac.compare_digest(
+                receipt.locator_repository_key,
+                current_provenance.locator_repository_key,
+            )
+            and hmac.compare_digest(
+                receipt.authority_repository_key,
+                current_provenance.authority_repository_key,
+            )
+            and hmac.compare_digest(
+                receipt.authority_resolution_hash,
+                current_provenance.authority_resolution_hash,
+            )
+            and receipt.binding_id == current_provenance.binding_id
+            and receipt.authorized_source_refs == candidate.source_refs
+            and candidate.origin_review_id == current_provenance.review_id
+            and hmac.compare_digest(
+                candidate.repository_key,
+                current_provenance.authority_repository_key,
+            )
+        )
+        if not exact_authority:
+            raise SourceValidationError(
+                SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH
+            )
+
+        if current_provenance.origin is ProducerType.MODEL:
+            allowed_keys = {
+                _source_ref_key(item)
+                for item in current_provenance.allowed_source_refs
+            }
+            if any(
+                _source_ref_key(item) not in allowed_keys
+                for item in candidate.source_refs
+            ):
+                raise SourceValidationError(
+                    SourceValidationCode.PRODUCER_POLICY_UNAUTHORIZED
+                )
+
+        trusted_declarations = self._trusted_candidate_declarations(
+            candidate,
+            current_provenance.review_id,
+        )
+        if current_provenance.origin is ProducerType.HUMAN:
+            if (
+                not trusted_declarations
+                or receipt.human_declarations != trusted_declarations
+            ):
+                raise SourceValidationError(
+                    SourceValidationCode.HUMAN_DECLARATION_UNAUTHORIZED
+                )
+        elif receipt.human_declarations:
+            raise SourceValidationError(
+                SourceValidationCode.AUTHORITY_RECEIPT_INVALID
+            )
+
+        restored_provenance = current_provenance
+        fresh_report = self.validate_candidate(
+            candidate,
+            runtime_provenance=restored_provenance,
+        )
+        fresh_report.require_valid()
+        if not hmac.compare_digest(
+            receipt.initial_validation_report_hash,
+            fresh_report.report_hash,
+        ):
+            raise SourceValidationError(
+                SourceValidationCode.VALIDATION_REPORT_MISMATCH,
+                report=fresh_report,
+            )
+        return CandidateAuthorityRestoration(
+            provenance=restored_provenance,
+            human_declarations=trusted_declarations,
         )
 
     def validate_sources(
@@ -798,6 +1259,8 @@ class SourceValidator:
             require_allowlisted=require_allowlisted,
             allowed_source_ref_keys=self._allowed_source_ref_keys,
             subject_id=None,
+            candidate_validation_context_hash=None,
+            authority_resolution_hash=None,
             initial_issues=[],
         )
 
@@ -810,6 +1273,8 @@ class SourceValidator:
         require_allowlisted: bool,
         allowed_source_ref_keys: Optional[frozenset],
         subject_id: Optional[str],
+        candidate_validation_context_hash: Optional[str],
+        authority_resolution_hash: Optional[str],
         initial_issues: Sequence[ValidationIssue],
     ) -> SourceValidationReport:
         issues: List[ValidationIssue] = list(initial_issues)
@@ -930,6 +1395,10 @@ class SourceValidator:
             source_results=tuple(results),
             issues=tuple(issues),
             subject_id=subject_id,
+            candidate_validation_context_hash=(
+                candidate_validation_context_hash
+            ),
+            authority_resolution_hash=authority_resolution_hash,
         )
 
     def _is_allowlisted(
@@ -941,6 +1410,35 @@ class SourceValidator:
             allowed_source_ref_keys is not None
             and _source_ref_key(source_ref) in allowed_source_ref_keys
         )
+
+    def _trusted_candidate_declarations(
+        self,
+        candidate: MemoryCandidate,
+        review_id: str,
+    ) -> Tuple[HumanDeclarationAuthority, ...]:
+        declarations: List[HumanDeclarationAuthority] = []
+        for source_ref in candidate.source_refs:
+            if type(source_ref) is not HumanDeclarationSourceRef:
+                continue
+            declaration = self._human_declarations.get(source_ref.request_id)
+            if declaration is None:
+                raise SourceValidationError(
+                    SourceValidationCode.HUMAN_DECLARATION_UNAUTHORIZED
+                )
+            if declaration.source_ref != source_ref:
+                raise SourceValidationError(
+                    SourceValidationCode.HUMAN_DECLARATION_MISMATCH
+                )
+            declaration_review_id = declaration.source_ref.review_id
+            if (
+                declaration_review_id is not None
+                and declaration_review_id != review_id
+            ):
+                raise SourceValidationError(
+                    SourceValidationCode.REVIEW_ID_MISMATCH
+                )
+            declarations.append(declaration)
+        return tuple(sorted(declarations, key=lambda item: item.to_json()))
 
     def _candidate_authority_issues(
         self,
@@ -956,9 +1454,19 @@ class SourceValidator:
         if (
             self._repository_key_cache is None
             or not hmac.compare_digest(
-                candidate.repository_key,
+                runtime_provenance.locator_repository_key,
                 self._repository_key_cache,
             )
+        ):
+            issues.append(
+                _issue(
+                    SourceValidationCode.REPOSITORY_MISMATCH,
+                    field_name="locator_repository_key",
+                )
+            )
+        if not hmac.compare_digest(
+            candidate.repository_key,
+            runtime_provenance.authority_repository_key,
         ):
             issues.append(
                 _issue(
@@ -1259,18 +1767,18 @@ class SourceValidator:
                 SourceValidationCode.HUMAN_DECLARATION_UNAUTHORIZED,
                 "request_id",
             )
-        if declaration.to_source_ref() != source_ref:
+        if declaration.source_ref != source_ref:
             raise _Failure(SourceValidationCode.HUMAN_DECLARATION_MISMATCH)
         _require_safe_content(
             declaration.declaration,
             field_name="human_declaration.content",
         )
         _require_safe_content(
-            declaration.actor,
+            declaration.source_ref.actor,
             field_name="human_declaration.actor",
         )
         return _VerifiedEvidence(
-            declaration.declaration_hash,
+            declaration.source_ref.declaration_hash,
             source_ref.review_id,
             len(declaration.declaration.encode("utf-8")),
         )
@@ -1702,6 +2210,105 @@ def _source_type_or_none(value: Any) -> Optional[SourceRefType]:
 
 def _source_ref_key(source_ref: SourceRef) -> str:
     return canonical_sha256(source_ref.to_dict())
+
+
+def _canonical_git_object_id(value: Any, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("%s must be a full Git object ID" % field_name)
+    normalized = value.casefold()
+    if _GIT_OBJECT_ID_PATTERN.fullmatch(normalized) is None:
+        raise ValueError("%s must be a full Git object ID" % field_name)
+    return normalized
+
+
+def _candidate_validation_context_hash(
+    candidate: MemoryCandidate,
+    runtime_provenance: TrustedCandidateProvenance,
+) -> str:
+    return canonical_sha256(
+        {
+            "schema_version": SOURCE_VALIDATION_SCHEMA_VERSION,
+            "candidate_id": candidate.candidate_id,
+            "candidate_hash": canonical_sha256(candidate.to_dict()),
+            "origin": runtime_provenance.origin.value,
+            "review_id": runtime_provenance.review_id,
+            "proposal_head_sha": runtime_provenance.target_head_sha,
+            "locator_repository_key": (
+                runtime_provenance.locator_repository_key
+            ),
+            "authority_repository_key": (
+                runtime_provenance.authority_repository_key
+            ),
+            "authority_resolution_hash": (
+                runtime_provenance.authority_resolution_hash
+            ),
+            "binding_id": runtime_provenance.binding_id,
+            "authorized_source_refs_hash": canonical_sha256(
+                [item.to_dict() for item in candidate.source_refs]
+            ),
+        }
+    )
+
+
+def _require_canonical_candidate(candidate: Any) -> MemoryCandidate:
+    if type(candidate) is not MemoryCandidate:
+        raise SourceValidationError(SourceValidationCode.AUTHORITY_RECEIPT_INVALID)
+    try:
+        hydrated = MemoryCandidate.from_dict(candidate.to_dict())
+    except (TypeError, ValueError):
+        raise SourceValidationError(
+            SourceValidationCode.AUTHORITY_RECEIPT_INVALID
+        ) from None
+    if hydrated != candidate:
+        raise SourceValidationError(
+            SourceValidationCode.AUTHORITY_RECEIPT_INVALID
+        )
+    return candidate
+
+
+def _require_canonical_provenance(
+    provenance: Any,
+) -> TrustedCandidateProvenance:
+    if type(provenance) is not TrustedCandidateProvenance:
+        raise SourceValidationError(
+            SourceValidationCode.RUNTIME_PROVENANCE_REQUIRED
+        )
+    try:
+        hydrated = TrustedCandidateProvenance(
+            origin=provenance.origin,
+            review_id=provenance.review_id,
+            target_head_sha=provenance.target_head_sha,
+            locator_repository_key=provenance.locator_repository_key,
+            authority_repository_key=provenance.authority_repository_key,
+            authority_resolution_hash=provenance.authority_resolution_hash,
+            binding_id=provenance.binding_id,
+            allowed_source_refs=provenance.allowed_source_refs,
+        )
+    except (TypeError, ValueError):
+        raise SourceValidationError(
+            SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH
+        ) from None
+    if hydrated != provenance:
+        raise SourceValidationError(
+            SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH
+        )
+    return provenance
+
+
+def _require_canonical_receipt(receipt: Any) -> CandidateAuthorityReceipt:
+    if type(receipt) is not CandidateAuthorityReceipt:
+        raise SourceValidationError(SourceValidationCode.AUTHORITY_RECEIPT_INVALID)
+    try:
+        hydrated = CandidateAuthorityReceipt.from_dict(receipt.to_dict())
+    except (TypeError, ValueError):
+        raise SourceValidationError(
+            SourceValidationCode.AUTHORITY_RECEIPT_INVALID
+        ) from None
+    if hydrated != receipt:
+        raise SourceValidationError(
+            SourceValidationCode.AUTHORITY_RECEIPT_INVALID
+        )
+    return receipt
 
 
 def _persisted_string_fields(
@@ -2375,7 +2982,69 @@ def _require_observation_hash(content: bytes, observation: Observation) -> None:
     raise _Failure(SourceValidationCode.OBSERVATION_UNTRUSTED)
 
 
+def build_candidate_authority_receipt(
+    candidate: MemoryCandidate,
+    runtime_provenance: TrustedCandidateProvenance,
+    report: SourceValidationReport,
+    *,
+    validator: SourceValidator,
+    current_target_head_sha: str,
+    created_at: str,
+) -> CandidateAuthorityReceipt:
+    """Build a canonical receipt through the live SourceValidator boundary."""
+
+    if type(validator) is not SourceValidator:
+        raise SourceValidationError(SourceValidationCode.INVALID_CONFIGURATION)
+    return validator.build_candidate_authority_receipt(
+        candidate,
+        runtime_provenance,
+        report,
+        current_target_head_sha=current_target_head_sha,
+        created_at=created_at,
+    )
+
+
+def restore_candidate_authority(
+    receipt: CandidateAuthorityReceipt,
+    candidate: MemoryCandidate,
+    *,
+    validator: SourceValidator,
+    current_provenance: TrustedCandidateProvenance,
+    current_target_head_sha: str,
+) -> CandidateAuthorityRestoration:
+    """Restore and revalidate a receipt against independent current authority."""
+
+    if type(validator) is not SourceValidator:
+        raise SourceValidationError(SourceValidationCode.INVALID_CONFIGURATION)
+    return validator.restore_candidate_authority(
+        receipt,
+        candidate,
+        current_provenance=current_provenance,
+        current_target_head_sha=current_target_head_sha,
+    )
+
+
+def hydrate_candidate_authority_receipt(
+    receipt: CandidateAuthorityReceipt,
+    candidate: MemoryCandidate,
+    *,
+    validator: SourceValidator,
+    current_provenance: TrustedCandidateProvenance,
+    current_target_head_sha: str,
+) -> CandidateAuthorityRestoration:
+    """Compatibility name for strict candidate-authority restoration."""
+
+    return restore_candidate_authority(
+        receipt,
+        candidate,
+        validator=validator,
+        current_provenance=current_provenance,
+        current_target_head_sha=current_target_head_sha,
+    )
+
+
 __all__ = [
+    "CandidateAuthorityRestoration",
     "DEFAULT_MAX_SOURCE_BYTES",
     "HumanDeclarationOrigin",
     "SOURCE_VALIDATION_SCHEMA_VERSION",
@@ -2391,9 +3060,13 @@ __all__ = [
     "TrustedCandidateProvenance",
     "TrustedHumanDeclaration",
     "ValidationIssue",
+    "build_candidate_authority_receipt",
+    "candidate_authority_resolution_hash",
     "git_commit_metadata_hash",
+    "hydrate_candidate_authority_receipt",
     "human_declaration_hash",
     "repository_range_hash",
     "repository_symbol_hash",
+    "restore_candidate_authority",
     "scan_sensitive_text",
 ]
