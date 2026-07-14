@@ -7,6 +7,7 @@ import pytest
 
 from review_agent.memory_models import (
     Applicability,
+    CandidateAuthorityReceipt,
     CandidateStatus,
     DurableMemoryRecord,
     FeedbackCalibrationSignal,
@@ -20,6 +21,8 @@ from review_agent.memory_models import (
     FindingSnapshot,
     GenerationMetadata,
     GitCommitSourceRef,
+    HumanDeclarationAuthority,
+    HumanDeclarationOrigin,
     HumanDeclarationSourceRef,
     MemoryCandidate,
     MemoryConfidence,
@@ -49,6 +52,7 @@ from review_agent.memory_models import (
     ValidityPolicy,
     canonical_json,
     stable_event_id,
+    stable_repository_binding_id,
     stable_request_id,
     validate_stable_id,
 )
@@ -61,6 +65,8 @@ HASH_2 = "2" * 64
 HASH_3 = "3" * 64
 CREATED_AT = "2026-07-14T12:00:00Z"
 REPOSITORY_KEY = "4" * 64
+LOCATOR_REPOSITORY_KEY = "5" * 64
+DECLARATION = "Approve this candidate for the current review."
 
 
 def _human_source(actor: str = "amy") -> HumanDeclarationSourceRef:
@@ -70,6 +76,29 @@ def _human_source(actor: str = "amy") -> HumanDeclarationSourceRef:
         declaration_hash=HASH_3,
         created_at=CREATED_AT,
         review_id="review-001",
+    )
+
+
+def _authority_declaration(
+    declaration: str = DECLARATION,
+    *,
+    actor: str = "amy",
+    review_id: str | None = "review-001",
+    origin: HumanDeclarationOrigin = HumanDeclarationOrigin.USER_REQUEST,
+) -> HumanDeclarationAuthority:
+    source_ref = HumanDeclarationSourceRef(
+        request_id=stable_request_id(
+            "candidate-authority", actor, review_id, declaration
+        ),
+        actor=actor,
+        declaration_hash=hashlib.sha256(declaration.encode("utf-8")).hexdigest(),
+        created_at=CREATED_AT,
+        review_id=review_id,
+    )
+    return HumanDeclarationAuthority(
+        source_ref=source_ref,
+        origin=origin,
+        declaration=declaration,
     )
 
 
@@ -122,6 +151,26 @@ def _candidate(**overrides: object) -> MemoryCandidate:
     }
     values.update(overrides)
     return MemoryCandidate(**values)
+
+
+def _authority_receipt(**overrides: object) -> CandidateAuthorityReceipt:
+    declaration = _authority_declaration()
+    values = {
+        "candidate_id": _candidate().candidate_id,
+        "authority_repository_key": REPOSITORY_KEY,
+        "locator_repository_key": REPOSITORY_KEY,
+        "origin": ProducerType.HUMAN,
+        "review_id": "review-001",
+        "proposal_head_sha": SHA_A,
+        "authorized_source_refs": (_range_source(), declaration.source_ref),
+        "human_declarations": (declaration,),
+        "initial_validation_report_hash": HASH_1,
+        "authority_resolution_hash": HASH_2,
+        "binding_id": None,
+        "created_at": CREATED_AT,
+    }
+    values.update(overrides)
+    return CandidateAuthorityReceipt(**values)
 
 
 def _bundle(candidate: MemoryCandidate) -> SourceBundleDescriptor:
@@ -300,6 +349,293 @@ def test_source_ref_rejects_empty_identifiers_and_incomplete_symbol_hash() -> No
             declaration_hash=HASH_1,
             created_at=CREATED_AT,
         )
+
+
+def test_human_declaration_authority_is_strict_immutable_and_redacts_repr() -> None:
+    authority = _authority_declaration()
+    payload = authority.to_dict()
+
+    assert set(payload) == {
+        "schema_version",
+        "source_ref",
+        "origin",
+        "declaration",
+    }
+    assert payload["declaration"] == DECLARATION
+    assert HumanDeclarationAuthority.from_dict(payload) == authority
+    assert authority.to_json() == canonical_json(payload)
+    assert DECLARATION not in repr(authority)
+    with pytest.raises(FrozenInstanceError):
+        authority.origin = HumanDeclarationOrigin.CLI_REQUEST
+
+    with pytest.raises(ValueError, match="declaration_hash"):
+        HumanDeclarationAuthority(
+            source_ref=HumanDeclarationSourceRef(
+                request_id=stable_request_id("bad-declaration-hash"),
+                actor="amy",
+                declaration_hash=HASH_1,
+                created_at=CREATED_AT,
+                review_id="review-001",
+            ),
+            origin=HumanDeclarationOrigin.USER_REQUEST,
+            declaration=DECLARATION,
+        )
+    with pytest.raises(ValueError, match="review_id"):
+        _authority_declaration(
+            review_id=None,
+            origin=HumanDeclarationOrigin.USER_REQUEST,
+        )
+
+    cli_authority = _authority_declaration(
+        review_id=None,
+        origin=HumanDeclarationOrigin.CLI_REQUEST,
+    )
+    assert HumanDeclarationAuthority.from_dict(cli_authority.to_dict()) == cli_authority
+
+
+@pytest.mark.parametrize("declaration", ["", "   ", "contains\x00nul", "x" * 8193])
+def test_human_declaration_authority_rejects_invalid_or_unbounded_text(
+    declaration: str,
+) -> None:
+    with pytest.raises(ValueError, match="declaration"):
+        _authority_declaration(declaration)
+
+
+def test_authority_models_reject_unknown_fields_and_versions() -> None:
+    declaration = _authority_declaration()
+    declaration_payload = declaration.to_dict()
+    receipt = _authority_receipt()
+    receipt_payload = receipt.to_dict()
+
+    with pytest.raises(ValueError, match="unsupported field"):
+        HumanDeclarationAuthority.from_dict({**declaration_payload, "actor": "amy"})
+    with pytest.raises(ValueError, match="schema_version"):
+        HumanDeclarationAuthority.from_dict(
+            {**declaration_payload, "schema_version": 2}
+        )
+    with pytest.raises(ValueError, match="source_ref"):
+        HumanDeclarationAuthority.from_dict(
+            {**declaration_payload, "source_ref": _range_source().to_dict()}
+        )
+
+    with pytest.raises(ValueError, match="unsupported field"):
+        CandidateAuthorityReceipt.from_dict({**receipt_payload, "trusted": True})
+    with pytest.raises(ValueError, match="schema_version"):
+        CandidateAuthorityReceipt.from_dict({**receipt_payload, "schema_version": 2})
+    with pytest.raises(ValueError, match="receipt_id"):
+        CandidateAuthorityReceipt.from_dict(
+            {**receipt_payload, "receipt_id": "CAR-" + "0" * 64}
+        )
+    with pytest.raises(ValueError, match="must be a list"):
+        CandidateAuthorityReceipt.from_dict(
+            {**receipt_payload, "authorized_source_refs": tuple(receipt_payload["authorized_source_refs"])}
+        )
+
+
+def test_candidate_authority_receipt_round_trips_with_exact_fields() -> None:
+    receipt = _authority_receipt()
+    payload = receipt.to_dict()
+
+    assert set(payload) == {
+        "schema_version",
+        "receipt_id",
+        "candidate_id",
+        "authority_repository_key",
+        "locator_repository_key",
+        "origin",
+        "review_id",
+        "proposal_head_sha",
+        "authorized_source_refs",
+        "human_declarations",
+        "initial_validation_report_hash",
+        "authority_resolution_hash",
+        "binding_id",
+        "created_at",
+    }
+    assert receipt.receipt_id.startswith("CAR-")
+    assert len(receipt.receipt_id) == 68
+    assert CandidateAuthorityReceipt.from_dict(payload) == receipt
+    assert receipt.to_json() == canonical_json(payload)
+    assert DECLARATION not in repr(receipt)
+    validate_stable_id(receipt.receipt_id, "CAR", "receipt_id")
+    with pytest.raises(FrozenInstanceError):
+        receipt.binding_id = "RB-" + "0" * 64
+
+
+def test_candidate_authority_receipt_canonicalizes_collection_order_and_duplicates() -> None:
+    first = _authority_declaration("Approve the first authority statement.")
+    second = _authority_declaration(
+        "Approve the second authority statement.",
+        actor="bob",
+    )
+    range_ref = _range_source()
+    left = _authority_receipt(
+        authorized_source_refs=(
+            second.source_ref,
+            range_ref,
+            first.source_ref,
+            range_ref,
+        ),
+        human_declarations=(second, first, first),
+    )
+    right = _authority_receipt(
+        authorized_source_refs=(range_ref, first.source_ref, second.source_ref),
+        human_declarations=(first, second),
+    )
+
+    assert left.authorized_source_refs == tuple(
+        sorted(left.authorized_source_refs, key=lambda item: item.to_json())
+    )
+    assert left.human_declarations == tuple(
+        sorted(left.human_declarations, key=lambda item: item.to_json())
+    )
+    assert left.authorized_source_refs == right.authorized_source_refs
+    assert left.human_declarations == right.human_declarations
+    assert left.receipt_id == right.receipt_id
+    assert left.to_json() == right.to_json()
+
+
+def test_candidate_authority_receipt_enforces_direct_and_bound_repository_modes() -> None:
+    with pytest.raises(ValueError, match="direct.*binding_id"):
+        _authority_receipt(binding_id=stable_repository_binding_id("unexpected"))
+    with pytest.raises(ValueError, match="bound.*binding_id"):
+        _authority_receipt(locator_repository_key=LOCATOR_REPOSITORY_KEY)
+    with pytest.raises(ValueError, match="binding_id"):
+        _authority_receipt(
+            locator_repository_key=LOCATOR_REPOSITORY_KEY,
+            binding_id="RB-short",
+        )
+
+    binding_id = stable_repository_binding_id(
+        REPOSITORY_KEY,
+        LOCATOR_REPOSITORY_KEY,
+    )
+    bound = _authority_receipt(
+        locator_repository_key=LOCATOR_REPOSITORY_KEY,
+        binding_id=binding_id,
+    )
+    assert bound.binding_id == binding_id
+    validate_stable_id(bound.binding_id, "RB", "binding_id")
+    assert CandidateAuthorityReceipt.from_dict(bound.to_dict()) == bound
+
+
+def test_candidate_authority_receipt_matches_human_hash_actor_and_review() -> None:
+    declaration = _authority_declaration()
+    actor_mismatch = HumanDeclarationSourceRef(
+        request_id=declaration.source_ref.request_id,
+        actor="bob",
+        declaration_hash=declaration.source_ref.declaration_hash,
+        created_at=declaration.source_ref.created_at,
+        review_id=declaration.source_ref.review_id,
+    )
+
+    with pytest.raises(ValueError, match="authorized_source_refs"):
+        _authority_receipt(
+            authorized_source_refs=(_range_source(), actor_mismatch),
+            human_declarations=(declaration,),
+        )
+    with pytest.raises(ValueError, match="review_id"):
+        _authority_receipt(review_id="review-002")
+    with pytest.raises(ValueError, match="authorized_source_refs"):
+        _authority_receipt(authorized_source_refs=(_range_source(),))
+
+    cli_declaration = _authority_declaration(
+        review_id=None,
+        origin=HumanDeclarationOrigin.CLI_REQUEST,
+    )
+    cli_receipt = _authority_receipt(
+        authorized_source_refs=(_range_source(), cli_declaration.source_ref),
+        human_declarations=(cli_declaration,),
+    )
+    assert cli_receipt.human_declarations == (cli_declaration,)
+
+
+@pytest.mark.parametrize("origin", [ProducerType.MODEL, ProducerType.LOCAL])
+def test_non_human_authority_receipts_cannot_carry_declarations(
+    origin: ProducerType,
+) -> None:
+    with pytest.raises(ValueError, match="non-human|MODEL|LOCAL|human_declarations"):
+        _authority_receipt(origin=origin)
+
+
+def test_human_authority_receipt_requires_a_declaration() -> None:
+    with pytest.raises(ValueError, match="HUMAN|human_declarations"):
+        _authority_receipt(
+            origin=ProducerType.HUMAN,
+            authorized_source_refs=(_range_source(),),
+            human_declarations=(),
+        )
+
+
+def test_candidate_authority_receipt_identity_covers_every_authority_field() -> None:
+    base_values = {
+        "candidate_id": _candidate().candidate_id,
+        "authority_repository_key": REPOSITORY_KEY,
+        "locator_repository_key": LOCATOR_REPOSITORY_KEY,
+        "origin": ProducerType.MODEL,
+        "review_id": "review-001",
+        "proposal_head_sha": SHA_A,
+        "authorized_source_refs": (_range_source(),),
+        "human_declarations": (),
+        "initial_validation_report_hash": HASH_1,
+        "authority_resolution_hash": HASH_2,
+        "binding_id": stable_repository_binding_id("base-binding"),
+        "created_at": CREATED_AT,
+    }
+    base = CandidateAuthorityReceipt(**base_values)
+    variants = (
+        {"candidate_id": _candidate(confidence=MemoryConfidence.MEDIUM).candidate_id},
+        {"authority_repository_key": "6" * 64},
+        {"locator_repository_key": "7" * 64},
+        {"origin": ProducerType.LOCAL},
+        {"review_id": "review-002"},
+        {"proposal_head_sha": SHA_B},
+        {"authorized_source_refs": (_range_source(content_hash=HASH_3),)},
+        {"initial_validation_report_hash": HASH_3},
+        {"authority_resolution_hash": HASH_3},
+        {"binding_id": stable_repository_binding_id("changed-binding")},
+        {"created_at": "2026-07-14T12:00:01Z"},
+    )
+    for override in variants:
+        changed = CandidateAuthorityReceipt(**{**base_values, **override})
+        assert changed.receipt_id != base.receipt_id
+
+    changed_declaration = _authority_declaration("Approve changed authority text.")
+    declaration_receipt = _authority_receipt(
+        authorized_source_refs=(_range_source(), changed_declaration.source_ref),
+        human_declarations=(changed_declaration,),
+    )
+    assert declaration_receipt.receipt_id != _authority_receipt().receipt_id
+
+
+def test_candidate_authority_receipt_rejects_invalid_duplicate_and_unbounded_inputs() -> None:
+    declaration = _authority_declaration()
+    conflicting_duplicate = HumanDeclarationAuthority(
+        source_ref=declaration.source_ref,
+        origin=HumanDeclarationOrigin.CLI_REQUEST,
+        declaration=declaration.declaration,
+    )
+
+    with pytest.raises(ValueError, match="duplicate.*source_ref"):
+        _authority_receipt(
+            human_declarations=(declaration, conflicting_duplicate),
+        )
+    with pytest.raises(ValueError, match="authorized_source_refs"):
+        _authority_receipt(authorized_source_refs=())
+    with pytest.raises(ValueError, match="maximum item count"):
+        _authority_receipt(
+            authorized_source_refs=tuple(_range_source() for _ in range(65)),
+        )
+    with pytest.raises(ValueError, match="maximum item count"):
+        _authority_receipt(human_declarations=tuple(declaration for _ in range(65)))
+    with pytest.raises(ValueError, match="candidate_id"):
+        _authority_receipt(candidate_id="MC-short")
+    with pytest.raises(ValueError, match="proposal_head_sha"):
+        _authority_receipt(proposal_head_sha="abc123")
+    with pytest.raises(ValueError, match="initial_validation_report_hash"):
+        _authority_receipt(initial_validation_report_hash="1" * 32)
+    with pytest.raises(ValueError, match="origin"):
+        _authority_receipt(origin="human")
 
 
 def test_memory_scope_normalizes_sorts_deduplicates_and_is_immutable() -> None:

@@ -29,12 +29,14 @@ MEMORY_SELECTION_POLICY_VERSION = "memory_selection_v1"
 FEEDBACK_AGGREGATION_POLICY_VERSION = "feedback_aggregation_v1"
 
 MAX_STATEMENT_LENGTH = 8_192
+MAX_HUMAN_DECLARATION_LENGTH = 8_192
 MAX_TEXT_LENGTH = 4_096
 MAX_REASON_LENGTH = 2_048
 MAX_IDENTIFIER_LENGTH = 512
 MAX_PATH_LENGTH = 1_024
 MAX_SCOPE_ITEMS = 128
 MAX_SOURCE_REFS = 64
+MAX_HUMAN_DECLARATIONS = 64
 MAX_EVIDENCE_REFS = 256
 MAX_DECISION_REASONS = 32
 MAX_SNAPSHOT_RECORDS = 2_000
@@ -158,6 +160,11 @@ class ProducerType(str, Enum):
     HUMAN = "human"
 
 
+class HumanDeclarationOrigin(str, Enum):
+    USER_REQUEST = "user_request"
+    CLI_REQUEST = "cli_request"
+
+
 class SourceRefType(str, Enum):
     REPOSITORY_RANGE = "repository_range"
     REPOSITORY_SYMBOL = "repository_symbol"
@@ -264,6 +271,10 @@ def stable_event_id(*identity: Any) -> str:
 
 def stable_request_id(*identity: Any) -> str:
     return stable_id("REQ", *identity)
+
+
+def stable_repository_binding_id(*identity: Any) -> str:
+    return stable_id("RB", *identity)
 
 
 def validate_stable_id(value: Any, prefix: str, field_name: str) -> str:
@@ -878,6 +889,104 @@ class HumanDeclarationSourceRef(SourceRef):
         )
 
 
+def _human_declaration_text(value: Any, context: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("%s must be a string" % context)
+    if not value.strip():
+        raise ValueError("%s must be a non-empty string" % context)
+    if "\x00" in value:
+        raise ValueError("%s must not contain NUL characters" % context)
+    if len(value) > MAX_HUMAN_DECLARATION_LENGTH:
+        raise ValueError(
+            "%s exceeds the maximum length of %d"
+            % (context, MAX_HUMAN_DECLARATION_LENGTH)
+        )
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("%s must contain valid UTF-8 text" % context) from error
+    return value
+
+
+@dataclass(frozen=True)
+class HumanDeclarationAuthority(_JsonModel):
+    source_ref: HumanDeclarationSourceRef
+    origin: HumanDeclarationOrigin
+    declaration: str = field(repr=False)
+    schema_version: int = MODEL_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_schema(self.schema_version, "human_declaration_authority")
+        if type(self.source_ref) is not HumanDeclarationSourceRef:
+            raise ValueError(
+                "human_declaration_authority.source_ref must be a "
+                "HumanDeclarationSourceRef"
+            )
+        if not isinstance(self.origin, HumanDeclarationOrigin):
+            raise ValueError(
+                "human_declaration_authority.origin must be a "
+                "HumanDeclarationOrigin"
+            )
+        object.__setattr__(
+            self,
+            "declaration",
+            _human_declaration_text(
+                self.declaration,
+                "human_declaration_authority.declaration",
+            ),
+        )
+        declaration_hash = hashlib.sha256(
+            self.declaration.encode("utf-8")
+        ).hexdigest()
+        if declaration_hash != self.source_ref.declaration_hash:
+            raise ValueError(
+                "human_declaration_authority.declaration_hash does not match "
+                "the UTF-8 declaration"
+            )
+        if (
+            self.origin is HumanDeclarationOrigin.USER_REQUEST
+            and self.source_ref.review_id is None
+        ):
+            raise ValueError(
+                "human_declaration_authority.source_ref.review_id is required "
+                "for user_request declarations"
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "source_ref": self.source_ref.to_dict(),
+            "origin": self.origin.value,
+            "declaration": self.declaration,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "HumanDeclarationAuthority":
+        root = _object(payload, "human_declaration_authority")
+        _exact_fields(
+            root,
+            {"schema_version", "source_ref", "origin", "declaration"},
+            "human_declaration_authority",
+        )
+        _validate_schema(root["schema_version"], "human_declaration_authority")
+        source_ref = SourceRef.from_dict(root["source_ref"])
+        if type(source_ref) is not HumanDeclarationSourceRef:
+            raise ValueError(
+                "human_declaration_authority.source_ref must be a "
+                "HumanDeclarationSourceRef"
+            )
+        return cls(
+            source_ref=source_ref,
+            origin=_enum_value(
+                HumanDeclarationOrigin,
+                root["origin"],
+                "human_declaration_authority.origin",
+            ),
+            declaration=root["declaration"],
+            schema_version=root["schema_version"],
+        )
+
+
 def _canonical_source_refs(
     values: Any,
     context: str,
@@ -916,6 +1025,304 @@ def _source_refs_from_payload(value: Any, context: str) -> Tuple[SourceRef, ...]
         tuple(SourceRef.from_dict(item) for item in value),
         context,
     )
+
+
+def _canonical_human_declarations(
+    values: Any,
+    context: str,
+) -> Tuple[HumanDeclarationAuthority, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple)):
+        raise ValueError(
+            "%s must be a list or tuple of HumanDeclarationAuthority values"
+            % context
+        )
+    if len(values) > MAX_HUMAN_DECLARATIONS:
+        raise ValueError(
+            "%s exceeds the maximum item count of %d"
+            % (context, MAX_HUMAN_DECLARATIONS)
+        )
+    by_json: Dict[str, HumanDeclarationAuthority] = {}
+    by_source_ref: Dict[str, HumanDeclarationAuthority] = {}
+    for value in values:
+        if type(value) is not HumanDeclarationAuthority:
+            raise ValueError(
+                "%s items must be exact HumanDeclarationAuthority values" % context
+            )
+        item_json = value.to_json()
+        source_ref_json = value.source_ref.to_json()
+        existing = by_source_ref.get(source_ref_json)
+        if existing is not None and existing.to_json() != item_json:
+            raise ValueError(
+                "%s contains a duplicate source_ref with conflicting authority "
+                "semantics" % context
+            )
+        by_source_ref[source_ref_json] = value
+        by_json[item_json] = value
+    return tuple(by_json[key] for key in sorted(by_json))
+
+
+def _human_declarations_from_payload(
+    value: Any,
+    context: str,
+) -> Tuple[HumanDeclarationAuthority, ...]:
+    if not isinstance(value, list):
+        raise ValueError("%s must be a list" % context)
+    return _canonical_human_declarations(
+        tuple(HumanDeclarationAuthority.from_dict(item) for item in value),
+        context,
+    )
+
+
+def _candidate_authority_receipt_id(identity_payload: Mapping[str, Any]) -> str:
+    return "CAR-" + canonical_sha256(identity_payload)
+
+
+@dataclass(frozen=True)
+class CandidateAuthorityReceipt(_JsonModel):
+    candidate_id: str
+    authority_repository_key: str
+    locator_repository_key: str
+    origin: ProducerType
+    review_id: str
+    proposal_head_sha: str
+    authorized_source_refs: Tuple[SourceRef, ...]
+    human_declarations: Tuple[HumanDeclarationAuthority, ...]
+    initial_validation_report_hash: str
+    authority_resolution_hash: str
+    binding_id: Optional[str]
+    created_at: str
+    schema_version: int = MODEL_SCHEMA_VERSION
+    receipt_id: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        _validate_schema(self.schema_version, "candidate_authority_receipt")
+        object.__setattr__(
+            self,
+            "candidate_id",
+            validate_stable_id(self.candidate_id, "MC", "candidate_id"),
+        )
+        object.__setattr__(
+            self,
+            "authority_repository_key",
+            _normalize_repository_key(
+                self.authority_repository_key,
+                "authority_repository_key",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "locator_repository_key",
+            _normalize_repository_key(
+                self.locator_repository_key,
+                "locator_repository_key",
+            ),
+        )
+        if not isinstance(self.origin, ProducerType):
+            raise ValueError("origin must be a ProducerType")
+        object.__setattr__(
+            self,
+            "review_id",
+            _normalize_identifier(self.review_id, "review_id"),
+        )
+        object.__setattr__(
+            self,
+            "proposal_head_sha",
+            _git_object_id(self.proposal_head_sha, "proposal_head_sha"),
+        )
+        object.__setattr__(
+            self,
+            "authorized_source_refs",
+            _canonical_source_refs(
+                self.authorized_source_refs,
+                "authorized_source_refs",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "human_declarations",
+            _canonical_human_declarations(
+                self.human_declarations,
+                "human_declarations",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "initial_validation_report_hash",
+            _sha256_digest(
+                self.initial_validation_report_hash,
+                "initial_validation_report_hash",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "authority_resolution_hash",
+            _sha256_digest(
+                self.authority_resolution_hash,
+                "authority_resolution_hash",
+            ),
+        )
+
+        is_direct = self.locator_repository_key == self.authority_repository_key
+        if is_direct:
+            if self.binding_id is not None:
+                raise ValueError(
+                    "direct authority receipt requires binding_id to be None"
+                )
+        else:
+            if self.binding_id is None:
+                raise ValueError(
+                    "bound authority receipt requires a canonical binding_id"
+                )
+            object.__setattr__(
+                self,
+                "binding_id",
+                validate_stable_id(self.binding_id, "RB", "binding_id"),
+            )
+
+        if self.origin is ProducerType.HUMAN:
+            if not self.human_declarations:
+                raise ValueError(
+                    "HUMAN authority receipt requires at least one "
+                    "human_declarations item"
+                )
+        elif self.human_declarations:
+            raise ValueError(
+                "non-human authority receipt must not carry human_declarations"
+            )
+
+        authorized_source_ref_json = {
+            source_ref.to_json() for source_ref in self.authorized_source_refs
+        }
+        for declaration in self.human_declarations:
+            if declaration.source_ref.to_json() not in authorized_source_ref_json:
+                raise ValueError(
+                    "human declaration source_ref must be present in "
+                    "authorized_source_refs with matching hash, actor, and review"
+                )
+            declaration_review_id = declaration.source_ref.review_id
+            if (
+                declaration_review_id is not None
+                and declaration_review_id != self.review_id
+            ):
+                raise ValueError(
+                    "human declaration source_ref.review_id must match receipt "
+                    "review_id"
+                )
+
+        object.__setattr__(
+            self,
+            "created_at",
+            _utc_timestamp(self.created_at, "created_at"),
+        )
+        object.__setattr__(
+            self,
+            "receipt_id",
+            _candidate_authority_receipt_id(self._identity_payload()),
+        )
+
+    def _identity_payload(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "candidate_id": self.candidate_id,
+            "authority_repository_key": self.authority_repository_key,
+            "locator_repository_key": self.locator_repository_key,
+            "origin": self.origin.value,
+            "review_id": self.review_id,
+            "proposal_head_sha": self.proposal_head_sha,
+            "authorized_source_refs": [
+                item.to_dict() for item in self.authorized_source_refs
+            ],
+            "human_declarations": [
+                item.to_dict() for item in self.human_declarations
+            ],
+            "initial_validation_report_hash": self.initial_validation_report_hash,
+            "authority_resolution_hash": self.authority_resolution_hash,
+            "binding_id": self.binding_id,
+            "created_at": self.created_at,
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "receipt_id": self.receipt_id,
+            "candidate_id": self.candidate_id,
+            "authority_repository_key": self.authority_repository_key,
+            "locator_repository_key": self.locator_repository_key,
+            "origin": self.origin.value,
+            "review_id": self.review_id,
+            "proposal_head_sha": self.proposal_head_sha,
+            "authorized_source_refs": [
+                item.to_dict() for item in self.authorized_source_refs
+            ],
+            "human_declarations": [
+                item.to_dict() for item in self.human_declarations
+            ],
+            "initial_validation_report_hash": self.initial_validation_report_hash,
+            "authority_resolution_hash": self.authority_resolution_hash,
+            "binding_id": self.binding_id,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "CandidateAuthorityReceipt":
+        root = _object(payload, "candidate_authority_receipt")
+        _exact_fields(
+            root,
+            {
+                "schema_version",
+                "receipt_id",
+                "candidate_id",
+                "authority_repository_key",
+                "locator_repository_key",
+                "origin",
+                "review_id",
+                "proposal_head_sha",
+                "authorized_source_refs",
+                "human_declarations",
+                "initial_validation_report_hash",
+                "authority_resolution_hash",
+                "binding_id",
+                "created_at",
+            },
+            "candidate_authority_receipt",
+        )
+        _validate_schema(root["schema_version"], "candidate_authority_receipt")
+        receipt = cls(
+            candidate_id=root["candidate_id"],
+            authority_repository_key=root["authority_repository_key"],
+            locator_repository_key=root["locator_repository_key"],
+            origin=_enum_value(
+                ProducerType,
+                root["origin"],
+                "candidate_authority_receipt.origin",
+            ),
+            review_id=root["review_id"],
+            proposal_head_sha=root["proposal_head_sha"],
+            authorized_source_refs=_source_refs_from_payload(
+                root["authorized_source_refs"],
+                "candidate_authority_receipt.authorized_source_refs",
+            ),
+            human_declarations=_human_declarations_from_payload(
+                root["human_declarations"],
+                "candidate_authority_receipt.human_declarations",
+            ),
+            initial_validation_report_hash=root["initial_validation_report_hash"],
+            authority_resolution_hash=root["authority_resolution_hash"],
+            binding_id=root["binding_id"],
+            created_at=root["created_at"],
+            schema_version=root["schema_version"],
+        )
+        validate_stable_id(
+            root["receipt_id"],
+            "CAR",
+            "candidate_authority_receipt.receipt_id",
+        )
+        if root["receipt_id"] != receipt.receipt_id:
+            raise ValueError(
+                "candidate_authority_receipt.receipt_id does not match "
+                "canonical authority identity"
+            )
+        return receipt
 
 
 @dataclass(frozen=True)
