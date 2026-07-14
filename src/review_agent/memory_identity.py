@@ -1634,6 +1634,7 @@ __all__ = [
     "repository_key",
     "repository_namespace_path",
     "resolve_memory_root",
+    "sanitize_origin_url",
     "validate_repository_memory_namespace",
     "verify_repository_identity",
     "verify_repository_locator",

@@ -44,6 +44,7 @@ from review_agent.memory_identity import (
     RepositoryIdentityCore,
     RepositoryIdentityDescriptor,
     RepositoryMemoryNamespace,
+    sanitize_origin_url,
     validate_repository_memory_namespace,
 )
 from review_agent.memory_models import (
@@ -64,7 +65,6 @@ from review_agent.memory_models import (
     stable_request_id,
     validate_stable_id,
 )
-from review_agent.revision import sanitize_origin_url
 
 
 STORE_SCHEMA_NAME = "memory_store_schema_v1"
