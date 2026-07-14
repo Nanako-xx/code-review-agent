@@ -377,6 +377,89 @@ def test_approval_uses_generation_and_status_cas_without_duplicate_record(
         store.get_record(record.memory_id)
 
 
+def test_atomic_lifecycle_approval_rolls_back_bundle_pin_and_authority(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate(status=CandidateStatus.PENDING_APPROVAL)
+    store.put_candidate(
+        candidate,
+        request_id=stable_request_id("candidate", candidate.candidate_id),
+    )
+    content = b'{"schema":"memory_source_bundle_v1","sources":[]}'
+    blob = store.put_blob(
+        content,
+        media_type="application/vnd.review-agent.source-bundle+json",
+        created_at=CREATED_AT,
+    )
+    bundle = SourceBundleDescriptor(
+        repository_key=candidate.repository_key,
+        candidate_id=candidate.candidate_id,
+        source_refs=candidate.source_refs,
+        blob_hash=blob.blob_hash,
+        size_bytes=blob.size_bytes,
+        media_type=blob.media_type,
+        created_at=CREATED_AT,
+    )
+    request_id = stable_request_id("atomic-approve", candidate.candidate_id)
+    record = _record(candidate, bundle, request_id)
+    generation = store.get_generations(REPOSITORY_KEY).memory_generation
+
+    with store.open_connection(read_only=False) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_atomic_record BEFORE INSERT ON records
+            BEGIN SELECT RAISE(ABORT, 'injected record failure'); END
+            """
+        )
+
+    with pytest.raises(MemoryStoreConflictError):
+        store.approve_candidate_with_source_bundle(
+            record,
+            bundle,
+            request_id=request_id,
+            expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
+            expected_generation=generation,
+            actor_id="amy",
+            reason="Approved after source revalidation.",
+        )
+
+    assert store.get_candidate(candidate.candidate_id).status is CandidateStatus.PENDING_APPROVAL
+    assert store.find_source_bundle(bundle.bundle_hash) is None
+    assert store.count_records(REPOSITORY_KEY) == 0
+    assert store.get_generations(REPOSITORY_KEY).memory_generation == generation
+    with store.open_connection(read_only=True) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM blob_pins WHERE pin_type = 'source_bundle'"
+        ).fetchone()[0] == 0
+
+    with store.open_connection(read_only=False) as connection:
+        connection.execute("DROP TRIGGER reject_atomic_record")
+    result = store.approve_candidate_with_source_bundle(
+        record,
+        bundle,
+        request_id=request_id,
+        expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
+        expected_generation=generation,
+        actor_id="amy",
+        reason="Approved after source revalidation.",
+    )
+
+    assert result.applied
+    assert store.get_candidate(candidate.candidate_id).status is CandidateStatus.APPROVED
+    assert store.get_record(record.memory_id) == record
+    assert store.get_source_bundle(bundle.bundle_hash) == bundle
+    with store.open_connection(read_only=True) as connection:
+        pin = connection.execute(
+            """
+            SELECT pin_type, pin_id FROM blob_pins
+            WHERE blob_hash = ?
+            """,
+            (blob.blob_hash,),
+        ).fetchone()
+    assert tuple(pin) == ("source_bundle", bundle.bundle_hash)
+
+
 @pytest.mark.parametrize(
     "tamper_sql",
     [
@@ -445,6 +528,45 @@ def test_blob_hash_size_validation_atomic_promotion_and_fail_closed_read(
     Path(blob.path).write_bytes(b"tampered")
     with pytest.raises(MemoryStoreCorruptionError):
         store.read_blob(digest)
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_blob_repair_is_serialized_store_owned_and_preserves_metadata(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    namespace = tmp_path / "memory"
+    store = MemoryStore(namespace)
+    content = b"canonical repository knowledge"
+    blob = store.put_blob(
+        content,
+        media_type="application/octet-stream",
+        created_at=CREATED_AT,
+    )
+    path = Path(blob.path)
+    if damage == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"tampered")
+
+    repaired = store.repair_blob(
+        content,
+        media_type=blob.media_type,
+        expected_hash=blob.blob_hash,
+        expected_size=blob.size_bytes,
+    )
+
+    assert repaired == blob
+    assert store.read_blob(blob.blob_hash) == content
+    with pytest.raises(MemoryStoreCorruptionError, match="metadata"):
+        store.repair_blob(content, media_type="application/json")
+    assert store.read_blob(blob.blob_hash) == content
+
+    with pytest.raises(MemoryStoreReadOnlyError):
+        MemoryStore(namespace, read_only=True).repair_blob(
+            content,
+            media_type=blob.media_type,
+        )
 
 
 def test_read_only_store_never_promotes_a_blob_before_rejecting_write(

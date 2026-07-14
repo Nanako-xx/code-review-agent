@@ -1759,6 +1759,72 @@ class MemoryStore:
 
     store_blob = put_blob
 
+    def repair_blob(
+        self,
+        content: Union[bytes, bytearray, memoryview],
+        *,
+        media_type: str,
+        expected_hash: Optional[str] = None,
+        expected_size: Optional[int] = None,
+    ) -> BlobInfo:
+        """Atomically restore a corrupt/missing file for existing blob metadata.
+
+        Repository-cache rebuilds must not unlink content-addressed files behind
+        the Store's back.  Repair is serialized with readers, promotion, and GC,
+        and it never creates or changes canonical blob metadata.
+        """
+
+        if self._read_only:
+            raise MemoryStoreReadOnlyError()
+        if not isinstance(content, (bytes, bytearray, memoryview)):
+            raise MemoryStoreValidationError("blob content must be bytes")
+        raw = bytes(content)
+        if len(raw) > MAX_BLOB_SIZE_BYTES:
+            raise MemoryStoreValidationError("blob exceeds the supported size limit")
+        checked_media_type = _media_type(media_type)
+        digest = hashlib.sha256(raw).hexdigest()
+        size = len(raw)
+        if expected_hash is not None and not hmac.compare_digest(
+            digest, _digest(expected_hash, "expected_hash")
+        ):
+            raise MemoryStoreValidationError("blob hash validation failed")
+        if expected_size is not None:
+            if type(expected_size) is not int or expected_size < 0:
+                raise MemoryStoreValidationError("expected blob size is invalid")
+            if expected_size != size:
+                raise MemoryStoreValidationError("blob size validation failed")
+
+        with _exclusive_file_lock(self._blob_lock_path, self._busy_timeout_ms):
+            destination = self.blob_path(digest)
+            with self._authority() as connection:
+                row = connection.execute(
+                    "SELECT * FROM blobs WHERE blob_hash = ?", (digest,)
+                ).fetchone()
+                if row is None:
+                    raise MemoryStoreCorruptionError(
+                        "cannot repair unregistered memory blob"
+                    )
+                if (
+                    row["size_bytes"] != size
+                    or row["media_type"] != checked_media_type
+                ):
+                    raise MemoryStoreCorruptionError(
+                        "blob metadata is inconsistent"
+                    )
+                created_at = _timestamp(row["created_at"], "blob created_at")
+                try:
+                    self._validate_blob_file_values(destination, digest, size)
+                except MemoryStoreCorruptionError:
+                    self._replace_blob_file(raw, digest, size, destination)
+
+            return BlobInfo(
+                blob_hash=digest,
+                size_bytes=size,
+                media_type=checked_media_type,
+                created_at=created_at,
+                path=str(destination),
+            )
+
     def _promote_blob(
         self,
         content: bytes,
@@ -1806,6 +1872,57 @@ class MemoryStore:
             raise
         except OSError:
             raise MemoryStoreUnavailableError("memory blob store is unavailable") from None
+
+    def _replace_blob_file(
+        self,
+        content: bytes,
+        digest: str,
+        size: int,
+        destination: Path,
+    ) -> None:
+        """Replace one known corrupt blob while the process lock is held."""
+
+        temporary = self._blob_temp_root / (".%s.%s.repair" % (digest, uuid.uuid4().hex))
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            self._blob_temp_root.mkdir(parents=True, exist_ok=True)
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            descriptor = os.open(str(temporary), flags, 0o600)
+            try:
+                offset = 0
+                while offset < size:
+                    written = os.write(
+                        descriptor,
+                        content[offset : offset + 1024 * 1024],
+                    )
+                    if written <= 0:
+                        raise OSError("short blob repair write")
+                    offset += written
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            self._validate_blob_file_values(temporary, digest, size)
+            os.replace(str(temporary), str(destination))
+            _fsync_directory(destination.parent)
+            self._validate_blob_file_values(destination, digest, size)
+        except MemoryStoreError:
+            raise
+        except OSError:
+            raise MemoryStoreUnavailableError(
+                "memory blob store is unavailable"
+            ) from None
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @staticmethod
     def _validate_blob_file_values(path: Path, digest: str, size: int) -> None:
@@ -2072,6 +2189,400 @@ class MemoryStore:
         if bundle is None:
             raise MemoryStoreNotFoundError("source bundle was not found")
         return bundle
+
+    def approve_candidate_with_source_bundle(
+        self,
+        record: DurableMemoryRecord,
+        bundle: SourceBundleDescriptor,
+        *,
+        request_id: str,
+        expected_candidate_status: CandidateStatus,
+        expected_generation: Optional[int] = None,
+        actor_type: str = "human",
+        actor_id: Optional[str] = None,
+        reason_code: str = "approved",
+        reason: Optional[str] = None,
+        supersede_memory_id: Optional[str] = None,
+        expected_supersede_status: Optional[RecordStatus] = None,
+    ) -> WriteResult:
+        """Atomically pin evidence, approve a candidate, and optionally supersede.
+
+        The content-addressed blob may have been promoted before this call; a
+        blob by itself carries no Memory authority.  The SourceBundle row, its
+        permanent pin, the approved Record, Candidate projection, events, and
+        optional predecessor supersession are committed in one SQLite authority
+        transaction.  A failure therefore leaves no observable half-authority
+        state.
+        """
+
+        if not isinstance(record, DurableMemoryRecord):
+            raise MemoryStoreValidationError(
+                "record must be a canonical DurableMemoryRecord"
+            )
+        if not isinstance(bundle, SourceBundleDescriptor):
+            raise MemoryStoreValidationError(
+                "source bundle must be a canonical SourceBundleDescriptor"
+            )
+        if record.sensitivity is Sensitivity.BLOCKED:
+            raise MemoryStoreValidationError("blocked memory content cannot be persisted")
+        if record.status is not RecordStatus.ACTIVE:
+            raise MemoryStoreValidationError(
+                "a newly approved durable memory record must be active"
+            )
+        if not isinstance(expected_candidate_status, CandidateStatus):
+            raise MemoryStoreValidationError("candidate status is invalid")
+        if expected_candidate_status is CandidateStatus.APPROVED:
+            raise MemoryStoreValidationError(
+                "candidate approval requires a pre-approval status"
+            )
+        checked_supersede_id = (
+            None
+            if supersede_memory_id is None
+            else _stable_subject_id(
+                supersede_memory_id,
+                "MEM",
+                "supersede_memory_id",
+            )
+        )
+        if checked_supersede_id is None:
+            if expected_supersede_status is not None:
+                raise MemoryStoreValidationError(
+                    "expected supersede status requires a predecessor record"
+                )
+        else:
+            if not isinstance(expected_supersede_status, RecordStatus):
+                raise MemoryStoreValidationError(
+                    "predecessor record status is invalid"
+                )
+            if expected_supersede_status not in {
+                RecordStatus.ACTIVE,
+                RecordStatus.REVALIDATION_REQUIRED,
+            }:
+                raise MemoryStoreValidationError(
+                    "only active or revalidation-required records can be superseded"
+                )
+            if checked_supersede_id == record.memory_id:
+                raise MemoryStoreValidationError(
+                    "a record cannot supersede itself"
+                )
+        if (
+            bundle.repository_key != record.repository_key
+            or bundle.candidate_id != record.candidate_id
+            or bundle.source_refs != record.source_refs
+        ):
+            raise MemoryStoreValidationError(
+                "source bundle does not match the approved record"
+            )
+        if bundle.created_at != record.created_at:
+            raise MemoryStoreValidationError(
+                "source bundle and approved record timestamps must match"
+            )
+
+        operation = "approve_candidate_with_source_bundle"
+        checked_request = _request_id(request_id)
+        approver = actor_id or record.approved_by
+        request_hash = canonical_sha256(
+            {
+                "operation": operation,
+                "record": record.to_dict(),
+                "bundle": bundle.to_dict(),
+                "expected_candidate_status": expected_candidate_status.value,
+                "expected_generation": expected_generation,
+                "actor_type": actor_type,
+                "actor_id": approver,
+                "reason_code": reason_code,
+                "reason": reason,
+                "supersede_memory_id": checked_supersede_id,
+                "expected_supersede_status": (
+                    None
+                    if expected_supersede_status is None
+                    else expected_supersede_status.value
+                ),
+            }
+        )
+        record_json, record_body_hash = _model_storage(record)
+        bundle_json, bundle_body_hash = _model_storage(bundle)
+
+        with self._authority() as connection:
+            self._ensure_repository_rows(
+                connection,
+                record.repository_key,
+                record.created_at,
+            )
+            replay = self._request_receipt(
+                connection,
+                request_id=checked_request,
+                repository_key=record.repository_key,
+                operation=operation,
+                request_hash=request_hash,
+            )
+            if replay is not None:
+                return replay
+            self._assert_generation(
+                connection,
+                record.repository_key,
+                "memory",
+                expected_generation,
+            )
+
+            candidate_row = connection.execute(
+                "SELECT * FROM candidates WHERE candidate_id = ?",
+                (record.candidate_id,),
+            ).fetchone()
+            if candidate_row is None:
+                raise MemoryStoreNotFoundError("memory candidate was not found")
+            candidate = _candidate_from_row(candidate_row)
+            if not _record_matches_candidate(record, candidate):
+                raise MemoryStoreConflictError(
+                    "record body does not match its immutable candidate"
+                )
+            if candidate.status is not expected_candidate_status:
+                raise MemoryStoreConflictError()
+            if connection.execute(
+                "SELECT 1 FROM records WHERE candidate_id = ?",
+                (record.candidate_id,),
+            ).fetchone() is not None:
+                raise MemoryStoreConflictError(
+                    "candidate already has a durable memory record"
+                )
+
+            predecessor: Optional[DurableMemoryRecord] = None
+            if checked_supersede_id is not None:
+                predecessor_row = connection.execute(
+                    "SELECT * FROM records WHERE memory_id = ?",
+                    (checked_supersede_id,),
+                ).fetchone()
+                if predecessor_row is None:
+                    raise MemoryStoreNotFoundError(
+                        "predecessor durable memory record was not found"
+                    )
+                predecessor = _validated_record_from_row(
+                    connection,
+                    predecessor_row,
+                )
+                if predecessor.repository_key != record.repository_key:
+                    raise MemoryStoreConflictError(
+                        "replacement and predecessor repositories differ"
+                    )
+                if predecessor.status is not expected_supersede_status:
+                    raise MemoryStoreConflictError()
+
+            blob = self._blob_info_from_connection(
+                connection,
+                bundle.blob_hash,
+                validate_file=True,
+            )
+            if (
+                blob.size_bytes != bundle.size_bytes
+                or blob.media_type != bundle.media_type
+            ):
+                raise MemoryStoreConflictError(
+                    "source bundle blob metadata does not match"
+                )
+
+            bundle_row = connection.execute(
+                "SELECT * FROM source_bundles WHERE bundle_hash = ?",
+                (bundle.bundle_hash,),
+            ).fetchone()
+            if bundle_row is None:
+                bundle_generation = self._bump_generation(
+                    connection,
+                    bundle.repository_key,
+                    "memory",
+                )
+                connection.execute(
+                    """
+                    INSERT INTO source_bundles(
+                        bundle_hash, repository_key, candidate_id, blob_hash,
+                        model_json, body_hash, generation, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        bundle.bundle_hash,
+                        bundle.repository_key,
+                        bundle.candidate_id,
+                        bundle.blob_hash,
+                        bundle_json,
+                        bundle_body_hash,
+                        bundle_generation,
+                        bundle.created_at,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO blob_pins(blob_hash, pin_type, pin_id, created_at)
+                    VALUES (?, 'source_bundle', ?, ?)
+                    """,
+                    (
+                        bundle.blob_hash,
+                        bundle.bundle_hash,
+                        bundle.created_at,
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    repository_key=bundle.repository_key,
+                    subject_type="source_bundle",
+                    subject_id=bundle.bundle_hash,
+                    action="source_bundle_stored",
+                    actor_type="runtime",
+                    actor_id="memory_lifecycle",
+                    reason_code="source_bundle_materialized",
+                    reason=None,
+                    previous_status=None,
+                    new_status="stored",
+                    request_id=stable_request_id(
+                        operation,
+                        "source_bundle",
+                        checked_request,
+                        bundle.bundle_hash,
+                    ),
+                    created_at=bundle.created_at,
+                    generation_kind="memory",
+                    generation=bundle_generation,
+                )
+            else:
+                existing_bundle = _validated_source_bundle_from_row(
+                    connection,
+                    bundle_row,
+                )
+                if existing_bundle != bundle:
+                    raise MemoryStoreConflictError(
+                        "source bundle hash already has different canonical content"
+                    )
+                existing_pin = connection.execute(
+                    """
+                    SELECT 1 FROM blob_pins
+                    WHERE blob_hash = ? AND pin_type = 'source_bundle' AND pin_id = ?
+                    """,
+                    (bundle.blob_hash, bundle.bundle_hash),
+                ).fetchone()
+                if existing_pin is None:
+                    raise MemoryStoreCorruptionError(
+                        "source bundle permanent pin is missing"
+                    )
+
+            approval_generation = self._bump_generation(
+                connection,
+                record.repository_key,
+                "memory",
+            )
+            connection.execute(
+                """
+                UPDATE candidates SET current_status = ?, generation = ?
+                WHERE candidate_id = ? AND current_status = ?
+                """,
+                (
+                    CandidateStatus.APPROVED.value,
+                    approval_generation,
+                    record.candidate_id,
+                    expected_candidate_status.value,
+                ),
+            )
+            if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                raise MemoryStoreConflictError()
+            connection.execute(
+                """
+                INSERT INTO records(
+                    memory_id, candidate_id, repository_key, source_bundle_hash,
+                    model_json, body_hash, current_status, generation, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.memory_id,
+                    record.candidate_id,
+                    record.repository_key,
+                    record.source_bundle_hash,
+                    record_json,
+                    record_body_hash,
+                    record.status.value,
+                    approval_generation,
+                    record.created_at,
+                ),
+            )
+            approval_event = self._append_event(
+                connection,
+                repository_key=record.repository_key,
+                subject_type="candidate",
+                subject_id=record.candidate_id,
+                action="approve",
+                actor_type=actor_type,
+                actor_id=approver,
+                reason_code=reason_code,
+                reason=reason,
+                previous_status=expected_candidate_status.value,
+                new_status=CandidateStatus.APPROVED.value,
+                request_id=checked_request,
+                created_at=record.created_at,
+                generation_kind="memory",
+                generation=approval_generation,
+                event_id=record.approval_event_id,
+            )
+
+            if predecessor is not None:
+                supersede_generation = self._bump_generation(
+                    connection,
+                    record.repository_key,
+                    "memory",
+                )
+                connection.execute(
+                    """
+                    UPDATE records SET current_status = ?, generation = ?
+                    WHERE memory_id = ? AND current_status = ?
+                    """,
+                    (
+                        RecordStatus.SUPERSEDED.value,
+                        supersede_generation,
+                        predecessor.memory_id,
+                        expected_supersede_status.value,
+                    ),
+                )
+                if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise MemoryStoreConflictError()
+                self._append_event(
+                    connection,
+                    repository_key=record.repository_key,
+                    subject_type="record",
+                    subject_id=predecessor.memory_id,
+                    action="supersede",
+                    actor_type=actor_type,
+                    actor_id=approver,
+                    reason_code="revalidated",
+                    reason=reason,
+                    previous_status=expected_supersede_status.value,
+                    new_status=RecordStatus.SUPERSEDED.value,
+                    request_id=stable_request_id(
+                        operation,
+                        "supersede",
+                        checked_request,
+                        predecessor.memory_id,
+                        record.memory_id,
+                    ),
+                    created_at=record.created_at,
+                    generation_kind="memory",
+                    generation=supersede_generation,
+                )
+
+            result = WriteResult(
+                operation=operation,
+                subject_id=record.memory_id,
+                event_id=approval_event.event_id,
+                generations=self._generations_from_connection(
+                    connection,
+                    record.repository_key,
+                ),
+                applied=True,
+            )
+            self._store_request_receipt(
+                connection,
+                request_id=checked_request,
+                repository_key=record.repository_key,
+                operation=operation,
+                request_hash=request_hash,
+                result=result,
+                created_at=record.created_at,
+            )
+            return result
 
     def approve_candidate(
         self,
