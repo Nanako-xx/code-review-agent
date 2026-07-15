@@ -1,6 +1,6 @@
 # Core Code Review Eval System 实施计划
 
-**状态：** 执行中（Task 1 已完成，Task 2 待开始）
+**状态：** 执行中（Task 1–3 已完成，下一步 Task 4）
 
 **设计来源：** `docs/superpowers/specs/2026-07-16-core-code-review-eval-system-design.md`
 
@@ -10,7 +10,7 @@
 
 **技术栈：** Python frozen dataclasses/enums、stdlib JSON/Git/subprocess/hashlib/statistics、现有统一 Model Adapter、pytest；公共 Parquet 数据读取仅放在可选 `eval-public` 依赖中，核心 Harness 不依赖数据科学框架。
 
-**最终协议：** `eval_input_v1`、`eval_submission_v1`、`eval_case_v1`、`eval_run_config_v1`、`eval_run_manifest_v1`、结构化 Judge 输出 v1、Suite Manifest v1 和 Run Artifact v1。所有批次从第一天使用这些最终协议和严格 hydration，不建立以后迁移掉的 v0 格式。
+**最终协议：** `eval_input_v1`、`eval_submission_v1`、`eval_case_v1`、`eval_run_config_v1`、`eval_evaluator_execution_config_v1`、`eval_run_manifest_v1`、结构化 Judge 输出 v1、Suite Manifest v1 和 Run Artifact v1。所有批次从第一天使用这些最终协议和严格 hydration，不建立以后迁移掉的 v0 格式。
 
 ---
 
@@ -217,21 +217,21 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 **RED 测试：**
 
-- [ ] Suite Manifest 固定 suite ID/version、Case 列表、split、source metadata、license、content hash 和 truth completeness。
-- [ ] Loader 在使用 Case 前重新计算文件 hash 与 canonical Case digest，篡改、重复 task ID 和缺失 Case 均失败。
-- [ ] Agent-facing loader 只能返回 `EvalInput`；truth 和完整 Clarification Script 只能由 evaluator/Runner-facing API 读取，类型层面不共享一个包含答案的对象。
-- [ ] Case path 必须留在 suite root；拒绝 absolute path、`..`、symlink/reparse-point escape 和大小写碰撞。
-- [ ] intent authority、required claims、forbidden claims 与 clarification policy 组合合法性受校验。
-- [ ] closed-world Case 可以禁止 novel Finding；human-observed Case 不允许把 unmatched 自动标成 fabricated。
-- [ ] fixed train/dev/capability/regression/held-out split 不能在一次 Run 内重映射。
-- [ ] manifest/source/version/license/hash 缺失时公共数据 Case 不可运行。
+- [x] Suite Manifest 固定 suite ID/version、Case 列表、split、source metadata、license、content hash 和 truth completeness。
+- [x] Loader 在使用 Case 前重新计算文件 hash 与 canonical Case digest，篡改、重复 task ID 和缺失 Case 均失败。
+- [x] Agent-facing loader 只能返回 `EvalInput`；truth 和完整 Clarification Script 只能由 evaluator/Runner-facing API 读取，类型层面不共享一个包含答案的对象。
+- [x] Case path 必须留在 suite root；拒绝 absolute path、`..`、symlink/reparse-point escape 和大小写碰撞。
+- [x] intent authority、required claims、forbidden claims 与 clarification policy 组合合法性受校验。
+- [x] closed-world Case 可以禁止 novel Finding；human-observed Case 不允许把 unmatched 自动标成 fabricated。
+- [x] fixed train/dev/capability/regression/held-out split 不能在一次 Run 内重映射。
+- [x] manifest/source/version/license/hash 缺失时公共数据 Case 不可运行。
 
 **实现：**
 
-- [ ] 实现 immutable `CaseBank`、`SuiteManifest`、`CaseHandle` 和只暴露输入的 `AgentCaseView`。
-- [ ] ground truth 和完整 Clarification Script 保留在 Harness 控制目录；Repository Preparer 只接收 repository descriptor，不接收 truth 或答案 payload。
-- [ ] 生成运行所需的 Case manifest snapshot，确保后续源文件变化不会静默改变已完成 Run。
-- [ ] 支持 Core/public/private suite 元数据，但不在核心 Loader 内写特定数据集分支。
+- [x] 实现 immutable `CaseBank`、`SuiteManifest`、`CaseHandle` 和只暴露输入的 `AgentCaseView`。
+- [x] ground truth 和完整 Clarification Script 保留在 Harness 控制目录；Repository Preparer 只接收 repository descriptor，不接收 truth 或答案 payload。
+- [x] 生成运行所需的 Case manifest snapshot，确保后续源文件变化不会静默改变已完成 Run。
+- [x] 支持 Core/public/private suite 元数据，但不在核心 Loader 内写特定数据集分支。
 
 **验证：**
 
@@ -240,6 +240,8 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 ```
 
 **提交边界：** `feat(eval): add versioned case bank and truth isolation`
+
+**完成记录（2026-07-16）：** Suite/Case/Snapshot 定向测试 51 项通过；实现 raw bytes、canonical Case、source provenance、EvalInput 与 snapshot digest 的独立绑定，truth-free Run Snapshot，以及 POSIX descriptor-relative/Windows opened-handle 的有界安全读取。
 
 ### Task 3：Run Config、Artifact Store 与可恢复 Manifest
 
@@ -254,22 +256,22 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 **RED 测试：**
 
-- [ ] Run Config 记录 Agent/commit/model/provider/参数/config digest、Suite/Case digest、trial count、Judge/rubric 版本和资源预算。
-- [ ] API key 值、认证 URL userinfo、完整环境变量和隐藏 reasoning 不能进入 Config、Manifest、错误或报告。
-- [ ] Run ID、trial ID、路径和 manifest digest 稳定且防 traversal。
-- [ ] 每个 artifact 使用 UTF-8 canonical JSON、内容 hash、原子写与 fsync；已完成 artifact 不被静默覆盖。
-- [ ] interrupted trial 可被识别为 incomplete，resume 只补齐缺失的合法阶段，不重写已有 Submission。
-- [ ] incomplete 是非终态且没有 terminal Submission；恢复成功后写 completed，放弃恢复时原子最终化为 failed/process_killed 或其他稳定 failure code。
-- [ ] 并行 Trial 写入互不覆盖；同一 run/case/trial 的冲突 writer fail closed。
-- [ ] `judge_input/output`、matches、score 和 report 可以在不修改原 submission 的情况下版本化重算。
-- [ ] artifact 读取有单文件/总大小上限，拒绝 symlink、special file 和 hash 不匹配。
+- [x] Run Config 记录 Agent/commit/model/provider/参数/config digest、Suite/Case digest、trial count、Judge/rubric 版本和资源预算。
+- [x] API key 值、认证 URL userinfo、完整环境变量和隐藏 reasoning 不能进入 Config、Manifest、错误或报告。
+- [x] Run ID、trial ID、路径和 manifest digest 稳定且防 traversal。
+- [x] 每个 artifact 使用 UTF-8 canonical JSON、内容 hash、原子写与 fsync；已完成 artifact 不被静默覆盖。
+- [x] interrupted trial 可被识别为 incomplete，resume 只补齐缺失的合法阶段，不重写已有 Submission。
+- [x] incomplete 是非终态且没有 terminal Submission；恢复成功后写 completed，放弃恢复时原子最终化为 failed/process_killed 或其他稳定 failure code。
+- [x] 并行 Trial 写入互不覆盖；同一 run/case/trial 的冲突 writer fail closed。
+- [x] `judge_input/output`、matches、score 和 report 可以在不修改原 submission 的情况下版本化重算。
+- [x] artifact 读取有单文件/总大小上限，拒绝 symlink、special file 和 hash 不匹配。
 
 **实现：**
 
-- [ ] 实现 `.eval-runs/<run-id>/` 的最终目录布局、Run/Trial manifest、stage receipts 和 atomic writer。
-- [ ] 将 Agent execution 与 evaluator execution 记为不同阶段与配置 digest。
-- [ ] 保留可选不透明 `trace_ref`，但不复制未授权 secret/raw reasoning。
-- [ ] 实现只读 `load_existing_submission` 与 re-evaluation output namespace。
+- [x] 实现 `.eval-runs/<run-id>/` 的最终目录布局、Run/Trial manifest、stage receipts 和 atomic writer。
+- [x] 将 Agent execution 与 evaluator execution 记为不同阶段与配置 digest。
+- [x] 保留可选不透明 `trace_ref`，但不复制未授权 secret/raw reasoning。
+- [x] 实现只读 `load_existing_submission` 与 re-evaluation output namespace。
 
 **验证：**
 
@@ -278,6 +280,8 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 ```
 
 **提交边界：** `feat(eval): add immutable run artifacts and manifests`
+
+**完成记录（2026-07-16）：** Task 3 定向测试 75 项通过；Task 1–3 全部 Eval 回归 273 项、产品模型/hydration/架构边界回归 63 项通过。Run Config、truth-free Snapshot、Run Manifest 与 Trial plan 通过唯一 verified bundle 联合校验；磁盘状态重放严格 hydration terminal Submission。POSIX 写入/锁使用 descriptor-relative primitive 并固定 root identity，Windows 持有拒绝 delete-share 的目录 handle chain；control-plane 与 execution artifact budget 分离并累计执行。每次重评使用严格 `EvaluatorExecutionConfig`，将 Judge/rubric、timeout、执行预算和显式 revision 共同绑定到 evaluation ID/receipt；Trial mutation 使用 active-attempt lease 阻止 stale worker 提交。Secret、嵌套环境 dump 与 raw reasoning probe 均 fail closed，只读 loader 不创建磁盘状态。
 
 ## Wave A3：Repository Preparation 与 Trial Isolation
 

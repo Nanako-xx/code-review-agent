@@ -658,7 +658,69 @@ v1 资源上限是协议的一部分：
 
 ## 10. 数据集与 Suite
 
-### 10.1 Core Regression Suite
+### 10.1 Suite Manifest v1 与 Run Case Snapshot
+
+所有 Core/public/private 数据集先转换为同一份严格 `suite_manifest_v1`，核心 Loader 不读取数据集专用 sidecar 来决定 Case 身份、split 或分组：
+
+```yaml
+schema_version: suite_manifest_v1
+suite_id: ...
+suite_version: ...
+source:
+  kind: core | public | private
+  source_id: ...
+  source_version: ...
+  source_uri: ... | null
+  license: ... | null
+  content_hash: ...
+cases:
+  - task_id: ...
+    case_version: 1
+    path: cases/example.json
+    split: train | dev | capability | regression | held_out
+    protocol_id: native_repository | official_frozen_context | ...
+    dimensions:
+      - name: language
+        value: python
+      - name: difficulty
+        value: hard
+    raw_file_size_bytes: 1234
+    raw_file_sha256: ...
+    canonical_case_digest: ...
+    eval_input_digest: ...
+    truth_completeness: closed_world | expert_augmented | human_observed
+```
+
+`dimensions` 是通用、evaluator-only 的严格 name/value 列表，用于保存 language、difficulty、benchmark type/config、PR-size bucket 等分组字段；name 使用唯一的小写 ASCII grouping key。`protocol_id` 单独存在，因为 official frozen-context 与 native repository 等执行协议参与兼容性判断，不能只当松散 tag。两者都不进入 Agent-facing EvalInput。
+
+四种内容身份必须分开：
+
+- `raw_file_sha256`：Case 文件 exact bytes 的 SHA-256；
+- `canonical_case_digest`：严格 hydration 后 EvalCase canonical JSON 的 SHA-256；
+- `CaseSource.content_hash`：上游数据记录的 provenance hash；
+- Run snapshot digest：本次固定选择及全部 binding 的 canonical digest。
+
+这些 digest 语义不同，但数值不要求互异；当 Case 文件本身就是 canonical JSON 时，raw SHA 与 canonical Case digest 可以相等。Loader 必须对同一次有界安全读取得到的 bytes 同时执行 raw hash、hydration 和 canonical digest 校验，不能 hash A、hydrate B。
+
+每个 manifest entry 还固定 `eval_input_digest`，使 truth-free Run snapshot 中携带的 EvalInput 可独立验证确实来自该 Case binding。`raw_file_size_bytes` 同时参与单文件和 Suite 累计预算。
+
+运行前生成 `eval_run_case_snapshot_v1`：
+
+```yaml
+schema_version: eval_run_case_snapshot_v1
+snapshot_id: ...
+manifest: ...
+cases:
+  - manifest_case: ...
+    source: ...
+    input: ...
+```
+
+Snapshot 只保存已验证的 manifest binding、Case provenance 和 EvalInput，不保存 Intent/Review truth、rationale 或 Clarification answers。完整 EvalCase 只留在 evaluator/Runner 私有 CaseBank。源文件后续变化不能改变 snapshot；重新打开私有 Case 时 digest 不符必须失败。
+
+Manifest、Snapshot 每层 exact-key、严格 UTF-8 JSON、重复 key/未知字段/非有限数 fail closed；Case path 使用 suite-relative portable POSIX path并拒绝 symlink/reparse/大小写与 Unicode-normalized collision。Public source 与 public Case 必须有 URI、version、license 和 hash。固定 v1 上限为：Manifest 16 MiB、Snapshot 256 MiB、65,536 Cases、Suite raw Case bytes 累计 512 MiB、每个 Case 64 个 dimensions。
+
+### 10.2 Core Regression Suite
 
 项目自建、长期维护的回归集，负责同时评 Intent 和 Review。
 
@@ -680,7 +742,7 @@ Capability Case 与 Regression Case 使用同一格式，但 Suite 目标不同�
 - Capability：Agent 目前做不到或不稳定，提供提升方向；
 - Regression：应接近稳定通过，防止已有能力退化。
 
-### 10.2 AACR-Bench Adapter
+### 10.3 AACR-Bench Adapter
 
 AACR-Bench 的公开数据口径：
 
@@ -701,7 +763,7 @@ Adapter 映射：
 
 AACR-Bench 默认只参与 Review Eval。当前产品只运行 Python eligibility subset，但 Adapter 保留其他语言元数据。
 
-### 10.3 SWE-PRBench Adapter
+### 10.4 SWE-PRBench Adapter
 
 SWE-PRBench 使用 `human_observed` ground truth，并保留：
 
@@ -721,7 +783,7 @@ native repository Agent protocol
 
 两种 protocol 分开报告，不声称 native Agent 结果与官方 frozen-context leaderboard 完全同口径。
 
-### 10.4 Private Held-out Suite
+### 10.5 Private Held-out Suite
 
 来自真实使用中的：
 
@@ -1240,24 +1302,39 @@ Average Time / Token / Cost
 ```text
 .eval-runs/<run-id>/
 ├── run_config.json
+├── case_snapshot.json
 ├── run_manifest.json
 ├── cases/
-│   └── <task-id>/
-│       └── trials/
-│           └── <trial-id>/
-│               ├── input.json
-│               ├── submission.json
+│   └── <opaque-case-path-id>/
+│       └── trials/<trial-id>/
+│           ├── trial_manifest.json
+│           ├── input.json
+│           ├── submission.json
+│           ├── trace_ref.json
+│           ├── receipts/
+│           │   ├── attempt-0001/start.json
+│           │   ├── attempt-0001/incomplete.json
+│           │   ├── prepare.json
+│           │   └── terminal.json
+│           └── evaluations/<evaluation-id>/
+│               ├── evaluator_execution_config.json
 │               ├── intent_matches.json
 │               ├── review_matches.json
 │               ├── judge_input.json
 │               ├── judge_output.json
 │               ├── score.json
-│               └── trace_ref.json
-├── summary.json
-└── report.md
+│               ├── report.md
+│               └── receipt.json
+└── evaluations/<evaluation-id>/
+    ├── summary.json
+    └── report.md
 ```
 
-`trace_ref.json` 可不存在。
+`case_snapshot.json` 是 10.1 节定义的 truth-free `eval_run_case_snapshot_v1`。它与 `run_config.json` 都由 `run_manifest.json` 的内容 hash/size 引用；Config 同时固定 manifest digest、snapshot ID、snapshot digest 和完整 `SuiteCase` bindings。三者在创建和每次加载时交叉验证，不能只相信其中一份文件。`trace_ref.json`、incomplete receipt 和各 evaluation namespace 可不存在。
+
+Run/Trial manifest 是不可变计划，不保存可变 status。运行状态只从 create-only stage receipts 派生：start 表示一次 attempt 已开始，incomplete 表示该 attempt 可恢复，prepare receipt 最后提交 EvalInput，唯一 terminal receipt 最后提交终态 Submission。`start_trial` 返回的 active attempt 是后续 incomplete/prepare/finalize mutation 的必填 lease；旧 worker 不能省略 attempt，也不能在 retry 已启动后把旧输出提交成当前 attempt。恢复只能采用与 immutable plan 完全一致的 orphan artifact 或补写缺失 receipt，不能重写已有 Submission。
+
+Case 的原始 `task_id` 不进入目录名；`opaque-case-path-id`、run ID、trial ID、evaluation ID 都由稳定 identity payload 派生并做单路径段校验。`canonical_case_digest` 在 Suite Config、Run/Trial manifest 中保持同名，不能重新缩写成语义含糊的 `case_digest`。
 
 Run Config 记录：
 
@@ -1266,11 +1343,19 @@ Run Config 记录：
 - 模型和 Provider；
 - Prompt/config digest；
 - 模型参数；
-- Case/Suite 版本；
+- Suite manifest digest、Case Snapshot ID/digest、Case bindings 与版本；
 - Trial 数量；
 - Grader/Judge/rubric 版本。
 
-这些字段只用于回答“这次测的是谁、使用了什么配置”，不形成独立得分。
+Run ID 只绑定 Agent-side execution identity：run instance key、Agent config、影响 Agent 执行的 timeout/output/trace/artifact/parallel resource budgets、Case Snapshot/Suite binding 和 Trial 数量；不绑定 Evaluator/Judge 及只影响重评的 evaluator timeout，因此同一 Submission 可以重评。每次重评把 Judge/model/rubric 配置、evaluator timeout 与 execution artifact file/total budgets 冻结为严格 `eval_evaluator_execution_config_v1`；其完整 digest 与显式 revision 派生独立 `evaluation-id`。Evaluator receipt 同时保存 execution digest、revision 与 ID，并在 hydration 时重新验证三者关系。相同 Judge/revision 但 timeout 或执行预算不同，也必须得到不同命名空间，不能覆盖或伪装成同一次评测。
+
+所有 JSON artifact 使用 canonical UTF-8、单文件/累计读取预算、内容 hash 和 create-if-absent 发布。`run_config.json`、`case_snapshot.json`、Run/Trial manifest、receipts 与必须始终落盘的 canonical terminal Submission 属于 control plane，分别受协议上限约束，不受 execution artifact budget 意外截断；v1 Run Config 上限为 32 MiB，Artifact Store 默认单文件/累计读取上限为 256/512 MiB，正好能够持久化协议允许的 Snapshot。Agent 原始 stdout/stderr、trace 与 evaluator 产物另受 `max_execution_artifact_file_bytes` / `max_execution_artifact_total_bytes` 约束，字段名不得再伪装成覆盖所有 control-plane artifact 的全局上限。
+
+文件内容在发布前 fsync；POSIX 额外 fsync 父目录。Python stdlib 在 Windows 不提供等价的目录 fsync，因此 Windows 明确只声明 file flush 与 atomic no-overwrite publication，不声称与 POSIX 父目录持久化语义等价。POSIX 的创建、写入、hard-link publish 与 lock 使用 descriptor-relative 路径；Windows 在写入/锁期间持有拒绝 delete-share 的已验证目录 handle chain，防止父目录被替换成 junction/reparse path。
+
+Evaluator-only 的模块级 Submission loader 以 read-only 模式打开既有 `.eval-runs`；根目录缺失时必须报错，不能以“读取”为名创建目录或 fsync 用户磁盘。Harness 必须显式传入与 Agent workspace 物理隔离的 `.eval-runs` 根，不提供 `for_workspace` 之类容易把 Judge input/truth 写回 Agent 可见工作区的便利入口。
+
+这些配置和 artifact 字段只用于回答“这次测的是谁、使用了什么配置、输入绑定是什么、结果如何复现”，不形成独立得分。
 
 ## 18. CLI
 
