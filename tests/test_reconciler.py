@@ -5,7 +5,12 @@ import json
 
 import pytest
 
-from review_agent.evidence import ConflictHint, FindingCandidate, ReconciliationPrepass
+from review_agent.evidence import (
+    ConflictHint,
+    FindingCandidate,
+    ReconciliationPrepass,
+    reconciliation_to_dict,
+)
 from review_agent.model_adapter import FakeToolCallingAdapter
 from review_agent.model_adapter_factory import (
     ModelAdapterConfig,
@@ -22,6 +27,7 @@ from review_agent.reconciler import (
     reconcile_semantically,
     semantic_reconciliation_from_dict,
     semantic_reconciliation_to_dict,
+    semantic_to_evidence_reconciliation,
 )
 
 
@@ -339,3 +345,16 @@ def test_semantic_reconciliation_round_trips_and_rejects_schema_drift():
     drifted["invented"] = True
     with pytest.raises(ValueError, match="exact fields"):
         semantic_reconciliation_from_dict(drifted)
+
+
+def test_semantic_finding_id_passes_through_evidence_projection() -> None:
+    candidate = _candidate("finding-id-pass-through", claim="Canonical finding")
+    prepass, observations, _ = _packet([candidate])
+    semantic = reconcile_semantically(prepass, observations, adapter=None).reconciliation
+
+    evidence = semantic_to_evidence_reconciliation(semantic)
+
+    assert evidence.canonical_findings[0].finding_id == candidate.finding_id
+    assert reconciliation_to_dict(evidence)["canonical_findings"][0][
+        "finding_id"
+    ] == candidate.finding_id
