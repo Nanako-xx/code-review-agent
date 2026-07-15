@@ -56,6 +56,12 @@ from review_agent.memory_sources import (
 )
 from review_agent.memory_store import MemoryStore
 from review_agent.observations import ObservationStore
+from review_agent.models import RiskAssessment, RiskLevel
+from review_agent.portfolio import (
+    DEFAULT_CONTRACT_ALLOWLIST,
+    build_portfolio_packet,
+    portfolio_packet_to_dict,
+)
 from review_agent.revision import ResolvedRevisions, RevisionResolver
 from review_agent.reconciler import (
     SemanticModelSummary,
@@ -117,6 +123,7 @@ def _session_authority(
     include_canonical: bool = True,
     semantic_matches_projection: bool = True,
     reconciliation_phase: RunPhase = RunPhase.RECONCILIATION,
+    contract_allowlist: tuple[str, ...] = DEFAULT_CONTRACT_ALLOWLIST,
 ) -> tuple[SessionStore, FindingSnapshot, ObservationSourceRef]:
     resolver = RevisionResolver()
     head = resolver.resolve_commit(repo, "HEAD")
@@ -161,6 +168,40 @@ def _session_authority(
         phase=RunPhase.REPORTING,
         revision_binding=head + ".." + head,
         now="2026-07-14T08:01:00Z",
+    )
+
+    portfolio_packet = build_portfolio_packet(
+        RiskAssessment(
+            level=RiskLevel.LOW,
+            dimensions={
+                "impact": "low",
+                "blast_radius": "low",
+                "reversibility": "high",
+                "uncertainty": "low",
+                "verification_strength": "high",
+            },
+            reasons=["Deterministic test Runtime policy."],
+            signal_refs=[],
+            uncertainties=[],
+            suggested_focus=["Behavioral correctness."],
+        ),
+        contract_allowlist=contract_allowlist,
+    )
+    (run_dir / "portfolio_packet.json").write_text(
+        json.dumps(
+            portfolio_packet_to_dict(portfolio_packet),
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    session_store.register_existing_artifact(
+        name="portfolio_packet",
+        relative_path="portfolio_packet.json",
+        schema="portfolio_packet_v1",
+        phase=RunPhase.PLANNING,
+        revision_binding=head + ".." + head,
+        now="2026-07-14T08:01:30Z",
     )
 
     canonical = CanonicalFinding(
@@ -234,6 +275,7 @@ def _session_authority(
         now="2026-07-14T08:03:00Z",
     )
     artifacts_by_phase = {
+        RunPhase.PLANNING: ["portfolio_packet"],
         RunPhase.RECONCILIATION: ["semantic_reconciliation"],
         RunPhase.REPORTING: ["observations"],
     }
@@ -626,6 +668,37 @@ def test_missed_requires_location_coverage_and_registered_contracts(
     assert store.list_feedback(_repository_key(git_repo)) == ()
 
 
+def test_missed_contract_registry_is_hydrated_from_session_runtime_authority(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    session_contract = "session_specific_contract"
+    _session, canonical, observation_ref = _session_authority(
+        git_repo,
+        tmp_path,
+        contract_allowlist=(*DEFAULT_CONTRACT_ALLOWLIST, session_contract),
+    )
+    request, declaration = _missed_request(
+        git_repo,
+        canonical,
+        observation_ref,
+        finding_id=_finding_id("session-authoritative-contract"),
+        line=canonical.line,
+        contracts=(session_contract,),
+    )
+    service, store = _service(
+        git_repo,
+        tmp_path,
+        declarations=(declaration,),
+        contract_ids=("caller_only_contract",),
+    )
+
+    result = service.record_feedback(request)
+
+    assert result.record.finding_snapshot.contracts == (session_contract,)
+    assert store.get_feedback(result.record.feedback_id) == result.record
+
+
 def test_retry_is_idempotent_and_conflicting_decision_never_overwrites(
     git_repo: Path,
     tmp_path: Path,
@@ -821,10 +894,11 @@ def test_aggregation_survives_original_session_deletion(
     imported = service.record_feedback(_request(git_repo, snapshot))
 
     shutil.rmtree(session.run_dir)
-    replay = service.record_feedback(_request(git_repo, snapshot))
+    with pytest.raises(FeedbackError) as replay_error:
+        service.record_feedback(_request(git_repo, snapshot))
     result = aggregate_feedback(store, _repository_key(git_repo))
 
-    assert replay.write_result.replayed
+    assert replay_error.value.code is FeedbackErrorCode.SESSION_NOT_FOUND
     assert result.sample_count == 1
     assert result.summary.source_feedback_ids == (imported.record.feedback_id,)
     assert result.groups[0].disposition is FeedbackAggregationDisposition.EVAL_ONLY

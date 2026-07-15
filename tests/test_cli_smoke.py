@@ -3,11 +3,20 @@ import hashlib
 import json
 import re
 
+import pytest
+
 from conftest import run_git
 from review_agent.attempts import AttemptWorkspace
 from review_agent.checkpoint import CheckpointStore
 from review_agent.cli import main
 from review_agent.session_store import SessionStore
+
+
+@pytest.fixture(autouse=True)
+def cli_memory_root(tmp_path: Path, monkeypatch) -> Path:
+    root = (tmp_path / "memory-root").resolve()
+    monkeypatch.setenv("REVIEW_AGENT_MEMORY_ROOT", str(root))
+    return root
 
 
 def _first_reviewer_artifact(run_dir: Path, kind: str) -> Path:
@@ -69,7 +78,44 @@ def test_cli_review_writes_current_schema_artifacts(git_repo: Path):
     assert completion["blockers"] == ["Core Reviewer did not run"]
 
 
-def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypatch, capsys):
+@pytest.mark.parametrize("memory_mode", ("off", "read"))
+def test_cli_non_writing_memory_modes_do_not_materialize_cross_run_store(
+    git_repo: Path,
+    cli_memory_root: Path,
+    memory_mode: str,
+) -> None:
+    revision = run_git(git_repo, "rev-parse", "HEAD")
+
+    assert (
+        main(
+            [
+                "review",
+                "--repo",
+                str(git_repo),
+                "--base",
+                revision,
+                "--head",
+                revision,
+                "--memory-mode",
+                memory_mode,
+                "--non-interactive",
+            ]
+        )
+        == 0
+    )
+
+    run_dir = next((git_repo / ".review-agent" / "runs").iterdir())
+    session = json.loads((run_dir / "session.json").read_text(encoding="utf-8"))
+    assert session["execution"]["memory"]["mode"] == memory_mode
+    assert not cli_memory_root.exists()
+
+
+def test_cli_review_writes_state_and_preflight_summary(
+    git_repo: Path,
+    monkeypatch,
+    capsys,
+    cli_memory_root: Path,
+):
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "auth.py").write_text("def check(token):\n    return token == 'ok'\n", encoding="utf-8")
     run_git(git_repo, "add", "auth.py")
@@ -116,6 +162,8 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypat
     assert "Review brief:" in output
     assert "Review brief JSON:" in output
     assert "Recommendation:" in output
+    assert "Memory mode: read-write" in output
+    assert "Memory root fingerprint:" in output
     assert state["status"] == "completed"
     assert state["phase"] == "completed"
     assert state["base_revision"] == "HEAD~1"
@@ -134,7 +182,7 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypat
     assert brief["change_map_and_repository_impact"]["changed_files"] == ["auth.py"]
     assert brief["initial_and_final_risk_assessment"]["final"]["status"] == "reassessed"
     assert brief["non_binding_recommendation"] == "manual_review"
-    assert session["schema_version"] == 4
+    assert session["schema_version"] == 5
     assert session["status"] == "completed"
     assert session["current_phase"] == "completed"
     assert session["revisions"] == {
@@ -200,6 +248,28 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypat
             "max_total_tokens": 262144,
             "max_elapsed_seconds": 600.0,
         },
+        "memory": {
+            "schema_version": 1,
+            "mode": "read-write",
+            "root_path": cli_memory_root.as_posix(),
+            "required": False,
+            "selection_policy_version": "memory_selection_v1",
+            "feedback_policy_version": "feedback_aggregation_v1",
+            "max_snapshot_records": 2000,
+            "max_snapshot_bytes": 8388608,
+            "max_context_records": 12,
+            "max_query_results": 8,
+        },
+        "memory_curator": {
+            "mode": "local",
+            "provider": "none",
+            "model": None,
+            "base_url": None,
+            "api_key_env": "REVIEW_AGENT_API_KEY",
+            "max_output_tokens": 4096,
+            "max_provider_attempts": 2,
+            "max_elapsed_seconds": 60.0,
+        },
     }
     assert secret not in session_text
     assert "state" not in session["artifacts"]
@@ -224,12 +294,15 @@ def test_cli_review_writes_state_and_preflight_summary(git_repo: Path, monkeypat
 
 def test_cli_model_stage_inherit_and_overrides_persist_concrete_config(
     git_repo: Path,
+    monkeypatch,
 ) -> None:
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "app.py").write_text("value = 2\n", encoding="utf-8")
     run_git(git_repo, "add", "app.py")
     run_git(git_repo, "commit", "-m", "change app")
     head = run_git(git_repo, "rev-parse", "HEAD")
+    curator_secret = "curator-secret-must-not-be-persisted"
+    monkeypatch.setenv("CURATOR_API_KEY", curator_secret)
 
     exit_code = main(
         [
@@ -290,6 +363,24 @@ def test_cli_model_stage_inherit_and_overrides_persist_concrete_config(
             "5",
             "--semantic-reconciler-max-elapsed-seconds",
             "90",
+            "--memory-mode",
+            "read",
+            "--memory-curator-mode",
+            "model",
+            "--memory-curator-provider",
+            "inherit",
+            "--memory-curator-model",
+            "curator-model",
+            "--memory-curator-base-url",
+            "https://curator.example/v1",
+            "--memory-curator-api-key-env",
+            "CURATOR_API_KEY",
+            "--memory-curator-max-output-tokens",
+            "1536",
+            "--memory-curator-max-provider-attempts",
+            "6",
+            "--memory-curator-max-elapsed-seconds",
+            "30",
             "--non-interactive",
         ]
     )
@@ -329,9 +420,21 @@ def test_cli_model_stage_inherit_and_overrides_persist_concrete_config(
         "max_provider_attempts": 5,
         "max_elapsed_seconds": 90.0,
     }
+    assert execution["memory_curator"] == {
+        "mode": "model",
+        "provider": "fake",
+        "model": "curator-model",
+        "base_url": "https://curator.example/v1",
+        "api_key_env": "CURATOR_API_KEY",
+        "max_output_tokens": 1536,
+        "max_provider_attempts": 6,
+        "max_elapsed_seconds": 30.0,
+    }
     assert execution["risk_assessor"]["provider"] != "inherit"
     assert execution["portfolio_planner"]["provider"] != "inherit"
     assert execution["semantic_reconciler"]["provider"] != "inherit"
+    assert execution["memory_curator"]["provider"] != "inherit"
+    assert curator_secret not in session_text
 
 
 def test_cli_model_stage_rejects_inheriting_reviewer_provider_none(

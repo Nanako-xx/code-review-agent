@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 
@@ -8,10 +9,18 @@ import pytest
 
 from conftest import run_git
 import review_agent.command as command_module
+import review_agent.pipeline as pipeline_module
 from review_agent.command import _build_parser, main
+from review_agent.evidence import (
+    CanonicalFinding,
+    EvidenceReconciliation,
+    reconciliation_to_dict,
+)
+from review_agent.memory_feedback import FeedbackErrorCode
 from review_agent.memory_identity import (
     MemoryRootResolver,
     build_repository_memory_namespace,
+    repository_key,
     repository_namespace_path,
 )
 from review_agent.memory_lifecycle import (
@@ -21,9 +30,16 @@ from review_agent.memory_lifecycle import (
 )
 from review_agent.memory_models import (
     CandidateStatus,
+    FeedbackDecision,
+    FeedbackReasonCode,
+    FindingSeverity,
+    FindingSnapshot,
+    MAX_SNAPSHOT_RECORDS,
     MemoryCandidate,
     MemoryConfidence,
+    MemoryExecutionConfig,
     MemoryKind,
+    MemoryMode,
     MemoryScope,
     PolicyEffect,
     PolicyEffectKind,
@@ -33,20 +49,45 @@ from review_agent.memory_models import (
     RepositoryRangeSourceRef,
     Sensitivity,
     ValidityPolicy,
+    canonical_sha256,
     stable_request_id,
 )
 from review_agent.memory_sources import (
+    SourceValidationCode,
     SourceValidator,
     TrustedCandidateProvenance,
     candidate_authority_resolution_hash,
     repository_range_hash,
 )
-from review_agent.memory_relink import RepositoryRelinkRegistry
+from review_agent.memory_relink import (
+    RepositoryRelinkConflictError,
+    RepositoryRelinkRegistry,
+)
 from review_agent.memory_store import (
     MemoryStore,
     MemoryStoreValidationError,
 )
-from review_agent.revision import RevisionResolver
+from review_agent.models import RiskAssessment, RiskLevel
+from review_agent.observations import ObservationStore
+from review_agent.portfolio import (
+    DEFAULT_CONTRACT_ALLOWLIST,
+    build_portfolio_packet,
+    portfolio_packet_to_dict,
+)
+from review_agent.reconciler import (
+    SemanticModelSummary,
+    SemanticReconciliation,
+    SupplementalSemanticSummary,
+    semantic_reconciliation_to_dict,
+)
+from review_agent.revision import ResolvedRevisions, RevisionResolver
+from review_agent.run_state import RunPhase
+from review_agent.session import (
+    ReviewExecutionConfig,
+    initial_session_manifest,
+    session_phases_for_schema,
+)
+from review_agent.session_store import SessionStore
 
 
 NOW = "2026-07-14T08:00:00Z"
@@ -64,6 +105,244 @@ def _store(repo: Path, memory_root: Path) -> MemoryStore:
 
 def _head(repo: Path) -> str:
     return run_git(repo, "rev-parse", "HEAD")
+
+
+def _finding_id(value: str) -> str:
+    return "F-" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
+def _complete_session(
+    store: SessionStore,
+    artifacts_by_phase: dict[RunPhase, list[str]],
+) -> None:
+    manifest = store.load()
+    for index, phase in enumerate(
+        session_phases_for_schema(manifest.schema_version),
+        start=1,
+    ):
+        store.mark_phase_completed(
+            phase,
+            artifacts_by_phase.get(phase, []),
+            "2026-07-14T09:%02d:00Z" % index,
+        )
+    store.mark_session_completed("2026-07-14T10:00:00Z")
+
+
+def _feedback_outbox_session(
+    repo: Path,
+    tmp_path: Path,
+    *,
+    review_id: str,
+) -> tuple[SessionStore, FindingSnapshot, str]:
+    resolver = RevisionResolver()
+    head = resolver.resolve_commit(repo, "HEAD")
+    identity = resolver.repository_identity(repo)
+    run_dir = repo / ".review-agent" / "runs" / review_id
+    session_store = SessionStore(run_dir)
+    session_store.create(
+        initial_session_manifest(
+            review_id=review_id,
+            repository=identity,
+            revisions=ResolvedRevisions("HEAD", "HEAD", head, head),
+            execution=ReviewExecutionConfig(
+                reviewer_provider="fake",
+                reviewer_model=None,
+                reviewer_base_url=None,
+                reviewer_api_key_env="REVIEW_AGENT_API_KEY",
+                reviewer_mode="single",
+                reviewer_loop="single-shot",
+                non_interactive=True,
+                memory=MemoryExecutionConfig(
+                    mode=MemoryMode.READ,
+                    root_path=str((tmp_path / "session-memory-config").resolve()),
+                ),
+            ),
+            now=NOW,
+        )
+    )
+
+    portfolio_packet = build_portfolio_packet(
+        RiskAssessment(
+            level=RiskLevel.LOW,
+            dimensions={
+                "impact": "low",
+                "blast_radius": "low",
+                "reversibility": "high",
+                "uncertainty": "low",
+                "verification_strength": "high",
+            },
+            reasons=["Deterministic CLI fixture."],
+            signal_refs=[],
+            uncertainties=[],
+            suggested_focus=["Behavioral correctness."],
+        ),
+        contract_allowlist=DEFAULT_CONTRACT_ALLOWLIST,
+    )
+    (run_dir / "portfolio_packet.json").write_text(
+        json.dumps(
+            portfolio_packet_to_dict(portfolio_packet),
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    session_store.register_existing_artifact(
+        name="portfolio_packet",
+        relative_path="portfolio_packet.json",
+        schema="portfolio_packet_v1",
+        phase=RunPhase.PLANNING,
+        revision_binding=head + ".." + head,
+        now="2026-07-14T08:01:00Z",
+    )
+
+    observations = ObservationStore(run_dir)
+    observation = observations.record(
+        source="git.read_range",
+        revision="head@" + head,
+        path="app.py",
+        line_start=1,
+        line_end=2,
+        raw_content="def add(a, b):\n    return a + b\n",
+        context_view="Validated addition implementation.",
+    )
+    session_store.register_existing_artifact(
+        name="observations",
+        relative_path="observations.jsonl",
+        schema="observation_log_jsonl_v1",
+        phase=RunPhase.REPORTING,
+        revision_binding=head + ".." + head,
+        now="2026-07-14T08:02:00Z",
+    )
+
+    finding = CanonicalFinding(
+        finding_id=_finding_id(review_id),
+        claim="Addition returns the wrong operand.",
+        severity="high",
+        confidence="high",
+        path="app.py",
+        line=2,
+        impact="Incorrect arithmetic result.",
+        suggested_action="Return a plus b.",
+        verification_performed=["Inspected the committed range."],
+        evidence_refs=[observation.observation_id],
+        reviewer_indices=[],
+        roles=["arithmetic specialist"],
+    )
+    reconciliation = EvidenceReconciliation(
+        canonical_findings=[finding],
+        rejected_findings=[],
+        remaining_disagreements=[],
+        contract_coverage=[],
+        evidence_quality="verified",
+    )
+    semantic = SemanticReconciliation(
+        status="local_only",
+        canonical_findings=(finding,),
+        rejected_findings=(),
+        conflicts_resolved=(),
+        remaining_disagreements=(),
+        contract_coverage=(),
+        evidence_quality="verified",
+        supplemental=SupplementalSemanticSummary(),
+        policy_actions=("deterministic_local_reconciliation",),
+        uncertainties=(),
+        model=SemanticModelSummary(status="disabled"),
+    )
+    (run_dir / "reconciliation.json").write_text(
+        json.dumps(
+            reconciliation_to_dict(reconciliation),
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    session_store.register_existing_artifact(
+        name="reconciliation",
+        relative_path="reconciliation.json",
+        schema="evidence_reconciliation_v1",
+        phase=RunPhase.RECONCILIATION,
+        revision_binding=head + ".." + head,
+        now="2026-07-14T08:03:00Z",
+    )
+    (run_dir / "semantic_reconciliation.json").write_text(
+        json.dumps(
+            semantic_reconciliation_to_dict(semantic),
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    session_store.register_existing_artifact(
+        name="semantic_reconciliation",
+        relative_path="semantic_reconciliation.json",
+        schema="semantic_reconciliation_v1",
+        phase=RunPhase.RECONCILIATION,
+        revision_binding=head + ".." + head,
+        now="2026-07-14T08:04:00Z",
+    )
+
+    batch_digest = hashlib.sha256(b"empty-candidate-batch").hexdigest()
+    repository_key_value = repository_key(identity)
+    outbox_body = {
+        "schema": "memory_candidate_outbox_v1",
+        "review_id": review_id,
+        "repository_key": repository_key_value,
+        "locator_repository_key": repository_key_value,
+        "authority_resolution_hash": candidate_authority_resolution_hash(
+            repository_key_value,
+            repository_key_value,
+        ),
+        "binding_id": None,
+        "head_sha": head,
+        "snapshot_id": "MSNAP-" + hashlib.sha256(b"snapshot").hexdigest(),
+        "batch_digest": batch_digest,
+        "actor_type": "runtime",
+        "actor_id": "memory-curator",
+        "reason_code": "candidate_outbox",
+        "entries": [],
+    }
+    outbox_payload = {
+        **outbox_body,
+        "outbox_digest": canonical_sha256(outbox_body),
+    }
+    (run_dir / "memory_outbox.json").write_text(
+        json.dumps(
+            outbox_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    session_store.register_existing_artifact(
+        name="memory_outbox",
+        relative_path="memory_outbox.json",
+        schema="memory_candidate_outbox_v1",
+        phase=RunPhase.MEMORY_PROPOSAL,
+        revision_binding=head + ".." + head,
+        now="2026-07-14T08:05:00Z",
+    )
+    _complete_session(
+        session_store,
+        {
+            RunPhase.PLANNING: ["portfolio_packet"],
+            RunPhase.MEMORY_PROPOSAL: ["memory_outbox"],
+            RunPhase.RECONCILIATION: [
+                "reconciliation",
+                "semantic_reconciliation",
+            ],
+            RunPhase.REPORTING: ["observations"],
+        },
+    )
+    snapshot = FindingSnapshot(
+        finding_id=finding.finding_id or "",
+        claim=finding.claim,
+        path=finding.path or "",
+        line=finding.line or 0,
+        contracts=(),
+        original_severity=FindingSeverity.HIGH,
+        evidence_refs=tuple(finding.evidence_refs),
+    )
+    return session_store, snapshot, str(outbox_payload["outbox_digest"])
 
 
 def _candidate(
@@ -154,6 +433,36 @@ def _documents(output: str) -> list[dict]:
     return [json.loads(line) for line in output.splitlines() if line.strip()]
 
 
+def _valid_replay_receipt(
+    call: dict[str, object],
+    *,
+    locator_repository_key: str | None = None,
+    binding_id: str | None = None,
+) -> dict[str, object]:
+    repository_key_value = str(call["expected_repository_key"])
+    body: dict[str, object] = {
+        "schema": "memory_persistence_receipt_v1",
+        "success": True,
+        "review_id": str(call["review_id"]),
+        "repository_key": repository_key_value,
+        "locator_repository_key": (
+            repository_key_value
+            if locator_repository_key is None
+            else locator_repository_key
+        ),
+        "authority_resolution_hash": str(
+            call["expected_authority_resolution_hash"]
+        ),
+        "binding_id": binding_id,
+        "outbox_digest": str(call["expected_outbox_digest"]),
+        "batch_digest": hashlib.sha256(b"empty-candidate-batch").hexdigest(),
+        "persisted_candidate_ids": [],
+        "replayed_candidate_ids": [],
+        "results": [],
+    }
+    return {**body, "receipt_digest": canonical_sha256(body)}
+
+
 def test_parser_core_only() -> None:
     parser = _build_parser()
     parsed = parser.parse_args(
@@ -193,10 +502,135 @@ def test_parser_core_only() -> None:
             ["memory", "approve", "MC-" + "3" * 64, "--reason", "ok"]
         )
     assert missing_actor.value.code == 2
+    feedback = parser.parse_args(
+        [
+            "memory",
+            "feedback",
+            "record",
+            "review-feedback",
+            "F-" + "4" * 32,
+            "--head-sha",
+            "5" * 40,
+            "--finding-hash",
+            "6" * 64,
+            "--evidence-ref",
+            "O-" + "7" * 32,
+            "--decision",
+            "accepted",
+            "--final-severity",
+            "high",
+            "--reason-code",
+            "other",
+            "--actor",
+            "amy",
+            "--reason",
+            "Finding disposition was confirmed.",
+            "--yes",
+        ]
+    )
+    assert feedback.memory_action == "feedback_record"
+    assert feedback.review_id == "review-feedback"
+    assert feedback.finding_id == "F-" + "4" * 32
+
+    feedback_list = parser.parse_args(["memory", "feedback", "list"])
+    assert feedback_list.memory_action == "feedback_list"
+
+    replay = parser.parse_args(
+        [
+            "memory",
+            "replay-outbox",
+            "review-feedback",
+            "--actor",
+            "amy",
+            "--reason",
+            "Replay the hash-verified Session outbox.",
+            "--yes",
+        ]
+    )
+    assert replay.memory_action == "replay_outbox"
+    assert replay.review_id == "review-feedback"
+
     with pytest.raises(SystemExit):
         parser.parse_args(["memory", "feedback"])
     with pytest.raises(SystemExit):
         parser.parse_args(["memory", "replay-outbox"])
+
+
+def _review_args(*arguments: str):
+    return _build_parser().parse_args(
+        ["review", "--base", "HEAD~1", "--head", "HEAD", *arguments]
+    )
+
+
+def test_review_memory_config_defaults_and_root_priority_are_fixed_without_creation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    environment_root = (tmp_path / "environment-memory").resolve()
+    cli_root = (tmp_path / "cli-memory").resolve()
+    monkeypatch.setenv("REVIEW_AGENT_MEMORY_ROOT", str(environment_root))
+
+    environment_config = command_module._resolve_memory_execution_config(
+        _review_args()
+    )
+    cli_config = command_module._resolve_memory_execution_config(
+        _review_args("--memory-root", str(cli_root))
+    )
+
+    assert environment_config.mode is MemoryMode.READ_WRITE
+    assert environment_config.root_path == environment_root.as_posix()
+    assert cli_config.root_path == cli_root.as_posix()
+    assert not environment_root.exists()
+    assert not cli_root.exists()
+
+
+def test_review_memory_config_validates_required_mode_and_snapshot_budgets(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "memory").resolve()
+
+    with pytest.raises(ValueError, match="required=true cannot be combined"):
+        command_module._resolve_memory_execution_config(
+            _review_args(
+                "--memory-root",
+                str(root),
+                "--memory-mode",
+                "off",
+                "--memory-required",
+            )
+        )
+
+    with pytest.raises(ValueError, match="max_snapshot_records"):
+        command_module._resolve_memory_execution_config(
+            _review_args(
+                "--memory-root",
+                str(root),
+                "--memory-max-snapshot-records",
+                str(MAX_SNAPSHOT_RECORDS + 1),
+            )
+        )
+
+    config = command_module._resolve_memory_execution_config(
+        _review_args(
+            "--memory-root",
+            str(root),
+            "--memory-mode",
+            "read",
+            "--memory-max-snapshot-records",
+            "20",
+            "--memory-max-snapshot-bytes",
+            "4096",
+            "--memory-max-context-records",
+            "4",
+            "--memory-max-query-results",
+            "3",
+        )
+    )
+    assert config.mode is MemoryMode.READ
+    assert config.max_snapshot_records == 20
+    assert config.max_snapshot_bytes == 4096
+    assert config.max_context_records == 4
+    assert config.max_query_results == 3
 
 
 @pytest.mark.parametrize(
@@ -285,6 +719,491 @@ def test_absent_store_status_does_not_materialize_memory_root(
     document = _documents(capsys.readouterr().out)[-1]
     assert document["store_present"] is False
     assert not memory_root.exists()
+
+
+def test_feedback_list_is_read_only_and_absent_store_is_empty(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    memory_root = tmp_path / "absent-feedback-memory"
+
+    assert _cli(git_repo, memory_root, "feedback", "list") == 0
+
+    document = _documents(capsys.readouterr().out)[-1]
+    assert document["type"] == "feedback_list"
+    assert document["count"] == 0
+    assert document["feedback"] == []
+    assert document["generations"]["feedback_generation"] == 0
+    assert not memory_root.exists()
+
+
+def test_feedback_record_requires_explicit_confirmation_before_service_write(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    memory_root = tmp_path / "feedback-memory"
+    review_id = "review-feedback-confirmation"
+    _session, snapshot, _outbox_digest = _feedback_outbox_session(
+        git_repo,
+        tmp_path,
+        review_id=review_id,
+    )
+    arguments = (
+        "feedback",
+        "record",
+        review_id,
+        snapshot.finding_id,
+        "--head-sha",
+        _head(git_repo),
+        "--finding-hash",
+        snapshot.finding_hash,
+        "--evidence-ref",
+        snapshot.evidence_refs[0],
+        "--decision",
+        FeedbackDecision.ACCEPTED.value,
+        "--final-severity",
+        FindingSeverity.HIGH.value,
+        "--reason-code",
+        FeedbackReasonCode.OTHER.value,
+        "--actor",
+        "amy",
+        "--reason",
+        "Maintainer confirmed the canonical Finding.",
+        "--created-at",
+        NOW,
+        "--non-interactive",
+    )
+
+    assert _cli(git_repo, memory_root, *arguments) == 2
+
+    captured = capsys.readouterr()
+    preview = _documents(captured.out)[-1]
+    error = _documents(captured.err)[-1]
+    assert preview["type"] == "feedback_record_preview"
+    assert preview["review_id"] == review_id
+    assert preview["finding_id"] == snapshot.finding_id
+    assert preview["safe_text_validated"] is True
+    assert "actor" not in preview
+    assert error["error"]["code"] == "confirmation_required"
+    assert not memory_root.exists()
+
+
+def test_replay_outbox_has_final_service_seam_and_fails_explicitly_when_absent(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    memory_root = tmp_path / "outbox-memory"
+    review_id = "review-outbox"
+    _session, _snapshot, outbox_digest = _feedback_outbox_session(
+        git_repo,
+        tmp_path,
+        review_id=review_id,
+    )
+    monkeypatch.delattr(
+        pipeline_module,
+        "replay_memory_outbox",
+        raising=False,
+    )
+
+    exit_code = _cli(
+        git_repo,
+        memory_root,
+        "replay-outbox",
+        review_id,
+        "--actor",
+        "amy",
+        "--reason",
+        "Replay the exact committed Session outbox.",
+        "--yes",
+        "--non-interactive",
+    )
+
+    captured = capsys.readouterr()
+    preview = _documents(captured.out)[-1]
+    error = _documents(captured.err)[-1]
+    assert exit_code == 1
+    assert preview["type"] == "replay_outbox_preview"
+    assert preview["review_id"] == review_id
+    assert preview["expected_outbox_digest"] == outbox_digest
+    assert error["error"]["code"] == "outbox_service_unavailable"
+    assert not memory_root.exists()
+
+
+def test_feedback_tampered_session_wins_before_secret_scan_or_preview_and_creates_no_store(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    memory_root = tmp_path / "tampered-feedback-memory"
+    review_id = "review-feedback-tampered"
+    session, snapshot, _outbox_digest = _feedback_outbox_session(
+        git_repo,
+        tmp_path,
+        review_id=review_id,
+    )
+    (session.run_dir / "reconciliation.json").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+    secret_actor = "sk-" + "a" * 32
+
+    exit_code = _cli(
+        git_repo,
+        memory_root,
+        "feedback",
+        "record",
+        review_id,
+        snapshot.finding_id,
+        "--head-sha",
+        _head(git_repo),
+        "--finding-hash",
+        snapshot.finding_hash,
+        "--evidence-ref",
+        snapshot.evidence_refs[0],
+        "--decision",
+        FeedbackDecision.ACCEPTED.value,
+        "--final-severity",
+        FindingSeverity.HIGH.value,
+        "--reason-code",
+        FeedbackReasonCode.OTHER.value,
+        "--actor",
+        secret_actor,
+        "--reason",
+        "This free text must never be previewed before Session validation.",
+        "--created-at",
+        NOW,
+        "--yes",
+        "--non-interactive",
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 4
+    assert captured.out == ""
+    assert "feedback_session_untrusted" in captured.err
+    assert secret_actor not in captured.err
+    assert "free text" not in captured.err
+    assert not memory_root.exists()
+
+
+def test_feedback_secret_scan_precedes_safe_preview_and_store_creation(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    memory_root = tmp_path / "secret-feedback-memory"
+    review_id = "review-feedback-secret"
+    _session, snapshot, _outbox_digest = _feedback_outbox_session(
+        git_repo,
+        tmp_path,
+        review_id=review_id,
+    )
+    secret_actor = "sk-" + "b" * 32
+
+    exit_code = _cli(
+        git_repo,
+        memory_root,
+        "feedback",
+        "record",
+        review_id,
+        snapshot.finding_id,
+        "--head-sha",
+        _head(git_repo),
+        "--finding-hash",
+        snapshot.finding_hash,
+        "--evidence-ref",
+        snapshot.evidence_refs[0],
+        "--decision",
+        FeedbackDecision.ACCEPTED.value,
+        "--final-severity",
+        FindingSeverity.HIGH.value,
+        "--reason-code",
+        FeedbackReasonCode.OTHER.value,
+        "--actor",
+        secret_actor,
+        "--reason",
+        "Maintainer confirmed the canonical Finding.",
+        "--created-at",
+        NOW,
+        "--yes",
+        "--non-interactive",
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 4
+    assert captured.out == ""
+    assert "feedback_source_validation_failed" in captured.err
+    assert secret_actor not in captured.err
+    assert not memory_root.exists()
+
+
+def test_feedback_validated_preview_is_persisted_only_after_confirmation(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    memory_root = tmp_path / "validated-feedback-memory"
+    review_id = "review-feedback-write"
+    _session, snapshot, _outbox_digest = _feedback_outbox_session(
+        git_repo,
+        tmp_path,
+        review_id=review_id,
+    )
+
+    exit_code = _cli(
+        git_repo,
+        memory_root,
+        "feedback",
+        "record",
+        review_id,
+        snapshot.finding_id,
+        "--head-sha",
+        _head(git_repo),
+        "--finding-hash",
+        snapshot.finding_hash,
+        "--evidence-ref",
+        snapshot.evidence_refs[0],
+        "--decision",
+        FeedbackDecision.ACCEPTED.value,
+        "--final-severity",
+        FindingSeverity.HIGH.value,
+        "--reason-code",
+        FeedbackReasonCode.OTHER.value,
+        "--actor",
+        "amy",
+        "--reason",
+        "Maintainer confirmed the canonical Finding.",
+        "--created-at",
+        NOW,
+        "--yes",
+        "--non-interactive",
+    )
+
+    documents = _documents(capsys.readouterr().out)
+    assert exit_code == 0
+    assert [document["type"] for document in documents] == [
+        "feedback_record_preview",
+        "feedback_record",
+    ]
+    store = _store(git_repo, memory_root)
+    records = store.list_feedback(
+        _namespace(git_repo, memory_root).repository_key
+    )
+    assert len(records) == 1
+    assert records[0].finding_id == snapshot.finding_id
+
+
+def test_replay_outbox_passes_only_final_cas_inputs_and_accepts_strict_receipt(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    memory_root = tmp_path / "strict-replay-memory"
+    review_id = "review-outbox-strict"
+    _session, _snapshot, outbox_digest = _feedback_outbox_session(
+        git_repo,
+        tmp_path,
+        review_id=review_id,
+    )
+    observed: list[dict[str, object]] = []
+
+    def replay_memory_outbox(**kwargs):
+        observed.append(dict(kwargs))
+        return _valid_replay_receipt(dict(kwargs))
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "replay_memory_outbox",
+        replay_memory_outbox,
+        raising=False,
+    )
+
+    exit_code = _cli(
+        git_repo,
+        memory_root,
+        "replay-outbox",
+        review_id,
+        "--actor",
+        "amy",
+        "--reason",
+        "Replay the exact committed Session outbox.",
+        "--yes",
+        "--non-interactive",
+    )
+
+    documents = _documents(capsys.readouterr().out)
+    assert exit_code == 0
+    assert [document["type"] for document in documents] == [
+        "replay_outbox_preview",
+        "replay_outbox_result",
+    ]
+    assert observed
+    call = observed[0]
+    assert {
+        key for key in call if key.startswith("expected_")
+    } == {
+        "expected_repository_key",
+        "expected_authority_resolution_hash",
+        "expected_outbox_digest",
+    }
+    assert call["expected_outbox_digest"] == outbox_digest
+    assert documents[-1]["receipt"]["success"] is True
+    assert not memory_root.exists()
+
+
+@pytest.mark.parametrize(
+    "invalid_kind",
+    (
+        "empty",
+        "false",
+        "repository",
+        "authority",
+        "binding",
+        "outbox",
+        "digest",
+    ),
+)
+def test_replay_outbox_rejects_empty_false_or_misbound_receipts_as_operational(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    invalid_kind: str,
+) -> None:
+    memory_root = tmp_path / ("invalid-receipt-" + invalid_kind)
+    review_id = "review-outbox-invalid-" + invalid_kind
+    _session, _snapshot, _outbox_digest = _feedback_outbox_session(
+        git_repo,
+        tmp_path,
+        review_id=review_id,
+    )
+
+    def replay_memory_outbox(**kwargs):
+        if invalid_kind == "empty":
+            return {}
+        receipt = _valid_replay_receipt(dict(kwargs))
+        if invalid_kind == "false":
+            receipt["success"] = False
+        elif invalid_kind == "repository":
+            receipt["repository_key"] = "f" * 64
+        elif invalid_kind == "authority":
+            receipt["authority_resolution_hash"] = "e" * 64
+        elif invalid_kind == "binding":
+            receipt["binding_id"] = "RB-" + "d" * 64
+        elif invalid_kind == "outbox":
+            receipt["outbox_digest"] = "c" * 64
+        elif invalid_kind == "digest":
+            receipt["receipt_digest"] = "b" * 64
+        if invalid_kind != "digest":
+            receipt["receipt_digest"] = canonical_sha256(
+                {
+                    key: value
+                    for key, value in receipt.items()
+                    if key != "receipt_digest"
+                }
+            )
+        return receipt
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "replay_memory_outbox",
+        replay_memory_outbox,
+        raising=False,
+    )
+
+    exit_code = _cli(
+        git_repo,
+        memory_root,
+        "replay-outbox",
+        review_id,
+        "--actor",
+        "amy",
+        "--reason",
+        "Reject a forged replay receipt.",
+        "--yes",
+        "--non-interactive",
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert [document["type"] for document in _documents(captured.out)] == [
+        "replay_outbox_preview"
+    ]
+    assert "outbox_service_invalid" in captured.err
+    assert not memory_root.exists()
+
+
+def test_replay_outbox_reports_relink_cas_race_as_conflict(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    memory_root = tmp_path / "replay-cas-conflict"
+    review_id = "review-outbox-cas-conflict"
+    _feedback_outbox_session(git_repo, tmp_path, review_id=review_id)
+
+    def replay_memory_outbox(**_kwargs):
+        raise RepositoryRelinkConflictError("simulated relink race")
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "replay_memory_outbox",
+        replay_memory_outbox,
+        raising=False,
+    )
+
+    exit_code = _cli(
+        git_repo,
+        memory_root,
+        "replay-outbox",
+        review_id,
+        "--actor",
+        "amy",
+        "--reason",
+        "Reject a concurrent authority relink.",
+        "--yes",
+        "--non-interactive",
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 4
+    assert "relink_conflict" in captured.err
+    assert not memory_root.exists()
+
+
+def test_memory_error_exit_classification_is_exhaustive() -> None:
+    assert set(command_module._FEEDBACK_ERROR_EXIT_CODES) == set(FeedbackErrorCode)
+    assert set(command_module._SOURCE_ERROR_EXIT_CODES) == set(SourceValidationCode)
+    assert set(command_module._LIFECYCLE_ERROR_EXIT_CODES) == set(
+        MemoryLifecycleErrorCode
+    )
+    assert (
+        command_module._FEEDBACK_ERROR_EXIT_CODES[
+            FeedbackErrorCode.SESSION_NOT_COMPLETED
+        ]
+        == 4
+    )
+    assert (
+        command_module._FEEDBACK_ERROR_EXIT_CODES[
+            FeedbackErrorCode.AGGREGATION_LIMIT_EXCEEDED
+        ]
+        == 1
+    )
+    assert (
+        command_module._SOURCE_ERROR_EXIT_CODES[SourceValidationCode.INTERNAL_ERROR]
+        == 1
+    )
+    assert (
+        command_module._LIFECYCLE_ERROR_EXIT_CODES[
+            MemoryLifecycleErrorCode.SOURCE_VALIDATION_FAILED
+        ]
+        == 4
+    )
 
 
 @pytest.mark.parametrize(

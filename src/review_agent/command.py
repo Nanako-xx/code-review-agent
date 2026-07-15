@@ -4,16 +4,20 @@ import argparse
 from contextlib import redirect_stderr
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import hashlib
+import importlib
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import stat
 import sys
 import tempfile
 from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 from review_agent.checkpoint import CheckpointStore
+from review_agent.artifacts import artifact_schema
 from review_agent.git_repo import ChangeSummary, collect_change_summary
 from review_agent.intent_clarification import ConsoleIntentClarifier
 from review_agent.memory_identity import (
@@ -22,7 +26,15 @@ from review_agent.memory_identity import (
     RepositoryMemoryNamespace,
     materialize_repository_memory_namespace,
     plan_repository_memory_namespace,
+    repository_key as canonical_repository_key,
     repository_namespace_path,
+)
+from review_agent.memory_feedback import (
+    FeedbackError,
+    FeedbackErrorCode,
+    FeedbackImportRequest,
+    FeedbackImportService,
+    MissedFindingInput,
 )
 from review_agent.memory_lifecycle import (
     ApprovalResult,
@@ -34,10 +46,23 @@ from review_agent.memory_models import (
     CandidateStatus,
     CURRENT_MEMORY_STORE_SCHEMA_VERSION,
     DurableMemoryRecord,
+    FeedbackDecision,
+    FeedbackReasonCode,
+    FeedbackStatus,
+    FindingSeverity,
     GenerationMetadata,
+    HumanDeclarationAuthority,
+    HumanDeclarationOrigin,
+    HumanDeclarationSourceRef,
+    MAX_SNAPSHOT_RECORDS,
     MemoryCandidate,
+    MemoryExecutionConfig,
+    MemoryMode,
     RecordStatus,
+    SourceRef,
+    canonical_sha256,
     stable_request_id,
+    validate_stable_id,
 )
 from review_agent.memory_relink import (
     RepositoryAuthorityResolution,
@@ -49,6 +74,7 @@ from review_agent.memory_relink import (
     resolve_repository_authority,
 )
 from review_agent.memory_sources import (
+    SourceValidationCode,
     SourceValidationError,
     SourceValidationReport,
     SourceValidator,
@@ -71,12 +97,13 @@ from review_agent.pipeline import (
 )
 from review_agent.revision import RevisionResolver
 from review_agent.resume import ResumeAction, ResumeBlockedError, ReviewSessionResumer
-from review_agent.run_state import RunStatus
+from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
     DEFAULT_MODEL_STAGE_MAX_ELAPSED_SECONDS,
     DEFAULT_MODEL_STAGE_MAX_OUTPUT_TOKENS,
     DEFAULT_MODEL_STAGE_MAX_PROVIDER_ATTEMPTS,
     ModelStageConfig,
+    PhaseStatus,
     ReviewExecutionConfig,
     initial_session_manifest,
 )
@@ -197,9 +224,11 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument("--reviewer-model")
     review.add_argument("--reviewer-base-url")
     review.add_argument("--reviewer-api-key-env", default="REVIEW_AGENT_API_KEY")
+    _add_review_memory_arguments(review)
     _add_model_stage_arguments(review, "risk-assessor")
     _add_model_stage_arguments(review, "portfolio-planner")
     _add_model_stage_arguments(review, "semantic-reconciler")
+    _add_model_stage_arguments(review, "memory-curator")
 
     resume = subparsers.add_parser(
         "resume",
@@ -209,6 +238,47 @@ def _build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--repo", default=".", help="Repository path")
     _add_memory_parser(subparsers)
     return parser
+
+
+def _add_review_memory_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--memory-mode",
+        choices=[item.value for item in MemoryMode],
+        default=MemoryMode.READ_WRITE.value,
+        help="Durable Memory permission boundary (default: read-write)",
+    )
+    parser.add_argument(
+        "--memory-root",
+        help=(
+            "Absolute Memory root override; otherwise "
+            "REVIEW_AGENT_MEMORY_ROOT then the platform default is used"
+        ),
+    )
+    parser.add_argument(
+        "--memory-required",
+        action="store_true",
+        help="Block instead of degrading when required Memory cannot be validated",
+    )
+    parser.add_argument(
+        "--memory-max-snapshot-records",
+        type=int,
+        default=MAX_SNAPSHOT_RECORDS,
+    )
+    parser.add_argument(
+        "--memory-max-snapshot-bytes",
+        type=int,
+        default=8_388_608,
+    )
+    parser.add_argument(
+        "--memory-max-context-records",
+        type=int,
+        default=12,
+    )
+    parser.add_argument(
+        "--memory-max-query-results",
+        type=int,
+        default=8,
+    )
 
 
 def _add_memory_parser(subparsers: Any) -> None:
@@ -290,6 +360,126 @@ def _add_memory_parser(subparsers: Any) -> None:
     )
     _add_memory_decision_arguments(revalidate)
     revalidate.set_defaults(memory_action="revalidate")
+
+    feedback = commands.add_parser(
+        "feedback",
+        help="Record or inspect audited human review Feedback",
+    )
+    _add_memory_common_arguments(feedback, suppress_defaults=True)
+    feedback_commands = feedback.add_subparsers(
+        dest="feedback_command",
+        required=True,
+    )
+
+    feedback_record = feedback_commands.add_parser(
+        "record",
+        help="Record one human decision about a canonical review Finding",
+    )
+    _add_memory_common_arguments(feedback_record, suppress_defaults=True)
+    feedback_record.add_argument("review_id", help="Completed review Session id")
+    feedback_record.add_argument("finding_id", help="Stable canonical F- identifier")
+    feedback_record.add_argument("--head-sha", required=True)
+    feedback_record.add_argument("--finding-hash", required=True)
+    feedback_record.add_argument(
+        "--evidence-ref",
+        action="append",
+        required=True,
+        default=[],
+        help="Canonical Observation ID; repeat for every Finding evidence ref",
+    )
+    feedback_record.add_argument(
+        "--decision",
+        choices=[item.value for item in FeedbackDecision],
+        required=True,
+    )
+    feedback_record.add_argument(
+        "--final-severity",
+        choices=[item.value for item in FindingSeverity],
+        required=True,
+    )
+    feedback_record.add_argument(
+        "--reason-code",
+        choices=[item.value for item in FeedbackReasonCode],
+        required=True,
+    )
+    feedback_record.add_argument("--actor", required=True)
+    feedback_record.add_argument("--reason", required=True)
+    feedback_record.add_argument("--created-at")
+    feedback_record.add_argument("--request-id")
+    feedback_record.add_argument(
+        "--missed-claim",
+        "--claim",
+        dest="missed_claim",
+    )
+    feedback_record.add_argument(
+        "--missed-path",
+        "--path",
+        dest="missed_path",
+    )
+    feedback_record.add_argument(
+        "--missed-line",
+        "--line",
+        dest="missed_line",
+        type=int,
+    )
+    feedback_record.add_argument(
+        "--missed-contract",
+        "--contract",
+        dest="missed_contracts",
+        action="append",
+        default=[],
+    )
+    feedback_record.add_argument(
+        "--missed-original-severity",
+        "--original-severity",
+        dest="missed_original_severity",
+        choices=[item.value for item in FindingSeverity],
+    )
+    feedback_record.add_argument(
+        "--human-declaration",
+        help="Explicit human declaration required for a missed Finding",
+    )
+    feedback_record.add_argument(
+        "--source-ref-json",
+        "--source-ref",
+        dest="source_ref_json",
+        action="append",
+        default=[],
+        help="Canonical SourceRef JSON (or @path); repeat for missed evidence",
+    )
+    feedback_record.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm a non-interactive Feedback write",
+    )
+    feedback_record.set_defaults(memory_action="feedback_record")
+
+    feedback_list = feedback_commands.add_parser(
+        "list",
+        help="List audited human Feedback records",
+    )
+    _add_memory_common_arguments(feedback_list, suppress_defaults=True)
+    feedback_list.add_argument("--review-id")
+    feedback_list.add_argument(
+        "--decision",
+        choices=[item.value for item in FeedbackDecision],
+        dest="feedback_decision",
+    )
+    feedback_list.add_argument(
+        "--status",
+        choices=[item.value for item in FeedbackStatus],
+        dest="feedback_status",
+    )
+    feedback_list.set_defaults(memory_action="feedback_list")
+
+    replay_outbox = commands.add_parser(
+        "replay-outbox",
+        help="Replay one hash-verified Session Memory outbox through its service",
+    )
+    _add_memory_common_arguments(replay_outbox, suppress_defaults=True)
+    replay_outbox.add_argument("review_id", help="Review Session id")
+    _add_memory_decision_arguments(replay_outbox)
+    replay_outbox.set_defaults(memory_action="replay_outbox")
 
     export = commands.add_parser("export", help="Write a redacted Memory export")
     _add_memory_common_arguments(export, suppress_defaults=True)
@@ -474,6 +664,24 @@ def _add_model_stage_arguments(
     )
 
 
+def _resolve_memory_execution_config(
+    args: argparse.Namespace,
+) -> MemoryExecutionConfig:
+    resolution = MemoryRootResolver().resolve(
+        getattr(args, "memory_root", None),
+        create=False,
+    )
+    return MemoryExecutionConfig(
+        mode=MemoryMode(args.memory_mode),
+        root_path=resolution.path,
+        required=args.memory_required,
+        max_snapshot_records=args.memory_max_snapshot_records,
+        max_snapshot_bytes=args.memory_max_snapshot_bytes,
+        max_context_records=args.memory_max_context_records,
+        max_query_results=args.memory_max_query_results,
+    )
+
+
 def _resolve_model_stage_config(
     args: argparse.Namespace,
     stage: str,
@@ -540,6 +748,87 @@ _MEMORY_EXIT_OPERATIONAL = 1
 _MEMORY_EXIT_USAGE = 2
 _MEMORY_EXIT_NOT_FOUND = 3
 _MEMORY_EXIT_CONFLICT = 4
+_MEMORY_OUTBOX_SCHEMA = "memory_candidate_outbox_v1"
+_MEMORY_PERSISTENCE_RECEIPT_SCHEMA = "memory_persistence_receipt_v1"
+
+_FEEDBACK_ERROR_EXIT_CODES = {
+    FeedbackErrorCode.INVALID_INPUT: _MEMORY_EXIT_USAGE,
+    FeedbackErrorCode.SESSION_NOT_FOUND: _MEMORY_EXIT_NOT_FOUND,
+    FeedbackErrorCode.SESSION_UNTRUSTED: _MEMORY_EXIT_CONFLICT,
+    FeedbackErrorCode.SESSION_NOT_COMPLETED: _MEMORY_EXIT_CONFLICT,
+    FeedbackErrorCode.REPOSITORY_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    FeedbackErrorCode.HEAD_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    FeedbackErrorCode.FINDING_NOT_FOUND: _MEMORY_EXIT_NOT_FOUND,
+    FeedbackErrorCode.FINDING_NOT_CANONICAL: _MEMORY_EXIT_CONFLICT,
+    FeedbackErrorCode.FINDING_HASH_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    FeedbackErrorCode.EVIDENCE_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    FeedbackErrorCode.HUMAN_DECLARATION_REQUIRED: _MEMORY_EXIT_USAGE,
+    FeedbackErrorCode.VERIFIABLE_SOURCE_REQUIRED: _MEMORY_EXIT_USAGE,
+    FeedbackErrorCode.SOURCE_VALIDATION_FAILED: _MEMORY_EXIT_CONFLICT,
+    FeedbackErrorCode.CONFLICTING_DECISION: _MEMORY_EXIT_CONFLICT,
+    FeedbackErrorCode.AGGREGATION_LIMIT_EXCEEDED: _MEMORY_EXIT_OPERATIONAL,
+    FeedbackErrorCode.DURABLE_MEMORY_CONVERSION_PROHIBITED: _MEMORY_EXIT_USAGE,
+}
+
+_SOURCE_ERROR_EXIT_CODES = {
+    SourceValidationCode.INVALID_INPUT: _MEMORY_EXIT_USAGE,
+    SourceValidationCode.INVALID_CONFIGURATION: _MEMORY_EXIT_OPERATIONAL,
+    SourceValidationCode.UNTYPED_SOURCE: _MEMORY_EXIT_USAGE,
+    SourceValidationCode.SOURCE_NOT_ALLOWLISTED: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.RUNTIME_PROVENANCE_REQUIRED: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.SENSITIVITY_BLOCKED: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.SENSITIVE_CONTENT: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.VALIDATION_SKIPPED: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.UNSAFE_PATH: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.REPOSITORY_UNAVAILABLE: _MEMORY_EXIT_OPERATIONAL,
+    SourceValidationCode.REVISION_NOT_FOUND: _MEMORY_EXIT_NOT_FOUND,
+    SourceValidationCode.REVISION_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.REVISION_LINEAGE_UNAUTHORIZED: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.SOURCE_NOT_FOUND: _MEMORY_EXIT_NOT_FOUND,
+    SourceValidationCode.SOURCE_NOT_REGULAR: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.SOURCE_TOO_LARGE: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.SOURCE_ENCODING_INVALID: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.RANGE_OUT_OF_BOUNDS: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.HASH_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.SYMBOL_NOT_FOUND: _MEMORY_EXIT_NOT_FOUND,
+    SourceValidationCode.SYMBOL_AMBIGUOUS: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.SYMBOL_UNSUPPORTED: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.SESSION_NOT_FOUND: _MEMORY_EXIT_NOT_FOUND,
+    SourceValidationCode.SESSION_UNTRUSTED: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.REVIEW_ID_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.REPOSITORY_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.DESCRIPTOR_NOT_FOUND: _MEMORY_EXIT_NOT_FOUND,
+    SourceValidationCode.DESCRIPTOR_SCHEMA_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.SESSION_ARTIFACT_INELIGIBLE: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.REVISION_BINDING_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.SESSION_ARTIFACT_INVALID: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.OBSERVATION_NOT_FOUND: _MEMORY_EXIT_NOT_FOUND,
+    SourceValidationCode.OBSERVATION_UNTRUSTED: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.HUMAN_DECLARATION_UNAUTHORIZED: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.HUMAN_DECLARATION_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.CANDIDATE_AUTHORITY_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.VALIDATION_REPORT_MISMATCH: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.AUTHORITY_RECEIPT_INVALID: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.PRODUCER_POLICY_UNAUTHORIZED: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.INTERNAL_ERROR: _MEMORY_EXIT_OPERATIONAL,
+}
+
+_LIFECYCLE_ERROR_EXIT_CODES = {
+    MemoryLifecycleErrorCode.INVALID_INPUT: _MEMORY_EXIT_USAGE,
+    MemoryLifecycleErrorCode.INVALID_TRANSITION: _MEMORY_EXIT_CONFLICT,
+    MemoryLifecycleErrorCode.HUMAN_ACTOR_REQUIRED: _MEMORY_EXIT_USAGE,
+    MemoryLifecycleErrorCode.HUMAN_REASON_REQUIRED: _MEMORY_EXIT_USAGE,
+    MemoryLifecycleErrorCode.SOURCE_VALIDATION_FAILED: _MEMORY_EXIT_CONFLICT,
+    MemoryLifecycleErrorCode.DUPLICATE_SUPPRESSED: _MEMORY_EXIT_CONFLICT,
+    MemoryLifecycleErrorCode.INVALID_REPLACEMENT: _MEMORY_EXIT_CONFLICT,
+}
+
+if set(_FEEDBACK_ERROR_EXIT_CODES) != set(FeedbackErrorCode):
+    raise RuntimeError("Feedback CLI error classification is incomplete")
+if set(_SOURCE_ERROR_EXIT_CODES) != set(SourceValidationCode):
+    raise RuntimeError("source CLI error classification is incomplete")
+if set(_LIFECYCLE_ERROR_EXIT_CODES) != set(MemoryLifecycleErrorCode):
+    raise RuntimeError("Memory lifecycle CLI error classification is incomplete")
 
 
 class _MemoryCLIError(RuntimeError):
@@ -570,6 +859,13 @@ class _CandidateRuntimeAuthority:
     validator: SourceValidator
 
 
+@dataclass(frozen=True)
+class _PreparedOutboxReplay:
+    outbox_digest: str
+    batch_digest: str
+    entries: tuple[tuple[str, str], ...]
+
+
 def _run_memory(args: argparse.Namespace) -> int:
     action = getattr(args, "memory_action", None)
     handlers: Mapping[str, Callable[[argparse.Namespace], int]] = {
@@ -582,6 +878,9 @@ def _run_memory(args: argparse.Namespace) -> int:
         "reject": _memory_reject,
         "revoke": _memory_revoke,
         "revalidate": _memory_revalidate,
+        "feedback_record": _memory_feedback_record,
+        "feedback_list": _memory_feedback_list,
+        "replay_outbox": _memory_replay_outbox,
         "export": _memory_export,
         "import": _memory_import,
         "gc": _memory_gc,
@@ -606,28 +905,25 @@ def _run_memory(args: argparse.Namespace) -> int:
     except MemoryStoreError as error:
         return _emit_memory_store_error(args, error)
     except MemoryLifecycleError as error:
-        exit_code = (
-            _MEMORY_EXIT_CONFLICT
-            if error.code
-            in {
-                MemoryLifecycleErrorCode.DUPLICATE_SUPPRESSED,
-                MemoryLifecycleErrorCode.INVALID_REPLACEMENT,
-                MemoryLifecycleErrorCode.INVALID_TRANSITION,
-            }
-            else _MEMORY_EXIT_USAGE
-        )
         return _emit_memory_error(
             args,
             code="lifecycle_%s" % error.code.value,
             message="the requested memory lifecycle transition was rejected",
-            exit_code=exit_code,
+            exit_code=_LIFECYCLE_ERROR_EXIT_CODES[error.code],
+        )
+    except FeedbackError as error:
+        return _emit_memory_error(
+            args,
+            code="feedback_%s" % error.code.value,
+            message="human Feedback failed strict authority validation",
+            exit_code=_FEEDBACK_ERROR_EXIT_CODES[error.code],
         )
     except SourceValidationError as error:
         return _emit_memory_error(
             args,
             code="source_%s" % error.code.value,
             message="memory source validation failed",
-            exit_code=_MEMORY_EXIT_USAGE,
+            exit_code=_SOURCE_ERROR_EXIT_CODES[error.code],
         )
     except MemoryIdentityError:
         return _emit_memory_error(
@@ -664,12 +960,19 @@ def _run_memory(args: argparse.Namespace) -> int:
             message="repository Memory authority could not be resolved safely",
             exit_code=_MEMORY_EXIT_CONFLICT,
         )
-    except (OSError, RuntimeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return _emit_memory_error(
             args,
             code="input_invalid",
             message="the memory command input or repository could not be validated",
             exit_code=_MEMORY_EXIT_USAGE,
+        )
+    except (OSError, RuntimeError):
+        return _emit_memory_error(
+            args,
+            code="operational_failure",
+            message="the memory command failed safely during an operation",
+            exit_code=_MEMORY_EXIT_OPERATIONAL,
         )
     except Exception:
         return _emit_memory_error(
@@ -1304,6 +1607,942 @@ def _memory_revalidate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _memory_feedback_list(args: argparse.Namespace) -> int:
+    context = _resolve_memory_context(args, write=False)
+    generations = _context_generations(context)
+    requested_status = getattr(args, "feedback_status", None)
+    status = None if requested_status is None else FeedbackStatus(requested_status)
+    records = (
+        ()
+        if context.store is None
+        else context.store.list_feedback(context.repository_key, status=status)
+    )
+    requested_review = getattr(args, "review_id", None)
+    requested_decision = getattr(args, "feedback_decision", None)
+    if requested_review is not None:
+        requested_review = _required_cli_text(requested_review, "review_id")
+        records = tuple(
+            record for record in records if record.review_id == requested_review
+        )
+    if requested_decision is not None:
+        decision = FeedbackDecision(requested_decision)
+        records = tuple(record for record in records if record.decision is decision)
+
+    payload = _memory_envelope(context, "feedback_list", generations)
+    payload.update(
+        {
+            "review_id_filter": requested_review,
+            "decision_filter": requested_decision,
+            "status_filter": requested_status,
+            "count": len(records),
+            "feedback": [record.to_dict() for record in records],
+        }
+    )
+    lines = [
+        "Human Feedback",
+        "Repository: %s" % context.repository_key,
+        "Feedback generation: %d" % generations.feedback_generation,
+        "Records: %d" % len(records),
+    ]
+    lines.extend(
+        "  %s  %s  %s  %s"
+        % (
+            record.feedback_id,
+            record.review_id,
+            record.finding_id,
+            record.decision.value,
+        )
+        for record in records
+    )
+    _emit_memory_document(args, payload, lines)
+    return 0
+
+
+def _memory_feedback_record(args: argparse.Namespace) -> int:
+    preview_context = _resolve_memory_context(args, write=False)
+    request, declaration = _feedback_request(preview_context, args)
+    declarations = () if declaration is None else (declaration,)
+    source_validator = SourceValidator(
+        preview_context.repository,
+        sessions_root=preview_context.repository / ".review-agent" / "runs",
+        human_declarations=declarations,
+    )
+    preparation_service = FeedbackImportService(
+        None,
+        source_validator,
+    )
+    prepared = preparation_service.prepare_feedback(request)
+    prepared_record = prepared.record
+    generations = _context_generations(preview_context)
+    preview = _memory_envelope(
+        preview_context,
+        "feedback_record_preview",
+        generations,
+    )
+    preview.update(
+        {
+            "request_id": request.request_id,
+            "review_id": request.review_id,
+            "finding_id": request.finding_id,
+            "head_sha": request.head_sha,
+            "finding_hash": request.finding_hash,
+            "evidence_refs": list(request.evidence_refs),
+            "decision": request.decision.value,
+            "final_severity": request.final_severity.value,
+            "reason_code": request.reason_code.value,
+            "created_at": request.created_at,
+            "missed": request.missed_finding is not None,
+            "source_ref_count": len(prepared_record.source_refs),
+            "preparation_hash": prepared.preparation_hash,
+            "source_validation_hash": prepared.validation.report_hash,
+            "safe_text_validated": True,
+        }
+    )
+    _emit_memory_document(
+        args,
+        preview,
+        [
+            "Human Feedback write preview",
+            "Repository: %s" % preview_context.repository_key,
+            "Review: %s" % request.review_id,
+            "Finding: %s" % request.finding_id,
+            "Decision: %s" % request.decision.value,
+            "Final severity: %s" % request.final_severity.value,
+            "Actor and free text: validated",
+        ],
+    )
+    _confirm_memory_write(args, "record Feedback", request.finding_id)
+
+    context = _resolve_memory_context(args, write=True)
+    _require_same_memory_authority(preview_context, context)
+    assert context.store is not None
+    service = FeedbackImportService(
+        context.store,
+        source_validator,
+    )
+    result = service.record_prepared(prepared)
+    payload = _write_result_payload(
+        context,
+        "feedback_record",
+        result.write_result,
+    )
+    payload.update(
+        {
+            "feedback": result.record.to_dict(),
+            "validation": (
+                None if result.validation is None else result.validation.to_dict()
+            ),
+        }
+    )
+    lines = [
+        "Human Feedback recorded",
+        "Repository: %s" % context.repository_key,
+        "Feedback: %s" % result.record.feedback_id,
+        "Review: %s" % result.record.review_id,
+        "Finding: %s" % result.record.finding_id,
+        "Decision: %s" % result.record.decision.value,
+        "Event: %s" % result.write_result.event_id,
+        "Feedback generation: %d"
+        % result.write_result.generations.feedback_generation,
+        "Replayed: %s" % ("yes" if result.write_result.replayed else "no"),
+    ]
+    _emit_memory_document(args, payload, lines)
+    return 0
+
+
+def _feedback_request(
+    context: _MemoryCommandContext,
+    args: argparse.Namespace,
+) -> tuple[FeedbackImportRequest, HumanDeclarationAuthority | None]:
+    actor, reason = _decision_fields(args)
+    review_id = _required_cli_text(args.review_id, "review_id")
+    finding_id = _required_cli_text(args.finding_id, "finding_id")
+    created_at = (
+        _utc_now()
+        if getattr(args, "created_at", None) is None
+        else _required_cli_text(args.created_at, "created_at")
+    )
+    evidence_refs = tuple(args.evidence_ref)
+    decision = FeedbackDecision(args.decision)
+    final_severity = FindingSeverity(args.final_severity)
+    reason_code = FeedbackReasonCode(args.reason_code)
+    request_id = getattr(args, "request_id", None)
+    if request_id is None:
+        request_id = stable_request_id(
+            _MEMORY_CLI_SCHEMA,
+            "feedback_record",
+            context.repository_key,
+            review_id,
+            finding_id,
+            args.head_sha,
+            args.finding_hash,
+            *evidence_refs,
+            decision.value,
+            final_severity.value,
+            reason_code.value,
+            actor,
+            reason,
+            created_at,
+        )
+
+    source_refs = tuple(
+        _source_ref_from_cli_json(value)
+        for value in getattr(args, "source_ref_json", ())
+    )
+    declaration: HumanDeclarationAuthority | None = None
+    missed: MissedFindingInput | None = None
+    missed_values_present = any(
+        value is not None
+        for value in (
+            getattr(args, "missed_claim", None),
+            getattr(args, "missed_path", None),
+            getattr(args, "missed_line", None),
+            getattr(args, "missed_original_severity", None),
+            getattr(args, "human_declaration", None),
+        )
+    ) or bool(getattr(args, "missed_contracts", ()))
+    if decision is FeedbackDecision.MISSED:
+        declaration_text = _required_cli_text(
+            getattr(args, "human_declaration", None),
+            "human_declaration",
+        )
+        declaration_ref = HumanDeclarationSourceRef(
+            request_id=request_id,
+            actor=actor,
+            declaration_hash=hashlib.sha256(
+                declaration_text.encode("utf-8")
+            ).hexdigest(),
+            created_at=created_at,
+            review_id=review_id,
+        )
+        declaration = HumanDeclarationAuthority(
+            source_ref=declaration_ref,
+            origin=HumanDeclarationOrigin.CLI_REQUEST,
+            declaration=declaration_text,
+        )
+        original_severity = getattr(args, "missed_original_severity", None)
+        if original_severity is None:
+            raise _MemoryCLIError(
+                "feedback_missed_input_required",
+                "missed Feedback requires the original Finding severity",
+                _MEMORY_EXIT_USAGE,
+            )
+        line = getattr(args, "missed_line", None)
+        if line is None:
+            raise _MemoryCLIError(
+                "feedback_missed_input_required",
+                "missed Feedback requires a Finding line",
+                _MEMORY_EXIT_USAGE,
+            )
+        missed = MissedFindingInput(
+            finding_id=finding_id,
+            claim=_required_cli_text(args.missed_claim, "missed_claim"),
+            path=_required_cli_text(args.missed_path, "missed_path"),
+            line=line,
+            contracts=tuple(getattr(args, "missed_contracts", ())),
+            original_severity=FindingSeverity(original_severity),
+            evidence_refs=evidence_refs,
+        )
+        source_refs = (declaration.source_ref, *source_refs)
+    elif missed_values_present or source_refs:
+        raise _MemoryCLIError(
+            "feedback_source_not_allowed",
+            "typed missed-Finding sources are only valid for decision=missed",
+            _MEMORY_EXIT_USAGE,
+        )
+
+    try:
+        request = FeedbackImportRequest(
+            request_id=request_id,
+            repository_key=context.repository_key,
+            review_id=review_id,
+            finding_id=finding_id,
+            head_sha=args.head_sha,
+            finding_hash=args.finding_hash,
+            evidence_refs=evidence_refs,
+            decision=decision,
+            final_severity=final_severity,
+            reason_code=reason_code,
+            reason=reason,
+            actor=actor,
+            created_at=created_at,
+            missed_finding=missed,
+            human_declaration=declaration,
+            source_refs=source_refs,
+        )
+    except (TypeError, ValueError) as error:
+        raise _MemoryCLIError(
+            "feedback_input_invalid",
+            "the Feedback request is not canonical",
+            _MEMORY_EXIT_USAGE,
+        ) from error
+    return request, declaration
+
+
+def _source_ref_from_cli_json(value: str) -> SourceRef:
+    if not isinstance(value, str) or not value:
+        raise _MemoryCLIError(
+            "feedback_source_invalid",
+            "a Feedback source ref must be canonical JSON",
+            _MEMORY_EXIT_USAGE,
+        )
+    try:
+        if value.startswith("@"):
+            source_path = Path(value[1:])
+            if source_path.stat().st_size > 1_048_576:
+                raise ValueError("source ref input is too large")
+            raw = source_path.read_text(encoding="utf-8")
+        else:
+            raw = value
+        payload = json.loads(raw, object_pairs_hook=_strict_cli_json_object)
+        return SourceRef.from_dict(payload)
+    except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise _MemoryCLIError(
+            "feedback_source_invalid",
+            "a Feedback source ref failed strict hydration",
+            _MEMORY_EXIT_USAGE,
+        ) from error
+
+
+def _strict_cli_json_object(
+    pairs: Sequence[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _memory_replay_outbox(args: argparse.Namespace) -> int:
+    context = _resolve_memory_context(args, write=False)
+    actor, reason = _decision_fields(args)
+    review_id = _required_cli_text(args.review_id, "review_id")
+    prepared_outbox = _prepare_outbox_replay(
+        context,
+        review_id,
+    )
+    request_id = _decision_request_id(
+        args,
+        "replay_outbox",
+        review_id,
+        actor,
+        "memory_candidate_outbox_v1",
+        reason,
+    )
+    try:
+        request_id = validate_stable_id(
+            request_id,
+            "REQ",
+            "outbox replay request_id",
+        )
+    except (TypeError, ValueError) as error:
+        raise _MemoryCLIError(
+            "outbox_request_invalid",
+            "the outbox replay request ID is not canonical",
+            _MEMORY_EXIT_USAGE,
+        ) from error
+    generations = _context_generations(context)
+    preview = _memory_envelope(
+        context,
+        "replay_outbox_preview",
+        generations,
+    )
+    preview.update(
+        {
+            "review_id": review_id,
+            "request_id": request_id,
+            "actor": actor,
+            "required_artifact_schema": _MEMORY_OUTBOX_SCHEMA,
+            "validation": "delegated_to_memory_outbox_persistence_service",
+            "expected_outbox_digest": prepared_outbox.outbox_digest,
+            "batch_digest": prepared_outbox.batch_digest,
+            "entry_count": len(prepared_outbox.entries),
+        }
+    )
+    _emit_memory_document(
+        args,
+        preview,
+        [
+            "Memory outbox replay preview",
+            "Repository: %s" % context.repository_key,
+            "Review: %s" % review_id,
+            "Actor: %s" % actor,
+            "Artifact validation: required",
+        ],
+    )
+    _confirm_memory_write(args, "replay outbox", review_id)
+
+    receipt = _replay_memory_outbox_via_service(
+        repository=context.repository,
+        review_id=review_id,
+        memory_root=context.memory_root,
+        actor=actor,
+        reason=reason,
+        request_id=request_id,
+        expected_repository_key=context.repository_key,
+        expected_locator_repository_key=context.locator_repository_key,
+        expected_authority_resolution_hash=context.authority_resolution_hash,
+        expected_binding_id=context.binding_id,
+        expected_outbox_digest=prepared_outbox.outbox_digest,
+        expected_batch_digest=prepared_outbox.batch_digest,
+        expected_entries=prepared_outbox.entries,
+    )
+    result_context = _resolve_memory_context(args, write=False)
+    _require_same_memory_authority(context, result_context)
+    payload = _memory_envelope(
+        result_context,
+        "replay_outbox_result",
+        _context_generations(result_context),
+    )
+    payload.update({"review_id": review_id, "receipt": receipt})
+    _emit_memory_document(
+        args,
+        payload,
+        [
+            "Memory outbox replay completed",
+            "Repository: %s" % result_context.repository_key,
+            "Review: %s" % review_id,
+            "Receipt: %s" % _terminal_json(receipt),
+        ],
+    )
+    return 0
+
+
+def _prepare_outbox_replay(
+    context: _MemoryCommandContext,
+    review_id: str,
+) -> _PreparedOutboxReplay:
+    """Read and bind one completed, hash-valid Session outbox for CAS."""
+
+    if (
+        not isinstance(review_id, str)
+        or not 1 <= len(review_id) <= 128
+        or not review_id[0].isalnum()
+        or any(
+            not (character.isalnum() or character in "._-")
+            for character in review_id
+        )
+    ):
+        raise _MemoryCLIError(
+            "outbox_review_invalid",
+            "the outbox review ID is not canonical",
+            _MEMORY_EXIT_USAGE,
+        )
+    try:
+        sessions_root = (
+            context.repository / ".review-agent" / "runs"
+        ).resolve(strict=True)
+        run_dir = sessions_root / review_id
+        if run_dir.is_symlink() or not run_dir.is_dir():
+            raise ValueError("unsafe Session run directory")
+        resolved_run_dir = run_dir.resolve(strict=True)
+        resolved_run_dir.relative_to(sessions_root)
+    except FileNotFoundError as error:
+        raise _MemoryCLIError(
+            "outbox_session_not_found",
+            "the requested outbox Session does not exist",
+            _MEMORY_EXIT_NOT_FOUND,
+        ) from error
+    except (OSError, RuntimeError, ValueError) as error:
+        raise _MemoryCLIError(
+            "outbox_session_untrusted",
+            "the requested outbox Session path is not trusted",
+            _MEMORY_EXIT_CONFLICT,
+        ) from error
+
+    session_store = SessionStore(resolved_run_dir)
+    try:
+        manifest = session_store.load()
+        session_repository_key = canonical_repository_key(manifest.repository)
+    except FileNotFoundError as error:
+        raise _MemoryCLIError(
+            "outbox_session_not_found",
+            "the requested outbox Session does not exist",
+            _MEMORY_EXIT_NOT_FOUND,
+        ) from error
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise _MemoryCLIError(
+            "outbox_session_untrusted",
+            "the requested outbox Session failed strict hydration",
+            _MEMORY_EXIT_CONFLICT,
+        ) from error
+    if (
+        manifest.review_id != review_id
+        or manifest.status is not RunStatus.COMPLETED
+        or session_repository_key != context.locator_repository_key
+    ):
+        raise _MemoryCLIError(
+            "outbox_session_conflict",
+            "the requested outbox Session state or repository authority conflicts",
+            _MEMORY_EXIT_CONFLICT,
+        )
+
+    descriptor = manifest.artifacts.get("memory_outbox")
+    if descriptor is None:
+        raise _MemoryCLIError(
+            "outbox_not_found",
+            "the Session has no committed Memory outbox",
+            _MEMORY_EXIT_NOT_FOUND,
+        )
+    checkpoint = manifest.phases.get(RunPhase.MEMORY_PROPOSAL.value)
+    expected_revision = (
+        manifest.revisions.resolved_base_sha
+        + ".."
+        + manifest.revisions.resolved_head_sha
+    )
+    try:
+        valid_descriptor = (
+            artifact_schema("memory_outbox") == _MEMORY_OUTBOX_SCHEMA
+            and descriptor.schema == _MEMORY_OUTBOX_SCHEMA
+            and descriptor.phase is RunPhase.MEMORY_PROPOSAL
+            and descriptor.revision_binding is not None
+            and descriptor.revision_binding.casefold()
+            == expected_revision.casefold()
+            and checkpoint is not None
+            and checkpoint.status is PhaseStatus.COMPLETED
+            and descriptor.name in checkpoint.artifacts
+            and session_store.validate_artifact(descriptor)
+            and _is_canonical_sha256(descriptor.sha256)
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        valid_descriptor = False
+    if not valid_descriptor:
+        raise _MemoryCLIError(
+            "outbox_untrusted",
+            "the Session Memory outbox failed descriptor, revision, or hash validation",
+            _MEMORY_EXIT_CONFLICT,
+        )
+    try:
+        payload = _read_bounded_session_json(
+            session_store,
+            descriptor,
+            max_bytes=8 * 1024 * 1024,
+        )
+        return _hydrate_memory_outbox(
+            payload,
+            review_id=review_id,
+            expected_repository_key=context.repository_key,
+            expected_locator_repository_key=context.locator_repository_key,
+            expected_authority_resolution_hash=context.authority_resolution_hash,
+            expected_binding_id=context.binding_id,
+            expected_head_sha=manifest.revisions.resolved_head_sha,
+        )
+    except _MemoryCLIError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise _MemoryCLIError(
+            "outbox_untrusted",
+            "the Session Memory outbox failed strict payload hydration",
+            _MEMORY_EXIT_CONFLICT,
+        ) from error
+
+
+def _read_bounded_session_json(
+    session_store: SessionStore,
+    descriptor: Any,
+    *,
+    max_bytes: int,
+) -> Mapping[str, Any]:
+    root = session_store.run_dir.resolve(strict=True)
+    relative_parts = PurePosixPath(descriptor.path).parts
+    candidate = root.joinpath(*relative_parts)
+    current = root
+    for index, part in enumerate(relative_parts):
+        current = current / part
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("artifact path contains a symlink")
+        if index < len(relative_parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("artifact parent is not a directory")
+    resolved = candidate.resolve(strict=True)
+    resolved.relative_to(root)
+    metadata = resolved.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+        raise ValueError("artifact is not a bounded regular file")
+    content = resolved.read_bytes()
+    if len(content) > max_bytes:
+        raise ValueError("artifact grew beyond its bound")
+    if hashlib.sha256(content).hexdigest() != descriptor.sha256:
+        raise ValueError("artifact content hash changed")
+    payload = json.loads(
+        content.decode("utf-8"),
+        object_pairs_hook=_strict_cli_json_object,
+    )
+    if type(payload) is not dict or not session_store.validate_artifact(descriptor):
+        raise ValueError("artifact changed during strict hydration")
+    return payload
+
+
+def _hydrate_memory_outbox(
+    payload: Mapping[str, Any],
+    *,
+    review_id: str,
+    expected_repository_key: str,
+    expected_locator_repository_key: str,
+    expected_authority_resolution_hash: str,
+    expected_binding_id: str | None,
+    expected_head_sha: str,
+) -> _PreparedOutboxReplay:
+    fields = {
+        "schema",
+        "review_id",
+        "repository_key",
+        "locator_repository_key",
+        "authority_resolution_hash",
+        "binding_id",
+        "head_sha",
+        "snapshot_id",
+        "batch_digest",
+        "actor_type",
+        "actor_id",
+        "reason_code",
+        "entries",
+        "outbox_digest",
+    }
+    if type(payload) is not dict or set(payload) != fields:
+        raise _MemoryCLIError(
+            "outbox_untrusted",
+            "the Session Memory outbox schema is invalid",
+            _MEMORY_EXIT_CONFLICT,
+        )
+    if (
+        payload["schema"] != _MEMORY_OUTBOX_SCHEMA
+        or payload["review_id"] != review_id
+        or payload["repository_key"] != expected_repository_key
+        or payload["locator_repository_key"]
+        != expected_locator_repository_key
+        or payload["authority_resolution_hash"]
+        != expected_authority_resolution_hash
+        or payload["binding_id"] != expected_binding_id
+        or payload["head_sha"] != expected_head_sha
+        or not _is_canonical_sha256(payload["batch_digest"])
+        or not _is_canonical_sha256(payload["outbox_digest"])
+        or not _canonical_outbox_text(payload["actor_type"])
+        or not _canonical_outbox_text(payload["actor_id"])
+        or not _canonical_outbox_text(payload["reason_code"])
+    ):
+        raise _MemoryCLIError(
+            "outbox_untrusted",
+            "the Session Memory outbox authority binding is invalid",
+            _MEMORY_EXIT_CONFLICT,
+        )
+    try:
+        validate_stable_id(payload["snapshot_id"], "MSNAP", "outbox snapshot_id")
+    except (TypeError, ValueError) as error:
+        raise _MemoryCLIError(
+            "outbox_untrusted",
+            "the Session Memory outbox snapshot binding is invalid",
+            _MEMORY_EXIT_CONFLICT,
+        ) from error
+
+    raw_entries = payload["entries"]
+    if not isinstance(raw_entries, list) or len(raw_entries) > 64:
+        raise _MemoryCLIError(
+            "outbox_untrusted",
+            "the Session Memory outbox entries are invalid",
+            _MEMORY_EXIT_CONFLICT,
+        )
+    entries: list[tuple[str, str]] = []
+    candidate_ids: list[str] = []
+    request_ids: list[str] = []
+    try:
+        for entry in raw_entries:
+            if type(entry) is not dict or set(entry) != {
+                "candidate_id",
+                "candidate_hash",
+                "request_id",
+            }:
+                raise ValueError("outbox entry fields are invalid")
+            candidate_id = validate_stable_id(
+                entry["candidate_id"],
+                "MC",
+                "outbox candidate_id",
+            )
+            request_id = validate_stable_id(
+                entry["request_id"],
+                "REQ",
+                "outbox request_id",
+            )
+            if not _is_canonical_sha256(entry["candidate_hash"]):
+                raise ValueError("outbox candidate_hash is invalid")
+            candidate_ids.append(candidate_id)
+            request_ids.append(request_id)
+            entries.append((candidate_id, request_id))
+    except (TypeError, ValueError) as error:
+        raise _MemoryCLIError(
+            "outbox_untrusted",
+            "the Session Memory outbox entries failed strict hydration",
+            _MEMORY_EXIT_CONFLICT,
+        ) from error
+    if (
+        candidate_ids != sorted(set(candidate_ids))
+        or len(request_ids) != len(set(request_ids))
+    ):
+        raise _MemoryCLIError(
+            "outbox_untrusted",
+            "the Session Memory outbox entries are not canonical",
+            _MEMORY_EXIT_CONFLICT,
+        )
+
+    body = {key: value for key, value in payload.items() if key != "outbox_digest"}
+    if canonical_sha256(body) != payload["outbox_digest"]:
+        raise _MemoryCLIError(
+            "outbox_untrusted",
+            "the Session Memory outbox digest is invalid",
+            _MEMORY_EXIT_CONFLICT,
+        )
+    return _PreparedOutboxReplay(
+        outbox_digest=payload["outbox_digest"],
+        batch_digest=payload["batch_digest"],
+        entries=tuple(entries),
+    )
+
+
+def _canonical_outbox_text(value: Any) -> bool:
+    return (
+        type(value) is str
+        and value == value.strip()
+        and 1 <= len(value) <= 512
+        and all(character.isprintable() for character in value)
+    )
+
+
+def _replay_memory_outbox_via_service(
+    *,
+    repository: Path,
+    review_id: str,
+    memory_root: Path,
+    actor: str,
+    reason: str,
+    request_id: str,
+    expected_repository_key: str,
+    expected_locator_repository_key: str,
+    expected_authority_resolution_hash: str,
+    expected_binding_id: str | None,
+    expected_outbox_digest: str,
+    expected_batch_digest: str,
+    expected_entries: tuple[tuple[str, str], ...],
+) -> Mapping[str, Any]:
+    """Final CLI seam for Task 15's authoritative outbox service.
+
+    Artifact descriptor/hash/revision checks and idempotent candidate writes
+    belong to that service.  The CLI intentionally never rehydrates an outbox
+    or writes candidates itself.
+    """
+
+    pipeline_module = importlib.import_module("review_agent.pipeline")
+    replay = getattr(pipeline_module, "replay_memory_outbox", None)
+    if not callable(replay):
+        raise _MemoryCLIError(
+            "outbox_service_unavailable",
+            "the authoritative Memory outbox replay service is not available",
+            _MEMORY_EXIT_OPERATIONAL,
+        )
+    try:
+        result = replay(
+            repository=repository,
+            review_id=review_id,
+            memory_root=memory_root,
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+            expected_repository_key=expected_repository_key,
+            expected_authority_resolution_hash=(
+                expected_authority_resolution_hash
+            ),
+            expected_outbox_digest=expected_outbox_digest,
+        )
+        if hasattr(result, "to_dict") and callable(result.to_dict):
+            result = result.to_dict()
+        if not isinstance(result, Mapping):
+            raise _invalid_outbox_receipt()
+        canonical = json.loads(
+            json.dumps(
+                dict(result),
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            object_pairs_hook=_strict_cli_json_object,
+        )
+        return _validate_outbox_replay_receipt(
+            canonical,
+            review_id=review_id,
+            expected_repository_key=expected_repository_key,
+            expected_locator_repository_key=expected_locator_repository_key,
+            expected_authority_resolution_hash=(
+                expected_authority_resolution_hash
+            ),
+            expected_binding_id=expected_binding_id,
+            expected_outbox_digest=expected_outbox_digest,
+            expected_batch_digest=expected_batch_digest,
+            expected_entries=expected_entries,
+        )
+    except (
+        _MemoryCLIError,
+        MemoryStoreError,
+        RepositoryRelinkConflictError,
+    ):
+        raise
+    except Exception as error:
+        raise _MemoryCLIError(
+            "outbox_service_failed",
+            "the authoritative Memory outbox service failed safely",
+            _MEMORY_EXIT_OPERATIONAL,
+        ) from error
+
+
+def _validate_outbox_replay_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    review_id: str,
+    expected_repository_key: str,
+    expected_locator_repository_key: str,
+    expected_authority_resolution_hash: str,
+    expected_binding_id: str | None,
+    expected_outbox_digest: str,
+    expected_batch_digest: str,
+    expected_entries: tuple[tuple[str, str], ...],
+) -> Mapping[str, Any]:
+    required_fields = {
+        "schema",
+        "success",
+        "review_id",
+        "repository_key",
+        "locator_repository_key",
+        "authority_resolution_hash",
+        "binding_id",
+        "outbox_digest",
+        "batch_digest",
+        "persisted_candidate_ids",
+        "replayed_candidate_ids",
+        "results",
+        "receipt_digest",
+    }
+    if type(receipt) is not dict or set(receipt) != required_fields:
+        raise _invalid_outbox_receipt()
+    if (
+        receipt["schema"] != _MEMORY_PERSISTENCE_RECEIPT_SCHEMA
+        or receipt["success"] is not True
+        or receipt["review_id"] != review_id
+        or receipt["repository_key"] != expected_repository_key
+        or receipt["locator_repository_key"]
+        != expected_locator_repository_key
+        or receipt["authority_resolution_hash"]
+        != expected_authority_resolution_hash
+        or receipt["binding_id"] != expected_binding_id
+        or receipt["outbox_digest"] != expected_outbox_digest
+        or receipt["batch_digest"] != expected_batch_digest
+        or not _is_canonical_sha256(receipt["receipt_digest"])
+    ):
+        raise _invalid_outbox_receipt()
+
+    receipt_body = {
+        key: value for key, value in receipt.items() if key != "receipt_digest"
+    }
+    if canonical_sha256(receipt_body) != receipt["receipt_digest"]:
+        raise _invalid_outbox_receipt()
+
+    persisted = _canonical_candidate_id_list(
+        receipt["persisted_candidate_ids"]
+    )
+    replayed = _canonical_candidate_id_list(
+        receipt["replayed_candidate_ids"]
+    )
+    if persisted is None or replayed is None or set(persisted) & set(replayed):
+        raise _invalid_outbox_receipt()
+    expected_entry_map = dict(expected_entries)
+    expected_results = set(expected_entry_map)
+    if {*persisted, *replayed} != expected_results:
+        raise _invalid_outbox_receipt()
+    raw_results = receipt["results"]
+    if not isinstance(raw_results, list) or len(raw_results) != len(
+        expected_results
+    ):
+        raise _invalid_outbox_receipt()
+    hydrated_results: list[tuple[str, str, bool, WriteResult]] = []
+    try:
+        for row in raw_results:
+            if type(row) is not dict or set(row) != {
+                "candidate_id",
+                "request_id",
+                "replayed",
+                "write_result",
+            }:
+                raise ValueError("receipt result fields are invalid")
+            candidate_id = validate_stable_id(
+                row["candidate_id"],
+                "MC",
+                "receipt candidate_id",
+            )
+            row_request_id = validate_stable_id(
+                row["request_id"],
+                "REQ",
+                "receipt request_id",
+            )
+            if type(row["replayed"]) is not bool:
+                raise ValueError("receipt replayed flag is invalid")
+            result = WriteResult.from_dict(row["write_result"])
+            if result.to_dict() != row["write_result"]:
+                raise ValueError("non-canonical write result")
+            hydrated_results.append(
+                (candidate_id, row_request_id, row["replayed"], result)
+            )
+    except (MemoryStoreError, TypeError, ValueError):
+        raise _invalid_outbox_receipt() from None
+    result_ids = [candidate_id for candidate_id, _, _, _ in hydrated_results]
+    if (
+        len(result_ids) != len(set(result_ids))
+        or result_ids != [candidate_id for candidate_id, _ in expected_entries]
+        or set(result_ids) != expected_results
+        or any(
+            expected_entry_map[candidate_id] != row_request_id
+            or replayed_flag != (candidate_id in set(replayed))
+            or result.operation != "put_candidate"
+            or result.subject_id != candidate_id
+            or (replayed_flag and result.applied)
+            for candidate_id, row_request_id, replayed_flag, result in hydrated_results
+        )
+    ):
+        raise _invalid_outbox_receipt()
+    return receipt
+
+
+def _canonical_candidate_id_list(value: Any) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    try:
+        canonical = [
+            validate_stable_id(item, "MC", "replay candidate_id")
+            for item in value
+        ]
+    except (TypeError, ValueError):
+        return None
+    if canonical != sorted(set(canonical)):
+        return None
+    return canonical
+
+
+def _is_canonical_sha256(value: Any) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and value == value.casefold()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _invalid_outbox_receipt() -> _MemoryCLIError:
+    return _MemoryCLIError(
+        "outbox_service_invalid",
+        "the authoritative Memory outbox service returned an invalid receipt",
+        _MEMORY_EXIT_OPERATIONAL,
+    )
+
+
 def _memory_export(args: argparse.Namespace) -> int:
     context = _resolve_memory_context(args, write=False, require_store=True)
     assert context.store is not None
@@ -1775,9 +3014,15 @@ def _memory_envelope(
         "locator_repository_key": context.locator_repository_key,
         "authority_resolution_hash": context.authority_resolution_hash,
         "binding_id": context.binding_id,
+        "root_fingerprint": _memory_root_fingerprint(context.memory_root),
         "generation": generations.memory_generation,
         "generations": generations.to_dict(),
     }
+
+
+def _memory_root_fingerprint(root_path: str | Path) -> str:
+    canonical = Path(root_path).as_posix()
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _enum_status_counts(items: Sequence[Any]) -> dict[str, int]:
@@ -2341,6 +3586,21 @@ def _terminal_text(value: Any, *, limit: int | None = None) -> str:
     return safe
 
 
+def _print_memory_execution_summary(
+    config: MemoryExecutionConfig | None,
+    *,
+    prefix: str = "",
+) -> None:
+    if config is None:
+        return
+    print(f"{prefix}Memory mode: {config.mode.value}")
+    print(
+        f"{prefix}Memory root fingerprint: "
+        f"{_memory_root_fingerprint(config.root_path)}"
+    )
+    print(f"{prefix}Memory required: {'yes' if config.required else 'no'}")
+
+
 def _run_review(args: argparse.Namespace) -> int:
     requested_repo = Path(args.repo).resolve()
     resolver = RevisionResolver()
@@ -2353,6 +3613,12 @@ def _run_review(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        memory_config = _resolve_memory_execution_config(args)
+    except (MemoryIdentityError, ValueError) as error:
+        print(f"Memory session configuration error: {error}")
+        return 2
+
+    try:
         execution_config = ReviewExecutionConfig(
             reviewer_provider=args.reviewer_provider,
             reviewer_model=args.reviewer_model,
@@ -2361,6 +3627,7 @@ def _run_review(args: argparse.Namespace) -> int:
             reviewer_mode=args.reviewer_mode,
             reviewer_loop=args.reviewer_loop,
             non_interactive=args.non_interactive,
+            memory=memory_config,
         )
     except ValueError as error:
         print(f"Reviewer session configuration error: {error}")
@@ -2382,6 +3649,11 @@ def _run_review(args: argparse.Namespace) -> int:
             semantic_reconciler=_resolve_model_stage_config(
                 args,
                 "semantic-reconciler",
+                execution_config,
+            ),
+            memory_curator=_resolve_model_stage_config(
+                args,
+                "memory-curator",
                 execution_config,
             ),
         )
@@ -2448,6 +3720,7 @@ def _run_review(args: argparse.Namespace) -> int:
         print(f"Review failed: {error}{suffix}", file=sys.stderr)
         return 1
 
+    _print_memory_execution_summary(execution_config.memory)
     if result.awaiting_user:
         print(f"Review awaiting intent clarification: {store.run_dir}")
         print(f"Review id: {review_id}")
@@ -2574,6 +3847,7 @@ def _print_session_summary(session_store: SessionStore, store: CheckpointStore) 
     print(f"  Requested Head: {session.revisions.requested_head}")
     print(f"  Resolved Base: {session.revisions.resolved_base_sha}")
     print(f"  Resolved Head: {session.revisions.resolved_head_sha}")
+    _print_memory_execution_summary(session.execution.memory, prefix="  ")
     print(f"  Run directory: {store.run_dir}")
     print("  Artifacts:")
     for name, descriptor in sorted(session.artifacts.items()):

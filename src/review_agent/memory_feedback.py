@@ -33,11 +33,6 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from review_agent.artifacts import artifact_schema
 from review_agent.evidence import CanonicalFinding, EvidenceReconciliation
-from review_agent.hydration import (
-    assignments_from_dict,
-    reconciliation_from_dict,
-    semantic_reconciliation_from_dict,
-)
 from review_agent.memory_identity import repository_key as canonical_repository_key
 from review_agent.memory_models import (
     FEEDBACK_AGGREGATION_POLICY_VERSION,
@@ -58,6 +53,7 @@ from review_agent.memory_models import (
     Sensitivity,
     SessionArtifactSourceRef,
     SourceRef,
+    canonical_sha256,
     validate_stable_id,
 )
 from review_agent.memory_sources import (
@@ -274,6 +270,60 @@ class FeedbackImportResult:
 
 
 @dataclass(frozen=True)
+class PreparedFeedbackImport:
+    """Write-free, hash-bound result of complete Feedback validation."""
+
+    request_id: str
+    record: FeedbackRecord = field(repr=False)
+    validation: SourceValidationReport = field(repr=False)
+    preparation_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        try:
+            request_id = validate_stable_id(
+                self.request_id,
+                "REQ",
+                "prepared feedback request_id",
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "prepared feedback request_id must be a canonical REQ ID"
+            ) from error
+        if type(self.record) is not FeedbackRecord:
+            raise ValueError("prepared feedback record must be a FeedbackRecord")
+        if self.record.status is not FeedbackStatus.RECORDED:
+            raise ValueError("prepared feedback record must have recorded status")
+        if type(self.validation) is not SourceValidationReport:
+            raise ValueError(
+                "prepared feedback validation must be a SourceValidationReport"
+            )
+        if not self.validation.valid:
+            raise ValueError("prepared feedback validation must be successful")
+        object.__setattr__(self, "request_id", request_id)
+        object.__setattr__(
+            self,
+            "preparation_hash",
+            canonical_sha256(self._identity_payload()),
+        )
+
+    def _identity_payload(self) -> Dict[str, Any]:
+        return {
+            "schema_version": "prepared_feedback_import_v1",
+            "request_id": self.request_id,
+            "record": self.record.to_dict(),
+            "validation_hash": self.validation.report_hash,
+        }
+
+    def require_intact(self) -> None:
+        expected = canonical_sha256(self._identity_payload())
+        if not hmac.compare_digest(expected, self.preparation_hash):
+            raise FeedbackError(
+                "prepared feedback changed after validation",
+                FeedbackErrorCode.SESSION_UNTRUSTED,
+            )
+
+
+@dataclass(frozen=True)
 class FeedbackAggregateGroup:
     decision: FeedbackDecision
     reason_code: FeedbackReasonCode
@@ -427,27 +477,106 @@ class FeedbackImportService:
 
     def __init__(
         self,
-        store: MemoryStore,
+        store: Optional[MemoryStore],
         source_validator: SourceValidator,
-        contract_registry: RuntimePolicyRegistry,
+        contract_registry: Optional[RuntimePolicyRegistry] = None,
     ) -> None:
-        if not isinstance(store, MemoryStore):
-            raise ValueError("store must be a MemoryStore")
+        if store is not None and not isinstance(store, MemoryStore):
+            raise ValueError("store must be a MemoryStore or null")
         if not isinstance(source_validator, SourceValidator):
             raise ValueError("source_validator must be a SourceValidator")
-        if type(contract_registry) is not RuntimePolicyRegistry:
-            raise ValueError("contract_registry must be a RuntimePolicyRegistry")
+        if contract_registry is not None and type(
+            contract_registry
+        ) is not RuntimePolicyRegistry:
+            raise ValueError(
+                "contract_registry must be a RuntimePolicyRegistry or null"
+            )
         self.store = store
         self.source_validator = source_validator
+        # Compatibility input for direct service callers.  Contract authority
+        # is always rehydrated from the bound Session's Runtime-owned packet.
         self.contract_registry = contract_registry
         self._materializer = FindingSnapshotMaterializer(
             source_validator.sessions_root
         )
 
     def record_feedback(self, request: FeedbackImportRequest) -> FeedbackImportResult:
+        prepared = self.prepare_feedback(request)
+        return self.record_prepared(prepared)
+
+    def prepare_feedback(
+        self,
+        request: FeedbackImportRequest,
+    ) -> PreparedFeedbackImport:
+        """Fully validate Feedback without opening or mutating a Memory Store."""
+
         if type(request) is not FeedbackImportRequest:
             raise FeedbackError(
                 "feedback request must be a canonical FeedbackImportRequest",
+                FeedbackErrorCode.INVALID_INPUT,
+            )
+
+        if request.decision is FeedbackDecision.MISSED:
+            snapshot, source_refs = self._materialize_missed(request)
+        else:
+            snapshot, source_refs = self._materialize_session_finding(request)
+
+        _validate_decision_severity(request, snapshot)
+        _require_safe_feedback_text(snapshot, request.reason, request.actor)
+        validation = self.source_validator.validate_sources(
+            source_refs,
+            sensitivity=Sensitivity.NORMAL,
+            statement=request.reason,
+        )
+        if not validation.valid:
+            raise FeedbackError(
+                "feedback typed source validation failed",
+                FeedbackErrorCode.SOURCE_VALIDATION_FAILED,
+            )
+
+        try:
+            record = FeedbackRecord(
+                repository_key=request.repository_key,
+                review_id=request.review_id,
+                finding_id=request.finding_id,
+                head_sha=request.head_sha,
+                finding_snapshot=snapshot,
+                decision=request.decision,
+                original_severity=snapshot.original_severity,
+                final_severity=request.final_severity,
+                reason_code=request.reason_code,
+                reason=request.reason,
+                actor=request.actor,
+                source_refs=source_refs,
+                status=FeedbackStatus.RECORDED,
+                created_at=request.created_at,
+            )
+            return PreparedFeedbackImport(
+                request_id=request.request_id,
+                record=record,
+                validation=validation,
+            )
+        except (TypeError, ValueError) as error:
+            raise FeedbackError(
+                "feedback record failed canonical validation",
+                FeedbackErrorCode.INVALID_INPUT,
+            ) from error
+
+    def record_prepared(
+        self,
+        prepared: PreparedFeedbackImport,
+    ) -> FeedbackImportResult:
+        """Persist exactly one previously validated Feedback preparation."""
+
+        if type(prepared) is not PreparedFeedbackImport:
+            raise FeedbackError(
+                "feedback write requires a prepared import",
+                FeedbackErrorCode.INVALID_INPUT,
+            )
+        prepared.require_intact()
+        if self.store is None:
+            raise FeedbackError(
+                "feedback write requires an available Memory Store",
                 FeedbackErrorCode.INVALID_INPUT,
             )
 
@@ -458,56 +587,22 @@ class FeedbackImportService:
             self.store.namespace_path,
             busy_timeout_ms=self.store.busy_timeout_ms,
         ):
-            existing = self._existing_decision(request)
+            existing = self._existing_decision(prepared.record)
             if existing is not None:
                 write_result = self.store.put_feedback(
                     existing,
-                    request_id=request.request_id,
+                    request_id=prepared.request_id,
                 )
                 return FeedbackImportResult(
                     record=existing,
                     write_result=write_result,
-                    validation=None,
-                )
-
-            if request.decision is FeedbackDecision.MISSED:
-                snapshot, source_refs = self._materialize_missed(request)
-            else:
-                snapshot, source_refs = self._materialize_session_finding(request)
-
-            _validate_decision_severity(request, snapshot)
-            _require_safe_feedback_text(snapshot, request.reason, request.actor)
-            validation = self.source_validator.validate_sources(
-                source_refs,
-                sensitivity=Sensitivity.NORMAL,
-                statement=request.reason,
-            )
-            if not validation.valid:
-                raise FeedbackError(
-                    "feedback typed source validation failed",
-                    FeedbackErrorCode.SOURCE_VALIDATION_FAILED,
+                    validation=prepared.validation,
                 )
 
             try:
-                record = FeedbackRecord(
-                    repository_key=request.repository_key,
-                    review_id=request.review_id,
-                    finding_id=request.finding_id,
-                    head_sha=request.head_sha,
-                    finding_snapshot=snapshot,
-                    decision=request.decision,
-                    original_severity=snapshot.original_severity,
-                    final_severity=request.final_severity,
-                    reason_code=request.reason_code,
-                    reason=request.reason,
-                    actor=request.actor,
-                    source_refs=source_refs,
-                    status=FeedbackStatus.RECORDED,
-                    created_at=request.created_at,
-                )
                 write_result = self.store.put_feedback(
-                    record,
-                    request_id=request.request_id,
+                    prepared.record,
+                    request_id=prepared.request_id,
                 )
             except MemoryStoreConflictError as error:
                 raise FeedbackError(
@@ -520,9 +615,9 @@ class FeedbackImportService:
                     FeedbackErrorCode.INVALID_INPUT,
                 ) from error
             return FeedbackImportResult(
-                record=record,
+                record=prepared.record,
                 write_result=write_result,
-                validation=validation,
+                validation=prepared.validation,
             )
 
     # Friendly spellings for command/runtime orchestration.
@@ -531,21 +626,20 @@ class FeedbackImportService:
 
     def _existing_decision(
         self,
-        request: FeedbackImportRequest,
+        prepared_record: FeedbackRecord,
     ) -> Optional[FeedbackRecord]:
-        view = self.store.read_view(request.repository_key)
+        assert self.store is not None
+        view = self.store.read_view(prepared_record.repository_key)
         matches = tuple(
             record
             for record in view.feedback
-            if record.review_id == request.review_id
-            and record.finding_id == request.finding_id
-            and record.head_sha == request.head_sha
+            if record.review_id == prepared_record.review_id
+            and record.finding_id == prepared_record.finding_id
+            and record.head_sha == prepared_record.head_sha
         )
         if not matches:
             return None
-        exact = tuple(
-            record for record in matches if _record_matches_request(record, request)
-        )
+        exact = tuple(record for record in matches if record == prepared_record)
         if len(matches) == 1 and len(exact) == 1:
             return exact[0]
         raise FeedbackError(
@@ -596,7 +690,11 @@ class FeedbackImportService:
 
         snapshot = request.missed_finding.materialize()
         _require_request_snapshot_match(request, snapshot)
-        if not set(snapshot.contracts) <= set(self.contract_registry.contract_ids):
+        contract_registry = self._materializer.runtime_contract_registry(
+            manifest,
+            session_store,
+        )
+        if not set(snapshot.contracts) <= set(contract_registry.contract_ids):
             raise FeedbackError(
                 "missed Finding references an unregistered contract",
                 FeedbackErrorCode.INVALID_INPUT,
@@ -1022,6 +1120,16 @@ class FindingSnapshotMaterializer:
             manifest,
             session_store,
         )
+        if contracts:
+            contract_registry = self.runtime_contract_registry(
+                manifest,
+                session_store,
+            )
+            if not set(contracts) <= set(contract_registry.contract_ids):
+                raise FeedbackError(
+                    "Finding assignments exceed the Session Runtime contract registry",
+                    FeedbackErrorCode.SESSION_UNTRUSTED,
+                )
         try:
             snapshot = FindingSnapshot(
                 finding_id=finding.finding_id or "",
@@ -1051,6 +1159,75 @@ class FindingSnapshotMaterializer:
             source_refs = (*source_refs, contracts_source)
         return snapshot, _canonical_source_refs(source_refs)
 
+    @staticmethod
+    def runtime_contract_registry(
+        manifest: SessionManifest,
+        session_store: SessionStore,
+    ) -> RuntimePolicyRegistry:
+        """Hydrate the contract catalog from the Runtime-owned Session packet."""
+
+        descriptor = _required_artifact(
+            manifest,
+            session_store,
+            "portfolio_packet",
+            "portfolio_packet_v1",
+            expected_phase=RunPhase.PLANNING,
+        )
+        _require_exact_revision_binding(
+            manifest,
+            descriptor,
+            "portfolio packet",
+        )
+        payload = _read_json_artifact(
+            session_store,
+            descriptor,
+            MAX_FEEDBACK_ARTIFACT_BYTES,
+        )
+        required_fields = {
+            "risk",
+            "change_map",
+            "changed_symbols",
+            "intent",
+            "allowed_role_kinds",
+            "reviewer_count_bounds",
+            "contract_allowlist",
+            "check_allowlist",
+            "command_template_allowlist",
+            "perspective_allowlist",
+            "ref_allowlist",
+            "ref_catalog",
+            "budget_policy",
+        }
+        if frozenset(payload) not in {
+            frozenset(required_fields),
+            frozenset(required_fields | {"memory_policy"}),
+        }:
+            raise FeedbackError(
+                "portfolio packet has an invalid Runtime authority schema",
+                FeedbackErrorCode.SESSION_UNTRUSTED,
+            )
+        contracts = payload.get("contract_allowlist")
+        if not isinstance(contracts, list):
+            raise FeedbackError(
+                "portfolio packet contract registry is invalid",
+                FeedbackErrorCode.SESSION_UNTRUSTED,
+            )
+        try:
+            registry = RuntimePolicyRegistry(contract_ids=tuple(contracts))
+        except (TypeError, ValueError) as error:
+            raise FeedbackError(
+                "portfolio packet contract registry failed strict hydration",
+                FeedbackErrorCode.SESSION_UNTRUSTED,
+            ) from error
+        if len(contracts) != len(registry.contract_ids) or set(
+            contracts
+        ) != set(registry.contract_ids):
+            raise FeedbackError(
+                "portfolio packet contract registry is not canonical",
+                FeedbackErrorCode.SESSION_UNTRUSTED,
+            )
+        return registry
+
     def has_canonical_finding(
         self,
         manifest: SessionManifest,
@@ -1071,6 +1248,11 @@ class FindingSnapshotMaterializer:
         manifest: SessionManifest,
         session_store: SessionStore,
     ) -> Tuple[EvidenceReconciliation, Tuple[SessionArtifactSourceRef, ...]]:
+        from review_agent.hydration import (
+            reconciliation_from_dict,
+            semantic_reconciliation_from_dict,
+        )
+
         descriptor = _required_artifact(
             manifest,
             session_store,
@@ -1221,6 +1403,8 @@ class FindingSnapshotMaterializer:
         manifest: SessionManifest,
         session_store: SessionStore,
     ) -> Tuple[Tuple[str, ...], Optional[SessionArtifactSourceRef]]:
+        from review_agent.hydration import assignments_from_dict
+
         reviewer_indices = tuple(sorted(set(finding.reviewer_indices)))
         if not reviewer_indices:
             return (), None
@@ -1835,6 +2019,7 @@ __all__ = [
     "FeedbackValidationService",
     "FindingSnapshotMaterializer",
     "MissedFindingInput",
+    "PreparedFeedbackImport",
     "ReviewFeedbackRequest",
     "ReviewFeedbackService",
     "aggregate_feedback",
