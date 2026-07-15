@@ -1,7 +1,7 @@
 # Core Code Review Eval System 设计
 
 - 日期：2026-07-16
-- 状态：已确认（2026-07-16）
+- 状态：已确认（含 v1 叶子协议补充，2026-07-16）
 - 项目根目录：`D:\Agent\code review agent`
 - 关联主设计：`docs/superpowers/specs/2026-06-22-evidence-driven-multi-agent-code-review-design.md`
 - 历史参考：`docs/superpowers/specs/2026-06-28-code-review-agent-eval-system-design.md`
@@ -71,9 +71,11 @@ Anthropic 提供“神”：
 被测 Agent 对 Eval System 是一个黑盒：
 
 ```text
-EvalInput
-  -> AgentUnderTest
-  -> EvalSubmission
+EvalInput ------> AgentUnderTest ------> EvalSubmission
+                       |
+                       v
+              ClarificationChannel
+              (one asked turn only)
 ```
 
 Eval System 不需要知道 Agent 内部：
@@ -99,9 +101,12 @@ class AgentUnderTestAdapter:
         eval_input: EvalInput,
         workspace: Path,
         config: AgentRunConfig,
+        clarification_channel: ClarificationChannel,
     ) -> EvalSubmission:
         ...
 ```
+
+`ClarificationChannel` 只暴露“提交一个实际问题并取得至多一个匹配回答”的方法，不暴露 Case policy、答案列表或剩余答案。Harness 持有并消费 Clarification Script；Adapter 和 Agent 永远拿不到完整脚本。
 
 Adapter 可以：
 
@@ -117,7 +122,7 @@ Eval 核心不因被测 Agent 的内部架构不同而改变。
 当前项目的 Adapter 负责：
 
 1. 把 `EvalInput` 转为正式 Review 请求；
-2. 执行当前产品；
+2. 执行当前产品，并在产品实际提问时通过受控 `ClarificationChannel` 交换单个问答；
 3. 从产品最终输出中提取 Intent、Findings、Evidence 和 Uncertainties；
 4. 写出统一的 `EvalSubmission`；
 5. 可选保存一个不透明 `trace_ref`。
@@ -194,6 +199,23 @@ Intent Outcome
 Review Outcome
 ```
 
+### 5.7 执行状态与判定状态
+
+Trial 生命周期和 Submission 终态不是同一个 enum：
+
+```text
+trial_status:
+  pending | running | incomplete | completed | failed | blocked | invalid_output
+
+submission_status:
+  completed | failed | blocked | invalid_output
+
+judge_status:
+  graded | judge_failed | ungraded
+```
+
+`unknown` 是 Intent、Finding 或 Evidence 的判定结果，不是 Judge 执行成功状态。Judge 超时、Provider 失败或结构化输出非法时使用 `judge_failed`；因上游缺失而未进入 Judge 时使用 `ungraded`。
+
 ## 6. EvalInput v1
 
 ```yaml
@@ -202,8 +224,8 @@ task_id: py-auth-admin-check-001
 
 repository:
   source: fixture | git
-  path: optional-local-path
-  url: optional-repository-url
+  path: optional-local-path | null
+  url: optional-repository-url | null
   base_revision: ...
   head_revision: ...
 
@@ -214,16 +236,27 @@ review_request:
   review_focus: ...
   linked_requirements: []
   project_rules: []
-  existing_ci_evidence: []
-
-clarification_script:
-  policy: required | optional | not_required
-  answers: []
+  existing_ci_evidence:
+    - source_id: ci-1
+      text: ...
+      content_hash: ...
 ```
 
 EvalInput 只包含真实产品可获得的输入。
 
 Ground truth 不得混入 EvalInput，也不得通过文件名、环境变量或工作区内容泄漏给被测 Agent。
+
+### 6.1 Repository 不变量
+
+- Repository exact keys 是 `source/path/url/base_revision/head_revision`；source/base/head 非 null，path/url 显式使用 string 或 null；
+- `base_revision` 和 `head_revision` 必须是不同的、同长度的 40 或 64 位小写完整 Git object ID；
+- `fixture` 必须提供安全的 suite-relative POSIX path，且 `url=null`；
+- `git` 必须在 local path 和 URL 中恰好提供一个；URL 不得包含 userinfo/credential；
+- repository path 拒绝绝对路径、盘符、UNC、`..`、空组件和 VCS metadata 逃逸。
+
+`linked_requirements` 和 `project_rules` 是有界文本列表。每条 existing-CI evidence 是 Agent 可见的 typed snapshot：source ID 唯一，`content_hash` 是 exact UTF-8 text SHA-256；Trial 不根据 URL 重新下载内容。`external_record.source_ref` 只能引用这里的 source ID。
+
+Review request exact keys 是 `title/description/user_intent/review_focus/linked_requirements/project_rules/existing_ci_evidence`。前四项是非空 string 或 null；后三项始终是 list。EvalInput 根 exact keys 是 `schema_version/task_id/repository/review_request`，全部非 null。
 
 ## 7. EvalSubmission v1
 
@@ -238,7 +271,7 @@ status: completed | failed | blocked | invalid_output
 
 intent:
   status: sufficient | partial | insufficient
-  goal: ...
+  goal: ... | null
   acceptance_criteria: []
   scope: []
   constraints: []
@@ -247,7 +280,17 @@ intent:
       dimension: goal | acceptance_criterion | scope | constraint
       text: ...
       source: explicit | inferred
-  clarification_questions: []
+  clarification_questions:
+    - turn_index: 1
+      question_id: ...
+      dimension: goal | acceptance_criterion | scope | constraint
+      question: ...
+      material_claim: ...
+      matched_answer_id: ... | null
+      action: confirm | correct | reject | skip | defer | null
+      response: ... | null
+      resolved_values: []
+  uncertainties: []
 
 review:
   findings:
@@ -259,31 +302,123 @@ review:
       from_line: ...
       to_line: ...
       evidence_refs: []
-      suggested_action: ...
+      suggested_action: ... | null
   uncertainties: []
 
 evidence:
   - evidence_id: ...
+    kind: repository_file | repository_diff | command_output | external_record
     revision: ...
-    path: ...
-    from_line: ...
-    to_line: ...
+    path: ... | null
+    from_line: ... | null
+    to_line: ... | null
+    command: [] | null
+    exit_code: ... | null
+    stream: stdout | stderr | combined | null
+    source_ref: ... | null
     content_hash: ...
     excerpt: ...
 
 usage:
-  elapsed_seconds: ...
-  input_tokens: ...
-  output_tokens: ...
-  total_tokens: ...
-  tool_calls: ...
+  elapsed_seconds: ... | null
+  input_tokens: ... | null
+  output_tokens: ... | null
+  total_tokens: ... | null
+  tool_calls: ... | null
+  cost_amount: ... | null
+  cost_currency: ... | null
 
 trace_ref: null
+
+failure: null
 ```
 
-### 7.2 必须总有 Submission
+非 completed Submission 使用结构化失败对象：
 
-每个 Trial 都必须产生 `EvalSubmission`。
+```yaml
+failure:
+  code: timeout | non_zero_exit | process_killed | output_overflow | invalid_json | schema_mismatch | clarification_required | agent_blocked | adapter_error | unknown
+  message: ...
+  retryable: true | false
+```
+
+### 7.2 Submission 叶子字段与 Clarification 组合
+
+所有列表字段必须存在。Intent 的 `acceptance_criteria/scope/constraints/uncertainties` 和 Review 的 `uncertainties` 都是有界非空 UTF-8 文本列表；空 list 表示 Agent 明确没有该项。列表输入顺序保留，不由 hydration 根据语义去重。
+
+Leaf exact-key/nullability 固定如下：
+
+- Intent claim：`claim_id/dimension/text/source` 全部非 null；claim ID 唯一；
+- Submission Intent：`status` 非 null，`goal` 可 null，其余六个 list 必须存在；status 与内容是否真实充分由 Intent Evaluator 评分，不由 hydration 猜测；
+- Finding：`finding_id/claim/severity/evidence_refs` 非 null，Finding ID 唯一；`path/side/from_line/to_line/suggested_action` 可各自为 null，以保留可评分的坏位置；
+- Evidence：YAML 中十二个字段全部存在；`evidence_id/kind/revision/content_hash/excerpt` 非 null，其他字段按 kind 在 Integrity Checker 中验证；Evidence object ID 唯一；
+- Failure：`code/message/retryable` 全部非 null；message 是有界、脱敏、非空诊断文本；
+- TraceRef：存在时 `type/value` 都非 null；不存在时根字段显式 null；
+- existing-CI entry：`source_id/text/content_hash` 都非 null，source ID 唯一；
+- Usage：对象始终存在；elapsed/cost 是 finite non-negative JSON number 或 null；四个 token/tool 字段是 non-negative integer 或 null且拒绝 bool；若 input/output/total 三者都存在，则 total 必须等于 input + output；cost amount/currency 必须成对出现。
+
+Clarification Answer 与 Submission exchange 使用相同 action enum，但承担不同职责：Answer 是 Harness 私有脚本，exchange 是 Agent 实际交互 transcript。
+
+| action | matched_answer_id | response | corrected/resolved values |
+|---|---|---|---|
+| null（未匹配/未回答） | null | null | empty |
+| `confirm` | non-null | optional | non-empty resolved values；script corrected values empty |
+| `correct` | non-null | non-null | non-empty |
+| `reject` | non-null | optional | empty |
+| `skip` | non-null | optional | empty |
+| `defer` | non-null | optional | empty |
+
+每条 exchange 的 `turn_index/question_id/dimension/question/material_claim` 都非 null；turn index 从 1 连续递增，question ID 唯一。`matched_answer_id` 必须引用 Case Script 中实际消费的 answer；Agent 是否根据 confirm/correct 正确更新最终 Intent 由 Intent Evaluator 判断。
+
+### 7.3 终态与空值不变量
+
+每个终态 Trial 恰好有一个 Submission；`pending/running/incomplete` 是可恢复的非终态，不要求也不得冒充终态 Submission。无法恢复的中断必须由 Runner 最终化为 failed，而不是永久停在 incomplete。
+
+| Submission status | Failure code | Intent / Review | Grader eligibility |
+|---|---|---|---|
+| `completed` | `failure=null` | 两者都必须非 null | Intent 与 Review 都评分；零 Finding 合法 |
+| `failed` | `timeout/non_zero_exit/process_killed/adapter_error/unknown` | 各自可 null；已产生的 canonical 部分可保留 | 对非 null 部分评分，同时计入 failure rate |
+| `blocked` + `clarification_required` | `clarification_required` | Intent 必须非 null 且至少有一条未解决 clarification；Review 可 null | Intent/Clarification 评分；非 null Review 可评分 |
+| `blocked` + `agent_blocked` | `agent_blocked` | 各自可 null | 对非 null 部分评分，同时计入 failure rate |
+| `invalid_output` | `invalid_json/schema_mismatch/output_overflow` | 两者都必须为 null | Outcome ungraded；只计 failure |
+
+timeout 使用 `failed + timeout`，等待用户澄清使用 `blocked + clarification_required`，均不新增 Submission status。
+
+`evidence` 始终是 list，`usage` 始终是对象；没有数据时分别使用空 list 和全部 nullable 字段为 null 的 Usage。`cost_amount` 与 `cost_currency` 同时为 null 或同时存在；amount 必须是有限非负数，currency 是大写 ISO-4217 token。只有 Agent/Provider 实际报告的 cost 才能填写。
+
+- canonical v1 的所有声明字段都必须出现：null 表示未知、未产生或不适用，空集合表示已观察到零项，数字 0 表示真实测得为零；空字符串不能代替 null；
+- clarification `turn_index` 从 1 连续递增并保留时序；没有回答时 `matched_answer_id/action/response` 为 null。
+
+Submission Finding/Evidence 的位置字段在 hydration 时只做类型、字符和数值边界检查；以下语义错误必须保留给 Location/Evidence Checker，不得使整份 Submission 消失：
+
+- from/to 只出现一个、逆序或超出真实文件；
+- path 为 null/不安全/不存在但仍声明 side 或 line；
+- side 缺失、错误，或位置只达到文件级；
+- revision 使用 `HEAD`、branch、任意 commit 或其他非 Case binding；
+- content hash 形状合法但与 excerpt/replayed source 不符。
+
+Submission 内 Finding ID 和 Evidence object ID 各自唯一；重复 object ID 会造成引用歧义，因此是 schema error。语义重复 Finding 必须保留为不同 ID，不能在 hydration 时去重。悬空或重复 `evidence_refs` 同样保留给 Evidence Checker 分类。
+
+三层边界固定为：
+
+1. 缺/多 key、错误 JSON 类型、超界数据、非有限数字、重复 object ID 或非法 digest 形状：整份 Submission schema invalid；
+2. 合法 ref 字符串找不到 Evidence object：该 ref/Evidence 为 `missing`；重复 ref 保留并记 duplicate diagnostic；
+3. Evidence object 可安全解析，但 kind-specific 坐标不完整、revision/path 未获授权、source attestation 缺失、excerpt/hash 与真实来源不一致：`invalid`。
+
+Evidence kind 的严格语义：
+
+| kind | 必要字段 | 必须为 null 的字段 | Integrity replay |
+|---|---|---|---|
+| `repository_file` | single revision、path、from/to、hash、excerpt | command/exit/stream/source_ref | 从精确 base 或 head Git object 重读完整行片段；excerpt 使用 LF，hash 是 exact UTF-8 excerpt SHA-256 |
+| `repository_diff` | exact `base..head`、path、hash、excerpt | from/to/command/exit/stream/source_ref | 重放固定 `git diff --no-color --no-ext-diff --unified=3 base..head -- path`；excerpt 必须是完整输出 |
+| `command_output` | head revision、non-empty argv、exit code、stream、Harness artifact attestation source_ref、hash、excerpt | path/from/to | source_ref 必须解析到 Trial manifest 中由 Harness 捕获或当前 Adapter 验证的不可变 artifact；hash 覆盖完整输出 |
+| `external_record` | head revision、EvalInput existing-CI source_ref、hash、excerpt | path/from/to/command/exit/stream | source_ref 必须解析到 Agent 可见的 `existing_ci_evidence` canonical entry，excerpt/hash 必须一致 |
+
+Repository search/symbol/commit-log 结果可以帮助 Agent 调查，但 v1 若要作为严格可发布 Evidence，Adapter 必须把它规范化为实际 `repository_file`/`repository_diff` 片段；不能仅凭搜索摘要获得 `evidence_integrity=valid`。
+
+### 7.4 必须总有 Submission
+
+每个终态 Trial 都必须产生且只产生一个 `EvalSubmission`。`pending/running/incomplete` 只存在于可恢复执行窗口；它们恢复后必须进入一个终态，或由 Runner 明确最终化为 failed Submission。
 
 即使 Agent：
 
@@ -297,7 +432,7 @@ trace_ref: null
 
 禁止像部分公开示例脚本一样，因为没有评论文件就直接跳过该 PR。没有 Finding 的成功执行应正常计为零 Finding；对含有 ground truth issue 的 Case，其 Recall 为零。
 
-### 7.3 可选 Trace
+### 7.5 可选 Trace
 
 `trace_ref` 只用于定位失败原因：
 
@@ -330,7 +465,16 @@ source:
 input:
   repository: ...
   review_request: ...
-  clarification_script: ...
+
+clarification_script:
+  max_rounds: 2
+  answers:
+    - answer_id: answer-goal-1
+      dimension: goal | acceptance_criterion | scope | constraint
+      material_claim: ...
+      action: confirm | correct | reject | skip | defer
+      response: ... | null
+      corrected_values: []
 
 intent_truth:
   scorable: true
@@ -340,24 +484,77 @@ intent_truth:
       dimension: goal
       text: ...
       required: true
-  forbidden_claims: []
+  forbidden_claims:
+    - truth_id: forbidden-intent-1
+      dimension: goal | acceptance_criterion | scope | constraint
+      text: ...
+      rationale: ...
   clarification_policy: required | optional | not_required
 
 review_truth:
   completeness: closed_world | expert_augmented | human_observed
+  novel_finding_policy: verify | forbid
   expected_findings:
     - truth_id: issue-1
       claim: ...
       severity: high
       category: security
       required: true
-      locations: []
-      evidence_anchors: []
+      locations:
+        - path: app/auth.py
+          side: right | left | null
+          from_line: 42 | null
+          to_line: 45 | null
+      evidence_anchors:
+        - fact: ...
+          locations:
+            - path: app/auth.py
+              side: right | left | null
+              from_line: 42 | null
+              to_line: 45 | null
       required_context_level: diff | file | repo
-  known_invalid_findings: []
+      rationale: ...
+  known_invalid_findings:
+    - truth_id: invalid-1
+      claim: ...
+      category: ... | null
+      locations:
+        - path: app/auth.py
+          side: right | left | null
+          from_line: 42 | null
+          to_line: 45 | null
+      rationale: ...
 ```
 
-### 8.2 Case 只定义输入与答案
+### 8.2 Truth 叶子协议与不变量
+
+- EvalCase 根 exact keys 是 `schema_version/task_id/case_version/source/input/clarification_script/intent_truth/review_truth`；case version 是 positive integer且拒绝 bool；
+- Case source exact keys 是 `suite/origin/source_id/source_version/source_uri/license/content_hash`；前四项与 content hash 非 null，source URI/license 是 non-empty string 或 null；public origin 必须在 Dataset Loader 阶段提供 URI/license；
+- expected Intent claim exact keys 是 `truth_id/dimension/text/required`，全部非 null；required 是 bool；forbidden claim exact keys 是 `truth_id/dimension/text/rationale`，全部非 null；
+- IntentTruth exact keys 是 `scorable/authority/expected_claims/forbidden_claims/clarification_policy`；scorable 是 bool，authority/policy 按 scorable 规则 null，其余 list 始终存在；
+- ExpectedFinding exact keys 是 `truth_id/claim/severity/category/required/locations/evidence_anchors/required_context_level/rationale`，全部非 null；KnownInvalidFinding exact keys 是 `truth_id/claim/category/locations/rationale`，只有 category 可 null；
+- ReviewTruth exact keys 是 `completeness/novel_finding_policy/expected_findings/known_invalid_findings`，全部非 null；两个 Finding collection 始终是 list；
+- ClarificationScript exact keys 是 `max_rounds/answers`；Answer exact keys 是 `answer_id/dimension/material_claim/action/response/corrected_values`，只有 response 可 null；
+- expected claim、forbidden claim、expected Finding 和 known-invalid Finding 使用各自 typed object，不复用带有无意义字段的结构；
+- 所有 truth ID 在所属 Case 内唯一，expected 与 known-invalid Finding ID 集合互斥；
+- `intent_truth.scorable=false` 的唯一 canonical 表示是 `authority=null`、两个 claim 集合为空、`clarification_policy=null`；scorable=true 时 authority 和 clarification policy 都必须非 null；
+- `novel_finding_policy=forbid` 只允许用于 `closed_world`；`expert_augmented` 和 `human_observed` 必须使用 `verify`；
+- `rationale` 记录标注依据，不会进入 Agent-facing EvalInput；
+- TruthLocation 的 path 必须是安全 repo-relative POSIX path；from/to 同时为 null或同时存在且 `to >= from >= 1`；path 必填，side 可 null；
+- EvidenceAnchor 必须有非空 fact，locations 可为空或包含严格 TruthLocation；
+- Finding 是否原子化由 annotation review 保证，dataclass 不使用关键词启发式猜测；
+- `evidence_anchors` 仍是可选事实锚点，不是唯一标准 Evidence。
+
+Clarification Script 是 Case/Harness 私有交互数据，不属于 Agent-facing EvalInput：
+
+- `max_rounds` 是 1 到 16 的正整数；answer ID 唯一；
+- `correct` 必须提供非空 `corrected_values`；其他 action 的 `corrected_values` 必须为空；
+- 问题按 `dimension + material_claim` 做语义匹配，不按精确句子匹配；
+- 是否应该澄清只由 `intent_truth.clarification_policy` 表达，不在 Script 中保存第二份可冲突 policy；
+- Runner 每次只向 `ClarificationChannel` 返回当前问题匹配到的一个回答，不暴露 truth policy、答案列表、剩余答案或 ground truth；
+- 没有匹配答案、答案耗尽或超过最大轮数时保留未解决 transcript，不由 Harness 猜测答案。
+
+### 8.3 Case 只定义输入与答案
 
 Case 不定义：
 
@@ -369,16 +566,67 @@ Case 不定义：
 
 这些都不属于问题本身。
 
-### 8.3 Intent 可以不评分
+### 8.4 Intent 可以不评分
 
 某些真实 PR 数据集只有 Review Comments，没有可靠 Intent 标注。此时：
 
 ```yaml
 intent_truth:
   scorable: false
+  authority: null
+  expected_claims: []
+  forbidden_claims: []
+  clarification_policy: null
 ```
 
 Harness 不得凭 PR 标题自动生成参考 Intent，再用它评 Agent。
+
+### 8.5 Canonical JSON、ID、重复项与协议边界
+
+三个根协议只使用 UTF-8 canonical JSON：
+
+```text
+ensure_ascii = false
+allow_nan = false
+separators = (",", ":")
+sort_keys = true
+digest = SHA-256(canonical UTF-8 bytes)
+```
+
+- schema version 使用设计中的字符串 `eval_input_v1`、`eval_submission_v1`、`eval_case_v1`；
+- `task_id`、`agent_id`、`trial_id` 和上游 `source_id` 是有界 opaque ID，不因文案变化而自动改写；
+- Harness 自行生成且没有权威上游 ID 的对象使用命名空间前缀加完整 64 位小写 SHA-256，不使用截断 digest；
+- identity payload 必须包含 schema/version namespace 并排除自身 ID；hydration 对派生 ID 重新计算并比较；
+- ID-addressed collection 按 ID 做 canonical 排序，但不转换成 set；语义重复 Finding、重复 evidence ref 和 clarification 时序不能被静默擦除；
+- clarification transcript 按连续 `turn_index` 保存；其他有序 transcript 同样不得按文本重排。
+
+唯一 JSON 读取入口必须在 hydration 前：
+
+- 先检查原始字节上限，再严格 UTF-8 decode；
+- 使用 recursive duplicate-key rejection 和 non-standard constant rejection；
+- 递归拒绝 NaN/Infinity，包括 `1e999` 解析出的非有限 float；
+- 每层 object exact-key，未知 key、缺 key、未知 enum/schema/version 全部拒绝；
+- integer 使用 `type(value) is int`，拒绝 bool 冒充数字；
+- JSON-ready 边界只接受 null/string/int/bool/finite float、字符串 key object、list/tuple 和 enum value，不接受 Path、datetime、bytes、Provider/Runtime 对象。
+
+v1 资源上限是协议的一部分：
+
+| 对象 | 上限 |
+|---|---:|
+| EvalInput JSON | 2 MiB |
+| EvalSubmission JSON | 16 MiB |
+| EvalCase JSON | 16 MiB |
+| identifier / repo path / URL | 512 / 1024 / 4096 characters |
+| title / description | 4096 / 32768 characters |
+| claim / rationale / question / answer / uncertainty | 8192 characters |
+| 单条 Evidence excerpt | 512 KiB UTF-8 bytes |
+| requirements / rules / CI evidence | each 256 items |
+| clarification answers / questions | each 64 items |
+| Intent claims / Findings / Evidence | 1024 / 2048 / 4096 items |
+| evidence refs per Finding | 256 items |
+| truth Findings / locations / anchors | 2048 / 64 per Finding / 64 per Finding |
+
+实现先按原始集合长度检查上限，再做任何 canonical 排序，防止大量重复值绕过资源限制。修改这些语义或上限需要新的 schema/rubric version，不能静默改变 v1。
 
 ## 9. Ground Truth 完整度
 
@@ -544,6 +792,8 @@ Runner 记录 Agent 实际问题并返回预置回答。
 
 问题按目标 claim 和 materiality 匹配，不按精确句子匹配。
 
+Clarification Script 只存在于 evaluator-facing Case view。Agent-facing `EvalInput` 不含 policy 或 answers；Adapter 只能通过受控 `ClarificationChannel` 逐问交换。
+
 ## 12. Intent Evaluator
 
 ### 12.1 评分对象
@@ -667,12 +917,13 @@ Anchor 用于描述必须被证明的事实和辅助 Judge，不要求 Agent 引
 Evidence Checker 先做不依赖 ground-truth Evidence 的完整性检查：
 
 - evidence ID 是否存在于 Submission；
-- revision 是否为允许的 base/head；
-- path 和 line range 是否真实；
-- excerpt hash 是否一致；
-- excerpt 是否与固定 revision 的仓库内容一致。
+- kind-specific revision 是否为 Case 的 exact base、head 或 exact base..head；
+- repository path/line/diff 是否能从固定 Git object 重放；
+- command output 是否有 Trial manifest 中的 Harness/Adapter artifact attestation；
+- external record 是否对应 Agent 可见的 existing-CI canonical entry；
+- excerpt hash 是否一致且 excerpt 是否是该 kind 的完整 canonical source bytes。
 
-结构或 hash 无效属于确定性失败，不交给 LLM 修复。
+JSON 类型、key 和 digest 形状由 hydration 判断；ref 不存在记 missing；source/revision/path/line/attestation/hash 内容不符记 invalid。这些都是确定性结果，不交给 LLM 修复。
 
 之后单独判断 Evidence Support：Agent 引用的材料是否真正支持 Finding claim。该判断可以结合必要 diff、代码上下文和可选 anchor 交给 Judge。
 
@@ -682,6 +933,14 @@ Evidence 使用两个正交状态：
 integrity: valid | invalid | missing
 support: supported | weak | unsupported | unknown
 ```
+
+Integrity 先逐 Evidence item 计算，再聚合到 Finding：
+
+- Finding 没有 evidence ref 或存在 dangling ref：`missing`；
+- 所有 ref 都解析，但任一引用 Evidence 为 invalid：`invalid`；
+- 至少引用一条 Evidence 且所有引用项都 valid：`valid`。
+
+Support 只基于成功解析的 Evidence 判断：组合材料支持完整 material claim 为 `supported`，只支持部分关键链条为 `weak`，不能支持或与 claim 冲突为 `unsupported`，Judge/上下文不足为 `unknown`。增加一条无关或错误 Evidence 不能提高 Finding 的 publishable 状态。
 
 ### 13.5 Semantic Matcher
 
@@ -759,12 +1018,29 @@ Evidence 路径、行号、hash 或 excerpt 错误本身不自动把 `issue_matc
 
 对 `human_observed` ground truth，未匹配不能单独成为 fabricated 的理由。
 
+问题事实判断之外，Evaluator 单独保存 policy disposition：
+
+```text
+matched | duplicate | novel_allowed | novel_disallowed | known_invalid | ungraded
+```
+
+判定顺序固定为：
+
+1. exact/semantic known-invalid 命中：`issue_match=fabricated`、`disposition=known_invalid`；
+2. 对 expected Findings 做全局一对一分配：选中边为 `confirmed/matched`；
+3. 与已匹配 truth 实质重复但未被分配的 Finding：不增加 Recall，记 `plausible/duplicate`；
+4. 其他 unmatched 且 policy=`verify`：运行 bounded factuality Judge，得到 plausible/fabricated/unknown，disposition=`novel_allowed`；
+5. 其他 unmatched 且 policy=`forbid`：不把“政策禁止”伪装成事实误报，记 `issue_match=unknown`、`disposition=novel_disallowed`，默认不运行 factuality Judge并进入 inspect/人工审查。
+
+因此 `novel_finding_policy=forbid` 只控制 Case 接受什么输出，不改变 fabricated 的事实定义。Regression report 单独展示 novel-disallowed count。
+
 Finding 的问题判断与 Evidence 判断必须分开保存：
 
 ```yaml
 finding_id: F-1
 issue_match: confirmed
 matched_truth_id: issue-1
+disposition: matched
 evidence_integrity: invalid
 evidence_support: unsupported
 ```

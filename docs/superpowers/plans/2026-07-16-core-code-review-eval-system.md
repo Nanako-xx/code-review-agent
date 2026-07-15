@@ -1,6 +1,6 @@
 # Core Code Review Eval System 实施计划
 
-**状态：** 待执行
+**状态：** 执行中（Task 1 v1 协议已冻结）
 
 **设计来源：** `docs/superpowers/specs/2026-07-16-core-code-review-eval-system-design.md`
 
@@ -16,9 +16,9 @@
 
 ## 1. 全局不变量
 
-- Eval Harness 只通过 `EvalInput -> AgentUnderTestAdapter -> EvalSubmission` 观察被测 Agent；除当前产品 Adapter 的输出转换外，Evaluator 不依赖 Agent 的 Runtime、Session、Memory、Reviewer 数量、Context 组装或工具调用顺序。
+- Eval Harness 只通过 `EvalInput + bounded ClarificationChannel -> AgentUnderTestAdapter -> EvalSubmission` 观察被测 Agent；除当前产品 Adapter 的输出转换外，Evaluator 不依赖 Agent 的 Runtime、Session、Memory、Reviewer 数量、Context 组装或工具调用顺序。完整 Clarification Script 只在 Harness 侧，不能进入 Agent-facing EvalInput。
 - Prompt、模型、Provider、Risk 策略、Reviewer 策略和 Memory 配置只记录为不透明 Run Configuration，用于复现和分组，不形成独立产品得分。
-- Ground truth 与 Agent workspace 必须物理隔离；Case 路径、环境变量、文件名、提交信息和临时目录都不得泄漏答案。
+- Ground truth 和完整 Clarification Script 与 Agent workspace 必须物理隔离；Case 路径、环境变量、文件名、提交信息和临时目录都不得泄漏答案。
 - 每个 Trial 都从独立、干净、固定 base/head 的工作区开始；一个 Trial 创建的文件、Git 状态和产品持久状态不得影响另一个 Trial。
 - `prepare`、`run-agent` 与 `evaluate` 必须解耦。更换 Judge、修复 matcher 或调整 rubric 时可以重评已有 Submission，不重新调用 Agent。
 - 每个 Trial 无论成功、失败、超时、阻塞还是输出不可解析，都必须生成一个终态 `EvalSubmission`；没有 Finding 是合法的零 Finding 输出，不得静默跳过 Case。
@@ -44,19 +44,22 @@
 - 一个 Wave 的定向测试与接口审计全部通过后，才能开始依赖它的下一 Wave。
 - 公共 benchmark Adapter 必须用本地缩小 fixture 测试同一解析路径；不得为测试写另一套 parser。
 - Judge 测试使用 scripted/fake Model Adapter，不调用真实远端模型。真实 Judge smoke test 由用户明确提供凭证时单独运行，不作为本地单测前置条件。
+- Windows pytest 统一使用 `C:\tmp\rae-*` 短 basetemp；同一 Task 复用固定目录，确认无 pytest 进程后清理本项目目录，禁止为每次重跑创建永久保留的新目录。
 - 未经用户明确要求，不 push、不创建 PR、不 merge 到 master。
 
 ### 实施开始门禁
 
-- [ ] 只暂存并提交已确认设计稿与本计划，排除所有既有临时目录。
-- [ ] 从包含设计和计划的提交创建 `codex/core-code-review-eval-system` 实现分支。
-- [ ] 记录基线 HEAD、`git status --short --untracked-files=no`、Git 版本和 Python 版本。
-- [ ] 使用独立短路径 basetemp 运行全量 pytest；真实失败必须先解释或修复，cleanup warning 不能代替退出码。
+- [x] 只暂存并提交已确认设计稿与本计划，排除所有既有临时目录。
+- [x] 从包含设计和计划的提交创建 `codex/core-code-review-eval-system` 实现分支。
+- [x] 记录基线 HEAD、`git status --short --untracked-files=no`、Git 版本和 Python 版本。
+- [x] 使用独立短路径 basetemp 运行全量 pytest；真实失败必须先解释或修复，cleanup warning 不能代替退出码。
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-baseline'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest -q -p no:cacheprovider --basetemp 'C:\tmp\rae-b'
 ```
+
+实施基线：HEAD `ac87db4ab75b34ed73a5849de612e33f598c4742`，分支 `codex/core-code-review-eval-system`，Git `2.50.1.windows.1`，Python `3.9.23`。2026-07-16 使用短路径 `C:\tmp\rb` 完成全量 pytest，退出码为 0。先前长 basetemp 的 7 个 Memory CLI identity 失败已在短路径逐项复现为通过，确认为 Windows 路径环境问题而非代码回归。
 
 ## 3. 最终包结构
 
@@ -160,29 +163,38 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 **RED 测试：**
 
-- [ ] `EvalInput v1` 严格 round-trip repository、review request 和 clarification script，拒绝未知字段、空 ID、相对逃逸路径、非法 revision 和无界字符串/列表。
-- [ ] `EvalSubmission v1` 对 completed/failed/blocked/invalid_output 都可构造；每个终态的必填字段明确，零 Finding 合法。
+- [ ] `EvalInput v1` 只严格 round-trip repository 和 review request，不包含 clarification policy/answers；EvalCase 单独严格 round-trip 带 `max_rounds`/typed answers 的私有 clarification script。
+- [ ] `EvalSubmission v1` 对 completed/failed/blocked/invalid_output 都可构造；每个终态的 intent/review/failure 必填与 null 组合明确，零 Finding 合法。
+- [ ] 每个终态 Trial 恰有一个 Submission；pending/running/incomplete 是可恢复非终态；blocked clarification 必须保留可评分 Intent transcript，invalid_output 不伪造部分 Outcome。
 - [ ] Intent claim 只接受四个 dimension 与 `explicit|inferred` source；`inferred` 不被 hydration 自动改成 explicit。
-- [ ] Finding、Evidence、location、uncertainty 和 usage 的 null/缺失语义不同，缺字段不被空字符串伪装。
+- [ ] clarification transcript 保留连续 turn index、material claim、匹配 answer、action、response 和 resolved values；答案耗尽/未匹配不被 Harness 猜测补齐。
+- [ ] clarification action/null 组合、matched answer 引用、confirm/correct/reject/skip/defer 的 response/resolved-values 约束严格 round-trip。
+- [ ] Finding、typed Evidence、location、uncertainty、usage 与 cost 的 null/缺失语义不同，缺字段不被空字符串伪装。
+- [ ] Intent/Review uncertainties 是 bounded non-empty string lists；Usage 的 elapsed/cost 为 finite non-negative number，token/tool fields 为 non-negative int，token total 与 cost currency 组合受跨字段验证。
 - [ ] `EvalCase v1` 严格区分 input 与 truth；intent truth 可 `scorable=false`；review completeness 只接受三种设计值。
-- [ ] expected Finding 原子、truth ID 唯一，location/evidence anchor 可多条，known-invalid 不与 expected Finding 使用同一 ID。
-- [ ] 所有 ID、集合排序、canonical JSON 和 SHA-256 digest 在输入顺序变化后稳定。
+- [ ] expected/forbidden Intent、expected/known-invalid Finding 使用不同 typed leaf；truth ID 唯一，location/evidence anchor 可多条，known-invalid 不与 expected Finding 使用同一 ID。
+- [ ] closed-world 支持 `verify|forbid` novel Finding policy；expert-augmented/human-observed 拒绝 `forbid`。
+- [ ] 所有 ID、集合排序、canonical JSON 和完整 SHA-256 digest 稳定；语义重复 Finding、重复 evidence ref 和 clarification 时序不会被 set 去重擦除。
 - [ ] 超长 claim、excerpt、Case、Finding 数量和 Evidence 数量 fail closed，防止 benchmark 或 Agent 输出无界占用内存。
-- [ ] 未知 schema/version/enum、重复 JSON key、NaN/Infinity、bool 冒充 int 全部拒绝。
+- [ ] 未知 schema/version/enum、递归重复 JSON key、NaN/Infinity/`1e999`、bool 冒充 int 全部拒绝。
+- [ ] dangling Evidence ref 结构上可 hydration 并留给 Evidence Checker 判 missing；非法 Evidence 对象本身仍拒绝。
+- [ ] duplicate Finding/Evidence object ID 是 schema error；重复或 dangling ref 保留；有界但未授权 revision/path/line/hash 内容进入 missing/invalid grader，不把问题 Finding 整体抹掉。
 
 **实现：**
 
-- [ ] 定义 frozen domain models 与 enums：trial/submission status、intent dimension/result、truth completeness、issue judgement、Evidence integrity/support、Judge status。
+- [ ] 定义 frozen domain models 与 enums：trial/submission status、failure code、clarification action、intent dimension/result、truth completeness、novel policy、issue judgement、Evidence integrity/support、Judge status。
 - [ ] 实现唯一 canonical `to_dict/from_dict`、JSON duplicate-key rejection、长度/数量上限和 digest helper。
 - [ ] 模型只保存 JSON-ready 基础值，不保存 `Path`、subprocess、Provider response、产品 Session 或 Runtime 类型。
 - [ ] 为输入、提交、Case、truth Finding、Evidence、clarification answer 定义稳定 ID 规则。
+- [ ] 实现 typed `SubmissionFailure`、`SubmissionClarificationExchange`、`ForbiddenIntentClaim`、`KnownInvalidFinding` 和 annotation rationale；completed 与非 completed 终态做跨字段验证。
+- [ ] 集中定义已确认设计中的 v1 字节/字符/数量上限；先检查原始 collection 数量，再 canonicalize。
 - [ ] 把设计中的 YAML 作为说明格式；实现与 artifact 使用 canonical UTF-8 JSON，避免新增核心 YAML 依赖。
-- [ ] 明确 Evidence revision binding 只允许精确 base SHA、head SHA 或精确 `base_sha..head_sha` diff range；Adapter 可以规范化产品的 `base@sha/head@sha`，Evaluator 不接受任意 ref。
+- [ ] 定义 `repository_file/repository_diff/command_output/external_record` Evidence 的 exact keys；hydration 保留有界但未授权的 revision/path 给 Checker，Checker 才按 kind 验证精确 base/head/range 与 source attestation。
 
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_models.py tests/eval/test_schema_hydration.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-models'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_models.py tests/eval/test_schema_hydration.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t1'
 ```
 
 **提交边界：** `feat(eval): add canonical input submission and case protocols`
@@ -204,7 +216,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 - [ ] Suite Manifest 固定 suite ID/version、Case 列表、split、source metadata、license、content hash 和 truth completeness。
 - [ ] Loader 在使用 Case 前重新计算文件 hash 与 canonical Case digest，篡改、重复 task ID 和缺失 Case 均失败。
-- [ ] Agent-facing loader 只能返回 `EvalInput`；truth 只能由 evaluator-facing API 读取，类型层面不共享一个包含答案的对象。
+- [ ] Agent-facing loader 只能返回 `EvalInput`；truth 和完整 Clarification Script 只能由 evaluator/Runner-facing API 读取，类型层面不共享一个包含答案的对象。
 - [ ] Case path 必须留在 suite root；拒绝 absolute path、`..`、symlink/reparse-point escape 和大小写碰撞。
 - [ ] intent authority、required claims、forbidden claims 与 clarification policy 组合合法性受校验。
 - [ ] closed-world Case 可以禁止 novel Finding；human-observed Case 不允许把 unmatched 自动标成 fabricated。
@@ -214,14 +226,14 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **实现：**
 
 - [ ] 实现 immutable `CaseBank`、`SuiteManifest`、`CaseHandle` 和只暴露输入的 `AgentCaseView`。
-- [ ] ground truth 保留在 Harness 控制目录；Repository Preparer 只接收 repository descriptor，不接收 truth payload。
+- [ ] ground truth 和完整 Clarification Script 保留在 Harness 控制目录；Repository Preparer 只接收 repository descriptor，不接收 truth 或答案 payload。
 - [ ] 生成运行所需的 Case manifest snapshot，确保后续源文件变化不会静默改变已完成 Run。
 - [ ] 支持 Core/public/private suite 元数据，但不在核心 Loader 内写特定数据集分支。
 
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_cases.py tests/eval/test_datasets.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-cases'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_cases.py tests/eval/test_datasets.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t2'
 ```
 
 **提交边界：** `feat(eval): add versioned case bank and truth isolation`
@@ -244,6 +256,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 - [ ] Run ID、trial ID、路径和 manifest digest 稳定且防 traversal。
 - [ ] 每个 artifact 使用 UTF-8 canonical JSON、内容 hash、原子写与 fsync；已完成 artifact 不被静默覆盖。
 - [ ] interrupted trial 可被识别为 incomplete，resume 只补齐缺失的合法阶段，不重写已有 Submission。
+- [ ] incomplete 是非终态且没有 terminal Submission；恢复成功后写 completed，放弃恢复时原子最终化为 failed/process_killed 或其他稳定 failure code。
 - [ ] 并行 Trial 写入互不覆盖；同一 run/case/trial 的冲突 writer fail closed。
 - [ ] `judge_input/output`、matches、score 和 report 可以在不修改原 submission 的情况下版本化重算。
 - [ ] artifact 读取有单文件/总大小上限，拒绝 symlink、special file 和 hash 不匹配。
@@ -258,7 +271,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_config.py tests/eval/test_artifacts.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-artifacts'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_config.py tests/eval/test_artifacts.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t3'
 ```
 
 **提交边界：** `feat(eval): add immutable run artifacts and manifests`
@@ -297,7 +310,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_repository.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-repository'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_repository.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t4'
 ```
 
 **提交边界：** `feat(eval): isolate reproducible repository trials`
@@ -326,7 +339,8 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 **RED 测试：**
 
-- [ ] Adapter 接口只接收 EvalInput、workspace 和 AgentRunConfig，只返回 EvalSubmission/trace descriptor，不接收 EvalCase truth。
+- [ ] Adapter 接口只接收 EvalInput、workspace、AgentRunConfig 和能力受限的 `ClarificationChannel`，只返回 EvalSubmission/trace descriptor，不接收 EvalCase truth。
+- [ ] `ClarificationChannel` 允许提交一个实际问题并取得至多一个匹配回答，但不能读取 policy、完整答案表或剩余答案。
 - [ ] generic subprocess Adapter 使用参数数组而非 shell string，环境变量 allowlist、cwd、timeout、stdout/stderr 大小和终止语义受控。
 - [ ] clarification answers 按 material claim/action 消费；多问、少问、问题次序变化、错误 field 和答案耗尽都形成可评分 transcript，而不是 Harness 猜答案。
 - [ ] 当前 Agent Adapter 只从最终 `review_brief.json`、受校验 Observation artifacts 和公开终态提取 Intent/Findings/Evidence/Uncertainties。
@@ -335,20 +349,20 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 - [ ] Observation ID、raw artifact hash、revision binding 与 Finding refs 交叉校验；未引用或越权 Observation 不被补成 Agent Evidence。
 - [ ] `base@sha`、`head@sha` 和精确 diff-range 规范化为 Eval Evidence binding；无法重放的产品证据保留为可诊断的 invalid/missing，不由 Adapter伪造新的文件引用。
 - [ ] completed、awaiting clarification、failed、invalid artifact 和零 Finding 都产生合法 Submission。
-- [ ] Adapter 不读取 Memory Store、Session 内部计划或 Reviewer trace 为 Agent 增加它未输出的 Finding。
+- [ ] Adapter 不读取 Memory Store、Session 内部计划或 Reviewer trace 为 Agent 增加它未输出的 Finding；只可为 Agent 已引用的 command artifact 生成可审计 attestation，或把已引用搜索/符号结果规范化为其实际 file/diff source。
 
 **实现：**
 
 - [ ] 定义 `AgentUnderTestAdapter` Protocol、`AgentRunConfig` 和稳定 error taxonomy。
 - [ ] generic subprocess Adapter 支持任意外部 Agent 的 JSON 输入/输出约定，具体命令模板由 Run Config 固定。
-- [ ] 当前产品 Adapter 黑盒调用正式 `review-agent review` 入口；每个 Trial 使用隔离 run/memory root，并通过 stdin 执行固定 clarification script。
+- [ ] 当前产品 Adapter 黑盒调用正式 `review-agent review` 入口；每个 Trial 使用隔离 run/memory root，并仅把 `ClarificationChannel` 当前返回的单个回答写入 stdin。
 - [ ] 解析当前产品最终 artifact，生成 canonical EvalSubmission；保留 `trace_ref` 指向有界 Trial trace。
 - [ ] usage 只填写产品真实提供的数据；未知 token/cost 为 null，不估算或捏造。
 
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_agent_adapter.py tests/eval/test_current_agent_adapter.py tests/eval/test_clarification_script.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-adapter'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_agent_adapter.py tests/eval/test_current_agent_adapter.py tests/eval/test_clarification_script.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t5'
 ```
 
 **提交边界：** `feat(eval): adapt black box agents into canonical submissions`
@@ -371,6 +385,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 - [ ] 正常零 Finding 输出写 completed Submission；truth 中有 issue 时后续 Recall 为零，但 Runner 不改写状态。
 - [ ] timeout、non-zero exit、killed process、output overflow、invalid JSON、schema mismatch、blocked 和 Adapter exception 各有稳定状态/错误码。
 - [ ] 所有失败路径都写 submission、stdout/stderr 摘要、timing 和 manifest terminal receipt；不因缺 comments 文件跳过 Case。
+- [ ] terminal receipt 与 Submission 一一对应；pending/running/incomplete 不得被 evaluate 命令当成零 Finding 成功结果。
 - [ ] resume 不重复运行已有 terminal Trial；只对没有 terminal receipt 且 policy 允许的 Trial 重试。
 - [ ] 并行 Case/Trial 的 workspace、run artifact、端口、环境和产品状态相互隔离。
 - [ ] 中断和 cancellation 终止完整子进程树，并保留可读诊断。
@@ -386,7 +401,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_runner.py tests/eval/test_runner_failures.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-runner'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_runner.py tests/eval/test_runner_failures.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t6'
 ```
 
 **提交边界：** `feat(eval): run isolated trials with terminal submissions`
@@ -413,9 +428,10 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 - [ ] path 使用规范 POSIX repo-relative 形式；wrong path、case collision、absolute/escape、deleted-side 错误都不会位置命中。
 - [ ] side 与 line-range overlap/distance 产生确定性候选分数；缺位置不会自动成功，也不会阻止后续合法 root-cause 语义匹配。
 - [ ] Evidence ID 必须存在且被 Finding 引用；missing、duplicate、dangling ref 明确分类。
-- [ ] revision 只接受 Case 的 exact base/head/diff range；symbolic HEAD、branch、任意 commit 和 drift revision 无效。
-- [ ] file-range Evidence 从固定 Git object 重读 exact lines，按 UTF-8/LF 规范计算 excerpt/hash；path/line/hash/excerpt 任一不符为 deterministic invalid。
-- [ ] diff Evidence 只可对 exact base..head/path 重放；不接受 Agent workspace 未提交内容。
+- [ ] hydration 可安全保留有界 symbolic HEAD/branch 等坏值；Checker 只接受 Case 的 exact base/head/diff range，并把其他值 deterministic invalid。
+- [ ] repository-file Evidence 从固定 Git object 重读 exact lines，按 UTF-8/LF 规范计算 excerpt/hash；path/line/hash/excerpt 任一不符为 deterministic invalid。
+- [ ] repository-diff Evidence 只可对 exact base..head/path 重放固定完整 diff；不接受 Agent workspace 未提交内容。
+- [ ] command-output 必须解析 Harness/Adapter attestation，external-record 必须解析 Agent 可见 existing-CI entry；缺 attestation/source 为 invalid。
 - [ ] Evidence anchor 不要求相同位置；它只作为后续 support Judge 的事实提示，不参与 integrity 伪造通过。
 - [ ] 问题命中但 Evidence 行号错误时保留独立 `issue_match` 输入，Evidence 结果为 invalid/unsupported。
 
@@ -429,7 +445,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_location_matcher.py tests/eval/test_evidence_checker.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-evidence'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_location_matcher.py tests/eval/test_evidence_checker.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t7'
 ```
 
 **提交边界：** `feat(eval): verify evidence integrity and location candidates`
@@ -466,7 +482,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_assignment.py tests/eval/test_intent_evaluator.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-intent'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_assignment.py tests/eval/test_intent_evaluator.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t8'
 ```
 
 **提交边界：** `feat(eval): score intent claims with global assignment`
@@ -505,7 +521,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_judge.py tests/eval/test_judge_rubrics.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-judge'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_judge.py tests/eval/test_judge_rubrics.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t9'
 ```
 
 **提交边界：** `feat(eval): add blind structured semantic judges`
@@ -529,6 +545,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 - [ ] 全局一对一分配优于贪心，重复 Finding 只命中一次，compound Finding 最多命中一个 truth issue。
 - [ ] confirmed、plausible、fabricated、unknown 与 matched truth ID 独立保存；unmatched duplicate 不增加 Recall。
 - [ ] known-invalid exact/semantic 命中为 fabricated；单纯 Evidence path/hash 错误不自动 fabricated。
+- [ ] evaluator 先做 known-invalid、truth assignment、duplicate，再按 novel policy 分流；`forbid` 产生 `unknown + novel_disallowed`，不冒充 fabricated，只有 `verify` unmatched 进入 factuality Judge。
 - [ ] closed-world、expert-augmented、human-observed 对 unmatched Finding 使用各自 policy；human-observed 不因未命中人类评论自动误报。
 - [ ] Evidence support 在 integrity 之后独立判断 supported/weak/unsupported/unknown；invalid/missing 不可成为严格 publishable Finding。
 - [ ] `confirmed + valid + supported` 是唯一 strict publishable 条件；问题正确但证据错误、证据正确但问题错误都不可发布。
@@ -537,14 +554,14 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **实现：**
 
 - [ ] 组合 deterministic candidate pairs、semantic Judge scores、global assignment 与 truth completeness policy。
-- [ ] 对 unmatched Finding 运行 bounded novel-finding factuality Judge；对 matched/novel Finding 分别运行 Evidence support Judge。
+- [ ] 只对 `novel_finding_policy=verify` 的 unmatched Finding 运行 bounded factuality Judge；对 matched/verified-novel Finding分别运行 Evidence support Judge。
 - [ ] 输出每条 Finding 的 issue judgement、truth assignment、location、Evidence integrity/support、Judge refs 和 publishable 状态。
 - [ ] 保存完整 matching matrix/selected edges/unmatched reasons，支持 `inspect` 解释。
 
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_review_evaluator.py tests/eval/test_review_truth_completeness.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-review'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_review_evaluator.py tests/eval/test_review_truth_completeness.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t10'
 ```
 
 **提交边界：** `feat(eval): reconcile review findings with strict evidence scoring`
@@ -587,7 +604,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_metrics.py tests/eval/test_report.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-metrics'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_metrics.py tests/eval/test_report.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t11'
 ```
 
 **提交边界：** `feat(eval): aggregate outcome metrics and explainable reports`
@@ -625,7 +642,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_cli.py tests/eval/test_cli_failures.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-cli'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_cli.py tests/eval/test_cli_failures.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t12'
 ```
 
 **提交边界：** `feat(eval): expose separated harness commands`
@@ -666,7 +683,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_core_suite.py tests/eval/test_core_golden_submissions.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-core-suite'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_core_suite.py tests/eval/test_core_golden_submissions.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t13'
 ```
 
 **提交边界：** `test(eval): add audited core code review suites`
@@ -705,7 +722,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_aacr_adapter.py tests/eval/test_swe_prbench_adapter.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-public-adapters'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_aacr_adapter.py tests/eval/test_swe_prbench_adapter.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t14'
 ```
 
 **提交边界：** `feat(eval): adapt aacr and swe pr review benchmarks`
@@ -756,7 +773,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_repeated_trials.py tests/eval/test_comparison.py tests/eval/test_calibration.py tests/eval/test_regression_gates.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-comparison'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_repeated_trials.py tests/eval/test_comparison.py tests/eval/test_calibration.py tests/eval/test_regression_gates.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t15'
 ```
 
 **提交边界：** `feat(eval): compare repeated trials and enforce calibrated gates`
@@ -802,14 +819,14 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **定向验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-all'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval -q -p no:cacheprovider --basetemp 'C:\tmp\rae-eval'
 ```
 
 **全量回归：**
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-eval-full'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest -q -p no:cacheprovider --basetemp 'C:\tmp\rae-full'
 ```
 
 **提交边界：** `docs(eval): complete harness integration and operating guide`
