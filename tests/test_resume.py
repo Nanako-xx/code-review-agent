@@ -10,14 +10,18 @@ from conftest import run_git
 import review_agent.pipeline as pipeline_module
 from review_agent.artifacts import artifact_schema
 from review_agent.checkpoint import CheckpointStore
+from review_agent.memory_models import MemoryExecutionConfig, MemoryMode
 from review_agent.models import ReviewRequest
 from review_agent.pipeline import PipelineStageError, ReviewPipeline
 from review_agent.resume import ResumeAction, ResumeBlockedError, ReviewSessionResumer
 from review_agent.revision import RevisionResolver
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
+    LEGACY_SESSION_SCHEMA_VERSION,
     MODEL_STAGE_SESSION_SCHEMA_VERSION,
     PREVIOUS_SESSION_SCHEMA_VERSION,
+    SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION,
+    SESSION_SCHEMA_VERSION,
     PhaseStatus,
     ReviewExecutionConfig,
     SessionManifest,
@@ -37,6 +41,8 @@ def _session_pipeline(
     adapter_factory_builder=None,
     symbolic_head: bool = False,
     symbolic_base: bool = False,
+    memory_mode: MemoryMode = MemoryMode.OFF,
+    project_rules: tuple[str, ...] = (),
 ) -> tuple[ReviewPipeline, SessionStore, CheckpointStore]:
     base = run_git(git_repo, "rev-parse", "HEAD")
     if symbolic_base:
@@ -68,6 +74,10 @@ def _session_pipeline(
                 reviewer_mode=reviewer_mode,
                 reviewer_loop=reviewer_loop,
                 non_interactive=True,
+                memory=MemoryExecutionConfig(
+                    mode=memory_mode,
+                    root_path=str((git_repo / ".memory-test").resolve()),
+                ),
             ),
             now="2026-07-12T00:00:00Z",
         )
@@ -84,6 +94,7 @@ def _session_pipeline(
             base_revision=requested_base,
             head_revision=requested_head,
             user_intent="Add authentication token check",
+            project_rules=project_rules,
         ),
         **kwargs,
     )
@@ -115,12 +126,16 @@ def _downgrade_session_schema(
     payload = json.loads(session_store.session_path.read_text(encoding="utf-8"))
     payload["schema_version"] = schema_version
     execution = payload["execution"]
-    execution.pop("semantic_reconciler")
-    execution.pop("supplemental_policy")
+    execution.pop("memory")
+    execution.pop("memory_curator")
+    if schema_version < SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION:
+        execution.pop("semantic_reconciler")
+        execution.pop("supplemental_policy")
     if schema_version < MODEL_STAGE_SESSION_SCHEMA_VERSION:
         execution.pop("risk_assessor")
         execution.pop("portfolio_planner")
-    payload.pop("supplemental_waves")
+    if schema_version < SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION:
+        payload.pop("supplemental_waves")
     legacy_phases = {
         phase.value for phase in session_phases_for_schema(schema_version)
     }
@@ -129,6 +144,9 @@ def _downgrade_session_schema(
         for phase_name, checkpoint in payload["phases"].items()
         if phase_name in legacy_phases
     }
+    if schema_version < PREVIOUS_SESSION_SCHEMA_VERSION:
+        for checkpoint in payload["phases"].values():
+            checkpoint.pop("user_decisions", None)
     payload["artifacts"] = {
         artifact_name: descriptor
         for artifact_name, descriptor in payload["artifacts"].items()
@@ -361,6 +379,9 @@ def test_legacy_resume_does_not_construct_or_call_semantic_reconciler(
         )
 
     with monkeypatch.context() as scoped:
+        scoped.setattr(pipeline_module, "MemoryStore", sentinel)
+        scoped.setattr(pipeline_module, "run_local_memory_curator", sentinel)
+        scoped.setattr(pipeline_module, "run_model_memory_curator", sentinel)
         scoped.setattr(
             ReviewPipeline,
             "_model_stage_adapter",
@@ -386,6 +407,109 @@ def test_legacy_resume_does_not_construct_or_call_semantic_reconciler(
     assert "supplemental_summary" not in completed.artifacts
 
 
+@pytest.mark.parametrize(
+    "schema_version",
+    [LEGACY_SESSION_SCHEMA_VERSION, SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION],
+    ids=["session-v1", "session-v4"],
+)
+def test_completed_legacy_resume_never_opens_memory_or_runs_curator(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schema_version: int,
+) -> None:
+    pipeline, session_store, checkpoint_store = _session_pipeline(
+        git_repo,
+        review_id=f"review-v{schema_version}-no-memory-resume",
+    )
+    pipeline.execute()
+    _downgrade_session_schema(
+        session_store,
+        schema_version,
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("legacy same-revision resume must not use Memory")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(pipeline_module, "MemoryStore", forbidden)
+        scoped.setattr(pipeline_module, "run_local_memory_curator", forbidden)
+        scoped.setattr(pipeline_module, "run_model_memory_curator", forbidden)
+        result = ReviewSessionResumer(
+            repository=git_repo,
+            checkpoint_store=checkpoint_store,
+            session_store=session_store,
+        ).resume()
+
+    assert result.action is ResumeAction.AUDIT_COMPLETED
+    assert result.starting_phase is None
+    assert session_store.load().schema_version == schema_version
+
+
+def test_legacy_revision_drift_requires_explicit_v5_memory_config(
+    git_repo: Path,
+) -> None:
+    pipeline, session_store, checkpoint_store = _session_pipeline(
+        git_repo,
+        review_id="review-v4-drift-upgrade",
+        symbolic_head=True,
+    )
+    pipeline.execute()
+    _downgrade_session_schema(
+        session_store,
+        SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION,
+    )
+    parent = session_store.load()
+    (git_repo / "legacy-later.py").write_text("value = 2\n", encoding="utf-8")
+    run_git(git_repo, "add", "legacy-later.py")
+    run_git(git_repo, "commit", "-m", "move legacy requested head")
+
+    with pytest.raises(
+        ResumeBlockedError,
+        match="explicit compatible v5 ReviewExecutionConfig",
+    ):
+        ReviewSessionResumer(
+            repository=git_repo,
+            checkpoint_store=checkpoint_store,
+            session_store=session_store,
+        ).resume()
+
+    legacy = parent.execution
+    upgrade = ReviewExecutionConfig(
+        reviewer_provider=legacy.reviewer_provider,
+        reviewer_model=legacy.reviewer_model,
+        reviewer_base_url=legacy.reviewer_base_url,
+        reviewer_api_key_env=legacy.reviewer_api_key_env,
+        reviewer_mode=legacy.reviewer_mode,
+        reviewer_loop=legacy.reviewer_loop,
+        non_interactive=legacy.non_interactive,
+        risk_assessor=legacy.risk_assessor,
+        portfolio_planner=legacy.portfolio_planner,
+        semantic_reconciler=legacy.semantic_reconciler,
+        supplemental_policy=legacy.supplemental_policy,
+        memory=MemoryExecutionConfig(
+            mode=MemoryMode.OFF,
+            root_path=str((git_repo / ".memory-v5-upgrade").resolve()),
+        ),
+    )
+    result = ReviewSessionResumer(
+        repository=git_repo,
+        checkpoint_store=checkpoint_store,
+        session_store=session_store,
+        upgrade_execution=upgrade,
+    ).resume()
+
+    assert result.action is ResumeAction.CREATE_INCREMENTAL_SESSION
+    child_store = SessionStore(
+        git_repo / ".review-agent" / "runs" / str(result.new_review_id)
+    )
+    child = child_store.load()
+    assert child.schema_version == SESSION_SCHEMA_VERSION
+    assert child.execution == upgrade
+    assert child.status is RunStatus.COMPLETED
+    assert "memory_snapshot" in child.artifacts
+    assert "memory_candidates" in child.artifacts
+
+
 def test_head_drift_creates_idempotent_child_with_incremental_priority_map(
     git_repo: Path,
 ) -> None:
@@ -396,6 +520,11 @@ def test_head_drift_creates_idempotent_child_with_incremental_priority_map(
     )
     pipeline.execute()
     parent = session_store.load()
+    parent_memory_snapshot = json.loads(
+        (checkpoint_store.run_dir / "memory_snapshot.json").read_text(
+            encoding="utf-8"
+        )
+    )
     parent_observations = _observation_payloads(checkpoint_store.run_dir, parent)
     parent_observation_ids = {
         str(observation["observation_id"])
@@ -509,6 +638,16 @@ def test_head_drift_creates_idempotent_child_with_incremental_priority_map(
     assert child.parent_review_id == parent.review_id
     assert child.incremental_from_sha == parent.revisions.resolved_head_sha
     assert "incremental_priority" in child.artifacts
+    child_memory_snapshot = json.loads(
+        (child_store.run_dir / "memory_snapshot.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert child_memory_snapshot["head_sha"] == child.revisions.resolved_head_sha
+    assert child_memory_snapshot["snapshot_id"] != parent_memory_snapshot[
+        "snapshot_id"
+    ]
+    assert child_memory_snapshot["memory_generation"] == 0
     priority = json.loads(
         (child_store.run_dir / "incremental_priority.json").read_text(encoding="utf-8")
     )
@@ -589,6 +728,98 @@ def test_head_drift_creates_idempotent_child_with_incremental_priority_map(
     assert child_budget["unknown_consumed"] == empty_budget
     assert child_budget["reserved"] == empty_budget
     assert child_budget["remaining"] == child_budget["limits"]
+
+
+def test_read_write_drift_child_reselects_generation_without_parent_proposal(
+    git_repo: Path,
+) -> None:
+    pipeline, session_store, checkpoint_store = _session_pipeline(
+        git_repo,
+        review_id="review-memory-head-drift",
+        symbolic_head=True,
+        memory_mode=MemoryMode.READ_WRITE,
+        project_rules=("Preserve the authentication token contract.",),
+    )
+    pipeline.execute()
+    parent = session_store.load()
+    parent_snapshot = json.loads(
+        (checkpoint_store.run_dir / "memory_snapshot.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    parent_candidates = json.loads(
+        (checkpoint_store.run_dir / "memory_candidates.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert parent_candidates["candidates"]
+    assert "memory_outbox" in parent.artifacts
+
+    (git_repo / "auth.py").write_text(
+        "def check(token):\n    return token in {'ok', 'legacy'}\n",
+        encoding="utf-8",
+    )
+    run_git(git_repo, "add", "auth.py")
+    run_git(git_repo, "commit", "-m", "move memory target head")
+
+    result = ReviewSessionResumer(
+        repository=git_repo,
+        checkpoint_store=checkpoint_store,
+        session_store=session_store,
+    ).resume()
+
+    child_store = SessionStore(
+        git_repo / ".review-agent" / "runs" / str(result.new_review_id)
+    )
+    child = child_store.load()
+    child_snapshot = json.loads(
+        (child_store.run_dir / "memory_snapshot.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    child_candidates = json.loads(
+        (child_store.run_dir / "memory_candidates.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert result.action is ResumeAction.CREATE_INCREMENTAL_SESSION
+    assert child_snapshot["head_sha"] == child.revisions.resolved_head_sha
+    assert child_snapshot["snapshot_id"] != parent_snapshot["snapshot_id"]
+    assert child_snapshot["memory_generation"] >= parent_snapshot[
+        "memory_generation"
+    ]
+    assert {
+        item["candidate_id"] for item in child_candidates["candidates"]
+    }.isdisjoint(
+        item["candidate_id"] for item in parent_candidates["candidates"]
+    )
+    parent_outbox = json.loads(
+        (checkpoint_store.run_dir / "memory_outbox.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    child_outbox = json.loads(
+        (child_store.run_dir / "memory_outbox.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert child_outbox["review_id"] == child.review_id
+    assert child_outbox["snapshot_id"] == child_snapshot["snapshot_id"]
+    assert child_outbox["outbox_digest"] != parent_outbox["outbox_digest"]
+    if "memory_persistence_receipt" in child.artifacts:
+        child_receipt = json.loads(
+            (child_store.run_dir / "memory_persistence_receipt.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert child_receipt["outbox_digest"] == child_outbox["outbox_digest"]
+    else:
+        child_brief = json.loads(
+            (child_store.run_dir / "review_brief.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert child_brief["memory_audit"]["status"]["outbox_pending"] is True
     assert len(list((git_repo / ".review-agent" / "runs").iterdir())) == 2
 
 

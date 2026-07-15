@@ -10,6 +10,7 @@ import pytest
 from conftest import run_git
 
 from review_agent.checkpoint import CheckpointStore
+from review_agent.memory_models import MemoryExecutionConfig, MemoryMode
 from review_agent.model_adapter import FakeToolCallingAdapter
 from review_agent.model_adapter_factory import FakeModelAdapterFactory
 from review_agent.model_protocol import (
@@ -79,6 +80,10 @@ def _pipeline(
                 risk_assessor=risk_assessor or ModelStageConfig(),
                 portfolio_planner=portfolio_planner or ModelStageConfig(),
                 semantic_reconciler=semantic_reconciler or ModelStageConfig(),
+                memory=MemoryExecutionConfig(
+                    mode=MemoryMode.OFF,
+                    root_path=str((git_repo / ".memory-test").resolve()),
+                ),
             ),
             now="2026-07-12T00:00:00Z",
         )

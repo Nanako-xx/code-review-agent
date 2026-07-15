@@ -21,6 +21,7 @@ from review_agent.memory_models import (
 from review_agent.memory_retrieval import (
     HardPolicyBudgetExceeded,
     RecordSelection,
+    RetrievalLimits,
     RetrievalRequest,
     RetrievalStage,
     SnapshotMemoryQueryService,
@@ -707,7 +708,14 @@ def _build_memory_projection(
         raise ValueError("memory policy compilation is blocking")
 
     request = _reviewer_retrieval_request(assignment)
-    canonical_selection = _select_reviewer_records(snapshot, request)
+    retrieval_limits = getattr(memory_context.query_service, "limits", None)
+    if type(retrieval_limits) is not RetrievalLimits:
+        retrieval_limits = RetrievalLimits()
+    canonical_selection = _select_reviewer_records(
+        snapshot,
+        request,
+        limits=retrieval_limits,
+    )
     if memory_context.selection is not None:
         _validate_reviewer_selection(
             memory_context.selection,
@@ -719,7 +727,11 @@ def _build_memory_projection(
     # therefore cannot consume a rank/count/byte slot or perturb any metadata
     # visible to the provider.
     remote_snapshot = remote_visible_memory_snapshot(snapshot)
-    selection = _select_reviewer_records(remote_snapshot, request)
+    selection = _select_reviewer_records(
+        remote_snapshot,
+        request,
+        limits=retrieval_limits,
+    )
 
     decision_by_id = {
         decision.memory_id: decision
@@ -839,8 +851,10 @@ def _reviewer_retrieval_request(assignment: Assignment) -> RetrievalRequest:
 def _select_reviewer_records(
     snapshot: MemorySnapshot,
     request: RetrievalRequest,
+    *,
+    limits: RetrievalLimits | None = None,
 ) -> RecordSelection:
-    return SnapshotMemorySelector(snapshot).select(request)
+    return SnapshotMemorySelector(snapshot, limits=limits).select(request)
 
 
 def _validate_reviewer_selection(

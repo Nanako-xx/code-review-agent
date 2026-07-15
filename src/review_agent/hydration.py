@@ -18,7 +18,7 @@ from review_agent.evidence import (
     EvidenceReconciliation,
     RejectedFinding,
 )
-from review_agent.final_risk import FinalRiskAssessment
+from review_agent.final_risk import FinalRiskAssessment, final_risk_to_dict
 from review_agent.incremental import (
     incremental_priority_from_dict,
     incremental_priority_to_dict,
@@ -1377,35 +1377,19 @@ def _review_brief_final_risk(value: Any) -> dict[str, Any]:
             "level": _enum_field(RiskLevel, item, "level", context).value,
             "reasons": _string_list(item, "reasons", context),
         }
-    _exact(
-        item,
-        {
-            "status",
-            "initial_level",
-            "level",
-            "reasons",
-            "escalations",
-            "deescalations",
-            "uncertainties",
-            "signal_refs",
-        },
-        context,
-    )
-    return {
-        "status": _string(item, "status", context),
-        "initial_level": _enum_field(
-            RiskLevel,
-            item,
-            "initial_level",
-            context,
-        ).value,
-        "level": _enum_field(RiskLevel, item, "level", context).value,
-        "reasons": _string_list(item, "reasons", context),
-        "escalations": _string_list(item, "escalations", context),
-        "deescalations": _string_list(item, "deescalations", context),
-        "uncertainties": _string_list(item, "uncertainties", context),
-        "signal_refs": _string_list(item, "signal_refs", context),
-    }
+    canonical = final_risk_to_dict(final_risk_from_dict(item))
+    if not {
+        "applied_memory",
+        "memory_diagnostics",
+        "residual_risk",
+    }.intersection(item):
+        for field_name in (
+            "applied_memory",
+            "memory_diagnostics",
+            "residual_risk",
+        ):
+            canonical.pop(field_name, None)
+    return canonical
 
 
 def _review_brief_quality_gates(value: Any) -> list[dict[str, Any]]:

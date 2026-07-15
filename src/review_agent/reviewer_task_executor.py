@@ -443,21 +443,26 @@ class ReviewerTaskExecutor:
             except Exception as error:
                 reviewer_observations = dict(task.initial_observations)
                 reviewer_observations.update(observation_store.summaries_by_id())
-                with reviewer_tool_scope(task.allowed_tools):
-                    execution = failed_reviewer_execution(
-                        index=task.reviewer_index,
-                        trace_id=task.trace_id,
-                        assignment=task.assignment,
-                        intent=task.intent,
-                        diff_excerpt=list(task.diff_excerpt),
-                        observations=reviewer_observations,
-                        error=error,
-                        model=self.model,
-                        elapsed_seconds=perf_counter() - started_at,
-                        retained_observation_refs=tuple(
-                            sorted(reviewer_observations)
-                        ),
-                    )
+                # The failure envelope is Runtime bookkeeping, not a second
+                # reviewer attempt.  Reusing a blocking Memory context here
+                # would raise the same policy error again and prevent
+                # Completion from recording the authoritative blocker.
+                with reviewer_memory_scope(None):
+                    with reviewer_tool_scope(task.allowed_tools):
+                        execution = failed_reviewer_execution(
+                            index=task.reviewer_index,
+                            trace_id=task.trace_id,
+                            assignment=task.assignment,
+                            intent=task.intent,
+                            diff_excerpt=list(task.diff_excerpt),
+                            observations=reviewer_observations,
+                            error=error,
+                            model=self.model,
+                            elapsed_seconds=perf_counter() - started_at,
+                            retained_observation_refs=tuple(
+                                sorted(reviewer_observations)
+                            ),
+                        )
         elapsed_seconds = max(0.0, perf_counter() - started_at)
         return ReviewerTaskRun(
             task=task,

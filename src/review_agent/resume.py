@@ -31,7 +31,9 @@ from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
     LEGACY_SESSION_SCHEMA_VERSION,
     PhaseStatus,
+    ReviewExecutionConfig,
     RevisionChangeKind,
+    SESSION_SCHEMA_VERSION,
     SessionManifest,
     child_session_manifest,
     session_phases_for_schema,
@@ -75,12 +77,21 @@ class ReviewSessionResumer:
         session_store: SessionStore,
         resolver: RevisionResolver | None = None,
         intent_clarifier: IntentClarifier | None = None,
+        upgrade_execution: ReviewExecutionConfig | None = None,
     ) -> None:
         self.repository = Path(repository).resolve()
         self.checkpoint_store = checkpoint_store
         self.session_store = session_store
         self.resolver = resolver or RevisionResolver()
         self.intent_clarifier = intent_clarifier
+        if upgrade_execution is not None and not isinstance(
+            upgrade_execution,
+            ReviewExecutionConfig,
+        ):
+            raise ValueError(
+                "upgrade_execution must be a ReviewExecutionConfig or None"
+            )
+        self.upgrade_execution = upgrade_execution
 
     def resume(self) -> ResumeResult:
         manifest = self.session_store.load()
@@ -278,18 +289,28 @@ class ReviewSessionResumer:
         child_created = not child_store.session_path.exists()
         if child_created:
             try:
-                child_store.create(
-                    child_session_manifest(
-                        review_id=child_id,
-                        parent=parent,
-                        repository=repository,
-                        revisions=revisions,
-                        change_kind=change_kind,
-                        now=_utc_now(),
-                    )
+                child_manifest = child_session_manifest(
+                    review_id=child_id,
+                    parent=parent,
+                    repository=repository,
+                    revisions=revisions,
+                    change_kind=change_kind,
+                    now=_utc_now(),
+                    execution=(
+                        None
+                        if parent.schema_version >= SESSION_SCHEMA_VERSION
+                        else self.upgrade_execution
+                    ),
                 )
+                child_store.create(child_manifest)
             except FileExistsError:
                 child_created = False
+            except ValueError as error:
+                raise ResumeBlockedError(
+                    "legacy revision drift requires an explicit compatible v5 "
+                    "ReviewExecutionConfig with fixed Memory settings: "
+                    f"{error}"
+                ) from error
         try:
             child = child_store.load()
         except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -302,6 +323,30 @@ class ReviewSessionResumer:
             revisions=revisions,
             change_kind=change_kind,
         )
+        if parent.schema_version >= SESSION_SCHEMA_VERSION:
+            expected_execution = parent.execution
+        else:
+            expected_execution = self.upgrade_execution or child.execution
+            try:
+                projected = child_session_manifest(
+                    review_id=child_id,
+                    parent=parent,
+                    repository=repository,
+                    revisions=revisions,
+                    change_kind=change_kind,
+                    now=child.created_at,
+                    execution=expected_execution,
+                )
+            except ValueError as error:
+                raise ResumeBlockedError(
+                    "existing legacy revision-drift child has an incompatible "
+                    f"v5 execution config: {error}"
+                ) from error
+            expected_execution = projected.execution
+        if child.execution != expected_execution:
+            raise ResumeBlockedError(
+                "deterministic child Session has mismatched v5 execution config"
+            )
 
         nested_result: ResumeResult | None = None
         pipeline_result: PipelineResult | None = None

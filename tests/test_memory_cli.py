@@ -34,6 +34,7 @@ from review_agent.memory_models import (
     FeedbackReasonCode,
     FindingSeverity,
     FindingSnapshot,
+    GenerationMetadata,
     MAX_SNAPSHOT_RECORDS,
     MemoryCandidate,
     MemoryConfidence,
@@ -66,6 +67,7 @@ from review_agent.memory_relink import (
 from review_agent.memory_store import (
     MemoryStore,
     MemoryStoreValidationError,
+    WriteResult,
 )
 from review_agent.models import RiskAssessment, RiskLevel
 from review_agent.observations import ObservationStore
@@ -133,6 +135,7 @@ def _feedback_outbox_session(
     tmp_path: Path,
     *,
     review_id: str,
+    candidate: MemoryCandidate | None = None,
 ) -> tuple[SessionStore, FindingSnapshot, str]:
     resolver = RevisionResolver()
     head = resolver.resolve_commit(repo, "HEAD")
@@ -281,7 +284,22 @@ def _feedback_outbox_session(
         now="2026-07-14T08:04:00Z",
     )
 
-    batch_digest = hashlib.sha256(b"empty-candidate-batch").hexdigest()
+    if candidate is not None and (
+        candidate.repository_key != repository_key(identity)
+        or candidate.origin_review_id != review_id
+        or candidate.valid_from_sha != head
+    ):
+        raise ValueError("candidate is not bound to the outbox Session")
+    batch_digest = (
+        hashlib.sha256(b"empty-candidate-batch").hexdigest()
+        if candidate is None
+        else canonical_sha256(
+            {
+                "schema": "memory_cli_test_candidate_batch_v1",
+                "candidate": candidate.to_dict(),
+            }
+        )
+    )
     repository_key_value = repository_key(identity)
     outbox_body = {
         "schema": "memory_candidate_outbox_v1",
@@ -299,7 +317,25 @@ def _feedback_outbox_session(
         "actor_type": "runtime",
         "actor_id": "memory-curator",
         "reason_code": "candidate_outbox",
-        "entries": [],
+        "entries": (
+            []
+            if candidate is None
+            else [
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_hash": canonical_sha256(candidate.to_dict()),
+                    "request_id": stable_request_id(
+                        "memory_cli_test_outbox",
+                        review_id,
+                        candidate.candidate_id,
+                    ),
+                    "origin": candidate.producer.producer_type.value,
+                    "allowed_source_refs": [
+                        item.to_dict() for item in candidate.source_refs
+                    ],
+                }
+            ]
+        ),
     }
     outbox_payload = {
         **outbox_body,
@@ -438,8 +474,29 @@ def _valid_replay_receipt(
     *,
     locator_repository_key: str | None = None,
     binding_id: str | None = None,
+    candidate_id: str | None = None,
+    request_id: str | None = None,
+    batch_digest: str | None = None,
 ) -> dict[str, object]:
     repository_key_value = str(call["expected_repository_key"])
+    if (candidate_id is None) != (request_id is None):
+        raise ValueError("candidate_id and request_id must be provided together")
+    write_result = (
+        None
+        if candidate_id is None
+        else WriteResult(
+            operation="transition_candidate",
+            subject_id=candidate_id,
+            event_id=None,
+            generations=GenerationMetadata(
+                store_schema_version=1,
+                memory_generation=3,
+                feedback_generation=0,
+                knowledge_generation=0,
+            ),
+            applied=True,
+        )
+    )
     body: dict[str, object] = {
         "schema": "memory_persistence_receipt_v1",
         "success": True,
@@ -455,10 +512,30 @@ def _valid_replay_receipt(
         ),
         "binding_id": binding_id,
         "outbox_digest": str(call["expected_outbox_digest"]),
-        "batch_digest": hashlib.sha256(b"empty-candidate-batch").hexdigest(),
-        "persisted_candidate_ids": [],
+        "batch_digest": (
+            hashlib.sha256(b"empty-candidate-batch").hexdigest()
+            if batch_digest is None
+            else batch_digest
+        ),
+        "persisted_candidate_ids": (
+            [] if candidate_id is None else [candidate_id]
+        ),
         "replayed_candidate_ids": [],
-        "results": [],
+        "results": (
+            []
+            if candidate_id is None
+            else [
+                {
+                    "candidate_id": candidate_id,
+                    "request_id": request_id,
+                    "replayed": False,
+                    "status": "pending_approval",
+                    "dedupe": "unique",
+                    "validation_report_hash": "7" * 64,
+                    "write_results": [write_result.to_dict()],
+                }
+            ]
+        ),
     }
     return {**body, "receipt_digest": canonical_sha256(body)}
 
@@ -1004,16 +1081,33 @@ def test_replay_outbox_passes_only_final_cas_inputs_and_accepts_strict_receipt(
 ) -> None:
     memory_root = tmp_path / "strict-replay-memory"
     review_id = "review-outbox-strict"
+    identity = RevisionResolver().repository_identity(git_repo)
+    candidate = _candidate(
+        git_repo,
+        repository_key(identity),
+        statement="Replay a lifecycle-validated candidate.",
+        review_id=review_id,
+    )
     _session, _snapshot, outbox_digest = _feedback_outbox_session(
         git_repo,
         tmp_path,
         review_id=review_id,
+        candidate=candidate,
     )
+    outbox = json.loads(
+        (_session.run_dir / "memory_outbox.json").read_text(encoding="utf-8")
+    )
+    entry = outbox["entries"][0]
     observed: list[dict[str, object]] = []
 
     def replay_memory_outbox(**kwargs):
         observed.append(dict(kwargs))
-        return _valid_replay_receipt(dict(kwargs))
+        return _valid_replay_receipt(
+            dict(kwargs),
+            candidate_id=entry["candidate_id"],
+            request_id=entry["request_id"],
+            batch_digest=outbox["batch_digest"],
+        )
 
     monkeypatch.setattr(
         pipeline_module,
@@ -1052,7 +1146,66 @@ def test_replay_outbox_passes_only_final_cas_inputs_and_accepts_strict_receipt(
     }
     assert call["expected_outbox_digest"] == outbox_digest
     assert documents[-1]["receipt"]["success"] is True
+    assert documents[-1]["receipt"]["results"][0]["status"] == (
+        "pending_approval"
+    )
     assert not memory_root.exists()
+
+
+def test_replay_outbox_validator_accepts_lifecycle_receipt_for_pending_candidate() -> None:
+    candidate_id = "MC-" + "1" * 64
+    request_id = "REQ-" + "2" * 64
+    write_result = WriteResult(
+        operation="transition_candidate",
+        subject_id=candidate_id,
+        event_id=None,
+        generations=GenerationMetadata(
+            store_schema_version=1,
+            memory_generation=3,
+            feedback_generation=0,
+            knowledge_generation=0,
+        ),
+        applied=True,
+    )
+    body: dict[str, object] = {
+        "schema": "memory_persistence_receipt_v1",
+        "success": True,
+        "review_id": "review-lifecycle-receipt",
+        "repository_key": "3" * 64,
+        "locator_repository_key": "3" * 64,
+        "authority_resolution_hash": "4" * 64,
+        "binding_id": None,
+        "outbox_digest": "5" * 64,
+        "batch_digest": "6" * 64,
+        "persisted_candidate_ids": [candidate_id],
+        "replayed_candidate_ids": [],
+        "results": [
+            {
+                "candidate_id": candidate_id,
+                "request_id": request_id,
+                "replayed": False,
+                "status": "pending_approval",
+                "dedupe": "unique",
+                "validation_report_hash": "7" * 64,
+                "write_results": [write_result.to_dict()],
+            }
+        ],
+    }
+    receipt = {**body, "receipt_digest": canonical_sha256(body)}
+
+    validated = command_module._validate_outbox_replay_receipt(
+        receipt,
+        review_id="review-lifecycle-receipt",
+        expected_repository_key="3" * 64,
+        expected_locator_repository_key="3" * 64,
+        expected_authority_resolution_hash="4" * 64,
+        expected_binding_id=None,
+        expected_outbox_digest="5" * 64,
+        expected_batch_digest="6" * 64,
+        expected_entries=((candidate_id, request_id),),
+    )
+
+    assert validated["results"][0]["status"] == "pending_approval"
 
 
 @pytest.mark.parametrize(

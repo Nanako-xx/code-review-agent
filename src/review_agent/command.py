@@ -38,6 +38,7 @@ from review_agent.memory_feedback import (
 )
 from review_agent.memory_lifecycle import (
     ApprovalResult,
+    CandidateDedupeKind,
     MemoryLifecycle,
     MemoryLifecycleError,
     MemoryLifecycleErrorCode,
@@ -58,6 +59,7 @@ from review_agent.memory_models import (
     MemoryCandidate,
     MemoryExecutionConfig,
     MemoryMode,
+    ProducerType,
     RecordStatus,
     SourceRef,
     canonical_sha256,
@@ -236,6 +238,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     resume.add_argument("review_id", help="Review id under .review-agent/runs")
     resume.add_argument("--repo", default=".", help="Repository path")
+    resume.add_argument(
+        "--upgrade-to-v5",
+        action="store_true",
+        help=(
+            "Explicitly upgrade a legacy revision-drift Session to the v5 "
+            "Memory-aware execution protocol"
+        ),
+    )
+    _add_review_memory_arguments(resume)
+    _add_model_stage_arguments(resume, "memory-curator")
     _add_memory_parser(subparsers)
     return parser
 
@@ -2253,6 +2265,8 @@ def _hydrate_memory_outbox(
                 "candidate_id",
                 "candidate_hash",
                 "request_id",
+                "origin",
+                "allowed_source_refs",
             }:
                 raise ValueError("outbox entry fields are invalid")
             candidate_id = validate_stable_id(
@@ -2267,6 +2281,19 @@ def _hydrate_memory_outbox(
             )
             if not _is_canonical_sha256(entry["candidate_hash"]):
                 raise ValueError("outbox candidate_hash is invalid")
+            if entry["origin"] not in {
+                ProducerType.LOCAL.value,
+                ProducerType.MODEL.value,
+            }:
+                raise ValueError("outbox candidate origin is invalid")
+            raw_source_refs = entry["allowed_source_refs"]
+            if not isinstance(raw_source_refs, list) or not raw_source_refs:
+                raise ValueError("outbox source allowlist is invalid")
+            source_refs = tuple(
+                SourceRef.from_dict(item) for item in raw_source_refs
+            )
+            if [item.to_dict() for item in source_refs] != raw_source_refs:
+                raise ValueError("outbox source allowlist is not canonical")
             candidate_ids.append(candidate_id)
             request_ids.append(request_id)
             entries.append((candidate_id, request_id))
@@ -2463,14 +2490,26 @@ def _validate_outbox_replay_receipt(
         expected_results
     ):
         raise _invalid_outbox_receipt()
-    hydrated_results: list[tuple[str, str, bool, WriteResult]] = []
+    hydrated_results: list[
+        tuple[
+            str,
+            str,
+            bool,
+            CandidateStatus,
+            CandidateDedupeKind,
+            tuple[WriteResult, ...],
+        ]
+    ] = []
     try:
         for row in raw_results:
             if type(row) is not dict or set(row) != {
                 "candidate_id",
                 "request_id",
                 "replayed",
-                "write_result",
+                "status",
+                "dedupe",
+                "validation_report_hash",
+                "write_results",
             }:
                 raise ValueError("receipt result fields are invalid")
             candidate_id = validate_stable_id(
@@ -2485,15 +2524,31 @@ def _validate_outbox_replay_receipt(
             )
             if type(row["replayed"]) is not bool:
                 raise ValueError("receipt replayed flag is invalid")
-            result = WriteResult.from_dict(row["write_result"])
-            if result.to_dict() != row["write_result"]:
+            status = CandidateStatus(row["status"])
+            dedupe = CandidateDedupeKind(row["dedupe"])
+            if not _is_canonical_sha256(row["validation_report_hash"]):
+                raise ValueError("receipt validation report hash is invalid")
+            raw_write_results = row["write_results"]
+            if not isinstance(raw_write_results, list) or len(raw_write_results) > 4:
+                raise ValueError("receipt write results are invalid")
+            write_results = tuple(
+                WriteResult.from_dict(item) for item in raw_write_results
+            )
+            if [item.to_dict() for item in write_results] != raw_write_results:
                 raise ValueError("non-canonical write result")
             hydrated_results.append(
-                (candidate_id, row_request_id, row["replayed"], result)
+                (
+                    candidate_id,
+                    row_request_id,
+                    row["replayed"],
+                    status,
+                    dedupe,
+                    write_results,
+                )
             )
     except (MemoryStoreError, TypeError, ValueError):
         raise _invalid_outbox_receipt() from None
-    result_ids = [candidate_id for candidate_id, _, _, _ in hydrated_results]
+    result_ids = [candidate_id for candidate_id, *_ in hydrated_results]
     if (
         len(result_ids) != len(set(result_ids))
         or result_ids != [candidate_id for candidate_id, _ in expected_entries]
@@ -2501,10 +2556,20 @@ def _validate_outbox_replay_receipt(
         or any(
             expected_entry_map[candidate_id] != row_request_id
             or replayed_flag != (candidate_id in set(replayed))
-            or result.operation != "put_candidate"
-            or result.subject_id != candidate_id
-            or (replayed_flag and result.applied)
-            for candidate_id, row_request_id, replayed_flag, result in hydrated_results
+            or (not replayed_flag and not write_results)
+            or any(
+                result.operation not in {"put_candidate", "transition_candidate"}
+                or result.subject_id != candidate_id
+                for result in write_results
+            )
+            for (
+                candidate_id,
+                row_request_id,
+                replayed_flag,
+                _status,
+                _dedupe,
+                write_results,
+            ) in hydrated_results
         )
     ):
         raise _invalid_outbox_receipt()
@@ -3774,16 +3839,38 @@ def _run_resume(args: argparse.Namespace) -> int:
     if session_path.exists():
         session_store = SessionStore(store.run_dir)
         try:
-            session_store.load()
+            manifest = session_store.load()
         except Exception as error:
             print(f"Review run has an invalid session.json: {error}", file=sys.stderr)
             return 2
+        upgrade_execution = None
+        if args.upgrade_to_v5:
+            try:
+                upgrade_execution = replace(
+                    manifest.execution,
+                    memory=_resolve_memory_execution_config(args),
+                )
+                upgrade_execution = replace(
+                    upgrade_execution,
+                    memory_curator=_resolve_model_stage_config(
+                        args,
+                        "memory-curator",
+                        upgrade_execution,
+                    ),
+                )
+            except (MemoryIdentityError, ValueError) as error:
+                print(
+                    f"Resume v5 upgrade configuration error: {error}",
+                    file=sys.stderr,
+                )
+                return 2
         try:
             result = ReviewSessionResumer(
                 repository=repo,
                 checkpoint_store=store,
                 session_store=session_store,
                 intent_clarifier=ConsoleIntentClarifier(),
+                upgrade_execution=upgrade_execution,
             ).resume()
         except ResumeBlockedError as error:
             print(f"Resume blocked: {error}", file=sys.stderr)
