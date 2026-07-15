@@ -222,6 +222,52 @@ def test_factory_fake_adapter_dispatches_planning_stage_schemas(
     assert response.raw == {"fake": True, "response_schema": response_schema}
 
 
+def test_factory_fake_adapter_dispatches_memory_curator_schema() -> None:
+    factory = build_model_adapter_factory_from_config(
+        ModelAdapterConfig(
+            provider_name="fake",
+            model=None,
+            base_url=None,
+            api_key_env="REVIEW_AGENT_API_KEY",
+        )
+    )
+
+    response = factory.create().complete_turn(
+        ModelTurnRequest(
+            system="memory curator",
+            tools=[],
+            messages=[
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "source_ref_allowlist": [
+                                {"source_ref_id": "SRC-" + "a" * 64}
+                            ]
+                        }
+                    ),
+                }
+            ],
+            tool_results=[],
+            parameters={
+                "tool_choice": "none",
+                "response_schema": "memory_curator_proposal_v1",
+            },
+        )
+    )
+    payload = json.loads(response.final_text)
+
+    assert response.kind is ModelResponseKind.FINAL
+    assert response.model == "fake-memory-curator"
+    assert set(payload) == {"schema_version", "candidates"}
+    assert payload["schema_version"] == 1
+    assert payload["candidates"][0]["source_ref_ids"] == ["SRC-" + "a" * 64]
+    assert response.raw == {
+        "fake": True,
+        "response_schema": "memory_curator_proposal_v1",
+    }
+
+
 def test_factory_creates_openai_compatible_adapter(monkeypatch):
     monkeypatch.setenv("REVIEW_AGENT_API_KEY", "secret-key")
 

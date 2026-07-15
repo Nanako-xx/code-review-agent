@@ -5,10 +5,13 @@ from pathlib import PurePosixPath, PureWindowsPath
 
 from review_agent.models import (
     Assignment,
+    CompletionMemoryProjection,
     ContractAssessment,
     ContractItemStatus,
+    PlannerMemoryProjection,
     ReviewerResult,
     ReviewerResultStatus,
+    hard_policy_overflow_diagnostic,
 )
 
 
@@ -22,6 +25,8 @@ def validate_reviewer_completion(
     assignment: Assignment,
     result: ReviewerResult,
     authorized_observation_ids: set[str],
+    *,
+    memory_projection: CompletionMemoryProjection | None = None,
 ) -> ReviewerCompletionValidation:
     """Validate evidence authority and the requirements for a completed review."""
     deficiencies: list[str] = []
@@ -32,6 +37,17 @@ def validate_reviewer_completion(
             return
         seen_deficiencies.add(message)
         deficiencies.append(message)
+
+    if memory_projection is not None and not isinstance(
+        memory_projection,
+        CompletionMemoryProjection,
+    ):
+        raise ValueError(
+            "memory_projection must be a CompletionMemoryProjection or None"
+        )
+    # Memory requirements are Portfolio-wide. Each Assignment is validated only
+    # against its own expanded Contract; global assignment/check coverage is
+    # enforced once by Completion across the complete execution set.
 
     for observation_ref in result.observation_refs:
         if observation_ref not in authorized_observation_ids:
@@ -102,6 +118,42 @@ def validate_reviewer_completion(
     return ReviewerCompletionValidation(
         accepted=not deficiencies,
         deficiencies=tuple(deficiencies),
+    )
+
+
+def completion_memory_projection_from_planner(
+    projection: PlannerMemoryProjection,
+    *,
+    max_hard_policy_items: int = 64,
+    max_hard_policy_bytes: int = 32_768,
+) -> CompletionMemoryProjection:
+    if not isinstance(projection, PlannerMemoryProjection):
+        raise ValueError("projection must be a PlannerMemoryProjection")
+    diagnostics = list(projection.diagnostics)
+    policies = (*projection.required_contracts, *projection.required_checks)
+    memory_ids = tuple(
+        sorted(
+            {
+                memory_id
+                for item in policies
+                for memory_id in item.memory_ids
+            }
+        )
+    )
+    if policies:
+        overflow = hard_policy_overflow_diagnostic(
+            "completion",
+            tuple(item.to_dict() for item in policies),
+            memory_ids,
+            max_items=max_hard_policy_items,
+            max_bytes=max_hard_policy_bytes,
+        )
+        if overflow is not None:
+            diagnostics.append(overflow)
+    return CompletionMemoryProjection(
+        required_contracts=projection.required_contracts,
+        required_checks=projection.required_checks,
+        diagnostics=tuple(diagnostics),
     )
 
 

@@ -16,6 +16,7 @@ from review_agent.incremental import (
     incremental_priority_from_dict,
     incremental_priority_to_dict,
 )
+from review_agent.memory_models import MemoryExecutionConfig, MemoryMode
 from review_agent.revision import RepositoryIdentity, ResolvedRevisions
 from review_agent.session import (
     ReviewExecutionConfig,
@@ -37,6 +38,10 @@ def _parent_manifest():
             reviewer_mode="single",
             reviewer_loop="single-shot",
             non_interactive=True,
+            memory=MemoryExecutionConfig(
+                mode=MemoryMode.OFF,
+                root_path="C:/review-agent-test-memory",
+            ),
         ),
         now="2026-07-12T00:00:00Z",
     )

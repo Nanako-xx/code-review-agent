@@ -5,6 +5,7 @@ from pathlib import Path
 from conftest import run_git
 
 from review_agent.checkpoint import CheckpointStore
+from review_agent.memory_models import MemoryExecutionConfig, MemoryMode
 from review_agent.models import (
     ClarificationQuestion,
     ClarificationStatus,
@@ -115,6 +116,10 @@ def _pipeline(
                 reviewer_mode="single",
                 reviewer_loop="agent-loop",
                 non_interactive=non_interactive,
+                memory=MemoryExecutionConfig(
+                    mode=MemoryMode.OFF,
+                    root_path=str((git_repo / ".memory-test").resolve()),
+                ),
             ),
             now="2026-07-13T00:00:00Z",
         )

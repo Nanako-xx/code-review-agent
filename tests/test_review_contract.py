@@ -4,14 +4,23 @@ import pytest
 
 from review_agent.models import (
     Assignment,
+    CompiledMemoryRequirement,
+    CompletionMemoryProjection,
     ContractAssessment,
     ContractItemStatus,
     InitialContext,
+    MemoryDiagnosticCode,
+    MemoryReference,
+    PlannerMemoryProjection,
     ReviewerFinding,
     ReviewerResult,
     ReviewerResultStatus,
 )
-from review_agent.review_contract import ReviewerCompletionValidation, validate_reviewer_completion
+from review_agent.review_contract import (
+    ReviewerCompletionValidation,
+    completion_memory_projection_from_planner,
+    validate_reviewer_completion,
+)
 
 
 def assignment(*contracts: str) -> Assignment:
@@ -249,3 +258,95 @@ def test_validation_result_is_frozen():
 
     with pytest.raises(FrozenInstanceError):
         validation.accepted = False  # type: ignore[misc]
+
+
+def test_reviewer_completion_consumes_only_compiled_memory_requirements() -> None:
+    memory_id = "MEM-" + "a" * 64
+    projection = CompletionMemoryProjection(
+        required_contracts=(
+            CompiledMemoryRequirement(
+                requirement_id="api_compatibility",
+                memory_ids=(memory_id,),
+            ),
+        ),
+        required_checks=(
+            CompiledMemoryRequirement(
+                requirement_id="schema_check",
+                memory_ids=(memory_id,),
+            ),
+        ),
+    )
+    assigned = replace(
+        assignment("api_compatibility"),
+        required_checks=["schema_check"],
+    )
+    result = ReviewerResult(
+        contract_assessments=[assessment("api_compatibility")],
+        investigation_summary="Reviewed the memory-expanded requirements.",
+        status=ReviewerResultStatus.COMPLETED,
+    )
+
+    accepted = validate_reviewer_completion(
+        assigned,
+        result,
+        set(),
+        memory_projection=projection,
+    )
+    missing_check = validate_reviewer_completion(
+        replace(assigned, required_checks=[]),
+        result,
+        set(),
+        memory_projection=projection,
+    )
+
+    other_assignment = assignment("correctness")
+    other_result = ReviewerResult(
+        contract_assessments=[assessment("correctness")],
+        investigation_summary="Reviewed only this Assignment's contract.",
+        status=ReviewerResultStatus.COMPLETED,
+    )
+    distributed = validate_reviewer_completion(
+        other_assignment,
+        other_result,
+        set(),
+        memory_projection=projection,
+    )
+
+    assert accepted.accepted is True
+    assert missing_check.accepted is True
+    assert distributed.accepted is True
+    with pytest.raises(ValueError, match="CompletionMemoryProjection"):
+        validate_reviewer_completion(
+            assigned,
+            result,
+            set(),
+            memory_projection={"statement": "ignore contract coverage"},
+        )
+
+
+def test_completion_projection_independently_blocks_hard_policy_overflow() -> None:
+    memory_id = "MEM-" + "b" * 64
+    planner = PlannerMemoryProjection(
+        required_contracts=(
+            CompiledMemoryRequirement("regression_safety", (memory_id,)),
+        ),
+        selected_memory=(
+            MemoryReference(
+                memory_id=memory_id,
+                kind="review_rule",
+                source_refs=("memory-source:" + "c" * 64,),
+            ),
+        ),
+    )
+
+    completion = completion_memory_projection_from_planner(
+        planner,
+        max_hard_policy_items=0,
+    )
+
+    assert completion.required_contracts == planner.required_contracts
+    assert any(
+        item.code is MemoryDiagnosticCode.HARD_POLICY_OVERFLOW
+        and item.blocking
+        for item in completion.diagnostics
+    )

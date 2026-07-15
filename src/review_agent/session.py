@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, TypeVar
 from urllib.parse import urlsplit
 
+from review_agent.memory_models import MemoryExecutionConfig
 from review_agent.revision import RepositoryIdentity, ResolvedRevisions
 from review_agent.run_state import RunPhase, RunStatus
 
@@ -16,16 +17,19 @@ from review_agent.run_state import RunPhase, RunStatus
 LEGACY_SESSION_SCHEMA_VERSION = 1
 PREVIOUS_SESSION_SCHEMA_VERSION = 2
 MODEL_STAGE_SESSION_SCHEMA_VERSION = 3
-SESSION_SCHEMA_VERSION = 4
+SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION = 4
+SESSION_SCHEMA_VERSION = 5
 SUPPORTED_SESSION_SCHEMA_VERSIONS = (
     LEGACY_SESSION_SCHEMA_VERSION,
     PREVIOUS_SESSION_SCHEMA_VERSION,
     MODEL_STAGE_SESSION_SCHEMA_VERSION,
+    SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION,
     SESSION_SCHEMA_VERSION,
 )
 RESUMABLE_SESSION_SCHEMA_VERSIONS = (
     PREVIOUS_SESSION_SCHEMA_VERSION,
     MODEL_STAGE_SESSION_SCHEMA_VERSION,
+    SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION,
     SESSION_SCHEMA_VERSION,
 )
 DEFAULT_MODEL_STAGE_API_KEY_ENV = "REVIEW_AGENT_API_KEY"
@@ -54,7 +58,7 @@ PREVIOUS_SESSION_PHASES = (
     RunPhase.FINAL_RISK,
     RunPhase.REPORTING,
 )
-SESSION_PHASES = (
+SEMANTIC_RECONCILIATION_SESSION_PHASES = (
     RunPhase.PREFLIGHT,
     RunPhase.QUALITY_GATES,
     RunPhase.REPOSITORY_INTELLIGENCE,
@@ -67,6 +71,23 @@ SESSION_PHASES = (
     RunPhase.RECONCILIATION,
     RunPhase.COMPLETION,
     RunPhase.FINAL_RISK,
+    RunPhase.REPORTING,
+)
+SESSION_PHASES = (
+    RunPhase.PREFLIGHT,
+    RunPhase.QUALITY_GATES,
+    RunPhase.REPOSITORY_INTELLIGENCE,
+    RunPhase.MEMORY_SELECTION,
+    RunPhase.INTENT_DISCOVERY,
+    RunPhase.INTENT_RESOLUTION,
+    RunPhase.PLANNING,
+    RunPhase.REVIEWERS,
+    RunPhase.RECONCILIATION_ANALYSIS,
+    RunPhase.SUPPLEMENTAL_INVESTIGATION,
+    RunPhase.RECONCILIATION,
+    RunPhase.COMPLETION,
+    RunPhase.FINAL_RISK,
+    RunPhase.MEMORY_PROPOSAL,
     RunPhase.REPORTING,
 )
 
@@ -347,6 +368,8 @@ class ReviewExecutionConfig:
     portfolio_planner: ModelStageConfig = field(default_factory=ModelStageConfig)
     semantic_reconciler: ModelStageConfig = field(default_factory=ModelStageConfig)
     supplemental_policy: SupplementalPolicy = field(default_factory=SupplementalPolicy)
+    memory: MemoryExecutionConfig | None = None
+    memory_curator: ModelStageConfig = field(default_factory=ModelStageConfig)
 
     def __post_init__(self) -> None:
         if not _ENVIRONMENT_VARIABLE_PATTERN.fullmatch(self.reviewer_api_key_env):
@@ -365,6 +388,13 @@ class ReviewExecutionConfig:
             raise ValueError("semantic_reconciler must be a ModelStageConfig")
         if not isinstance(self.supplemental_policy, SupplementalPolicy):
             raise ValueError("supplemental_policy must be a SupplementalPolicy")
+        if self.memory is not None and not isinstance(
+            self.memory,
+            MemoryExecutionConfig,
+        ):
+            raise ValueError("memory must be a MemoryExecutionConfig or null")
+        if not isinstance(self.memory_curator, ModelStageConfig):
+            raise ValueError("memory_curator must be a ModelStageConfig")
 
 
 @dataclass(frozen=True)
@@ -817,13 +847,26 @@ class SessionManifest:
                 "schema v1/v2 Sessions must use local risk_assessor and "
                 "portfolio_planner configurations"
             )
-        if self.schema_version < SESSION_SCHEMA_VERSION and (
+        if self.schema_version < SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION and (
             self.execution.semantic_reconciler != ModelStageConfig()
             or self.execution.supplemental_policy != SupplementalPolicy()
         ):
             raise ValueError(
                 "schema v1/v2/v3 Sessions must use local semantic_reconciler "
                 "and the legacy supplemental policy default"
+            )
+        if self.schema_version < SESSION_SCHEMA_VERSION:
+            if (
+                self.execution.memory is not None
+                or self.execution.memory_curator != ModelStageConfig()
+            ):
+                raise ValueError(
+                    "schema v1/v2/v3/v4 Sessions must use legacy memory-off "
+                    "and no-curator execution semantics"
+                )
+        elif self.execution.memory is None:
+            raise ValueError(
+                "schema v5 Sessions require a fixed MemoryExecutionConfig"
             )
 
         _validate_manifest_object_ids(self)
@@ -962,7 +1005,10 @@ class SessionManifest:
         if not isinstance(self.supplemental_waves, Mapping):
             raise ValueError("supplemental_waves must be a mapping")
         supplemental_waves = dict(self.supplemental_waves)
-        if self.schema_version < SESSION_SCHEMA_VERSION and supplemental_waves:
+        if (
+            self.schema_version < SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
+            and supplemental_waves
+        ):
             raise ValueError("schema v1/v2/v3 Sessions cannot contain supplemental_waves")
         expected_wave_index = 1
         task_ids: set[str] = set()
@@ -1198,6 +1244,8 @@ def session_phases_for_schema(schema_version: int) -> tuple[RunPhase, ...]:
         MODEL_STAGE_SESSION_SCHEMA_VERSION,
     }:
         return PREVIOUS_SESSION_PHASES
+    if schema_version == SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION:
+        return SEMANTIC_RECONCILIATION_SESSION_PHASES
     if schema_version == SESSION_SCHEMA_VERSION:
         return SESSION_PHASES
     raise ValueError(f"unsupported session schema_version: {schema_version}")
@@ -1241,6 +1289,7 @@ def child_session_manifest(
     revisions: ResolvedRevisions,
     change_kind: RevisionChangeKind,
     now: str,
+    execution: ReviewExecutionConfig | None = None,
 ) -> SessionManifest:
     if change_kind is RevisionChangeKind.INITIAL:
         raise ValueError("child Session change_kind must describe revision drift")
@@ -1249,6 +1298,38 @@ def child_session_manifest(
         if change_kind is RevisionChangeKind.HEAD_MOVED
         else None
     )
+    if parent.schema_version == SESSION_SCHEMA_VERSION:
+        if execution is not None and execution != parent.execution:
+            raise ValueError(
+                "v5 revision-drift child must preserve the parent's fixed "
+                "execution config"
+            )
+        child_execution = parent.execution
+    else:
+        if execution is None or execution.memory is None:
+            raise ValueError(
+                "legacy revision-drift child requires an explicit v5 execution "
+                "config with a fixed MemoryExecutionConfig"
+            )
+        legacy_projection = ReviewExecutionConfig(
+            reviewer_provider=execution.reviewer_provider,
+            reviewer_model=execution.reviewer_model,
+            reviewer_base_url=execution.reviewer_base_url,
+            reviewer_api_key_env=execution.reviewer_api_key_env,
+            reviewer_mode=execution.reviewer_mode,
+            reviewer_loop=execution.reviewer_loop,
+            non_interactive=execution.non_interactive,
+            risk_assessor=execution.risk_assessor,
+            portfolio_planner=execution.portfolio_planner,
+            semantic_reconciler=execution.semantic_reconciler,
+            supplemental_policy=execution.supplemental_policy,
+        )
+        if legacy_projection != parent.execution:
+            raise ValueError(
+                "legacy revision-drift child must preserve the parent's fixed "
+                "non-memory execution config"
+            )
+        child_execution = execution
     return SessionManifest(
         schema_version=SESSION_SCHEMA_VERSION,
         review_id=review_id,
@@ -1259,7 +1340,7 @@ def child_session_manifest(
         original_base_sha=parent.original_base_sha,
         incremental_from_sha=incremental_from_sha,
         revision_change_kind=change_kind,
-        execution=parent.execution,
+        execution=child_execution,
         status=RunStatus.CREATED,
         current_phase=RunPhase.CREATED,
         last_successful_phase=None,
@@ -1390,7 +1471,10 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
                 ),
             }
         )
-    if manifest.schema_version >= SESSION_SCHEMA_VERSION:
+    if (
+        manifest.schema_version
+        >= SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
+    ):
         execution_payload.update(
             {
                 "semantic_reconciler": model_stage_payload(
@@ -1398,6 +1482,19 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
                 ),
                 "supplemental_policy": supplemental_policy_payload(
                     manifest.execution.supplemental_policy
+                ),
+            }
+        )
+    if manifest.schema_version >= SESSION_SCHEMA_VERSION:
+        if manifest.execution.memory is None:
+            raise ValueError(
+                "schema v5 Sessions require a fixed MemoryExecutionConfig"
+            )
+        execution_payload.update(
+            {
+                "memory": manifest.execution.memory.to_dict(),
+                "memory_curator": model_stage_payload(
+                    manifest.execution.memory_curator
                 ),
             }
         )
@@ -1448,7 +1545,10 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
         "created_at": manifest.created_at,
         "updated_at": manifest.updated_at,
     }
-    if manifest.schema_version >= SESSION_SCHEMA_VERSION:
+    if (
+        manifest.schema_version
+        >= SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
+    ):
         payload["supplemental_waves"] = {
             wave_id: wave_payload(wave)
             for wave_id, wave in manifest.supplemental_waves.items()
@@ -1482,7 +1582,7 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
         "created_at",
         "updated_at",
     }
-    if schema_version >= SESSION_SCHEMA_VERSION:
+    if schema_version >= SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION:
         root_fields.add("supplemental_waves")
     _exact_fields(
         root,
@@ -1543,8 +1643,10 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
     }
     if schema_version >= MODEL_STAGE_SESSION_SCHEMA_VERSION:
         execution_fields |= {"risk_assessor", "portfolio_planner"}
-    if schema_version >= SESSION_SCHEMA_VERSION:
+    if schema_version >= SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION:
         execution_fields |= {"semantic_reconciler", "supplemental_policy"}
+    if schema_version >= SESSION_SCHEMA_VERSION:
+        execution_fields |= {"memory", "memory_curator"}
     _exact_fields(
         execution_payload,
         execution_fields,
@@ -1554,6 +1656,8 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
     portfolio_planner = ModelStageConfig()
     semantic_reconciler = ModelStageConfig()
     supplemental_policy = SupplementalPolicy()
+    memory: MemoryExecutionConfig | None = None
+    memory_curator = ModelStageConfig()
     if schema_version >= MODEL_STAGE_SESSION_SCHEMA_VERSION:
         risk_assessor = _model_stage_config_from_dict(
             _object_field(execution_payload, "risk_assessor", "session.execution"),
@@ -1563,7 +1667,7 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
             _object_field(execution_payload, "portfolio_planner", "session.execution"),
             "session.execution.portfolio_planner",
         )
-    if schema_version >= SESSION_SCHEMA_VERSION:
+    if schema_version >= SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION:
         semantic_reconciler = _model_stage_config_from_dict(
             _object_field(
                 execution_payload,
@@ -1579,6 +1683,18 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
                 "session.execution",
             ),
             "session.execution.supplemental_policy",
+        )
+    if schema_version >= SESSION_SCHEMA_VERSION:
+        memory = MemoryExecutionConfig.from_dict(
+            _object_field(execution_payload, "memory", "session.execution")
+        )
+        memory_curator = _model_stage_config_from_dict(
+            _object_field(
+                execution_payload,
+                "memory_curator",
+                "session.execution",
+            ),
+            "session.execution.memory_curator",
         )
     execution = ReviewExecutionConfig(
         reviewer_provider=_string(
@@ -1620,6 +1736,8 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
         portfolio_planner=portfolio_planner,
         semantic_reconciler=semantic_reconciler,
         supplemental_policy=supplemental_policy,
+        memory=memory,
+        memory_curator=memory_curator,
     )
 
     phases_payload = _object_field(root, "phases", "session")
@@ -1651,7 +1769,7 @@ def session_manifest_from_dict(payload: Mapping[str, Any]) -> SessionManifest:
         artifacts[artifact_name] = descriptor
 
     supplemental_waves: dict[str, ReviewWaveCheckpoint] = {}
-    if schema_version >= SESSION_SCHEMA_VERSION:
+    if schema_version >= SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION:
         waves_payload = _object_field(root, "supplemental_waves", "session")
         for wave_id, wave_payload in waves_payload.items():
             if not isinstance(wave_id, str):

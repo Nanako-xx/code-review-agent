@@ -4,7 +4,32 @@ from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 from review_agent.git_repo import ChangeSummary
-from review_agent.models import IntentPacket, RiskAssessment, RiskAssessmentPacket, RiskLevel
+from review_agent.memory_models import (
+    MAX_SNAPSHOT_RECORDS,
+    DurableMemoryRecord,
+    MemoryKind,
+    RecordStatus,
+    Sensitivity,
+    canonical_sha256,
+)
+from review_agent.memory_policy import (
+    PolicyCompilation,
+    PolicyDiagnosticSeverity,
+    RaiseRiskFloorAction,
+)
+from review_agent.models import (
+    CompiledRiskFloor,
+    IntentPacket,
+    MemoryDiagnostic,
+    MemoryDiagnosticCode,
+    MemoryReference,
+    MemoryRiskSignal,
+    RiskAssessment,
+    RiskAssessmentPacket,
+    RiskMemoryProjection,
+    RiskLevel,
+    hard_policy_overflow_diagnostic,
+)
 
 
 SENSITIVE_PATH_MARKERS = ("auth", "payment", "billing", "security", "migration", "permissions")
@@ -20,6 +45,7 @@ def build_risk_packet(
     intent_packet: IntentPacket,
     quality_gate_status: Mapping[str, str],
     repository_intelligence: object | None = None,
+    memory_projection: RiskMemoryProjection | None = None,
 ) -> RiskAssessmentPacket:
     """Build the bounded, deterministic input used by local and model risk assessors.
 
@@ -40,6 +66,10 @@ def build_risk_packet(
 
     changed_symbols = _changed_symbol_summaries(repository_intelligence)
     normalized_quality_gates = _normalized_quality_gates(quality_gate_status)
+    if memory_projection is not None and not isinstance(
+        memory_projection, RiskMemoryProjection
+    ):
+        raise ValueError("memory_projection must be a RiskMemoryProjection or None")
     normalized_intent_uncertainties = [
         _non_empty_text(item, f"intent uncertainty {index}").strip()
         for index, item in enumerate(intent_packet.uncertainties)
@@ -52,6 +82,10 @@ def build_risk_packet(
         intent_uncertainties=normalized_intent_uncertainties,
         diff_excerpt=change_summary.diff_excerpt[:80],
     )
+    if memory_projection is not None:
+        for signal in memory_projection.signals:
+            signal_catalog[signal.signal_ref] = signal.summary
+        signal_catalog = dict(sorted(signal_catalog.items()))
     return RiskAssessmentPacket(
         change_summary={
             "repository_path": change_summary.repository_path,
@@ -69,7 +103,109 @@ def build_risk_packet(
         diff_excerpt=list(change_summary.diff_excerpt[:80]),
         changed_symbols=changed_symbols,
         signal_catalog=signal_catalog,
+        memory_projection=memory_projection,
     )
+
+
+def build_risk_memory_projection(
+    records: Sequence[DurableMemoryRecord],
+    compilation: PolicyCompilation,
+    *,
+    diagnostics: Sequence[MemoryDiagnostic] = (),
+    max_hard_policy_items: int = 64,
+    max_hard_policy_bytes: int = 32_768,
+) -> RiskMemoryProjection:
+    """Build the minimal risk view; only compiled floor actions carry authority."""
+
+    if not isinstance(compilation, PolicyCompilation):
+        raise ValueError("compilation must be a PolicyCompilation")
+    if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
+        raise ValueError("records must be a sequence of DurableMemoryRecord values")
+    if len(records) > MAX_SNAPSHOT_RECORDS:
+        raise ValueError("records exceed the bounded Memory projection limit")
+    by_id: dict[str, DurableMemoryRecord] = {}
+    references: dict[str, MemoryReference] = {}
+    signals: list[MemoryRiskSignal] = []
+    for item in records:
+        if type(item) is not DurableMemoryRecord:
+            raise ValueError("records must contain DurableMemoryRecord values")
+        canonical = DurableMemoryRecord.from_dict(item.to_dict())
+        if canonical != item or canonical.status is not RecordStatus.ACTIVE:
+            raise ValueError("risk projection accepts only canonical active records")
+        if canonical.sensitivity is Sensitivity.BLOCKED:
+            raise ValueError("blocked-sensitivity Memory cannot enter risk projection")
+        if canonical.memory_id in by_id:
+            raise ValueError("records must not repeat a memory_id")
+        by_id[canonical.memory_id] = canonical
+        reference = _memory_reference(canonical)
+        references[canonical.memory_id] = reference
+        if canonical.kind not in {
+            MemoryKind.HIGH_RISK_MODULE,
+            MemoryKind.INCIDENT_LESSON,
+        }:
+            continue
+        signals.append(
+            MemoryRiskSignal(
+                signal_ref=f"memory:{canonical.memory_id}",
+                summary=canonical.statement,
+                memory=reference,
+            )
+        )
+
+    projected_diagnostics = list(diagnostics)
+    projected_diagnostics.extend(
+        MemoryDiagnostic(
+            code=MemoryDiagnosticCode.POLICY_REJECTED,
+            message=item.message,
+            memory_ids=(() if item.memory_id is None else (item.memory_id,)),
+        )
+        for item in compilation.diagnostics
+        if item.severity is PolicyDiagnosticSeverity.BLOCKING
+    )
+    floor_actions = [
+        item for item in compilation.actions if type(item) is RaiseRiskFloorAction
+    ]
+    risk_floor = None
+    policy_sources: tuple[MemoryReference, ...] = ()
+    if floor_actions:
+        order = {level: index for index, level in enumerate(RiskLevel)}
+        highest = max(floor_actions, key=lambda item: order[item.minimum_level])
+        all_ids = tuple(sorted({mid for item in floor_actions for mid in item.memory_ids}))
+        risk_floor = CompiledRiskFloor(highest.minimum_level, all_ids)
+        policy_sources = tuple(
+            references[memory_id]
+            for memory_id in all_ids
+            if memory_id in references
+        )
+        missing_ids = tuple(
+            memory_id for memory_id in all_ids if memory_id not in references
+        )
+        if missing_ids:
+            projected_diagnostics.append(
+                MemoryDiagnostic(
+                    code=MemoryDiagnosticCode.POLICY_REJECTED,
+                    message="compiled risk floor provenance is absent from the stage input",
+                    memory_ids=missing_ids,
+                )
+            )
+        overflow = hard_policy_overflow_diagnostic(
+            "initial_risk",
+            tuple(item.to_dict() for item in floor_actions),
+            all_ids,
+            max_items=max_hard_policy_items,
+            max_bytes=max_hard_policy_bytes,
+        )
+        if overflow is not None:
+            projected_diagnostics.append(overflow)
+    return RiskMemoryProjection(
+        signals=tuple(signals),
+        risk_floor=risk_floor,
+        policy_sources=policy_sources,
+        diagnostics=tuple(projected_diagnostics),
+    )
+
+
+project_memory_for_risk = build_risk_memory_projection
 
 
 class LocalRiskAssessor:
@@ -100,6 +236,7 @@ class LocalRiskAssessor:
             if status in {"unavailable", "timed_out", "error"}
         )
         signal_refs: list[str] = []
+        uncertainties = list(packet.intent_uncertainties)
 
         if sensitive_files:
             level = RiskLevel.HIGH
@@ -139,6 +276,33 @@ class LocalRiskAssessor:
                 for name in [*failed_gates, *unavailable_gates]
             )
 
+        memory = packet.memory_projection
+        if memory is not None:
+            for signal in memory.signals:
+                if signal.memory.local_only:
+                    continue
+                reasons.append(f"approved memory risk signal: {signal.summary}")
+                signal_refs.append(signal.signal_ref)
+            uncertainties.extend(
+                f"memory {item.code.value}: {item.message}"
+                for item in memory.diagnostics
+            )
+            if memory.signals:
+                focus = list(dict.fromkeys(["approved incident lessons", *focus]))
+            if memory.risk_floor is not None:
+                order = {value: index for index, value in enumerate(RiskLevel)}
+                if order[memory.risk_floor.minimum_level] > order[level]:
+                    level = memory.risk_floor.minimum_level
+                    reasons.append(
+                        "compiled Memory risk floor applied: "
+                        + memory.risk_floor.minimum_level.value
+                    )
+                signal_refs.extend(
+                    f"memory_floor:{memory_id}"
+                    for memory_id in memory.risk_floor.memory_ids
+                    if memory_id not in set(memory.local_only_memory_ids)
+                )
+
         return RiskAssessment(
             level=level,
             dimensions={
@@ -149,8 +313,8 @@ class LocalRiskAssessor:
                 "verification_strength": "derived from quality gates",
             },
             reasons=reasons,
-            signal_refs=signal_refs,
-            uncertainties=list(packet.intent_uncertainties),
+            signal_refs=list(dict.fromkeys(signal_refs)),
+            uncertainties=list(dict.fromkeys([*packet.intent_uncertainties, *uncertainties])),
             suggested_focus=focus,
         )
 
@@ -161,6 +325,21 @@ def _all_doc_like(paths: list[str]) -> bool:
     return bool(paths) and all(
         path.lower().endswith(doc_suffixes) or path.lower().startswith(doc_prefixes)
         for path in paths
+    )
+
+
+def _memory_reference(record: DurableMemoryRecord) -> MemoryReference:
+    return MemoryReference(
+        memory_id=record.memory_id,
+        kind=record.kind.value,
+        source_refs=tuple(
+            [f"memory:{record.memory_id}"]
+            + [
+                f"memory-source:{canonical_sha256(source.to_dict())}"
+                for source in record.source_refs
+            ]
+        ),
+        local_only=record.sensitivity is Sensitivity.LOCAL_ONLY,
     )
 
 

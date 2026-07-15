@@ -117,6 +117,8 @@ def _fake_response_for_request(request: ModelTurnRequest) -> ModelTurnResponse:
         return _fake_portfolio_proposal_response()
     if response_schema == "semantic_reconciliation_proposal_v1":
         return _fake_semantic_reconciliation_response(request)
+    if response_schema == "memory_curator_proposal_v1":
+        return _fake_memory_curator_response(request)
     if not request.tools or request.parameters.get("tool_choice") == "none":
         return _fake_single_shot_response()
 
@@ -283,6 +285,77 @@ def _fake_semantic_reconciliation_response(
         raw={
             "fake": True,
             "response_schema": "semantic_reconciliation_proposal_v1",
+        },
+    )
+
+
+def _fake_memory_curator_response(
+    request: ModelTurnRequest,
+) -> ModelTurnResponse:
+    envelope: dict[str, object] = {}
+    for message in request.messages:
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            candidate = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and isinstance(
+            candidate.get("source_ref_allowlist"),
+            list,
+        ):
+            envelope = candidate
+            break
+
+    source_ref_ids = []
+    source_catalog = envelope.get("source_ref_allowlist", [])
+    if isinstance(source_catalog, list):
+        for item in source_catalog:
+            if not isinstance(item, dict):
+                continue
+            source_ref_id = item.get("source_ref_id")
+            if isinstance(source_ref_id, str) and source_ref_id:
+                source_ref_ids.append(source_ref_id)
+                break
+
+    candidates = []
+    if source_ref_ids:
+        candidates.append(
+            {
+                "candidate_id": "fake-memory-candidate-1",
+                "kind": "review_rule",
+                "statement": (
+                    "Preserve verified project behavior represented by the "
+                    "authorized source."
+                ),
+                "scope": {
+                    "schema_version": 1,
+                    "paths": [],
+                    "symbols": [],
+                    "contracts": [],
+                    "languages": [],
+                },
+                "source_ref_ids": source_ref_ids,
+                "validity_policies": ["source_content_hash"],
+                "confidence": "low",
+                "sensitivity": "normal",
+                "policy_effect_id": None,
+            }
+        )
+    return ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=json.dumps(
+            {
+                "schema_version": 1,
+                "candidates": candidates,
+            }
+        ),
+        provider_name="fake",
+        model="fake-memory-curator",
+        raw={
+            "fake": True,
+            "response_schema": "memory_curator_proposal_v1",
         },
     )
 

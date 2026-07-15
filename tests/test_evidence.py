@@ -1,6 +1,8 @@
 import pytest
 
 from review_agent.evidence import (
+    CanonicalFinding,
+    canonical_finding_to_dict,
     build_reconciliation_prepass,
     reconcile_evidence,
     reconciliation_to_dict,
@@ -90,6 +92,42 @@ def test_reconcile_evidence_keeps_and_deduplicates_supported_findings():
     assert payload["canonical_findings"][0]["claim"] == "Auth bypass"
     assert payload["canonical_findings"][0]["reviewer_indices"] == [0, 1]
     assert payload["canonical_findings"][0]["roles"] == ["Core Reviewer", "Adversarial Reviewer"]
+
+
+def test_canonical_finding_id_uses_the_feedback_protocol_shape():
+    with pytest.raises(ValueError, match="32 or 64 lowercase hex"):
+        CanonicalFinding(
+            claim="Invalid identity",
+            severity="high",
+            confidence="high",
+            evidence_refs=["O-auth"],
+            reviewer_indices=[0],
+            roles=["core"],
+            finding_id="F-1",
+        )
+
+
+def test_canonical_finding_serializer_projects_id_without_changing_legacy_shape():
+    legacy = CanonicalFinding(
+        claim="Legacy finding",
+        severity="medium",
+        confidence="medium",
+        evidence_refs=["O-auth"],
+        reviewer_indices=[0],
+        roles=["core"],
+    )
+    canonical = CanonicalFinding(
+        claim="Canonical finding",
+        severity="high",
+        confidence="high",
+        evidence_refs=["O-auth"],
+        reviewer_indices=[0],
+        roles=["core"],
+        finding_id="F-" + "f" * 32,
+    )
+
+    assert "finding_id" not in canonical_finding_to_dict(legacy)
+    assert canonical_finding_to_dict(canonical)["finding_id"] == "F-" + "f" * 32
 
 
 def test_prepass_keeps_stable_candidates_before_exact_deduplication():

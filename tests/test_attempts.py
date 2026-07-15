@@ -16,6 +16,28 @@ def test_attempt_workspace_uses_phase_and_reviewer_isolation(tmp_path: Path) -> 
     )
 
 
+@pytest.mark.parametrize(
+    ("phase", "phase_namespace"),
+    [
+        (RunPhase.MEMORY_SELECTION, "memory_selection"),
+        (RunPhase.MEMORY_PROPOSAL, "memory_proposal"),
+    ],
+)
+def test_memory_attempt_workspace_uses_canonical_session_relative_phase_namespace(
+    tmp_path: Path,
+    phase: RunPhase,
+    phase_namespace: str,
+) -> None:
+    workspace = AttemptWorkspace(tmp_path, phase, 3)
+
+    assert workspace.prepare() == (
+        tmp_path / "attempts" / phase_namespace / "3"
+    )
+    assert workspace.path.relative_to(tmp_path).as_posix() == (
+        f"attempts/{phase_namespace}/3"
+    )
+
+
 def test_attempt_workspace_uses_safe_supplemental_task_namespace(
     tmp_path: Path,
 ) -> None:

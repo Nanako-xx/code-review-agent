@@ -1,10 +1,16 @@
 from pathlib import Path
+import os
 import subprocess
 
 import pytest
 
 from conftest import run_git
-from review_agent.revision import RevisionResolver
+from review_agent.revision import (
+    RevisionResolver,
+    normalize_repository_identity_path,
+    normalize_repository_origin,
+    sanitize_origin_url,
+)
 
 
 def test_revision_resolver_resolves_symbolic_revisions_to_commit_shas(
@@ -136,6 +142,98 @@ def test_repository_identity_sanitizes_strict_scp_like_origin(
     assert identity.origin_url == "example.test:acme/review-target.git"
 
 
+def test_public_origin_sanitizer_matches_repository_identity_behavior(
+    git_repo: Path,
+) -> None:
+    raw_origin = (
+        "HTTPS://user:token@Example.Test/acme/review-target.git"
+        "?access_token=secret#credential"
+    )
+    run_git(git_repo, "remote", "add", "origin", raw_origin)
+
+    identity = RevisionResolver().repository_identity(git_repo)
+
+    assert identity.origin_url == sanitize_origin_url(raw_origin)
+    assert normalize_repository_origin(raw_origin) == (
+        "https://example.test/acme/review-target.git"
+    )
+
+
+def test_repository_identity_path_normalization_is_stable(
+    git_repo: Path,
+) -> None:
+    identity = RevisionResolver().repository_identity(git_repo)
+    common_dir = Path(identity.git_common_dir)
+
+    assert normalize_repository_identity_path(common_dir) == (
+        normalize_repository_identity_path(common_dir / "." / "nested" / "..")
+    )
+
+
+def test_repository_layout_enumerates_linked_worktrees_and_real_git_dirs(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    linked = tmp_path / "revision-layout-linked"
+    run_git(
+        git_repo,
+        "worktree",
+        "add",
+        "-b",
+        "revision-layout-linked",
+        str(linked),
+        "HEAD",
+    )
+
+    layout = RevisionResolver().repository_layout(git_repo)
+
+    assert layout.git_common_dir == str((git_repo / ".git").resolve())
+    assert set(layout.worktree_paths) == {
+        str(git_repo.resolve()),
+        str(linked.resolve()),
+    }
+    assert layout.git_common_dir in layout.git_dirs
+    assert any(
+        Path(git_dir).parent == Path(layout.git_common_dir) / "worktrees"
+        for git_dir in layout.git_dirs
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits non-UTF-8 path bytes")
+def test_worktree_parser_preserves_non_utf8_path_bytes(tmp_path: Path) -> None:
+    from review_agent.revision import _parse_worktree_paths
+
+    raw_path = os.fsencode(str(tmp_path)) + b"/worktree-\xff"
+    output = b"worktree " + raw_path + b"\0HEAD " + (b"a" * 40) + b"\0\0"
+
+    parsed = _parse_worktree_paths(output)
+
+    assert len(parsed) == 1
+    assert os.fsencode(parsed[0]) == raw_path
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits non-UTF-8 path bytes")
+def test_repository_layout_preserves_non_utf8_repository_path_bytes(
+    tmp_path: Path,
+) -> None:
+    raw_repository = os.fsencode(str(tmp_path)) + b"/repository-\xff"
+    os.mkdir(raw_repository)
+    repository = Path(os.fsdecode(raw_repository))
+    run_git(repository, "init")
+    run_git(repository, "config", "user.email", "review-agent@example.test")
+    run_git(repository, "config", "user.name", "Review Agent")
+    (repository / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    run_git(repository, "add", "app.py")
+    run_git(repository, "commit", "-m", "initial")
+
+    resolver = RevisionResolver()
+    identity = resolver.repository_identity(repository)
+    layout = resolver.repository_layout(repository)
+
+    assert os.fsencode(identity.canonical_path) == raw_repository
+    assert os.fsencode(layout.worktree_paths[0]) == raw_repository
+
+
 def test_revision_resolver_reports_invalid_revision(git_repo: Path) -> None:
     with pytest.raises(ValueError, match="missing-revision") as captured:
         RevisionResolver().resolve_commit(git_repo, "missing-revision")
@@ -223,3 +321,74 @@ def test_commit_exists_supports_sha256_repository_object_ids(tmp_path: Path) -> 
     assert resolver.commit_exists(repo, "0" * 64) is False
     with pytest.raises(ValueError, match="full sha256 object ID"):
         resolver.commit_exists(repo, head_sha[:16])
+
+
+def test_revision_resolver_strips_inherited_git_routing_and_object_environment(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head_sha = run_git(git_repo, "rev-parse", "HEAD")
+    inherited = {
+        "GIT_DIR": str(git_repo / "other.git"),
+        "GIT_WORK_TREE": str(git_repo / "other-worktree"),
+        "GIT_COMMON_DIR": str(git_repo / "other-common"),
+        "GIT_OBJECT_DIRECTORY": str(git_repo / "other-objects"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(git_repo / "alternates"),
+        "GIT_NAMESPACE": "attacker",
+        "GIT_REPLACE_REF_BASE": "refs/attacker/",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.repositoryformatversion",
+        "GIT_CONFIG_VALUE_0": "999",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+
+    calls: list[tuple[list[str], dict[str, str]]] = []
+    real_run = subprocess.run
+
+    def recording_run(
+        command: list[str],
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[object]:
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        calls.append((command, environment))
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+
+    resolver = RevisionResolver()
+    assert resolver.resolve_commit(git_repo, head_sha) == head_sha
+    assert resolver.commit_exists(git_repo, head_sha)
+
+    assert calls
+    for command, environment in calls:
+        assert command[:2] == ["git", "--no-replace-objects"]
+        assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+        for key in inherited:
+            assert key not in environment
+
+
+def test_revision_resolver_authorizes_only_exact_commit_ancestry(
+    git_repo: Path,
+) -> None:
+    ancestor = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "app.py").write_text("print('next')\n", encoding="utf-8")
+    run_git(git_repo, "add", "app.py")
+    run_git(git_repo, "commit", "-m", "next commit")
+    descendant = run_git(git_repo, "rev-parse", "HEAD")
+    tree_sha = run_git(git_repo, "rev-parse", "HEAD^{tree}")
+    unrelated = run_git(
+        git_repo,
+        "commit-tree",
+        tree_sha,
+        "-m",
+        "unrelated commit",
+    )
+    resolver = RevisionResolver()
+
+    assert resolver.is_ancestor(git_repo, ancestor, descendant)
+    assert not resolver.is_ancestor(git_repo, unrelated, descendant)
+    with pytest.raises(ValueError, match="full sha1 object ID"):
+        resolver.is_ancestor(git_repo, "HEAD", descendant)

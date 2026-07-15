@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 from pathlib import PurePosixPath
+import re
 from typing import Any
 
 from review_agent.models import ContractAssessment, ReviewerFinding
@@ -24,6 +25,7 @@ CONFLICT_HINT_KINDS = (
     "severity_mismatch",
     "location_mismatch",
 )
+_FINDING_ID_PATTERN = re.compile(r"^F-[0-9a-f]{32}(?:[0-9a-f]{32})?$")
 
 
 @dataclass(frozen=True)
@@ -66,8 +68,10 @@ class FindingCandidate:
             "validation_status": self.validation_status,
         }.items():
             _require_non_empty_text(value, f"candidate.{name}")
-        if not self.finding_id.startswith("F-"):
-            raise ValueError("candidate.finding_id must start with F-")
+        if not _FINDING_ID_PATTERN.fullmatch(self.finding_id):
+            raise ValueError(
+                "candidate.finding_id must be F- followed by 32 or 64 lowercase hex characters"
+            )
         _require_enum(self.origin, set(FINDING_ORIGINS), "candidate.origin")
         _require_enum(self.severity, set(FINDING_SEVERITIES), "candidate.severity")
         _require_enum(
@@ -164,6 +168,26 @@ class CanonicalFinding:
     line: int | None = None
     impact: str = ""
     verification_performed: list[str] = field(default_factory=list)
+    finding_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.finding_id is not None:
+            _require_non_empty_text(self.finding_id, "canonical_finding.finding_id")
+            if not _FINDING_ID_PATTERN.fullmatch(self.finding_id):
+                raise ValueError(
+                    "canonical_finding.finding_id must be F- followed by 32 or 64 lowercase hex characters"
+                )
+
+
+def canonical_finding_to_dict(finding: CanonicalFinding) -> dict[str, Any]:
+    """Serialize a canonical Finding without changing legacy artifact shape."""
+
+    if not isinstance(finding, CanonicalFinding):
+        raise ValueError("finding must be a CanonicalFinding")
+    payload = asdict(finding)
+    if finding.finding_id is None:
+        payload.pop("finding_id")
+    return payload
 
 
 @dataclass(frozen=True)
@@ -314,7 +338,20 @@ def reconcile_evidence(
 
 
 def reconciliation_to_dict(reconciliation: EvidenceReconciliation) -> dict[str, Any]:
-    return asdict(reconciliation)
+    return {
+        "canonical_findings": [
+            canonical_finding_to_dict(finding)
+            for finding in reconciliation.canonical_findings
+        ],
+        "rejected_findings": [
+            asdict(finding) for finding in reconciliation.rejected_findings
+        ],
+        "remaining_disagreements": list(reconciliation.remaining_disagreements),
+        "contract_coverage": [
+            asdict(coverage) for coverage in reconciliation.contract_coverage
+        ],
+        "evidence_quality": reconciliation.evidence_quality,
+    }
 
 
 def build_reconciliation_prepass(

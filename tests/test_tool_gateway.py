@@ -4,8 +4,15 @@ import json
 import pytest
 
 from conftest import run_git
+from review_agent.memory_models import MemoryScope
+from review_agent.memory_retrieval import (
+    MemoryQuery,
+    RetrievalLimits,
+    SnapshotMemoryQueryService,
+)
 from review_agent.observations import ObservationStore
 from review_agent.tool_gateway import ToolGateway, ToolGatewayError
+from tests.test_context import _combined_memory_snapshot, _memory_snapshot
 
 
 def test_tool_gateway_read_range_records_observation(git_repo: Path, tmp_path: Path):
@@ -252,3 +259,216 @@ def test_tool_gateway_read_commit_messages_rejects_revision_override(
 
     with pytest.raises(ToolGatewayError, match="unauthorized revision binding"):
         gateway.execute("read_commit_messages", arguments)
+
+
+def test_tool_gateway_query_project_memory_uses_only_bound_snapshot_and_records_observation(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    snapshot = _memory_snapshot(head=head)
+    service = SnapshotMemoryQueryService(
+        snapshot,
+        assignment_id="assignment-memory",
+        assignment_scope=MemoryScope(paths=("app.py",)),
+    )
+    store = ObservationStore(tmp_path / "memory-query")
+    gateway = ToolGateway(
+        git_repo,
+        base_revision=head,
+        head_revision="HEAD",
+        observation_store=store,
+        allowed_tools=("query_project_memory",),
+        memory_query_service=service,
+    )
+
+    result = gateway.execute(
+        "query_project_memory",
+        {
+            "assignment_id": "assignment-memory",
+            "path": "app.py",
+            "query": "approved rule",
+        },
+    )
+
+    assert result.observation_ids
+    assert gateway.memory_snapshot.snapshot_id in result.context_view
+    assert "approved reviewer rule" in result.context_view
+    payload = json.loads(result.context_view)
+    assert payload["byte_size"] == len(result.context_view.encode("utf-8"))
+    observation = store.list_observations()[0]
+    assert observation.source == "memory.query_project_memory"
+    assert observation.revision == f"head@{head}"
+    assert gateway.attempted_tool_calls == 1
+
+
+def test_tool_gateway_query_project_memory_rejects_unbounded_arguments_and_local_only_output(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    snapshot = _memory_snapshot(head=head, local_only=True)
+    service = SnapshotMemoryQueryService(
+        snapshot,
+        assignment_id="assignment-memory",
+        assignment_scope=MemoryScope(paths=("app.py",)),
+    )
+    store = ObservationStore(tmp_path / "memory-query-local")
+    gateway = ToolGateway(
+        git_repo,
+        base_revision=head,
+        head_revision=head,
+        observation_store=store,
+        allowed_tools=("query_project_memory",),
+        memory_query_service=service,
+    )
+
+    with pytest.raises(ToolGatewayError, match="unsupported argument"):
+        gateway.execute(
+            "query_project_memory",
+            {"assignment_id": "assignment-memory", "path": "app.py", "store": "live"},
+        )
+
+    result = gateway.execute(
+        "query_project_memory",
+        {"assignment_id": "assignment-memory", "path": "app.py"},
+    )
+    assert "approved reviewer rule" not in result.context_view
+    assert snapshot.eligible_records[0].memory_id not in result.context_view
+    assert len(store.list_observations()) == 1
+
+
+def test_tool_gateway_rebuilds_preconstructed_service_to_expected_assignment_scope(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    snapshot = _memory_snapshot(head=head)
+    stale_service = SnapshotMemoryQueryService(
+        snapshot,
+        assignment_id="assignment-memory",
+        assignment_scope=MemoryScope(paths=("other.py",)),
+    )
+    gateway = ToolGateway(
+        git_repo,
+        base_revision=head,
+        head_revision=head,
+        observation_store=ObservationStore(tmp_path / "memory-rebound"),
+        allowed_tools=("query_project_memory",),
+        memory_query_service=stale_service,
+        assignment_id="assignment-memory",
+        assignment_scope=MemoryScope(paths=("app.py",)),
+    )
+
+    result = gateway.execute(
+        "query_project_memory",
+        {"assignment_id": "assignment-memory", "path": "app.py"},
+    )
+
+    assert "approved reviewer rule" in result.context_view
+    assert gateway.memory_assignment_scope == MemoryScope(paths=("app.py",))
+    assert stale_service.call_count == 0
+
+
+def test_tool_gateway_local_only_records_cannot_perturb_remote_tool_payload(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    normal = _memory_snapshot(head=head)
+    local_only = _memory_snapshot(head=head, local_only=True)
+    mixed = _combined_memory_snapshot(normal, local_only, memory_generation=888)
+
+    def execute(snapshot, suffix):
+        service = SnapshotMemoryQueryService(
+            snapshot,
+            assignment_id="assignment-memory",
+            assignment_scope=MemoryScope(paths=("app.py",)),
+        )
+        gateway = ToolGateway(
+            git_repo,
+            base_revision=head,
+            head_revision="HEAD",
+            observation_store=ObservationStore(tmp_path / suffix),
+            allowed_tools=("query_project_memory",),
+            memory_query_service=service,
+        )
+        return gateway.execute(
+            "query_project_memory",
+            {"assignment_id": "assignment-memory", "path": "app.py"},
+        ).context_view
+
+    visible_payload = execute(normal, "visible-only")
+    mixed_payload = execute(mixed, "mixed-local")
+
+    assert mixed_payload == visible_payload
+    assert local_only.eligible_records[0].memory_id not in mixed_payload
+    assert mixed.snapshot_id not in mixed_payload
+
+
+def test_memory_tool_rechecks_final_utf8_bytes_including_omitted_metadata(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    snapshot = _memory_snapshot(
+        head=head,
+        statement="审查规则必须验证边界" * 30,
+    )
+    query = MemoryQuery(
+        assignment_id="assignment-memory",
+        path="app.py",
+    )
+    probe = SnapshotMemoryQueryService(
+        snapshot,
+        assignment_id="assignment-memory",
+        assignment_scope=MemoryScope(paths=("app.py",)),
+    ).query(query)
+    limits = RetrievalLimits(max_query_bytes=probe.byte_size)
+    gateway = ToolGateway(
+        git_repo,
+        base_revision=head,
+        head_revision=head,
+        observation_store=ObservationStore(tmp_path / "memory-utf8-final"),
+        allowed_tools=("query_project_memory",),
+        memory_query_service=SnapshotMemoryQueryService(
+            snapshot,
+            assignment_id="assignment-memory",
+            assignment_scope=MemoryScope(paths=("app.py",)),
+            limits=limits,
+        ),
+        max_context_chars=limits.max_query_bytes,
+    )
+
+    result = gateway.execute(
+        "query_project_memory",
+        {"assignment_id": "assignment-memory", "path": "app.py"},
+    )
+    payload = json.loads(result.context_view)
+
+    assert payload["byte_size"] == len(result.context_view.encode("utf-8"))
+    assert payload["byte_size"] <= limits.max_query_bytes
+    assert payload["records"] == []
+    assert payload["omitted_memory_ids"] == [snapshot.eligible_records[0].memory_id]
+
+
+def test_memory_gateway_rejects_snapshot_that_does_not_match_resolved_head(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    snapshot = _memory_snapshot(head="f" * 40)
+    service = SnapshotMemoryQueryService(
+        snapshot,
+        assignment_id="assignment-memory",
+        assignment_scope=MemoryScope(paths=("app.py",)),
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        ToolGateway(
+            git_repo,
+            base_revision=head,
+            head_revision="HEAD",
+            observation_store=ObservationStore(tmp_path / "memory-wrong-head"),
+            memory_query_service=service,
+        )

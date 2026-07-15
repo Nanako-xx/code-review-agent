@@ -4,12 +4,34 @@ import pytest
 
 from review_agent.model_adapter import FakeToolCallingAdapter
 from review_agent.model_protocol import ModelResponseKind, ModelTurnResponse
-from review_agent.models import RiskAssessment, RiskLevel, ReviewProfile
+from review_agent.memory_models import PolicyEffectKind
+from review_agent.memory_policy import (
+    PolicyCompilation,
+    PolicyDisposition,
+    PolicyProvenance,
+    RequireContractAction,
+    RuntimeActionKind,
+    RuntimePolicyRegistry,
+)
+from review_agent.models import (
+    CompiledMemoryRequirement,
+    MemoryDiagnosticCode,
+    MemoryReference,
+    PlannerMemoryProjection,
+    PlannerPerspectiveHint,
+    RiskAssessment,
+    RiskLevel,
+    ReviewProfile,
+    VerificationTemplateHint,
+)
 from review_agent.portfolio import (
     CORE_REVIEW_CONTRACT,
     PortfolioProposalParseError,
     build_portfolio_packet,
+    build_planner_memory_projection,
+    deterministic_fallback_proposal,
     parse_portfolio_proposal,
+    portfolio_packet_to_model_input,
     portfolio_size_bounds,
     run_portfolio_planner,
 )
@@ -391,3 +413,225 @@ def test_malformed_adapter_response_is_bounded_and_falls_back():
         "invalid_response",
         "invalid_response",
     ]
+
+
+def test_typed_memory_planner_projection_only_adds_registered_requirements_and_hints() -> None:
+    memory_id = "MEM-" + "7" * 64
+    projection = PlannerMemoryProjection(
+        required_contracts=(
+            CompiledMemoryRequirement(
+                requirement_id="api_compatibility",
+                memory_ids=(memory_id,),
+            ),
+        ),
+        required_checks=(
+            CompiledMemoryRequirement(
+                requirement_id="schema_check",
+                memory_ids=(memory_id,),
+            ),
+        ),
+        verification_hints=(
+            VerificationTemplateHint(
+                command_template_id="python_schema_check",
+                memory_ids=(memory_id,),
+            ),
+        ),
+        perspective_hints=(
+            PlannerPerspectiveHint(
+                perspective_id="domain-invariants",
+                source_feedback_ids=("FB-" + "8" * 64,),
+            ),
+        ),
+        selected_memory=(
+            MemoryReference(
+                memory_id=memory_id,
+                kind="review_rule",
+                source_refs=("memory-source:" + "9" * 64,),
+            ),
+        ),
+    )
+
+    target = build_portfolio_packet(
+        risk(RiskLevel.LOW),
+        contract_allowlist=[*CORE_REVIEW_CONTRACT, "api_compatibility"],
+        check_allowlist=["schema_check"],
+        command_template_allowlist=["python_schema_check"],
+        perspective_allowlist=["domain-invariants"],
+        memory_projection=projection,
+    )
+    payload = target.to_dict()
+    fallback = deterministic_fallback_proposal(target)
+
+    assert target.reviewer_count_bounds == {"minimum": 1, "maximum": 1}
+    assert target.budget_policy == {
+        "risk_level": "low",
+        "reviewer_count": {"minimum": 1, "maximum": 1},
+        "per_reviewer": {
+            "max_turns": 6,
+            "max_tool_calls": 12,
+            "max_output_tokens": 4096,
+            "max_total_tokens": 32768,
+            "max_elapsed_seconds": 120.0,
+            "max_provider_attempts": 2,
+        },
+    }
+    assert payload["memory_policy"]["required_contracts"][0]["requirement_id"] == (
+        "api_compatibility"
+    )
+    assert payload["memory_policy"]["verification_hints"] == [
+        {
+            "command_template_id": "python_schema_check",
+            "memory_ids": [memory_id],
+        }
+    ]
+    assert "command" not in payload["memory_policy"]["verification_hints"][0]
+    assert "api_compatibility" in fallback.candidates[0].extra_contract
+    assert "schema_check" in fallback.candidates[0].required_checks
+
+    missing_requirements = proposal_payload(
+        candidate(
+            "core",
+            "core",
+            "core",
+            context_refs=["signal:public-api"],
+        )
+    )
+    with pytest.raises(PortfolioProposalParseError, match="memory-required"):
+        parse_portfolio_proposal(json.dumps(missing_requirements), target)
+
+
+def test_memory_projection_cannot_expand_runtime_registries() -> None:
+    memory_id = "MEM-" + "a" * 64
+    reference = MemoryReference(
+        memory_id=memory_id,
+        kind="review_rule",
+        source_refs=("memory-source:" + "b" * 64,),
+    )
+    projection = PlannerMemoryProjection(
+        required_contracts=(
+            CompiledMemoryRequirement("api_compatibility", (memory_id,)),
+        ),
+        required_checks=(
+            CompiledMemoryRequirement("schema_check", (memory_id,)),
+        ),
+        verification_hints=(
+            VerificationTemplateHint("python_schema_check", (memory_id,)),
+        ),
+        perspective_hints=(
+            PlannerPerspectiveHint(
+                "custom-domain",
+                ("FB-" + "c" * 64,),
+            ),
+        ),
+        selected_memory=(reference,),
+    )
+
+    with pytest.raises(ValueError, match="contract_allowlist"):
+        build_portfolio_packet(risk(RiskLevel.LOW), memory_projection=projection)
+    with pytest.raises(ValueError, match="check_allowlist"):
+        build_portfolio_packet(
+            risk(RiskLevel.LOW),
+            contract_allowlist=[*CORE_REVIEW_CONTRACT, "api_compatibility"],
+            memory_projection=projection,
+        )
+    with pytest.raises(ValueError, match="command_template_allowlist"):
+        build_portfolio_packet(
+            risk(RiskLevel.LOW),
+            contract_allowlist=[*CORE_REVIEW_CONTRACT, "api_compatibility"],
+            check_allowlist=["schema_check"],
+            memory_projection=projection,
+        )
+    with pytest.raises(ValueError, match="perspective_allowlist"):
+        build_portfolio_packet(
+            risk(RiskLevel.LOW),
+            contract_allowlist=[*CORE_REVIEW_CONTRACT, "api_compatibility"],
+            check_allowlist=["schema_check"],
+            command_template_allowlist=["python_schema_check"],
+            memory_projection=projection,
+        )
+
+
+def test_planner_model_payload_transitively_removes_local_only_memory() -> None:
+    memory_id = "MEM-" + "d" * 64
+    statement = "secret local incident detail"
+    projection = PlannerMemoryProjection(
+        required_contracts=(
+            CompiledMemoryRequirement("api_compatibility", (memory_id,)),
+        ),
+        selected_memory=(
+            MemoryReference(
+                memory_id=memory_id,
+                kind="review_rule",
+                source_refs=("memory-source:" + "e" * 64,),
+                local_only=True,
+            ),
+        ),
+    )
+    assessment = risk(RiskLevel.HIGH)
+    assessment = RiskAssessment(
+        level=assessment.level,
+        dimensions=assessment.dimensions,
+        reasons=[f"approved memory risk signal: {statement}"],
+        signal_refs=[f"memory:{memory_id}", f"memory_floor:{memory_id}"],
+        uncertainties=[],
+        suggested_focus=["approved incident lessons"],
+    )
+    target = build_portfolio_packet(
+        assessment,
+        contract_allowlist=[*CORE_REVIEW_CONTRACT, "api_compatibility"],
+        ref_catalog={f"memory:{memory_id}": statement},
+        memory_projection=projection,
+    )
+
+    encoded = json.dumps(portfolio_packet_to_model_input(target))
+
+    assert "api_compatibility" in encoded
+    assert memory_id not in encoded
+    assert statement not in encoded
+    assert "local_only" not in encoded
+    assert "memory_floor" not in encoded
+
+
+def test_planner_projection_revalidates_registry_and_blocks_its_own_overflow() -> None:
+    memory_id = "MEM-" + "2" * 64
+    compilation = PolicyCompilation(
+        initial_risk_floor=RiskLevel.LOW,
+        effective_risk_floor=RiskLevel.LOW,
+        actions=(RequireContractAction("api_compatibility", (memory_id,)),),
+        diagnostics=(),
+        provenance=(
+            PolicyProvenance(
+                memory_id=memory_id,
+                disposition=PolicyDisposition.APPLIED,
+                effect_kind=PolicyEffectKind.REQUIRE_CONTRACT,
+                effect_value="api_compatibility",
+                runtime_action_kind=RuntimeActionKind.REQUIRE_CONTRACT,
+            ),
+        ),
+    )
+    reference = MemoryReference(
+        memory_id=memory_id,
+        kind="review_rule",
+        source_refs=("memory-source:" + "3" * 64,),
+    )
+
+    with pytest.raises(ValueError, match="Runtime registry"):
+        build_planner_memory_projection(
+            compilation,
+            registry=RuntimePolicyRegistry(contract_ids=("other",)),
+            selected_memory=(reference,),
+        )
+
+    projection = build_planner_memory_projection(
+        compilation,
+        registry=RuntimePolicyRegistry(contract_ids=("api_compatibility",)),
+        selected_memory=(reference,),
+        max_hard_policy_items=0,
+    )
+
+    assert projection.required_contracts[0].requirement_id == "api_compatibility"
+    assert any(
+        item.code is MemoryDiagnosticCode.HARD_POLICY_OVERFLOW
+        and item.blocking
+        for item in projection.diagnostics
+    )

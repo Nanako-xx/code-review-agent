@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
+import re
+import subprocess
 from time import perf_counter
 from typing import Any, Callable, Mapping
 
@@ -11,8 +13,21 @@ from review_agent.agent_loop import (
     run_reviewer_agent_loop,
 )
 from review_agent.context import (
+    ReviewerMemoryContext,
     normalize_reviewer_allowed_tools,
+    reviewer_memory_scope,
     reviewer_tool_scope,
+)
+from review_agent.memory_models import (
+    FeedbackCalibrationSummary,
+    MemoryScope,
+    MemorySnapshot,
+)
+from review_agent.memory_retrieval import (
+    RecordSelection,
+    RetrievalLimits,
+    RetrievalStage,
+    SnapshotMemoryQueryService,
 )
 from review_agent.model_adapter import ModelAdapter
 from review_agent.models import Assignment, IntentPacket
@@ -51,6 +66,12 @@ class ReviewerTask:
     changed_files: tuple[str, ...] = ()
     diff_excerpt: tuple[str, ...] = ()
     initial_observations: Mapping[str, str] = field(default_factory=dict)
+    memory_snapshot: MemorySnapshot | None = None
+    memory_query_service: SnapshotMemoryQueryService | None = None
+    memory_selection: RecordSelection | None = None
+    memory_policy_compilation: Any = None
+    repository_knowledge: Any = None
+    feedback_calibration_summary: FeedbackCalibrationSummary | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.task_id, "task_id")
@@ -84,6 +105,58 @@ class ReviewerTask:
             raise ValueError(
                 "initial_observations must map non-empty IDs to strings"
             )
+        snapshot = self.memory_snapshot
+        service = self.memory_query_service
+        if service is not None and not isinstance(
+            service,
+            SnapshotMemoryQueryService,
+        ):
+            raise ValueError(
+                "memory_query_service must be Snapshot-backed; live stores are forbidden"
+            )
+        if snapshot is None and service is not None:
+            bound_snapshot = getattr(service, "_snapshot", None)
+            if type(bound_snapshot) is not MemorySnapshot:
+                raise ValueError(
+                    "memory_query_service must hold a canonical MemorySnapshot"
+                )
+            snapshot = bound_snapshot
+        if snapshot is not None:
+            if type(snapshot) is not MemorySnapshot:
+                raise ValueError("memory_snapshot must be a canonical MemorySnapshot")
+            snapshot = MemorySnapshot.from_dict(snapshot.to_dict())
+        if snapshot is None and any(
+            value is not None
+            for value in (
+                self.memory_selection,
+                self.memory_policy_compilation,
+                self.repository_knowledge,
+                self.feedback_calibration_summary,
+            )
+        ):
+            raise ValueError("memory projections require a MemorySnapshot")
+        if self.memory_selection is not None:
+            if type(self.memory_selection) is not RecordSelection:
+                raise ValueError("memory_selection must be a RecordSelection")
+            if self.memory_selection.snapshot_id != snapshot.snapshot_id:
+                raise ValueError("memory_selection must match memory_snapshot")
+            if self.memory_selection.stage is not RetrievalStage.REVIEWER:
+                raise ValueError("memory_selection must use the REVIEWER stage")
+        if self.feedback_calibration_summary is not None and type(
+            self.feedback_calibration_summary
+        ) is not FeedbackCalibrationSummary:
+            raise ValueError(
+                "feedback_calibration_summary must be canonical"
+            )
+        if service is not None and snapshot is not None:
+            bound_snapshot = getattr(service, "_snapshot", None)
+            if (
+                type(bound_snapshot) is not MemorySnapshot
+                or bound_snapshot.snapshot_id != snapshot.snapshot_id
+            ):
+                raise ValueError(
+                    "memory_query_service must be bound to memory_snapshot"
+                )
         if self.origin is ReviewerTaskOrigin.SUPPLEMENTAL:
             if not is_supplemental_assignment(self.assignment):
                 raise ValueError(
@@ -115,6 +188,8 @@ class ReviewerTask:
         object.__setattr__(self, "changed_files", tuple(sorted(set(changed_files))))
         object.__setattr__(self, "diff_excerpt", diff_excerpt)
         object.__setattr__(self, "initial_observations", observations)
+        object.__setattr__(self, "memory_snapshot", snapshot)
+        object.__setattr__(self, "memory_query_service", service)
 
     @classmethod
     def for_supplemental(
@@ -126,6 +201,12 @@ class ReviewerTask:
         initial_observations: Mapping[str, str],
         trace_id: str | None = None,
         diff_excerpt: tuple[str, ...] = (),
+        memory_snapshot: MemorySnapshot | None = None,
+        memory_query_service: SnapshotMemoryQueryService | None = None,
+        memory_selection: RecordSelection | None = None,
+        memory_policy_compilation: Any = None,
+        repository_knowledge: Any = None,
+        feedback_calibration_summary: FeedbackCalibrationSummary | None = None,
     ) -> ReviewerTask:
         if not isinstance(spec, SupplementalTaskSpec):
             raise ValueError("spec must be a SupplementalTaskSpec")
@@ -148,6 +229,12 @@ class ReviewerTask:
             changed_files=(),
             diff_excerpt=diff_excerpt,
             initial_observations=initial_observations,
+            memory_snapshot=memory_snapshot,
+            memory_query_service=memory_query_service,
+            memory_selection=memory_selection,
+            memory_policy_compilation=memory_policy_compilation,
+            repository_knowledge=repository_knowledge,
+            feedback_calibration_summary=feedback_calibration_summary,
         )
 
     @classmethod
@@ -163,6 +250,12 @@ class ReviewerTask:
         initial_observations: Mapping[str, str],
         allowed_tools: tuple[str, ...],
         diff_excerpt: tuple[str, ...] = (),
+        memory_snapshot: MemorySnapshot | None = None,
+        memory_query_service: SnapshotMemoryQueryService | None = None,
+        memory_selection: RecordSelection | None = None,
+        memory_policy_compilation: Any = None,
+        repository_knowledge: Any = None,
+        feedback_calibration_summary: FeedbackCalibrationSummary | None = None,
     ) -> ReviewerTask:
         return cls(
             task_id=task_id,
@@ -176,6 +269,12 @@ class ReviewerTask:
             changed_files=changed_files,
             diff_excerpt=diff_excerpt,
             initial_observations=initial_observations,
+            memory_snapshot=memory_snapshot,
+            memory_query_service=memory_query_service,
+            memory_selection=memory_selection,
+            memory_policy_compilation=memory_policy_compilation,
+            repository_knowledge=repository_knowledge,
+            feedback_calibration_summary=feedback_calibration_summary,
         )
 
     @property
@@ -270,90 +369,100 @@ class ReviewerTaskExecutor:
         if creation_error is not None and not isinstance(creation_error, Exception):
             raise ValueError("creation_error must be an Exception")
         started_at = perf_counter()
-        gateway = self.gateway_factory(
+        memory_context, query_service = self._memory_context_for_task(task)
+        gateway_kwargs: dict[str, Any] = dict(
             repository_path=self.repository_path,
             base_revision=self.base_revision,
             head_revision=self.head_revision,
             observation_store=observation_store,
             allowed_tools=task.allowed_tools,
         )
+        if query_service is not None:
+            gateway_kwargs["memory_query_service"] = query_service
+        gateway = self.gateway_factory(**gateway_kwargs)
         reviewer_observations = dict(task.initial_observations)
         loop_trace: AgentLoopTrace | None = None
-        try:
-            if (
-                task.bootstrap_policy
-                is ReviewerBootstrapPolicy.COMPARE_CHANGED_FILES
-            ):
-                for changed_file in task.changed_files:
-                    gateway.execute(
-                        "compare_base_head",
-                        {"path": changed_file},
-                    )
-            # targeted_only deliberately performs no automatic repository read.
-            reviewer_observations.update(observation_store.summaries_by_id())
-            if creation_error is not None:
-                raise creation_error
-            if adapter is None:
-                raise RuntimeError("reviewer adapter creation returned no adapter")
-            with reviewer_tool_scope(task.allowed_tools):
-                if self.reviewer_loop == "agent-loop":
-                    loop_run = run_reviewer_agent_loop(
-                        adapter=adapter,
-                        gateway=gateway,
-                        assignment=task.assignment,
-                        intent=task.intent,
-                        diff_excerpt=list(task.diff_excerpt),
-                        observations=reviewer_observations,
-                        trace_id=task.trace_id,
-                        model=self.model,
-                    )
-                    loop_trace = loop_run.trace
-                    execution = ReviewerExecution(
-                        reviewer_index=task.reviewer_index,
-                        trace_id=task.trace_id,
-                        assignment=task.assignment,
-                        envelope=loop_run.envelope,
-                        response=loop_run.response,
-                        result=loop_run.result,
-                        runtime=loop_run.runtime,
-                    )
-                else:
-                    reviewer_run = run_single_reviewer(
-                        adapter=adapter,
-                        assignment=task.assignment,
-                        intent=task.intent,
-                        diff_excerpt=list(task.diff_excerpt),
-                        observations=reviewer_observations,
-                        trace_id=task.trace_id,
-                        model=self.model,
-                    )
-                    execution = ReviewerExecution(
-                        reviewer_index=task.reviewer_index,
-                        trace_id=task.trace_id,
-                        assignment=task.assignment,
-                        envelope=reviewer_run.envelope,
-                        response=reviewer_run.response,
-                        result=reviewer_run.result,
-                        runtime=reviewer_run.runtime,
-                    )
-        except Exception as error:
-            reviewer_observations = dict(task.initial_observations)
-            reviewer_observations.update(observation_store.summaries_by_id())
-            with reviewer_tool_scope(task.allowed_tools):
-                execution = failed_reviewer_execution(
-                    index=task.reviewer_index,
-                    trace_id=task.trace_id,
-                    assignment=task.assignment,
-                    intent=task.intent,
-                    diff_excerpt=list(task.diff_excerpt),
-                    observations=reviewer_observations,
-                    error=error,
-                    model=self.model,
-                    elapsed_seconds=perf_counter() - started_at,
-                    retained_observation_refs=tuple(
-                        sorted(reviewer_observations)
-                    ),
-                )
+        with reviewer_memory_scope(memory_context):
+            try:
+                if (
+                    task.bootstrap_policy
+                    is ReviewerBootstrapPolicy.COMPARE_CHANGED_FILES
+                ):
+                    for changed_file in task.changed_files:
+                        gateway.execute(
+                            "compare_base_head",
+                            {"path": changed_file},
+                        )
+                # targeted_only deliberately performs no automatic repository read.
+                reviewer_observations.update(observation_store.summaries_by_id())
+                if creation_error is not None:
+                    raise creation_error
+                if adapter is None:
+                    raise RuntimeError("reviewer adapter creation returned no adapter")
+                with reviewer_tool_scope(task.allowed_tools):
+                    if self.reviewer_loop == "agent-loop":
+                        loop_run = run_reviewer_agent_loop(
+                            adapter=adapter,
+                            gateway=gateway,
+                            assignment=task.assignment,
+                            intent=task.intent,
+                            diff_excerpt=list(task.diff_excerpt),
+                            observations=reviewer_observations,
+                            trace_id=task.trace_id,
+                            model=self.model,
+                        )
+                        loop_trace = loop_run.trace
+                        execution = ReviewerExecution(
+                            reviewer_index=task.reviewer_index,
+                            trace_id=task.trace_id,
+                            assignment=task.assignment,
+                            envelope=loop_run.envelope,
+                            response=loop_run.response,
+                            result=loop_run.result,
+                            runtime=loop_run.runtime,
+                        )
+                    else:
+                        reviewer_run = run_single_reviewer(
+                            adapter=adapter,
+                            assignment=task.assignment,
+                            intent=task.intent,
+                            diff_excerpt=list(task.diff_excerpt),
+                            observations=reviewer_observations,
+                            trace_id=task.trace_id,
+                            model=self.model,
+                        )
+                        execution = ReviewerExecution(
+                            reviewer_index=task.reviewer_index,
+                            trace_id=task.trace_id,
+                            assignment=task.assignment,
+                            envelope=reviewer_run.envelope,
+                            response=reviewer_run.response,
+                            result=reviewer_run.result,
+                            runtime=reviewer_run.runtime,
+                        )
+            except Exception as error:
+                reviewer_observations = dict(task.initial_observations)
+                reviewer_observations.update(observation_store.summaries_by_id())
+                # The failure envelope is Runtime bookkeeping, not a second
+                # reviewer attempt.  Reusing a blocking Memory context here
+                # would raise the same policy error again and prevent
+                # Completion from recording the authoritative blocker.
+                with reviewer_memory_scope(None):
+                    with reviewer_tool_scope(task.allowed_tools):
+                        execution = failed_reviewer_execution(
+                            index=task.reviewer_index,
+                            trace_id=task.trace_id,
+                            assignment=task.assignment,
+                            intent=task.intent,
+                            diff_excerpt=list(task.diff_excerpt),
+                            observations=reviewer_observations,
+                            error=error,
+                            model=self.model,
+                            elapsed_seconds=perf_counter() - started_at,
+                            retained_observation_refs=tuple(
+                                sorted(reviewer_observations)
+                            ),
+                        )
         elapsed_seconds = max(0.0, perf_counter() - started_at)
         return ReviewerTaskRun(
             task=task,
@@ -365,11 +474,89 @@ class ReviewerTaskExecutor:
             loop_trace=loop_trace,
         )
 
+    def _memory_context_for_task(
+        self,
+        task: ReviewerTask,
+    ) -> tuple[ReviewerMemoryContext | None, SnapshotMemoryQueryService | None]:
+        snapshot = task.memory_snapshot
+        if snapshot is None:
+            return None, None
+        verified_head_sha = _resolve_commit_sha(
+            self.repository_path,
+            self.head_revision,
+        )
+        if snapshot.head_sha.casefold() != verified_head_sha.casefold():
+            raise ValueError(
+                "Reviewer task MemorySnapshot does not match reviewed head revision"
+            )
+        assignment_id = task.assignment.assignment_id or task.task_id
+        assignment_scope = _assignment_memory_scope(task.assignment)
+        service = task.memory_query_service
+        limits = RetrievalLimits()
+        if service is not None:
+            service_limits = getattr(service, "limits", None)
+            if type(service_limits) is not RetrievalLimits:
+                raise ValueError(
+                    "Snapshot query service has invalid retrieval limits"
+                )
+            limits = replace(service_limits)
+        # Always rebuild from the task's canonical Snapshot and Assignment.  A
+        # preconstructed service may carry a stale ID/scope or prior call count.
+        service = SnapshotMemoryQueryService(
+            snapshot,
+            assignment_id=assignment_id,
+            assignment_scope=assignment_scope,
+            limits=limits,
+        )
+        context = ReviewerMemoryContext(
+            snapshot=snapshot,
+            query_service=service,
+            selection=task.memory_selection,
+            policy_compilation=task.memory_policy_compilation,
+            repository_knowledge=task.repository_knowledge,
+            feedback_calibration_summary=task.feedback_calibration_summary,
+        )
+        return context, service
+
 
 def _non_empty(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return value.strip()
+
+
+def _assignment_memory_scope(assignment: Assignment) -> MemoryScope:
+    return MemoryScope(
+        paths=tuple(assignment.initial_context.changed_files),
+        contracts=tuple(assignment.assigned_contract),
+    )
+
+
+def _is_full_git_object_id(value: str) -> bool:
+    return re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value) is not None
+
+
+def _resolve_commit_sha(repository_path: Path, revision: str) -> str:
+    if (
+        not isinstance(revision, str)
+        or not revision.strip()
+        or revision != revision.strip()
+        or revision.startswith("-")
+        or "\x00" in revision
+    ):
+        raise ValueError("head_revision must be a canonical Git revision")
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{revision}^{{commit}}"],
+        cwd=repository_path,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+    )
+    resolved = result.stdout.strip()
+    if result.returncode != 0 or not _is_full_git_object_id(resolved):
+        raise ValueError("head_revision did not resolve to a Git commit")
+    return resolved.casefold()
 
 
 def _string_tuple(

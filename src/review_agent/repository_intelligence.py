@@ -5,7 +5,31 @@ from pathlib import Path
 import ast
 import hashlib
 import json
+import re
 import subprocess
+import sys
+from typing import Mapping
+
+from review_agent.memory_identity import repository_key as canonical_repository_key
+from review_agent.memory_models import (
+    RepositoryKnowledgeCapability,
+    canonical_json,
+    canonical_sha256,
+)
+from review_agent.repository_cache import (
+    CAPABILITY_METADATA,
+    RepositoryCacheProvenance,
+    RepositoryKnowledgeArtifact,
+    RepositoryKnowledgeCache,
+    build_repository_knowledge_key,
+)
+from review_agent.revision import RevisionResolver, sanitized_git_environment
+
+
+REPOSITORY_INTELLIGENCE_ARTIFACT_SCHEMA = "repository_intelligence_symbols_v1"
+REPOSITORY_INTELLIGENCE_ANALYZER_NAME = "python-ast"
+REPOSITORY_INTELLIGENCE_ANALYZER_VERSION = "repository-intelligence-v1"
+_WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:/")
 
 
 @dataclass(frozen=True)
@@ -46,6 +70,13 @@ class RepositoryIntelligenceSnapshot:
     fallback_strategy: str = "python_ast+git_grep"
     text_search_backend: str = "git-grep"
 
+    @property
+    def cache_provenance(self) -> RepositoryCacheProvenance | None:
+        # Provenance is Session-phase metadata, not part of the long-standing
+        # authoritative snapshot schema.  Keeping it outside dataclass fields
+        # also preserves compatibility for callers that use dataclasses.asdict.
+        return getattr(self, "_cache_provenance", None)
+
 
 def collect_python_symbols(repo: Path, revision: str, paths: list[str] | None = None) -> list[PythonSymbol]:
     candidate_paths = paths if paths is not None else _list_python_files(repo, revision)
@@ -69,13 +100,144 @@ def build_repository_intelligence(
     base_revision: str,
     head_revision: str,
     changed_files: list[str],
+    *,
+    cache_backend: RepositoryKnowledgeCache | None = None,
+    repository_key: str | None = None,
+    review_id: str | None = None,
+    lsp_status: str = "unavailable",
+    fallback_strategy: str = "python_ast+git_grep",
+    text_search_backend: str = "git-grep",
+    analyzer_name: str = REPOSITORY_INTELLIGENCE_ANALYZER_NAME,
+    analyzer_version: str = REPOSITORY_INTELLIGENCE_ANALYZER_VERSION,
+    python_ast_version: str | None = None,
+    text_search_backend_version: str | None = None,
+    analysis_configuration: Mapping[str, object] | None = None,
 ) -> RepositoryIntelligenceSnapshot:
-    changed_symbols = detect_changed_symbols(repo, base_revision, head_revision, changed_files)
-    return RepositoryIntelligenceSnapshot(
-        base_revision=base_revision,
-        revision=head_revision,
+    normalized_changed_files = _canonical_changed_files(changed_files)
+    cache_provenance = None
+    authoritative_base = base_revision
+    authoritative_head = head_revision
+    if cache_backend is None:
+        changed_symbols = detect_changed_symbols(
+            repo,
+            base_revision,
+            head_revision,
+            normalized_changed_files,
+        )
+    else:
+        if analysis_configuration is not None and not isinstance(
+            analysis_configuration,
+            Mapping,
+        ):
+            raise ValueError("analysis_configuration must be a mapping")
+        resolver = RevisionResolver()
+        resolved_revisions = resolver.resolve_pair(
+            repo,
+            base_revision,
+            head_revision,
+        )
+        authoritative_base = resolved_revisions.resolved_base_sha.casefold()
+        authoritative_head = resolved_revisions.resolved_head_sha.casefold()
+        actual_repository_key = canonical_repository_key(
+            resolver.repository_identity(repo)
+        )
+        if repository_key is not None and repository_key != actual_repository_key:
+            raise ValueError(
+                "repository_key does not match the authorized repository identity"
+            )
+        resolved_repository_key = actual_repository_key
+        resolved_ast_version = python_ast_version or _python_ast_version()
+        resolved_text_version = text_search_backend_version or _text_backend_version(
+            repo,
+            text_search_backend,
+        )
+        configuration = {
+            "schema": "repository_intelligence_configuration_v1",
+            "lsp_status": _required_configuration_text(lsp_status, "lsp_status"),
+            "fallback_strategy": _required_configuration_text(
+                fallback_strategy,
+                "fallback_strategy",
+            ),
+            "text_search_backend": _required_configuration_text(
+                text_search_backend,
+                "text_search_backend",
+            ),
+            "python_ast_version": _required_configuration_text(
+                resolved_ast_version,
+                "python_ast_version",
+            ),
+            "text_search_backend_version": _required_configuration_text(
+                resolved_text_version,
+                "text_search_backend_version",
+            ),
+            "analysis_configuration": dict(analysis_configuration or {}),
+        }
+        inputs = {
+            "schema": "repository_intelligence_input_v1",
+            "changed_files": normalized_changed_files,
+        }
+        key = build_repository_knowledge_key(
+            repository_key=resolved_repository_key,
+            revision_binding=f"{authoritative_base}..{authoritative_head}",
+            capability=RepositoryKnowledgeCapability.SYMBOL_INDEX,
+            analyzer_name=analyzer_name,
+            analyzer_version=analyzer_version,
+            configuration=configuration,
+            inputs=inputs,
+        )
+
+        def build_symbols() -> RepositoryKnowledgeArtifact:
+            symbols = detect_changed_symbols(
+                repo,
+                authoritative_base,
+                authoritative_head,
+                normalized_changed_files,
+            )
+            payload = _changed_symbols_payload(symbols)
+            content = canonical_json(payload).encode("utf-8")
+            metadata = CAPABILITY_METADATA[RepositoryKnowledgeCapability.SYMBOL_INDEX]
+            return RepositoryKnowledgeArtifact(
+                content=content,
+                content_type=metadata.content_type,
+                artifact_schema=REPOSITORY_INTELLIGENCE_ARTIFACT_SCHEMA,
+                summary_hash=canonical_sha256(
+                    {
+                        "schema": "repository_intelligence_summary_v1",
+                        "changed_symbol_count": len(symbols),
+                    }
+                ),
+            )
+
+        cache_result = cache_backend.get_or_build(
+            key,
+            build_symbols,
+            review_id=review_id,
+            validator=_changed_symbols_from_content,
+            fallback_provenance={
+                "lsp_status": lsp_status,
+                "fallback_strategy": fallback_strategy,
+                "text_search_backend": text_search_backend,
+            },
+            content_type=CAPABILITY_METADATA[
+                RepositoryKnowledgeCapability.SYMBOL_INDEX
+            ].content_type,
+            artifact_schema=REPOSITORY_INTELLIGENCE_ARTIFACT_SCHEMA,
+        )
+        if cache_result.content is None:  # pragma: no cover - API invariant
+            raise RuntimeError("repository cache returned no authoritative content")
+        changed_symbols = _changed_symbols_from_content(cache_result.content)
+        cache_provenance = cache_result.provenance
+    snapshot = RepositoryIntelligenceSnapshot(
+        base_revision=authoritative_base,
+        revision=authoritative_head,
         changed_symbols=changed_symbols,
+        lsp_status=lsp_status,
+        fallback_strategy=fallback_strategy,
+        text_search_backend=text_search_backend,
     )
+    if cache_provenance is not None:
+        object.__setattr__(snapshot, "_cache_provenance", cache_provenance)
+    return snapshot
 
 
 def detect_changed_symbols(
@@ -119,7 +281,17 @@ def search_repository_text(repo: Path, revision: str, query: str, max_results: i
 
 
 def repository_intelligence_to_dict(snapshot: RepositoryIntelligenceSnapshot) -> dict[str, object]:
-    return asdict(snapshot)
+    # Cache provenance is recorded separately by the owning Session phase.  The
+    # authoritative Repository Intelligence artifact retains its established
+    # strict shape so v1-v4 hydration and resume remain byte-compatible.
+    return {
+        "base_revision": snapshot.base_revision,
+        "revision": snapshot.revision,
+        "changed_symbols": [asdict(symbol) for symbol in snapshot.changed_symbols],
+        "lsp_status": snapshot.lsp_status,
+        "fallback_strategy": snapshot.fallback_strategy,
+        "text_search_backend": snapshot.text_search_backend,
+    }
 
 
 def repository_intelligence_raw_json(snapshot: RepositoryIntelligenceSnapshot) -> str:
@@ -127,10 +299,14 @@ def repository_intelligence_raw_json(snapshot: RepositoryIntelligenceSnapshot) -
 
 
 def summarize_repository_intelligence(snapshot: RepositoryIntelligenceSnapshot) -> str:
+    if snapshot.lsp_status == "unavailable":
+        analyzer_line = f"LSP unavailable; using {snapshot.fallback_strategy}"
+    else:
+        analyzer_line = f"LSP {snapshot.lsp_status}; using {snapshot.fallback_strategy}"
     lines = [
         "Repository Intelligence",
         f"Revision: {snapshot.revision}",
-        f"LSP unavailable; using {snapshot.fallback_strategy}",
+        analyzer_line,
         f"Text search backend: {snapshot.text_search_backend}",
         "Changed Symbols:",
     ]
@@ -227,21 +403,185 @@ def _changed(symbol: PythonSymbol, change_type: str) -> ChangedSymbol:
     )
 
 
+def _canonical_changed_files(changed_files: list[str]) -> list[str]:
+    if not isinstance(changed_files, list):
+        raise ValueError("changed_files must be a list")
+    normalized: set[str] = set()
+    for path in changed_files:
+        if not isinstance(path, str) or not path.strip() or path != path.strip():
+            raise ValueError("changed_files must contain non-empty repository paths")
+        canonical = path.replace("\\", "/")
+        parts = canonical.split("/")
+        if (
+            canonical.startswith("/")
+            or _WINDOWS_DRIVE_PATH.match(canonical)
+            or ".." in parts
+            or "" in parts
+            or parts[0].casefold() == ".git"
+        ):
+            raise ValueError("changed_files must contain safe repository-relative paths")
+        normalized.add(canonical)
+    return sorted(normalized)
+
+
+def _changed_symbols_payload(symbols: list[ChangedSymbol]) -> dict[str, object]:
+    return {
+        "schema": REPOSITORY_INTELLIGENCE_ARTIFACT_SCHEMA,
+        "changed_symbols": [asdict(symbol) for symbol in symbols],
+    }
+
+
+def _changed_symbols_from_content(content: bytes) -> list[ChangedSymbol]:
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("repository intelligence cache payload is not valid JSON") from None
+    if not isinstance(payload, dict) or set(payload) != {"schema", "changed_symbols"}:
+        raise ValueError("repository intelligence cache payload has an invalid envelope")
+    if payload["schema"] != REPOSITORY_INTELLIGENCE_ARTIFACT_SCHEMA:
+        raise ValueError("repository intelligence cache schema is unsupported")
+    rows = payload["changed_symbols"]
+    if not isinstance(rows, list):
+        raise ValueError("repository intelligence changed_symbols must be a list")
+
+    symbols: list[ChangedSymbol] = []
+    expected_fields = {
+        "path",
+        "qualified_name",
+        "kind",
+        "change_type",
+        "line_start",
+        "line_end",
+    }
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != expected_fields:
+            raise ValueError("repository intelligence cached symbol is invalid")
+        text_fields = ("path", "qualified_name", "kind", "change_type")
+        if any(
+            not isinstance(row[name], str)
+            or not row[name].strip()
+            or row[name] != row[name].strip()
+            for name in text_fields
+        ):
+            raise ValueError("repository intelligence cached symbol text is invalid")
+        if row["change_type"] not in {"added", "modified", "deleted"}:
+            raise ValueError("repository intelligence cached change type is invalid")
+        if (
+            type(row["line_start"]) is not int
+            or type(row["line_end"]) is not int
+            or row["line_start"] < 1
+            or row["line_end"] < row["line_start"]
+        ):
+            raise ValueError("repository intelligence cached line range is invalid")
+        path = row["path"].replace("\\", "/")
+        path_parts = path.split("/")
+        if (
+            path != row["path"]
+            or path.startswith("/")
+            or _WINDOWS_DRIVE_PATH.match(path)
+            or ".." in path_parts
+            or "" in path_parts
+            or path_parts[0].casefold() == ".git"
+        ):
+            raise ValueError("repository intelligence cached path is invalid")
+        symbols.append(
+            ChangedSymbol(
+                path=row["path"],
+                qualified_name=row["qualified_name"],
+                kind=row["kind"],
+                change_type=row["change_type"],
+                line_start=row["line_start"],
+                line_end=row["line_end"],
+            )
+        )
+
+    canonical_order = sorted(
+        symbols,
+        key=lambda item: (
+            item.path,
+            item.line_start,
+            item.qualified_name,
+            item.change_type,
+        ),
+    )
+    if symbols != canonical_order or len(set(map(_changed_symbol_identity, symbols))) != len(
+        symbols
+    ):
+        raise ValueError("repository intelligence cached symbols are not canonical")
+    if canonical_json(payload).encode("utf-8") != content:
+        raise ValueError("repository intelligence cache JSON is not canonical")
+    return symbols
+
+
+def _changed_symbol_identity(symbol: ChangedSymbol) -> tuple[object, ...]:
+    return (
+        symbol.path,
+        symbol.qualified_name,
+        symbol.kind,
+        symbol.change_type,
+        symbol.line_start,
+        symbol.line_end,
+    )
+
+
+def _python_ast_version() -> str:
+    return "cpython-%d.%d.%d-ast-v1" % (
+        sys.version_info.major,
+        sys.version_info.minor,
+        sys.version_info.micro,
+    )
+
+
+def _text_backend_version(repo: Path, backend: str) -> str:
+    if backend == "git-grep":
+        return _run_git(repo, ["--version"], allow_exit_codes={0}).strip()
+    if backend in {"rg", "ripgrep"}:
+        try:
+            result = subprocess.run(
+                ["rg", "--version"],
+                cwd=repo,
+                env=sanitized_git_environment(),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "ripgrep-version-unavailable"
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.splitlines()[0].strip()
+        return "ripgrep-version-unavailable"
+    return backend + "-version-unspecified"
+
+
+def _required_configuration_text(value: str, name: str) -> str:
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
 def _list_python_files(repo: Path, revision: str) -> list[str]:
     raw = _run_git(repo, ["ls-tree", "-r", "--name-only", revision], allow_exit_codes={0})
     return [line for line in raw.splitlines() if line.endswith(".py")]
 
 
 def _git_show(repo: Path, revision: str, path: str, allow_missing: bool) -> str | None:
-    result = subprocess.run(
-        ["git", "show", f"{revision}:{path}"],
-        cwd=repo,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "--no-replace-objects", "show", f"{revision}:{path}"],
+            cwd=repo,
+            env=sanitized_git_environment(),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError(f"git show failed for {path}") from None
     if result.returncode == 0:
         return result.stdout.lstrip("\ufeff")
     if allow_missing:
@@ -250,15 +590,20 @@ def _git_show(repo: Path, revision: str, path: str, allow_missing: bool) -> str 
 
 
 def _run_git(repo: Path, args: list[str], allow_exit_codes: set[int]) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=repo,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "--no-replace-objects", *args],
+            cwd=repo,
+            env=sanitized_git_environment(),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError(f"git {' '.join(args)} failed") from None
     if result.returncode not in allow_exit_codes:
         raise RuntimeError(result.stderr.strip() or f"git {' '.join(args)} failed")
     return result.stdout

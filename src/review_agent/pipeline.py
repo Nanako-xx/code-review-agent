@@ -23,7 +23,12 @@ from review_agent.evidence import (
     reconciliation_prepass_to_dict,
     reconciliation_to_dict,
 )
-from review_agent.final_risk import FinalRiskAssessment, final_risk_to_dict, reassess_final_risk
+from review_agent.final_risk import (
+    FinalRiskAssessment,
+    final_risk_memory_projection_from_risk,
+    final_risk_to_dict,
+    reassess_final_risk,
+)
 from review_agent.git_repo import (
     ChangeSummary,
     change_summary_from_dict,
@@ -64,9 +69,100 @@ from review_agent.intent_clarification import (
 from review_agent.intent_inference import (
     IntentInferenceCandidate,
     IntentInferenceRun,
+    build_intent_memory_projection,
+    intent_claims_from_memory_projection,
     intent_inference_run_to_dict,
     run_intent_inference,
 )
+from review_agent.memory_curator import (
+    CuratorAuthority,
+    ExistingFingerprint,
+    FinalVerifiedContext,
+    LocalCuratorRule,
+    MemoryCandidateBatch,
+    MemoryCuratorInput,
+    MemoryCuratorResult,
+    ValidatedCuratorSource,
+    run_local_memory_curator,
+    run_model_memory_curator,
+    source_ref_id,
+)
+from review_agent.memory_feedback import feedback_aggregation_v1
+from review_agent.memory_identity import (
+    MemoryIdentityError,
+    RepositoryMemoryNamespace,
+    materialize_repository_memory_namespace,
+    plan_repository_memory_namespace,
+    repository_key as memory_repository_key,
+    repository_namespace_path,
+)
+from review_agent.memory_lifecycle import (
+    MAX_EXPIRY_SWEEP_RECORDS,
+    CandidateDedupeKind,
+    CandidateLifecycleResult,
+    MemoryLifecycle,
+    TargetHeadApplicabilityEvaluator,
+)
+from review_agent.memory_models import (
+    Applicability,
+    FeedbackCalibrationSummary,
+    GenerationMetadata,
+    GitCommitSourceRef,
+    HumanDeclarationAuthority,
+    HumanDeclarationOrigin,
+    HumanDeclarationSourceRef,
+    DurableMemoryRecord,
+    MEMORY_SELECTION_POLICY_VERSION,
+    MemoryExecutionConfig,
+    MemoryCandidate,
+    CandidateStatus,
+    MemoryConfidence,
+    MemoryKind,
+    MemoryMode,
+    MemoryScope,
+    MemorySelectionInput,
+    MemorySnapshot,
+    ProducerType,
+    RecordStatus,
+    SessionArtifactSourceRef,
+    Sensitivity,
+    SourceRef,
+    ValidityPolicy,
+    canonical_sha256,
+    stable_request_id,
+    validate_stable_id,
+)
+from review_agent.memory_policy import (
+    PolicyCompilation,
+    RuntimePolicyRegistry,
+    compile_memory_policy,
+)
+from review_agent.memory_relink import (
+    RepositoryAuthorityResolution,
+    RepositoryRelinkConflictError,
+    RepositoryRelinkError,
+    repository_authority_resolution_hash,
+    resolve_repository_authority,
+)
+from review_agent.memory_retrieval import (
+    RecordSelection,
+    RetrievalLimits,
+    RetrievalRequest,
+    RetrievalStage,
+    SnapshotMemoryQueryService,
+    SnapshotMemorySelector,
+    build_disabled_snapshot,
+    build_memory_snapshot,
+)
+from review_agent.memory_sources import (
+    SensitiveContentKind,
+    SourceValidationCode,
+    SourceValidationError,
+    SourceValidator,
+    TrustedCandidateProvenance,
+    scan_sensitive_text,
+)
+from review_agent.memory_store import MemoryStore, MemoryStoreError, WriteResult
 from review_agent.incremental import (
     IncrementalPriorityMap,
     build_incremental_priority_map_from_summary,
@@ -90,7 +186,9 @@ from review_agent.model_risk import (
 from review_agent.models import (
     Assignment,
     ClarificationQuestion,
+    CompletionMemoryProjection,
     ConclusionImpact,
+    FinalRiskMemoryProjection,
     IntentClaim,
     IntentConfidence,
     IntentDecision,
@@ -98,12 +196,19 @@ from review_agent.models import (
     IntentOrigin,
     IntentPacket,
     IntentSource,
+    IntentMemoryProjection,
     InitialContext,
+    MemoryDiagnostic,
+    MemoryDiagnosticCode,
+    MemoryReference,
+    PlannerMemoryProjection,
     QualityGateResult,
     ReviewRequest,
     ReviewerResult,
     RiskAssessment,
     RiskAssessmentPacket,
+    RiskMemoryProjection,
+    RiskLevel,
 )
 from review_agent.observations import Observation, ObservationStore
 from review_agent.orchestrator import (
@@ -125,9 +230,13 @@ from review_agent.quality_runner import (
     skipped_quality_gate_execution,
 )
 from review_agent.portfolio import (
+    DEFAULT_COMMAND_TEMPLATE_ALLOWLIST,
+    DEFAULT_CONTRACT_ALLOWLIST,
+    DEFAULT_PERSPECTIVE_ALLOWLIST,
     PORTFOLIO_PLANNER_SYSTEM_PROMPT,
     PortfolioPacket,
     PortfolioPlannerRun,
+    build_planner_memory_projection,
     build_portfolio_packet,
     portfolio_packet_to_dict,
     portfolio_planner_run_to_dict,
@@ -140,7 +249,9 @@ from review_agent.repository_intelligence import (
     repository_intelligence_to_dict,
     summarize_repository_intelligence,
 )
+from review_agent.repository_cache import RepositoryKnowledgeCache
 from review_agent.reporting import render_review_brief_markdown
+from review_agent.revision import RevisionResolver
 from review_agent.reconciler import (
     SemanticConflict,
     SemanticReconcilerRun,
@@ -158,8 +269,15 @@ from review_agent.reviewer_task_executor import (
     ReviewerTaskRun,
 )
 from review_agent.reviewer_runtime import reviewer_runtime_to_dict
-from review_agent.review_contract import validate_reviewer_completion
-from review_agent.risk import LocalRiskAssessor, build_risk_packet
+from review_agent.review_contract import (
+    completion_memory_projection_from_planner,
+    validate_reviewer_completion,
+)
+from review_agent.risk import (
+    LocalRiskAssessor,
+    build_risk_memory_projection,
+    build_risk_packet,
+)
 from review_agent.run_state import RunPhase, RunState, RunStatus
 from review_agent.runtime import compile_portfolio, portfolio_plan_to_dict
 from review_agent.session import (
@@ -191,6 +309,7 @@ PHASE_MESSAGES = {
     RunPhase.PREFLIGHT: "Preflight completed",
     RunPhase.QUALITY_GATES: "Quality gates completed",
     RunPhase.REPOSITORY_INTELLIGENCE: "Repository intelligence collected",
+    RunPhase.MEMORY_SELECTION: "Durable Memory selection completed",
     RunPhase.INTENT_DISCOVERY: "Intent discovery completed",
     RunPhase.INTENT_RESOLUTION: "Intent resolution completed",
     RunPhase.PLANNING: "Risk and reviewer planning completed",
@@ -200,6 +319,7 @@ PHASE_MESSAGES = {
     RunPhase.RECONCILIATION: "Evidence reconciliation completed",
     RunPhase.COMPLETION: "Completion check completed",
     RunPhase.FINAL_RISK: "Final risk reassessment completed",
+    RunPhase.MEMORY_PROPOSAL: "Durable Memory proposal completed",
     RunPhase.REPORTING: "Reporting completed",
 }
 
@@ -242,6 +362,57 @@ class PipelineAwaitingUser(PipelineError):
         self.submitted_decisions = submitted_decisions
 
 
+@dataclass(frozen=True)
+class MemoryOutboxReplayPreview:
+    """Strict, content-free projection used by the CLI replay seam."""
+
+    outbox_digest: str
+    batch_digest: str
+    entries: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if not _is_sha256(self.outbox_digest) or not _is_sha256(
+            self.batch_digest
+        ):
+            raise ValueError("Memory outbox replay digests are invalid")
+        entries = tuple(self.entries)
+        if not entries:
+            raise ValueError("Memory outbox replay entries must not be empty")
+        candidate_ids: list[str] = []
+        request_ids: list[str] = []
+        for entry in entries:
+            if type(entry) is not tuple or len(entry) != 2:
+                raise ValueError("Memory outbox replay entries are invalid")
+            candidate_id, request_id = entry
+            validate_stable_id(
+                candidate_id,
+                "MC",
+                "Memory outbox candidate_id",
+            )
+            validate_stable_id(
+                request_id,
+                "REQ",
+                "Memory outbox request_id",
+            )
+            candidate_ids.append(candidate_id)
+            request_ids.append(request_id)
+        if (
+            candidate_ids != sorted(set(candidate_ids))
+            or len(request_ids) != len(set(request_ids))
+        ):
+            raise ValueError("Memory outbox replay entries are not canonical")
+        object.__setattr__(self, "entries", entries)
+
+
+@dataclass(frozen=True)
+class MemoryOutboxReplayAudit:
+    """Canonical human attribution for one explicit replay request."""
+
+    actor: str
+    reason: str
+    request_id: str
+
+
 @dataclass
 class PipelineContext:
     repository: Path
@@ -268,6 +439,33 @@ class PipelineContext:
     quality_gate_observations: ObservationStore | None = None
     deep_quality_gate_observations: ObservationStore | None = None
     repository_intelligence: RepositoryIntelligenceSnapshot | None = None
+    memory_config: MemoryExecutionConfig | None = None
+    memory_runtime_initialized: bool = False
+    memory_repository_key: str | None = None
+    memory_authority_resolution: RepositoryAuthorityResolution | None = None
+    memory_store: MemoryStore | None = None
+    memory_cache: RepositoryKnowledgeCache | None = None
+    memory_degradation_codes: list[str] = field(default_factory=list)
+    memory_selection_input: MemorySelectionInput | None = None
+    memory_snapshot: MemorySnapshot | None = None
+    memory_selection_decision: dict[str, Any] | None = None
+    memory_feedback_summary: FeedbackCalibrationSummary | None = None
+    memory_policy_compilation: PolicyCompilation | None = None
+    memory_runtime_binding: dict[str, Any] | None = None
+    memory_cache_provenance: dict[str, Any] | None = None
+    intent_memory_projection: IntentMemoryProjection | None = None
+    risk_memory_projection: RiskMemoryProjection | None = None
+    planner_memory_projection: PlannerMemoryProjection | None = None
+    completion_memory_projection: CompletionMemoryProjection | None = None
+    final_risk_memory_projection: FinalRiskMemoryProjection | None = None
+    reviewer_memory_selections: dict[str, RecordSelection] = field(
+        default_factory=dict
+    )
+    memory_candidate_batch: MemoryCandidateBatch | None = None
+    memory_curator_result: MemoryCuratorResult | None = None
+    memory_curator_decision: dict[str, Any] | None = None
+    memory_outbox: dict[str, Any] | None = None
+    memory_persistence_receipt: dict[str, Any] | None = None
     repository_observations: ObservationStore | None = None
     reviewer_observations: dict[int, ObservationStore] = field(default_factory=dict)
     reviewer_executions: list[ReviewerExecution] = field(default_factory=list)
@@ -339,6 +537,7 @@ class ReviewPipeline:
             checkpoint_store=checkpoint_store,
             session_store=session_store,
             request=request,
+            memory_config=session_store.load().execution.memory,
         )
         self._collect_change_summary = collect_change_summary_fn
         self._build_adapter_factory = adapter_factory_builder
@@ -617,6 +816,11 @@ class ReviewPipeline:
             preserve = checkpoint.artifacts
         elif phase is RunPhase.SUPPLEMENTAL_INVESTIGATION:
             preserve = self._prepare_supplemental_resume(checkpoint, resuming=resuming)
+        elif phase is RunPhase.MEMORY_PROPOSAL and resuming:
+            preserve = _memory_proposal_resume_artifacts(
+                self.context.session_store,
+                manifest,
+            )
         self.context.session_store.discard_uncommitted_phase_artifacts(
             phase,
             preserve,
@@ -689,6 +893,7 @@ class ReviewPipeline:
             RunPhase.PREFLIGHT: self._run_preflight,
             RunPhase.QUALITY_GATES: self._run_quality_gates,
             RunPhase.REPOSITORY_INTELLIGENCE: self._run_repository_intelligence,
+            RunPhase.MEMORY_SELECTION: self._run_memory_selection,
             RunPhase.INTENT_DISCOVERY: self._run_intent_discovery,
             RunPhase.INTENT_RESOLUTION: self._run_intent_resolution,
             RunPhase.PLANNING: self._run_planning,
@@ -698,6 +903,7 @@ class ReviewPipeline:
             RunPhase.RECONCILIATION: self._run_reconciliation,
             RunPhase.COMPLETION: self._run_completion,
             RunPhase.FINAL_RISK: self._run_final_risk,
+            RunPhase.MEMORY_PROPOSAL: self._run_memory_proposal,
             RunPhase.REPORTING: self._run_reporting,
         }
         return dispatch[phase]()
@@ -707,6 +913,7 @@ class ReviewPipeline:
             RunPhase.PREFLIGHT: self._load_preflight,
             RunPhase.QUALITY_GATES: self._load_quality_gates,
             RunPhase.REPOSITORY_INTELLIGENCE: self._load_repository_intelligence,
+            RunPhase.MEMORY_SELECTION: self._load_memory_selection,
             RunPhase.INTENT_DISCOVERY: self._load_intent_discovery,
             RunPhase.INTENT_RESOLUTION: self._load_intent_resolution,
             RunPhase.PLANNING: self._load_planning,
@@ -716,6 +923,7 @@ class ReviewPipeline:
             RunPhase.RECONCILIATION: self._load_reconciliation,
             RunPhase.COMPLETION: self._load_completion,
             RunPhase.FINAL_RISK: self._load_final_risk,
+            RunPhase.MEMORY_PROPOSAL: self._load_memory_proposal,
             RunPhase.REPORTING: self._load_reporting,
         }
         dispatch[phase]()
@@ -884,14 +1092,110 @@ class ReviewPipeline:
         )
         return replace(result, observation_ref=observation.observation_id)
 
+    def _ensure_memory_runtime(self) -> None:
+        if self.context.memory_runtime_initialized:
+            return
+        config = _required(self.context.memory_config, "Memory execution config")
+        if config.mode is MemoryMode.OFF:
+            self.context.memory_repository_key = memory_repository_key(
+                self.context.manifest.repository
+            )
+            self.context.memory_runtime_initialized = True
+            return
+
+        manifest = self.context.manifest
+        fallback_key = memory_repository_key(manifest.repository)
+        try:
+            plan = plan_repository_memory_namespace(
+                manifest.repository,
+                config.root_path,
+            )
+            if config.mode is MemoryMode.READ_WRITE:
+                with MemoryStore.lock_namespaces(plan.namespace):
+                    authority = resolve_repository_authority(
+                        config.root_path,
+                        plan.locator.identity,
+                    )
+                    if authority.binding_id is None:
+                        namespace = materialize_repository_memory_namespace(plan)
+                        store = MemoryStore(namespace)
+                    else:
+                        namespace = _memory_namespace_for_authority(
+                            config.root_path,
+                            authority,
+                        )
+                        database_path = (
+                            Path(namespace.namespace_path) / "memory.sqlite3"
+                        )
+                        if not database_path.is_file():
+                            raise FileNotFoundError(
+                                "bound Memory authority has no Store"
+                            )
+                        MemoryStore(namespace, read_only=True)
+                        store = MemoryStore(Path(namespace.namespace_path))
+            else:
+                authority = resolve_repository_authority(
+                    config.root_path,
+                    plan.locator.identity,
+                )
+                namespace = (
+                    plan.namespace
+                    if authority.binding_id is None
+                    else _memory_namespace_for_authority(
+                        config.root_path,
+                        authority,
+                    )
+                )
+                database_path = Path(namespace.namespace_path) / "memory.sqlite3"
+                store = (
+                    MemoryStore(namespace, read_only=True)
+                    if database_path.is_file()
+                    else None
+                )
+            self.context.memory_repository_key = authority.authority_repository_key
+            self.context.memory_authority_resolution = authority
+            self.context.memory_store = store
+            self.context.memory_cache = RepositoryKnowledgeCache(
+                store,
+                mode=config.mode,
+                clock=self._clock,
+            )
+        except (MemoryIdentityError, RepositoryRelinkError, MemoryStoreError, OSError):
+            self.context.memory_repository_key = fallback_key
+            self.context.memory_authority_resolution = None
+            self.context.memory_store = None
+            self.context.memory_cache = RepositoryKnowledgeCache(
+                None,
+                mode=MemoryMode.READ,
+                clock=self._clock,
+            )
+            self.context.memory_degradation_codes.append("memory_unavailable")
+            if config.required:
+                self.context.memory_degradation_codes.append(
+                    "memory_required_unavailable"
+                )
+        self.context.memory_runtime_initialized = True
+
     def _run_repository_intelligence(self) -> dict[str, str]:
         summary = _required(self.context.change_summary, "change summary")
         manifest = self.context.manifest
+        cache_backend: RepositoryKnowledgeCache | None = None
+        repository_key: str | None = None
+        if (
+            self.context.memory_config is not None
+            and self.context.memory_config.mode is not MemoryMode.OFF
+        ):
+            self._ensure_memory_runtime()
+            cache_backend = self.context.memory_cache
+            repository_key = self.context.memory_repository_key
         snapshot = build_repository_intelligence(
             repo=self.context.repository,
             base_revision=manifest.revisions.resolved_base_sha,
             head_revision=manifest.revisions.resolved_head_sha,
             changed_files=summary.changed_files,
+            cache_backend=cache_backend,
+            repository_key=repository_key,
+            review_id=manifest.review_id,
         )
         workspace = self._phase_workspace(RunPhase.REPOSITORY_INTELLIGENCE)
         workspace.write_json(
@@ -950,12 +1254,784 @@ class ReviewPipeline:
         else:
             raise ValueError("repository observation artifact is unavailable")
 
+    def _run_memory_selection(self) -> dict[str, str]:
+        created_at = self._clock()
+        config = _required(self.context.memory_config, "Memory execution config")
+        manifest = self.context.manifest
+        summary = _required(self.context.change_summary, "change summary")
+        intelligence = _required(
+            self.context.repository_intelligence,
+            "repository intelligence",
+        )
+        records = ()
+        feedback_records = ()
+        if config.mode is MemoryMode.OFF:
+            repository_key = memory_repository_key(manifest.repository)
+            generations = GenerationMetadata(
+                store_schema_version=1,
+                memory_generation=0,
+                feedback_generation=0,
+                knowledge_generation=0,
+            )
+        else:
+            self._ensure_memory_runtime()
+            repository_key = _required(
+                self.context.memory_repository_key,
+                "Memory repository key",
+            )
+            store = self.context.memory_store
+            if store is None:
+                generations = GenerationMetadata(
+                    store_schema_version=1,
+                    memory_generation=0,
+                    feedback_generation=0,
+                    knowledge_generation=0,
+                )
+            else:
+                if config.mode is MemoryMode.READ_WRITE:
+                    try:
+                        sweep = MemoryLifecycle(
+                            store,
+                            SourceValidator(self.context.repository),
+                        ).expire_due_records(
+                            repository_key,
+                            target_head=manifest.revisions.resolved_head_sha,
+                            evaluated_at=created_at,
+                            max_records=min(
+                                config.max_snapshot_records,
+                                MAX_EXPIRY_SWEEP_RECORDS,
+                            ),
+                        )
+                    except Exception:
+                        _append_memory_degradation_code(
+                            self.context,
+                            "expiry_sweep_failed",
+                        )
+                    else:
+                        if sweep.truncated:
+                            _append_memory_degradation_code(
+                                self.context,
+                                "expiry_sweep_truncated",
+                            )
+                        if sweep.unresolved_ids:
+                            _append_memory_degradation_code(
+                                self.context,
+                                "expiry_condition_unresolved",
+                            )
+                try:
+                    read_view = store.read_view(repository_key)
+                except (MemoryStoreError, OSError):
+                    generations = GenerationMetadata(
+                        store_schema_version=1,
+                        memory_generation=0,
+                        feedback_generation=0,
+                        knowledge_generation=0,
+                    )
+                    if "memory_unavailable" not in self.context.memory_degradation_codes:
+                        self.context.memory_degradation_codes.append(
+                            "memory_unavailable"
+                        )
+                    if config.required and (
+                        "memory_required_unavailable"
+                        not in self.context.memory_degradation_codes
+                    ):
+                        self.context.memory_degradation_codes.append(
+                            "memory_required_unavailable"
+                        )
+                else:
+                    generations = read_view.generations
+                    # The Snapshot builder owns status/applicability decisions.
+                    # Passing the complete validated catalog preserves an audit
+                    # trail for revoked, superseded, expired, and stale records
+                    # without ever making them eligible context.
+                    records = read_view.records
+                    feedback_records = read_view.feedback
+        selection_input = MemorySelectionInput(
+            review_id=manifest.review_id,
+            repository_key=repository_key,
+            base_sha=manifest.revisions.resolved_base_sha,
+            head_sha=manifest.revisions.resolved_head_sha,
+            changed_paths=tuple(summary.changed_files),
+            changed_symbols=tuple(
+                sorted(
+                    {
+                        item.qualified_name
+                        for item in intelligence.changed_symbols
+                    }
+                )
+            ),
+            # Selection runs before the Portfolio exists, so its only
+            # authoritative contract universe is the Runtime registry.  Keeping
+            # that fixed allowlist here lets contract-scoped Memory (including
+            # hard policy) enter the pinned Snapshot; later stage/Assignment
+            # selectors still narrow what each model receives.
+            contracts=tuple(DEFAULT_CONTRACT_ALLOWLIST),
+            languages=_memory_languages(summary.changed_files),
+            generations=generations,
+            selection_policy_version=MEMORY_SELECTION_POLICY_VERSION,
+        )
+        feedback = feedback_aggregation_v1(
+            feedback_records,
+            repository_key=repository_key,
+            feedback_generation=generations.feedback_generation,
+            created_at=created_at,
+        ).summary
+        knowledge_refs = _repository_knowledge_refs(intelligence)
+        if config.mode is MemoryMode.OFF:
+            snapshot = build_disabled_snapshot(
+                selection_input,
+                created_at=created_at,
+                max_snapshot_bytes=config.max_snapshot_bytes,
+            )
+            status = "disabled"
+            reason_codes = ["memory_disabled"]
+        else:
+            snapshot = build_memory_snapshot(
+                TargetHeadApplicabilityEvaluator(
+                    self.context.repository,
+                    SourceValidator(self.context.repository),
+                ),
+                selection_input,
+                records,
+                created_at=created_at,
+                limits=RetrievalLimits.from_execution_config(config),
+                feedback_calibration_summary=feedback,
+                repository_knowledge_refs=knowledge_refs,
+            )
+            snapshot_reason_codes = {
+                reason_code
+                for applicability in snapshot.applicability_decisions
+                for reason_code in applicability.reason_codes
+            }
+            if "expiry_condition_unresolved" in snapshot_reason_codes:
+                _append_memory_degradation_code(
+                    self.context,
+                    "expiry_condition_unresolved",
+                )
+            if snapshot_reason_codes.intersection(
+                {"expiry_time_reached", "expiry_commit_reached"}
+            ):
+                _append_memory_degradation_code(
+                    self.context,
+                    "expiry_persistence_deferred",
+                )
+            status = (
+                "degraded"
+                if self.context.memory_degradation_codes
+                else "selected"
+            )
+            reason_codes = list(self.context.memory_degradation_codes)
+        policy_compilation = compile_memory_policy(
+            snapshot.eligible_records,
+            current_risk_floor=RiskLevel.LOW,
+            registry=_memory_policy_registry(self.context),
+        )
+        cache_provenance = intelligence.cache_provenance
+        runtime_binding = {
+            "schema": "memory_runtime_binding_v1",
+            "mode": config.mode.value,
+            "repository_key": repository_key,
+            "locator_repository_key": memory_repository_key(manifest.repository),
+            "authority_resolution": (
+                None
+                if self.context.memory_authority_resolution is None
+                else self.context.memory_authority_resolution.to_payload()
+            ),
+            "cache_provenance": (
+                None
+                if cache_provenance is None
+                else cache_provenance.to_dict()
+            ),
+        }
+        decision = {
+            "schema": "memory_selection_decision_v1",
+            "mode": config.mode.value,
+            "status": status,
+            "reason_codes": reason_codes,
+            "snapshot_id": snapshot.snapshot_id,
+            "snapshot_hash": snapshot.snapshot_hash,
+            "selected_memory_ids": [
+                item.memory_id for item in snapshot.eligible_records
+            ],
+            "decision_count": len(snapshot.applicability_decisions),
+            "policy_compilation": policy_compilation.to_dict(),
+            "runtime_binding": runtime_binding,
+        }
+        workspace = self._phase_workspace(RunPhase.MEMORY_SELECTION)
+        workspace.write_json(
+            "memory_selection_input.json",
+            selection_input.to_dict(),
+        )
+        workspace.write_json("memory_snapshot.json", snapshot.to_dict())
+        workspace.write_json("memory_selection_decision.json", decision)
+        workspace.write_json("memory_feedback_summary.json", feedback.to_dict())
+        artifacts = self._commit_files(
+            RunPhase.MEMORY_SELECTION,
+            workspace,
+            {
+                "memory_selection_input": (
+                    "memory_selection_input.json",
+                    "memory_selection_input.json",
+                ),
+                "memory_snapshot": (
+                    "memory_snapshot.json",
+                    "memory_snapshot.json",
+                ),
+                "memory_selection_decision": (
+                    "memory_selection_decision.json",
+                    "memory_selection_decision.json",
+                ),
+                "memory_feedback_summary": (
+                    "memory_feedback_summary.json",
+                    "memory_feedback_summary.json",
+                ),
+            },
+        )
+        self.context.memory_selection_input = selection_input
+        self.context.memory_snapshot = snapshot
+        self.context.memory_selection_decision = decision
+        self.context.memory_feedback_summary = feedback
+        self.context.memory_policy_compilation = policy_compilation
+        self.context.memory_runtime_binding = runtime_binding
+        self.context.memory_cache_provenance = runtime_binding["cache_provenance"]
+        return artifacts
+
+    def _load_memory_selection(self) -> None:
+        selection_input = MemorySelectionInput.from_dict(
+            self._read_json_artifact("memory_selection_input")
+        )
+        snapshot = MemorySnapshot.from_dict(
+            self._read_json_artifact("memory_snapshot")
+        )
+        decision = _memory_selection_decision_from_dict(
+            self._read_json_artifact("memory_selection_decision")
+        )
+        feedback = FeedbackCalibrationSummary.from_dict(
+            self._read_json_artifact("memory_feedback_summary")
+        )
+        stored_compilation = decision["policy_compilation"]
+        runtime_binding = _memory_runtime_binding_from_dict(
+            decision["runtime_binding"]
+        )
+        policy_compilation = compile_memory_policy(
+            snapshot.eligible_records,
+            current_risk_floor=RiskLevel.LOW,
+            registry=_memory_policy_registry(self.context),
+        )
+        if stored_compilation != policy_compilation.to_dict():
+            raise ValueError(
+                "Memory policy compilation does not match the fixed Snapshot"
+            )
+        authority_payload = runtime_binding["authority_resolution"]
+        authority = (
+            None
+            if authority_payload is None
+            else RepositoryAuthorityResolution.from_payload(authority_payload)
+        )
+        cache_payload = runtime_binding["cache_provenance"]
+        cache_entry_id = (
+            None if cache_payload is None else cache_payload.get("entry_id")
+        )
+        if (
+            snapshot.repository_key != selection_input.repository_key
+            or snapshot.base_sha != selection_input.base_sha
+            or snapshot.head_sha != selection_input.head_sha
+            or snapshot.generations != selection_input.generations
+            or decision["snapshot_id"] != snapshot.snapshot_id
+            or decision["snapshot_hash"] != snapshot.snapshot_hash
+            or feedback.repository_key != selection_input.repository_key
+            or feedback.feedback_generation
+            != selection_input.generations.feedback_generation
+            or tuple(decision["selected_memory_ids"])
+            != tuple(item.memory_id for item in snapshot.eligible_records)
+            or decision["decision_count"]
+            != len(snapshot.applicability_decisions)
+            or (
+                decision["mode"] != MemoryMode.OFF.value
+                and snapshot.feedback_calibration_summary != feedback
+            )
+            or runtime_binding["mode"] != decision["mode"]
+            or runtime_binding["repository_key"] != snapshot.repository_key
+            or runtime_binding["locator_repository_key"]
+            != memory_repository_key(self.context.manifest.repository)
+            or (
+                authority is not None
+                and (
+                    authority.authority_repository_key != snapshot.repository_key
+                    or authority.locator_repository_key
+                    != runtime_binding["locator_repository_key"]
+                )
+            )
+            or (
+                cache_payload is not None
+                and (
+                    cache_payload.get("repository_key")
+                    != snapshot.repository_key
+                    or cache_payload.get("revision_binding")
+                    != self.context.revision_binding
+                )
+            )
+            or (
+                cache_entry_id is not None
+                and cache_entry_id not in snapshot.repository_knowledge_refs
+            )
+            or (
+                snapshot.repository_knowledge_refs
+                and cache_entry_id not in snapshot.repository_knowledge_refs
+            )
+        ):
+            raise ValueError("Memory Selection artifacts are not mutually bound")
+        self.context.memory_selection_input = selection_input
+        self.context.memory_snapshot = snapshot
+        self.context.memory_selection_decision = decision
+        self.context.memory_feedback_summary = feedback
+        self.context.memory_policy_compilation = policy_compilation
+        self.context.memory_runtime_binding = runtime_binding
+        self.context.memory_cache_provenance = runtime_binding[
+            "cache_provenance"
+        ]
+        self.context.memory_repository_key = snapshot.repository_key
+        self.context.memory_authority_resolution = authority
+        self.context.memory_degradation_codes = list(decision["reason_codes"])
+        # A completed Selection is immutable input.  Loading it must never open
+        # a newer Store generation or replace the pinned Snapshot.
+        self.context.memory_runtime_initialized = True
+
+    def _run_memory_proposal(self) -> dict[str, str]:
+        config = _required(self.context.memory_config, "Memory execution config")
+        snapshot = _required(self.context.memory_snapshot, "Memory Snapshot")
+        workspace = self._phase_workspace(RunPhase.MEMORY_PROPOSAL)
+        existing = self.context.manifest.artifacts
+        if _memory_proposal_has_reusable_curator_artifacts(
+            self.context.session_store,
+            self.context.manifest,
+        ):
+            decision = _memory_curator_decision_from_dict(
+                self._read_json_artifact("memory_curator_decision")
+            )
+            batch = _memory_candidate_batch_from_dict(
+                self._read_json_artifact("memory_candidates")
+            )
+            artifacts = {
+                name: descriptor.path
+                for name, descriptor in existing.items()
+                if descriptor.phase is RunPhase.MEMORY_PROPOSAL
+            }
+        elif config.mode is not MemoryMode.READ_WRITE:
+            request_digest = canonical_sha256(
+                {
+                    "schema": "memory_proposal_skip_request_v1",
+                    "review_id": self.context.manifest.review_id,
+                    "snapshot_id": snapshot.snapshot_id,
+                    "mode": config.mode.value,
+                }
+            )
+            invocation_id = "MCI-" + canonical_sha256(
+                {
+                    "schema": "memory_proposal_skip_invocation_v1",
+                    "request_digest": request_digest,
+                }
+            )
+            batch = MemoryCandidateBatch(
+                request_digest=request_digest,
+                invocation_id=invocation_id,
+                candidates=(),
+            )
+            decision = {
+                "schema": "memory_curator_decision_v1",
+                "mode": self.context.manifest.execution.memory_curator.mode,
+                "outcome": "skipped",
+                "reason_code": (
+                    "memory_disabled"
+                    if config.mode is MemoryMode.OFF
+                    else "memory_read_only"
+                ),
+                "request_digest": request_digest,
+                "invocation_id": invocation_id,
+                "attempt_count": 0,
+                "candidate_ids": [],
+                "warning_codes": [],
+                "review_conclusion_impact": "none",
+            }
+            workspace.write_json("memory_curator_decision.json", decision)
+            workspace.write_json("memory_candidates.json", batch.to_dict())
+            artifacts = self._commit_files(
+                RunPhase.MEMORY_PROPOSAL,
+                workspace,
+                {
+                    "memory_curator_decision": (
+                        "memory_curator_decision.json",
+                        "memory_curator_decision.json",
+                    ),
+                    "memory_candidates": (
+                        "memory_candidates.json",
+                        "memory_candidates.json",
+                    ),
+                },
+            )
+        else:
+            try:
+                result = self._run_memory_curator()
+            except Exception:
+                result = None
+            if result is None:
+                request_digest = canonical_sha256(
+                    {
+                        "schema": "memory_curator_failure_v1",
+                        "review_id": self.context.manifest.review_id,
+                        "snapshot_id": snapshot.snapshot_id,
+                    }
+                )
+                invocation_id = "MCI-" + canonical_sha256(
+                    {
+                        "schema": "memory_curator_failure_invocation_v1",
+                        "request_digest": request_digest,
+                    }
+                )
+                batch = MemoryCandidateBatch(
+                    request_digest=request_digest,
+                    invocation_id=invocation_id,
+                    candidates=(),
+                )
+                decision = {
+                    "schema": "memory_curator_decision_v1",
+                    "mode": self.context.manifest.execution.memory_curator.mode,
+                    "outcome": "rejected",
+                    "request_digest": request_digest,
+                    "invocation_id": invocation_id,
+                    "attempt_count": 0,
+                    "candidate_ids": [],
+                    "duplicate_fingerprints": [],
+                    "warning_codes": ["unsafe_response"],
+                    "warnings": [
+                        "Memory proposal response could not be safely retained; "
+                        "the batch was rejected."
+                    ],
+                    "review_conclusion_impact": "none",
+                }
+                if "curator_failed" not in self.context.memory_degradation_codes:
+                    self.context.memory_degradation_codes.append("curator_failed")
+            else:
+                self.context.memory_curator_result = result
+                batch = result.batch
+                decision = result.decision.to_dict()
+            workspace.write_json("memory_curator_decision.json", decision)
+            workspace.write_json("memory_candidates.json", batch.to_dict())
+            files: dict[str, tuple[str, str]] = {
+                "memory_curator_decision": (
+                    "memory_curator_decision.json",
+                    "memory_curator_decision.json",
+                ),
+                "memory_candidates": (
+                    "memory_candidates.json",
+                    "memory_candidates.json",
+                ),
+            }
+            if result is not None and result.envelope is not None:
+                workspace.write_json(
+                    "memory_curator_envelope.json",
+                    result.envelope.to_dict(),
+                )
+                files["memory_curator_envelope"] = (
+                    "memory_curator_envelope.json",
+                    "memory_curator_envelope.json",
+                )
+            if result is not None and result.raw_response is not None:
+                workspace.write_json(
+                    "memory_curator_raw_response.json",
+                    result.raw_response.to_dict(),
+                )
+                files["memory_curator_raw_response"] = (
+                    "memory_curator_raw_response.json",
+                    "memory_curator_raw_response.json",
+                )
+            artifacts = self._commit_files(
+                RunPhase.MEMORY_PROPOSAL,
+                workspace,
+                files,
+            )
+
+        if batch.candidates:
+            if "memory_outbox" in self.context.manifest.artifacts:
+                outbox = _memory_outbox_from_dict(
+                    self._read_json_artifact("memory_outbox")
+                )
+            else:
+                outbox = _build_memory_outbox(
+                    context=self.context,
+                    batch=batch,
+                    curator_mode=decision["mode"],
+                )
+                workspace.write_json("memory_outbox.json", outbox)
+                artifacts.update(
+                    self._commit_files(
+                        RunPhase.MEMORY_PROPOSAL,
+                        workspace,
+                        {
+                            "memory_outbox": (
+                                "memory_outbox.json",
+                                "memory_outbox.json",
+                            )
+                        },
+                    )
+                )
+            self.context.memory_outbox = outbox
+            receipt = None
+            if "memory_persistence_receipt" in self.context.manifest.artifacts:
+                receipt = _memory_persistence_receipt_for_outbox(
+                    self._read_json_artifact("memory_persistence_receipt"),
+                    batch=batch,
+                    outbox=outbox,
+                )
+            else:
+                try:
+                    receipt = replay_memory_outbox(
+                        repository=self.context.repository,
+                        memory_root=Path(config.root_path),
+                        review_id=self.context.manifest.review_id,
+                        expected_repository_key=outbox["repository_key"],
+                        expected_authority_resolution_hash=outbox[
+                            "authority_resolution_hash"
+                        ],
+                        expected_outbox_digest=outbox["outbox_digest"],
+                    )
+                except Exception:
+                    if "outbox_pending" not in self.context.memory_degradation_codes:
+                        self.context.memory_degradation_codes.append("outbox_pending")
+            if receipt is not None:
+                receipt = _memory_persistence_receipt_for_outbox(
+                    receipt,
+                    batch=batch,
+                    outbox=outbox,
+                )
+                workspace.write_json(
+                    "memory_persistence_receipt.json",
+                    dict(receipt),
+                )
+                artifacts.update(
+                    self._commit_files(
+                        RunPhase.MEMORY_PROPOSAL,
+                        workspace,
+                        {
+                            "memory_persistence_receipt": (
+                                "memory_persistence_receipt.json",
+                                "memory_persistence_receipt.json",
+                            )
+                        },
+                    )
+                )
+                self.context.memory_persistence_receipt = dict(receipt)
+        self.context.memory_candidate_batch = batch
+        self.context.memory_curator_decision = decision
+        return artifacts
+
+    def _run_memory_curator(self) -> MemoryCuratorResult:
+        curator_input = self._memory_curator_input()
+        stage = self.context.manifest.execution.memory_curator
+        if stage.mode == "local":
+            return run_local_memory_curator(curator_input)
+        try:
+            factory = self._build_adapter_factory(
+                ModelAdapterConfig(
+                    provider_name=stage.provider,
+                    model=stage.model,
+                    base_url=stage.base_url,
+                    api_key_env=stage.api_key_env,
+                    stage_label="memory-curator",
+                )
+            )
+            if factory is None:
+                raise RuntimeError("memory-curator model adapter is unavailable")
+        except Exception as error:
+            factory = _UnavailableMemoryCuratorFactory(
+                provider_name=stage.provider,
+                error=error,
+            )
+        return run_model_memory_curator(
+            factory,
+            curator_input,
+            model=_model_stage_name(stage, "configured-memory-curator"),
+            max_output_tokens=stage.max_output_tokens,
+            max_provider_attempts=stage.max_provider_attempts,
+            max_elapsed_seconds=stage.max_elapsed_seconds,
+        )
+
+    def _memory_curator_input(self) -> MemoryCuratorInput:
+        manifest = self.context.manifest
+        request = _required(self.context.request, "review request")
+        reconciliation = _required(
+            self.context.reconciliation,
+            "evidence reconciliation",
+        )
+        completion = _required(self.context.completion, "completion")
+        final_risk = _required(self.context.final_risk, "final risk")
+        created_at = self._clock()
+        sources: list[ValidatedCuratorSource] = []
+        rules: list[LocalCuratorRule] = []
+        declarations: list[HumanDeclarationAuthority] = []
+        for index, statement in enumerate(request.project_rules):
+            declaration_ref = HumanDeclarationSourceRef(
+                request_id=stable_request_id(
+                    "memory_project_rule",
+                    manifest.review_id,
+                    index,
+                    statement,
+                ),
+                actor="review-cli",
+                declaration_hash=hashlib.sha256(
+                    statement.encode("utf-8")
+                ).hexdigest(),
+                created_at=created_at,
+                review_id=manifest.review_id,
+            )
+            declarations.append(
+                HumanDeclarationAuthority(
+                    source_ref=declaration_ref,
+                    origin=HumanDeclarationOrigin.CLI_REQUEST,
+                    declaration=statement,
+                )
+            )
+            rules.append(
+                LocalCuratorRule(
+                    rule_id=f"project-rule-{index + 1}",
+                    authority=CuratorAuthority.EXPLICIT_PROJECT_RULE,
+                    kind=MemoryKind.REVIEW_RULE,
+                    statement=statement,
+                    scope=MemoryScope(),
+                    source_ref_ids=(source_ref_id(declaration_ref),),
+                    validity_policies=(ValidityPolicy.MANUAL_UNTIL_REVOKED,),
+                    confidence=MemoryConfidence.HIGH,
+                    sensitivity=Sensitivity.NORMAL,
+                )
+            )
+        reconciliation_descriptor = manifest.artifacts.get("reconciliation")
+        if reconciliation_descriptor is not None:
+            reconciliation_source_ref = SessionArtifactSourceRef(
+                review_id=manifest.review_id,
+                artifact_name="reconciliation",
+                artifact_schema=reconciliation_descriptor.schema,
+                revision_binding=_required(
+                    reconciliation_descriptor.revision_binding,
+                    "reconciliation artifact revision binding",
+                ),
+                artifact_hash=reconciliation_descriptor.sha256,
+            )
+            validation = SourceValidator(self.context.repository).validate_sources(
+                (reconciliation_source_ref,),
+                sensitivity=Sensitivity.NORMAL,
+            )
+            if validation.valid:
+                excerpt = "; ".join(
+                    item.claim for item in reconciliation.canonical_findings
+                ) or "Final evidence reconciliation completed for this review."
+                sources.append(
+                    ValidatedCuratorSource.from_validation_report(
+                        source_ref=reconciliation_source_ref,
+                        excerpt=excerpt,
+                        report=validation,
+                    )
+                )
+            elif (
+                "curator_source_unavailable"
+                not in self.context.memory_degradation_codes
+            ):
+                self.context.memory_degradation_codes.append(
+                    "curator_source_unavailable"
+                )
+        existing: list[ExistingFingerprint] = []
+        if self.context.memory_store is not None:
+            existing.extend(
+                _memory_curator_fingerprint_catalog(
+                    self.context.memory_store,
+                    _required(
+                        self.context.memory_repository_key,
+                        "Memory repository key",
+                    ),
+                )
+            )
+        return MemoryCuratorInput(
+            repository_key=_required(
+                self.context.memory_repository_key,
+                "Memory repository key",
+            ),
+            origin_review_id=manifest.review_id,
+            head_sha=manifest.revisions.resolved_head_sha,
+            created_at=created_at,
+            final_verified_context=FinalVerifiedContext(
+                verified_findings=tuple(
+                    item.claim for item in reconciliation.canonical_findings
+                ),
+                uncertainties=tuple(completion.uncertainties),
+                contract_coverage=tuple(
+                    f"{item.contract}:{item.status}"
+                    for item in reconciliation.contract_coverage
+                ),
+                final_risk=final_risk.level.value,
+            ),
+            validated_sources=tuple(sources),
+            explicit_project_rules=tuple(rules),
+            trusted_human_declarations=tuple(declarations),
+            existing_fingerprints=tuple(existing),
+        )
+
+    def _load_memory_proposal(self) -> None:
+        decision = _memory_curator_decision_from_dict(
+            self._read_json_artifact("memory_curator_decision")
+        )
+        batch = _memory_candidate_batch_from_dict(
+            self._read_json_artifact("memory_candidates")
+        )
+        if (
+            decision["request_digest"] != batch.request_digest
+            or decision["invocation_id"] != batch.invocation_id
+            or tuple(decision["candidate_ids"])
+            != tuple(item.candidate_id for item in batch.candidates)
+        ):
+            raise ValueError("Memory Proposal artifacts are not mutually bound")
+        self.context.memory_candidate_batch = batch
+        self.context.memory_curator_decision = decision
+        if "memory_outbox" in self.context.manifest.artifacts:
+            outbox = _memory_outbox_from_dict(
+                self._read_json_artifact("memory_outbox")
+            )
+            snapshot = _required(self.context.memory_snapshot, "Memory Snapshot")
+            if (
+                outbox["batch_digest"] != batch.batch_digest
+                or tuple(row["candidate_id"] for row in outbox["entries"])
+                != tuple(item.candidate_id for item in batch.candidates)
+                or outbox["snapshot_id"] != snapshot.snapshot_id
+                or outbox["head_sha"] != snapshot.head_sha
+                or outbox["repository_key"] != snapshot.repository_key
+                or outbox["review_id"] != self.context.manifest.review_id
+            ):
+                raise ValueError("Memory outbox does not match candidate batch")
+            self.context.memory_outbox = outbox
+        if "memory_persistence_receipt" in self.context.manifest.artifacts:
+            if self.context.memory_outbox is None:
+                raise ValueError("Memory receipt has no committed outbox")
+            receipt = _memory_persistence_receipt_for_outbox(
+                self._read_json_artifact("memory_persistence_receipt"),
+                batch=batch,
+                outbox=self.context.memory_outbox,
+            )
+            self.context.memory_persistence_receipt = receipt
+
     def _run_intent_discovery(self) -> dict[str, str]:
         request = _required(self.context.request, "review request")
         summary = _required(self.context.change_summary, "change summary")
         manifest = self.context.manifest
         claims = collect_deterministic_claims(request, summary)
         uncertainties: list[str] = []
+        memory_projection = _intent_memory_projection(self.context)
+        if memory_projection is not None:
+            claims = merge_inference_claims(
+                claims,
+                intent_claims_from_memory_projection(memory_projection),
+            )
+            uncertainties.extend(
+                f"memory {item.code.value}: {item.message}"
+                for item in memory_projection.diagnostics
+            )
 
         workspace = self._phase_workspace(RunPhase.INTENT_DISCOVERY)
         observation_root = workspace.path / "obs"
@@ -1001,6 +2077,7 @@ class ReviewPipeline:
                 resolved_base_revision=manifest.revisions.resolved_base_sha,
                 resolved_head_revision=manifest.revisions.resolved_head_sha,
                 model=manifest.execution.reviewer_model or "configured-intent-model",
+                memory_projection=memory_projection,
             )
             inference_claims = [
                 _intent_claim_from_inference(candidate)
@@ -1065,6 +2142,7 @@ class ReviewPipeline:
         self.context.intent_questions = questions
         self.context.intent_discovery_uncertainties = _dedupe(uncertainties)
         self.context.intent_inference = inference
+        self.context.intent_memory_projection = memory_projection
         self.context.intent_observations = ObservationStore.load(
             self.context.checkpoint_store.run_dir
             / "observation_stores"
@@ -1089,6 +2167,9 @@ class ReviewPipeline:
         )
         self.context.intent_observations = self._load_observation_artifact(
             "intent_observations"
+        )
+        self.context.intent_memory_projection = _intent_memory_projection(
+            self.context
         )
 
     def _run_intent_resolution(self) -> dict[str, str]:
@@ -1198,11 +2279,13 @@ class ReviewPipeline:
             and self.context.quality_gate_plan.discovery_issues
         ):
             pre_risk_quality_status["quality_gate_discovery"] = "error"
+        risk_memory_projection = _risk_memory_projection(self.context)
         risk_packet = build_risk_packet(
             summary,
             intent,
             pre_risk_quality_status,
             self.context.repository_intelligence,
+            risk_memory_projection,
         )
         local_risk = LocalRiskAssessor().assess(risk_packet)
         risk_stage = manifest.execution.risk_assessor
@@ -1249,6 +2332,7 @@ class ReviewPipeline:
             for ref, description in risk_packet.signal_catalog.items()
             if description.strip()
         }
+        planner_memory_projection = _planner_memory_projection(self.context)
         portfolio_packet = build_portfolio_packet(
             risk,
             change_map={
@@ -1268,6 +2352,11 @@ class ReviewPipeline:
             intent_uncertainties=intent.uncertainties,
             ref_allowlist=portfolio_ref_catalog,
             ref_catalog=portfolio_ref_catalog,
+            contract_allowlist=DEFAULT_CONTRACT_ALLOWLIST,
+            check_allowlist=_quality_gate_check_ids(self.context),
+            command_template_allowlist=DEFAULT_COMMAND_TEMPLATE_ALLOWLIST,
+            perspective_allowlist=DEFAULT_PERSPECTIVE_ALLOWLIST,
+            memory_projection=planner_memory_projection,
         )
         portfolio_stage = manifest.execution.portfolio_planner
         portfolio_adapter = self._model_stage_adapter(
@@ -1317,6 +2406,23 @@ class ReviewPipeline:
                         if incremental_priority is not None
                         else list(assignment.initial_context.diff_ranges)
                     ),
+                    selected_memory_refs=(
+                        [
+                            item.memory_id
+                            for item in planner_memory_projection.selected_memory
+                            if not item.local_only
+                        ]
+                        if planner_memory_projection is not None
+                        else []
+                    ),
+                    verification_template_hints=(
+                        [
+                            item.command_template_id
+                            for item in planner_memory_projection.verification_hints
+                        ]
+                        if planner_memory_projection is not None
+                        else []
+                    ),
                 ),
             )
             for assignment in portfolio.assignments
@@ -1324,15 +2430,23 @@ class ReviewPipeline:
         workspace = self._phase_workspace(RunPhase.PLANNING)
         deep_observations = ObservationStore(workspace.path / "quality-obs")
         deep_results: list[QualityGateResult] = []
+        memory_required_checks = _memory_required_check_ids(self.context)
         if self.context.quality_gate_plan is not None:
             for gate in self.context.quality_gate_plan.gates:
                 if gate.cost != "expensive":
                     continue
-                should_run, reason = quality_gate_policy_decision(
-                    gate,
-                    risk,
-                    assignments,
-                )
+                if gate.name in memory_required_checks:
+                    should_run, reason = (
+                        True,
+                        "required by approved project Memory in the frozen "
+                        "Quality Gate plan",
+                    )
+                else:
+                    should_run, reason = quality_gate_policy_decision(
+                        gate,
+                        risk,
+                        assignments,
+                    )
                 execution = (
                     self._execute_quality_gate(gate)
                     if should_run
@@ -1526,6 +2640,8 @@ class ReviewPipeline:
         self.context.risk_packet = risk_packet
         self.context.risk_assessment = risk
         self.context.risk_model_decision = risk_decision_payload
+        self.context.risk_memory_projection = risk_memory_projection
+        self.context.planner_memory_projection = planner_memory_projection
         self.context.incremental_priority = incremental_priority
         self.context.assignments = assignments
         self.context.portfolio_plan = portfolio_plan_payload
@@ -1541,6 +2657,12 @@ class ReviewPipeline:
         )
         self.context.risk_assessment = risk_assessment_from_dict(
             self._read_json_artifact("risk")
+        )
+        self.context.risk_memory_projection = (
+            self.context.risk_packet.memory_projection
+        )
+        self.context.planner_memory_projection = _planner_memory_projection(
+            self.context
         )
         self.context.assignments = assignments_from_dict(
             self._read_json_artifact("assignments")
@@ -1773,6 +2895,19 @@ class ReviewPipeline:
             except Exception as error:
                 adapter = None
                 creation_error = error
+            memory_selection = _reviewer_memory_selection(
+                self.context,
+                assignment,
+            )
+            memory_query_service = _reviewer_memory_query_service(
+                self.context,
+                assignment,
+                fallback_assignment_id=task_name,
+            )
+            if memory_selection is not None:
+                self.context.reviewer_memory_selections[
+                    assignment.assignment_id or task_name
+                ] = memory_selection
             pending.append(
                 _PendingReviewer(
                     index=index,
@@ -1782,6 +2917,8 @@ class ReviewPipeline:
                     creation_error=creation_error,
                     initial_observations=dict(initial_reviewer_observations),
                     single_artifacts=single_artifacts,
+                    memory_selection=memory_selection,
+                    memory_query_service=memory_query_service,
                 )
             )
 
@@ -1897,6 +3034,16 @@ class ReviewPipeline:
             initial_observations=pending.initial_observations,
             allowed_tools=REVIEWER_TOOL_NAMES,
             diff_excerpt=tuple(self._review_diff_excerpt(summary)),
+            memory_snapshot=self.context.memory_snapshot,
+            memory_query_service=pending.memory_query_service,
+            memory_selection=pending.memory_selection,
+            memory_policy_compilation=self.context.memory_policy_compilation,
+            repository_knowledge=(
+                None
+                if self.context.memory_snapshot is None
+                else self.context.memory_snapshot.repository_knowledge_refs
+            ),
+            feedback_calibration_summary=self.context.memory_feedback_summary,
         )
         task_run = ReviewerTaskExecutor(
             repository_path=self.context.repository,
@@ -2248,6 +3395,7 @@ class ReviewPipeline:
         )
         intent = _required(self.context.intent, "intent")
         effective_policy = self._effective_supplemental_policy()
+        reconciler_memory = _reconciler_memory_summary(self.context)
         return reconcile_semantically(
             prepass,
             observations,
@@ -2262,6 +3410,11 @@ class ReviewPipeline:
             policy_summary={
                 "supplemental_policy": asdict(
                     effective_policy
+                ),
+                **(
+                    {"memory": reconciler_memory}
+                    if reconciler_memory is not None
+                    else {}
                 ),
             },
             adapter=adapter,
@@ -2901,11 +4054,30 @@ class ReviewPipeline:
             if observation_id in all_summaries
         }
         reviewer_index = self._supplemental_reviewer_index(spec.task_id)
+        memory_selection = _reviewer_memory_selection(
+            self.context,
+            spec.assignment,
+        )
+        memory_query_service = _reviewer_memory_query_service(
+            self.context,
+            spec.assignment,
+            fallback_assignment_id=spec.task_id,
+        )
         task = ReviewerTask.for_supplemental(
             spec,
             reviewer_index=reviewer_index,
             intent=_required(self.context.intent, "intent"),
             initial_observations=initial_observations,
+            memory_snapshot=self.context.memory_snapshot,
+            memory_query_service=memory_query_service,
+            memory_selection=memory_selection,
+            memory_policy_compilation=self.context.memory_policy_compilation,
+            repository_knowledge=(
+                None
+                if self.context.memory_snapshot is None
+                else self.context.memory_snapshot.repository_knowledge_refs
+            ),
+            feedback_calibration_summary=self.context.memory_feedback_summary,
         )
         task_run = ReviewerTaskExecutor(
             repository_path=self.context.repository,
@@ -3387,6 +4559,17 @@ class ReviewPipeline:
         )
 
     def _run_completion(self) -> dict[str, str]:
+        planner_projection = (
+            self.context.planner_memory_projection
+            or _planner_memory_projection(self.context)
+        )
+        memory_projection = (
+            None
+            if planner_projection is None
+            else completion_memory_projection_from_planner(
+                planner_projection
+            )
+        )
         completion = check_completion(
             intent=_required(self.context.intent, "intent"),
             quality_results=self.context.quality_results,
@@ -3412,6 +4595,7 @@ class ReviewPipeline:
                 if self.context.semantic_reconciliation is not None
                 else None
             ),
+            memory_projection=memory_projection,
         )
         workspace = self._phase_workspace(RunPhase.COMPLETION)
         workspace.write_json("completion.json", completion_to_dict(completion))
@@ -3421,6 +4605,7 @@ class ReviewPipeline:
             {"completion": ("completion.json", "completion.json")},
         )
         self.context.completion = completion
+        self.context.completion_memory_projection = memory_projection
         return artifacts
 
     def _load_completion(self) -> None:
@@ -3431,6 +4616,25 @@ class ReviewPipeline:
         self.context.completion = completion_from_dict(
             self._read_json_artifact("completion")
         )
+        planner_projection = (
+            self.context.planner_memory_projection
+            or _planner_memory_projection(self.context)
+        )
+        memory_projection = (
+            None
+            if planner_projection is None
+            else completion_memory_projection_from_planner(
+                planner_projection
+            )
+        )
+        if memory_projection is not None and (
+            self.context.completion.memory_diagnostics
+            != memory_projection.diagnostics
+        ):
+            raise ValueError(
+                "completion Memory diagnostics do not match fixed policy"
+            )
+        self.context.completion_memory_projection = memory_projection
 
     def _run_final_risk(self) -> dict[str, str]:
         reconciliation_payload = (
@@ -3442,6 +4646,34 @@ class ReviewPipeline:
             completion_to_dict(self.context.completion)
             if self.context.completion is not None
             else None
+        )
+        risk_projection = (
+            self.context.risk_memory_projection
+            or (
+                None
+                if self.context.risk_packet is None
+                else self.context.risk_packet.memory_projection
+            )
+        )
+        final_memory_projection = (
+            None
+            if risk_projection is None
+            else final_risk_memory_projection_from_risk(
+                risk_projection,
+                residual_risk=(
+                    ()
+                    if self.context.completion is None
+                    else tuple(
+                        _dedupe(
+                            [
+                                item.strip()
+                                for item in self.context.completion.uncertainties
+                                if item.strip()
+                            ]
+                        )
+                    )
+                ),
+            )
         )
         final_risk = reassess_final_risk(
             initial_risk=_required(self.context.risk_assessment, "risk assessment"),
@@ -3457,6 +4689,7 @@ class ReviewPipeline:
                 if self.context.semantic_reconciliation is not None
                 else None
             ),
+            memory_projection=final_memory_projection,
         )
         workspace = self._phase_workspace(RunPhase.FINAL_RISK)
         workspace.write_json("final_risk.json", final_risk_to_dict(final_risk))
@@ -3466,12 +4699,39 @@ class ReviewPipeline:
             {"final_risk": ("final_risk.json", "final_risk.json")},
         )
         self.context.final_risk = final_risk
+        self.context.final_risk_memory_projection = final_memory_projection
         return artifacts
 
     def _load_final_risk(self) -> None:
         self.context.final_risk = final_risk_from_dict(
             self._read_json_artifact("final_risk")
         )
+        risk_projection = (
+            self.context.risk_memory_projection
+            or (
+                None
+                if self.context.risk_packet is None
+                else self.context.risk_packet.memory_projection
+            )
+        )
+        memory_projection = (
+            None
+            if risk_projection is None
+            else final_risk_memory_projection_from_risk(
+                risk_projection,
+                residual_risk=tuple(self.context.final_risk.residual_risk),
+            )
+        )
+        if memory_projection is not None and (
+            self.context.final_risk.applied_memory
+            != memory_projection.applied_memory
+            or self.context.final_risk.memory_diagnostics
+            != memory_projection.diagnostics
+        ):
+            raise ValueError(
+                "final risk Memory projection does not match fixed policy"
+            )
+        self.context.final_risk_memory_projection = memory_projection
 
     def _run_reporting(self) -> dict[str, str]:
         manifest = self.context.manifest
@@ -3560,6 +4820,19 @@ class ReviewPipeline:
             ),
             planning_summary=self.context.planning_summary,
             semantic_reconciliation_payload=semantic_payload,
+            memory_snapshot=self.context.memory_snapshot,
+            policy_compilation=self.context.memory_policy_compilation,
+            cache_provenance=(
+                repository_intelligence.cache_provenance
+                or self.context.memory_cache_provenance
+            ),
+            feedback_summary=self.context.memory_feedback_summary,
+            pending_memory_candidates=_memory_pending_candidate_rows(
+                self.context
+            ),
+            memory_status=_memory_reporting_status(self.context),
+            curator_status=_memory_curator_audit_status(self.context),
+            outbox_status=_memory_outbox_audit_status(self.context),
         )
         workspace.write_json("review_brief.json", review_brief_to_dict(brief))
         workspace.write_text("report.md", render_review_brief_markdown(brief))
@@ -3817,6 +5090,15 @@ class _UnavailableModelAdapter:
 
 
 @dataclass(frozen=True)
+class _UnavailableMemoryCuratorFactory:
+    provider_name: str
+    error: Exception
+
+    def create(self) -> _UnavailableModelAdapter:
+        return _UnavailableModelAdapter(self.provider_name, self.error)
+
+
+@dataclass(frozen=True)
 class _PendingReviewer:
     index: int
     task_name: str
@@ -3825,6 +5107,8 @@ class _PendingReviewer:
     creation_error: Exception | None = None
     initial_observations: dict[str, str] = field(default_factory=dict)
     single_artifacts: bool = False
+    memory_selection: RecordSelection | None = None
+    memory_query_service: SnapshotMemoryQueryService | None = None
 
 
 @dataclass(frozen=True)
@@ -4177,6 +5461,1714 @@ def _reviewer_artifact_filename(name: str) -> str:
     if name == "reviewer":
         return "reviewer_result.json"
     return f"{name}.json"
+
+
+def _build_memory_outbox(
+    *,
+    context: PipelineContext,
+    batch: MemoryCandidateBatch,
+    curator_mode: str,
+) -> dict[str, Any]:
+    if not isinstance(context, PipelineContext):
+        raise ValueError("Memory outbox context is invalid")
+    if not isinstance(batch, MemoryCandidateBatch) or not batch.candidates:
+        raise ValueError("Memory outbox requires a non-empty canonical batch")
+    if curator_mode not in {ProducerType.LOCAL.value, ProducerType.MODEL.value}:
+        raise ValueError("Memory outbox curator mode is invalid")
+    origin = ProducerType(curator_mode)
+    manifest = context.manifest
+    locator_key = memory_repository_key(manifest.repository)
+    authority = context.memory_authority_resolution
+    repository_key = _required(context.memory_repository_key, "Memory repository key")
+    authority_hash = (
+        authority.authority_resolution_hash
+        if authority is not None
+        else repository_authority_resolution_hash(locator_key, repository_key)
+    )
+    binding_id = None if authority is None else authority.binding_id
+    entries = []
+    for candidate in batch.candidates:
+        if candidate.producer.producer_type is not origin:
+            raise ValueError("Memory candidate producer does not match Curator mode")
+        entries.append(
+            {
+                "candidate_id": candidate.candidate_id,
+                "candidate_hash": canonical_sha256(candidate.to_dict()),
+                "request_id": stable_request_id(
+                    "memory_outbox",
+                    manifest.review_id,
+                    batch.batch_digest,
+                    candidate.candidate_id,
+                ),
+                # This is Runtime-owned authority restored out of band during
+                # replay; Candidate.producer is never trusted as authority.
+                "origin": origin.value,
+                "allowed_source_refs": [
+                    source_ref.to_dict() for source_ref in candidate.source_refs
+                ],
+            }
+        )
+    body: dict[str, Any] = {
+        "schema": "memory_candidate_outbox_v1",
+        "review_id": manifest.review_id,
+        "repository_key": repository_key,
+        "locator_repository_key": locator_key,
+        "authority_resolution_hash": authority_hash,
+        "binding_id": binding_id,
+        "head_sha": manifest.revisions.resolved_head_sha,
+        "snapshot_id": _required(context.memory_snapshot, "Memory Snapshot").snapshot_id,
+        "batch_digest": batch.batch_digest,
+        "actor_type": "runtime",
+        "actor_id": "memory-curator",
+        "reason_code": "candidate_submitted",
+        "entries": entries,
+    }
+    return {**body, "outbox_digest": canonical_sha256(body)}
+
+
+def _memory_outbox_from_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
+    expected = {
+        "schema",
+        "review_id",
+        "repository_key",
+        "locator_repository_key",
+        "authority_resolution_hash",
+        "binding_id",
+        "head_sha",
+        "snapshot_id",
+        "batch_digest",
+        "actor_type",
+        "actor_id",
+        "reason_code",
+        "entries",
+        "outbox_digest",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected:
+        raise ValueError("Memory outbox has unsupported fields")
+    body = {key: payload[key] for key in expected if key != "outbox_digest"}
+    if payload.get("schema") != "memory_candidate_outbox_v1":
+        raise ValueError("Memory outbox schema is unsupported")
+    review_id = payload.get("review_id")
+    if (
+        type(review_id) is not str
+        or not 1 <= len(review_id) <= 128
+        or not review_id[0].isalnum()
+        or any(
+            not (character.isalnum() or character in "._-")
+            for character in review_id
+        )
+    ):
+        raise ValueError("Memory outbox review_id is invalid")
+    for field_name in (
+        "repository_key",
+        "locator_repository_key",
+        "authority_resolution_hash",
+        "batch_digest",
+        "outbox_digest",
+    ):
+        if not _is_sha256(payload.get(field_name)):
+            raise ValueError(f"Memory outbox {field_name} is invalid")
+    head_sha = payload.get("head_sha")
+    if not isinstance(head_sha, str) or (
+        len(head_sha) not in {40, 64}
+        or head_sha != head_sha.casefold()
+        or any(character not in "0123456789abcdef" for character in head_sha)
+    ):
+        raise ValueError("Memory outbox head_sha is invalid")
+    try:
+        validate_stable_id(
+            payload.get("snapshot_id"),
+            "MSNAP",
+            "Memory outbox snapshot_id",
+        )
+        if payload["binding_id"] is not None:
+            validate_stable_id(
+                payload["binding_id"],
+                "RB",
+                "Memory outbox binding_id",
+            )
+    except (TypeError, ValueError):
+        raise ValueError("Memory outbox authority binding is invalid") from None
+    for field_name in ("actor_type", "actor_id", "reason_code"):
+        value = payload.get(field_name)
+        if (
+            type(value) is not str
+            or value != value.strip()
+            or not 1 <= len(value) <= 512
+            or any(not character.isprintable() for character in value)
+        ):
+            raise ValueError(f"Memory outbox {field_name} is invalid")
+    rows = payload.get("entries")
+    if not isinstance(rows, list) or not rows or len(rows) > 64:
+        raise ValueError("Memory outbox entries are invalid")
+    candidate_ids: list[str] = []
+    request_ids: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != {
+            "candidate_id",
+            "candidate_hash",
+            "request_id",
+            "origin",
+            "allowed_source_refs",
+        }:
+            raise ValueError("Memory outbox entry is invalid")
+        try:
+            candidate_id = validate_stable_id(
+                row.get("candidate_id"),
+                "MC",
+                "Memory outbox candidate_id",
+            )
+            request_id = validate_stable_id(
+                row.get("request_id"),
+                "REQ",
+                "Memory outbox request_id",
+            )
+        except (TypeError, ValueError):
+            raise ValueError("Memory outbox entry identity is invalid")
+        if not _is_sha256(row.get("candidate_hash")):
+            raise ValueError("Memory outbox candidate hash is invalid")
+        if row["origin"] not in {
+            ProducerType.LOCAL.value,
+            ProducerType.MODEL.value,
+        }:
+            raise ValueError("Memory outbox entry origin is invalid")
+        source_refs = row["allowed_source_refs"]
+        if not isinstance(source_refs, list) or not source_refs:
+            raise ValueError("Memory outbox entry source allowlist is invalid")
+        try:
+            hydrated_sources = tuple(SourceRef.from_dict(item) for item in source_refs)
+        except (TypeError, ValueError):
+            raise ValueError("Memory outbox entry source allowlist is invalid") from None
+        if [item.to_dict() for item in hydrated_sources] != source_refs:
+            raise ValueError("Memory outbox entry source allowlist is not canonical")
+        if candidate_id in candidate_ids or request_id in request_ids:
+            raise ValueError("Memory outbox entries are not unique")
+        candidate_ids.append(candidate_id)
+        request_ids.add(request_id)
+    if candidate_ids != sorted(candidate_ids):
+        raise ValueError("Memory outbox entries are not canonical")
+    if canonical_sha256(body) != payload["outbox_digest"]:
+        raise ValueError("Memory outbox digest is invalid")
+    return dict(payload)
+
+
+def validate_memory_outbox_for_replay(
+    payload: Mapping[str, Any],
+    *,
+    review_id: str,
+    expected_repository_key: str,
+    expected_locator_repository_key: str,
+    expected_authority_resolution_hash: str,
+    expected_binding_id: str | None,
+    expected_head_sha: str,
+) -> MemoryOutboxReplayPreview:
+    """Validate one outbox payload at the shared Pipeline/CLI boundary."""
+
+    outbox = _memory_outbox_from_dict(payload)
+    if (
+        outbox["review_id"] != review_id
+        or outbox["repository_key"] != expected_repository_key
+        or outbox["locator_repository_key"]
+        != expected_locator_repository_key
+        or outbox["authority_resolution_hash"]
+        != expected_authority_resolution_hash
+        or outbox["binding_id"] != expected_binding_id
+        or outbox["head_sha"].casefold() != expected_head_sha.casefold()
+    ):
+        raise ValueError("Memory outbox does not match expected authority")
+    return MemoryOutboxReplayPreview(
+        outbox_digest=outbox["outbox_digest"],
+        batch_digest=outbox["batch_digest"],
+        entries=tuple(
+            (row["candidate_id"], row["request_id"])
+            for row in outbox["entries"]
+        ),
+    )
+
+
+# The outer flag classifies this submission, not whether the Candidate exists.
+# An exact submission can therefore be non-replayed when it applies a new
+# authority receipt (or a rejection transition), while an already-rejected
+# Candidate can be a legitimate write-free ``rejected_unchanged`` replay.
+_MEMORY_PERSISTENCE_RESULT_STATUS_MATRIX = {
+    False: {
+        CandidateDedupeKind.UNIQUE: frozenset(
+            {
+                CandidateStatus.PENDING_APPROVAL,
+                CandidateStatus.REJECTED,
+            }
+        ),
+        CandidateDedupeKind.EXACT_REPLAY: frozenset(
+            {
+                CandidateStatus.PENDING_APPROVAL,
+                CandidateStatus.APPROVED,
+            }
+        ),
+        CandidateDedupeKind.ACTIVE_DUPLICATE: frozenset(
+            {CandidateStatus.REJECTED}
+        ),
+        CandidateDedupeKind.PENDING_DUPLICATE: frozenset(
+            {CandidateStatus.REJECTED}
+        ),
+        CandidateDedupeKind.ENHANCED_PROVENANCE: frozenset(
+            {CandidateStatus.PENDING_APPROVAL}
+        ),
+    },
+    True: {
+        CandidateDedupeKind.EXACT_REPLAY: frozenset(
+            {
+                CandidateStatus.PENDING_APPROVAL,
+                CandidateStatus.APPROVED,
+            }
+        ),
+        CandidateDedupeKind.REJECTED_UNCHANGED: frozenset(
+            {CandidateStatus.REJECTED}
+        ),
+    },
+}
+
+
+def _memory_persistence_receipt_from_dict(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = {
+        "schema",
+        "success",
+        "review_id",
+        "repository_key",
+        "locator_repository_key",
+        "authority_resolution_hash",
+        "binding_id",
+        "outbox_digest",
+        "batch_digest",
+        "persisted_candidate_ids",
+        "replayed_candidate_ids",
+        "results",
+        "receipt_digest",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected:
+        raise ValueError("Memory persistence receipt has unsupported fields")
+    if (
+        payload.get("schema") != "memory_persistence_receipt_v1"
+        or payload.get("success") is not True
+    ):
+        raise ValueError("Memory persistence receipt is not successful")
+    review_id = payload.get("review_id")
+    if not isinstance(review_id, str) or not review_id:
+        raise ValueError("Memory persistence receipt review_id is invalid")
+    for field_name in (
+        "repository_key",
+        "locator_repository_key",
+        "authority_resolution_hash",
+        "outbox_digest",
+        "batch_digest",
+        "receipt_digest",
+    ):
+        if not _is_sha256(payload.get(field_name)):
+            raise ValueError(f"Memory persistence receipt {field_name} is invalid")
+    if payload["binding_id"] is not None:
+        try:
+            validate_stable_id(
+                payload["binding_id"],
+                "RB",
+                "Memory persistence receipt binding_id",
+            )
+        except (TypeError, ValueError):
+            raise ValueError(
+                "Memory persistence receipt binding_id is invalid"
+            ) from None
+    all_ids: list[str] = []
+    for field_name in ("persisted_candidate_ids", "replayed_candidate_ids"):
+        values = payload.get(field_name)
+        if not isinstance(values, list) or len(values) > 64:
+            raise ValueError(f"Memory persistence receipt {field_name} is invalid")
+        try:
+            canonical_ids = [
+                validate_stable_id(
+                    item,
+                    "MC",
+                    f"Memory persistence receipt {field_name}",
+                )
+                for item in values
+            ]
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Memory persistence receipt {field_name} is invalid"
+            ) from None
+        if canonical_ids != sorted(set(canonical_ids)):
+            raise ValueError(
+                f"Memory persistence receipt {field_name} is not canonical"
+            )
+        all_ids.extend(values)
+    if len(all_ids) != len(set(all_ids)):
+        raise ValueError("Memory persistence receipt candidate IDs overlap")
+    if not all_ids:
+        raise ValueError("Memory persistence receipt candidate IDs are empty")
+    results = payload.get("results")
+    if (
+        not isinstance(results, list)
+        or not results
+        or len(results) != len(all_ids)
+        or len(results) > 64
+    ):
+        raise ValueError("Memory persistence receipt results are invalid")
+    result_ids: list[str] = []
+    result_request_ids: set[str] = set()
+    persisted_ids = set(payload["persisted_candidate_ids"])
+    replayed_ids = set(payload["replayed_candidate_ids"])
+    for row in results:
+        if not isinstance(row, Mapping) or set(row) != {
+            "candidate_id",
+            "request_id",
+            "replayed",
+            "status",
+            "dedupe",
+            "validation_report_hash",
+            "write_results",
+        }:
+            raise ValueError("Memory persistence result is invalid")
+        if type(row.get("replayed")) is not bool:
+            raise ValueError("Memory persistence replay flag is invalid")
+        try:
+            candidate_id = validate_stable_id(
+                row.get("candidate_id"),
+                "MC",
+                "Memory persistence result candidate_id",
+            )
+            row_request_id = validate_stable_id(
+                row.get("request_id"),
+                "REQ",
+                "Memory persistence result request_id",
+            )
+        except (TypeError, ValueError):
+            raise ValueError("Memory persistence result identity is invalid") from None
+        try:
+            status = CandidateStatus(row.get("status"))
+            dedupe = CandidateDedupeKind(row.get("dedupe"))
+        except (TypeError, ValueError):
+            raise ValueError("Memory persistence result identity is invalid") from None
+        if (
+            not _is_sha256(row.get("validation_report_hash"))
+            or not isinstance(row.get("write_results"), list)
+            or len(row["write_results"]) > 4
+        ):
+            raise ValueError("Memory persistence result identity is invalid")
+        if (
+            row["replayed"] != (candidate_id in replayed_ids)
+            or (not row["replayed"]) != (candidate_id in persisted_ids)
+        ):
+            raise ValueError("Memory persistence replay classification is invalid")
+        allowed_statuses = _MEMORY_PERSISTENCE_RESULT_STATUS_MATRIX[
+            row["replayed"]
+        ].get(dedupe)
+        if allowed_statuses is None or status not in allowed_statuses:
+            raise ValueError("Memory persistence result outcome is invalid")
+        hydrated_writes: list[WriteResult] = []
+        for raw_write_result in row["write_results"]:
+            if not isinstance(raw_write_result, Mapping):
+                raise ValueError("Memory persistence write result is invalid")
+            try:
+                write_result = WriteResult.from_dict(raw_write_result)
+            except (MemoryStoreError, TypeError, ValueError):
+                raise ValueError(
+                    "Memory persistence write result is invalid"
+                ) from None
+            if (
+                write_result.to_dict() != dict(raw_write_result)
+                or write_result.operation
+                not in {"put_candidate", "transition_candidate"}
+                or write_result.subject_id != candidate_id
+            ):
+                raise ValueError("Memory persistence result subject is invalid")
+            hydrated_writes.append(write_result)
+        applied_writes = tuple(
+            item for item in hydrated_writes if item.applied
+        )
+        if row["replayed"] and applied_writes:
+            raise ValueError("Memory persistence replay writes are invalid")
+        if not row["replayed"] and not applied_writes:
+            raise ValueError("Memory persistence applied writes are invalid")
+        if row_request_id in result_request_ids:
+            raise ValueError("Memory persistence request IDs are not unique")
+        result_request_ids.add(row_request_id)
+        result_ids.append(candidate_id)
+    if result_ids != sorted(result_ids) or sorted(result_ids) != sorted(all_ids):
+        raise ValueError("Memory persistence receipt results do not match IDs")
+    body = {key: payload[key] for key in expected if key != "receipt_digest"}
+    if canonical_sha256(body) != payload["receipt_digest"]:
+        raise ValueError("Memory persistence receipt digest is invalid")
+    return dict(payload)
+
+
+def validate_memory_outbox_replay_receipt(
+    payload: Mapping[str, Any],
+    *,
+    review_id: str,
+    expected_repository_key: str,
+    expected_locator_repository_key: str,
+    expected_authority_resolution_hash: str,
+    expected_binding_id: str | None,
+    expected_outbox_digest: str,
+    expected_batch_digest: str,
+    expected_entries: tuple[tuple[str, str], ...],
+) -> dict[str, Any]:
+    """Validate and bind a service receipt without duplicating CLI logic."""
+
+    receipt = _memory_persistence_receipt_from_dict(payload)
+    preview = MemoryOutboxReplayPreview(
+        outbox_digest=expected_outbox_digest,
+        batch_digest=expected_batch_digest,
+        entries=expected_entries,
+    )
+    if (
+        receipt["review_id"] != review_id
+        or receipt["repository_key"] != expected_repository_key
+        or receipt["locator_repository_key"]
+        != expected_locator_repository_key
+        or receipt["authority_resolution_hash"]
+        != expected_authority_resolution_hash
+        or receipt["binding_id"] != expected_binding_id
+        or receipt["outbox_digest"] != preview.outbox_digest
+        or receipt["batch_digest"] != preview.batch_digest
+    ):
+        raise ValueError("Memory persistence receipt authority is invalid")
+    result_entries = tuple(
+        (row["candidate_id"], row["request_id"])
+        for row in receipt["results"]
+    )
+    if result_entries != preview.entries:
+        raise ValueError("Memory persistence receipt entries are invalid")
+    return receipt
+
+
+def _memory_persistence_receipt_for_outbox(
+    payload: Mapping[str, Any],
+    *,
+    batch: MemoryCandidateBatch,
+    outbox: Mapping[str, Any],
+) -> dict[str, Any]:
+    if tuple(row["candidate_id"] for row in outbox["entries"]) != tuple(
+        candidate.candidate_id for candidate in batch.candidates
+    ):
+        raise ValueError("Memory outbox does not match its Candidate batch")
+    return validate_memory_outbox_replay_receipt(
+        payload,
+        review_id=outbox["review_id"],
+        expected_repository_key=outbox["repository_key"],
+        expected_locator_repository_key=outbox["locator_repository_key"],
+        expected_authority_resolution_hash=outbox[
+            "authority_resolution_hash"
+        ],
+        expected_binding_id=outbox["binding_id"],
+        expected_outbox_digest=outbox["outbox_digest"],
+        expected_batch_digest=batch.batch_digest,
+        expected_entries=tuple(
+            (row["candidate_id"], row["request_id"])
+            for row in outbox["entries"]
+        ),
+    )
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.casefold()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_memory_outbox_replay_audit(
+    *,
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> MemoryOutboxReplayAudit:
+    """Scan and canonicalize explicit replay attribution without retaining it.
+
+    This boundary intentionally lives above :class:`MemoryStore`: the Store
+    cannot import the source scanner, while both direct service callers and the
+    CLI must reject secrets and prompt-injection text before any audit write.
+    """
+
+    if not isinstance(actor, str) or not isinstance(reason, str):
+        raise SourceValidationError(SourceValidationCode.INVALID_INPUT)
+    scans = (
+        scan_sensitive_text(actor, field_name="outbox_replay.actor"),
+        scan_sensitive_text(reason, field_name="outbox_replay.reason"),
+    )
+    unsafe_findings = tuple(
+        finding
+        for scan in scans
+        for finding in scan.findings
+    )
+    if unsafe_findings:
+        code = (
+            SourceValidationCode.PROMPT_INJECTION
+            if any(
+                finding.kind is SensitiveContentKind.PROMPT_INJECTION
+                for finding in unsafe_findings
+            )
+            else SourceValidationCode.SENSITIVE_CONTENT
+        )
+        raise SourceValidationError(code)
+
+    checked_actor = actor.strip()
+    checked_reason = " ".join(reason.split())
+    if (
+        not 1 <= len(checked_actor) <= 512
+        or not checked_actor[0].isalnum()
+        or any(
+            not (
+                character.isalnum()
+                or character in "_.:+/@-"
+            )
+            for character in checked_actor
+        )
+        or not 1 <= len(checked_reason) <= 2_048
+        or any(
+            not character.isprintable() and not character.isspace()
+            for character in reason
+        )
+    ):
+        raise SourceValidationError(SourceValidationCode.INVALID_INPUT)
+    try:
+        checked_request_id = validate_stable_id(
+            request_id,
+            "REQ",
+            "outbox replay request_id",
+        )
+    except (TypeError, ValueError):
+        raise SourceValidationError(SourceValidationCode.INVALID_INPUT) from None
+    return MemoryOutboxReplayAudit(
+        actor=checked_actor,
+        reason=checked_reason,
+        request_id=checked_request_id,
+    )
+
+
+def _replay_human_declarations(
+    request: ReviewRequest,
+    *,
+    review_id: str,
+    source_refs: tuple[SourceRef, ...],
+) -> tuple[HumanDeclarationAuthority, ...]:
+    """Reconstruct only the explicit CLI declarations bound to this Session."""
+
+    declarations: list[HumanDeclarationAuthority] = []
+    for source_ref in source_refs:
+        if not isinstance(source_ref, HumanDeclarationSourceRef):
+            continue
+        matches = [
+            (index, statement)
+            for index, statement in enumerate(request.project_rules)
+            if stable_request_id(
+                "memory_project_rule",
+                review_id,
+                index,
+                statement,
+            )
+            == source_ref.request_id
+        ]
+        if len(matches) != 1:
+            raise ValueError("Memory outbox human declaration is not Session-bound")
+        _index, statement = matches[0]
+        expected_hash = hashlib.sha256(statement.encode("utf-8")).hexdigest()
+        if (
+            source_ref.review_id != review_id
+            or source_ref.actor != "review-cli"
+            or source_ref.declaration_hash != expected_hash
+        ):
+            raise ValueError("Memory outbox human declaration is not canonical")
+        declarations.append(
+            HumanDeclarationAuthority(
+                source_ref=source_ref,
+                origin=HumanDeclarationOrigin.CLI_REQUEST,
+                declaration=statement,
+            )
+        )
+    return tuple(declarations)
+
+
+def replay_memory_outbox(
+    *,
+    repository: Path,
+    memory_root: Path,
+    review_id: str,
+    expected_repository_key: str,
+    expected_authority_resolution_hash: str,
+    expected_outbox_digest: str,
+    actor: str | None = None,
+    reason: str | None = None,
+    request_id: str | None = None,
+) -> Mapping[str, Any]:
+    """Replay one hash-verified Session outbox through idempotent Store writes."""
+
+    repo = Path(repository).resolve()
+    checkpoint = CheckpointStore(repo, review_id, create=False)
+    session_store = SessionStore(checkpoint.run_dir)
+    manifest = session_store.load()
+    resolver = RevisionResolver()
+    live_identity = resolver.repository_identity(repo)
+    if Path(live_identity.git_common_dir).resolve() != Path(
+        manifest.repository.git_common_dir
+    ).resolve():
+        raise ValueError("Memory outbox repository identity mismatch")
+    for name, schema, phase in (
+        ("request", "review_request_v1", RunPhase.PREFLIGHT),
+        ("memory_snapshot", "memory_snapshot_v1", RunPhase.MEMORY_SELECTION),
+        (
+            "memory_candidates",
+            "memory_candidate_batch_v1",
+            RunPhase.MEMORY_PROPOSAL,
+        ),
+        (
+            "memory_outbox",
+            "memory_candidate_outbox_v1",
+            RunPhase.MEMORY_PROPOSAL,
+        ),
+    ):
+        descriptor = manifest.artifacts.get(name)
+        if (
+            descriptor is None
+            or descriptor.phase is not phase
+            or descriptor.schema != schema
+            or not session_store.validate_artifact(descriptor)
+        ):
+            raise ValueError(f"Memory outbox artifact {name} is invalid")
+    request = review_request_from_dict(
+        _read_session_json(
+            checkpoint.run_dir,
+            manifest.artifacts["request"].path,
+        )
+    )
+    snapshot = MemorySnapshot.from_dict(
+        _read_session_json(
+            checkpoint.run_dir,
+            manifest.artifacts["memory_snapshot"].path,
+        )
+    )
+    batch = _memory_candidate_batch_from_dict(
+        _read_session_json(checkpoint.run_dir, manifest.artifacts["memory_candidates"].path)
+    )
+    outbox = _memory_outbox_from_dict(
+        _read_session_json(checkpoint.run_dir, manifest.artifacts["memory_outbox"].path)
+    )
+    if (
+        outbox["review_id"] != review_id
+        or outbox["head_sha"] != manifest.revisions.resolved_head_sha
+        or outbox["batch_digest"] != batch.batch_digest
+        or outbox["repository_key"] != expected_repository_key
+        or outbox["authority_resolution_hash"]
+        != expected_authority_resolution_hash
+        or outbox["outbox_digest"] != expected_outbox_digest
+        or outbox["snapshot_id"] != snapshot.snapshot_id
+        or outbox["head_sha"] != snapshot.head_sha
+        or outbox["repository_key"] != snapshot.repository_key
+    ):
+        raise ValueError("Memory outbox does not match expected authority")
+    entries = {row["candidate_id"]: row for row in outbox["entries"]}
+    if set(entries) != {item.candidate_id for item in batch.candidates}:
+        raise ValueError("Memory outbox does not match its candidate batch")
+    for candidate in batch.candidates:
+        entry = entries[candidate.candidate_id]
+        if (
+            candidate.repository_key != outbox["repository_key"]
+            or candidate.origin_review_id != review_id
+            or candidate.valid_from_sha != outbox["head_sha"]
+            or canonical_sha256(candidate.to_dict()) != entry["candidate_hash"]
+        ):
+            raise ValueError("Memory outbox candidate binding is invalid")
+
+    audit_values = (actor, reason, request_id)
+    audit = None
+    if any(value is not None for value in audit_values):
+        if not all(value is not None for value in audit_values):
+            raise SourceValidationError(SourceValidationCode.INVALID_INPUT)
+        audit = validate_memory_outbox_replay_audit(
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
+
+    plan = plan_repository_memory_namespace(live_identity, memory_root)
+    authority = resolve_repository_authority(memory_root, plan.locator.identity)
+    if (
+        authority.authority_repository_key != outbox["repository_key"]
+        or authority.locator_repository_key != outbox["locator_repository_key"]
+        or authority.authority_resolution_hash
+        != outbox["authority_resolution_hash"]
+        or authority.binding_id != outbox["binding_id"]
+    ):
+        raise RepositoryRelinkConflictError(
+            "Memory authority changed before outbox replay"
+        )
+    if authority.binding_id is None:
+        namespace = materialize_repository_memory_namespace(plan)
+        store = MemoryStore(namespace)
+    else:
+        namespace = _memory_namespace_for_authority(str(memory_root), authority)
+        database_path = Path(namespace.namespace_path) / "memory.sqlite3"
+        if not database_path.is_file():
+            raise FileNotFoundError("bound Memory authority Store is unavailable")
+        MemoryStore(namespace, read_only=True)
+        store = MemoryStore(Path(namespace.namespace_path))
+
+    persisted: list[str] = []
+    replayed: list[str] = []
+    results: list[dict[str, Any]] = []
+    for candidate in batch.candidates:
+        entry = entries[candidate.candidate_id]
+        try:
+            origin = ProducerType(entry["origin"])
+            allowed_source_refs = tuple(
+                SourceRef.from_dict(item) for item in entry["allowed_source_refs"]
+            )
+        except (TypeError, ValueError):
+            raise ValueError("Memory outbox candidate authority is invalid") from None
+        if allowed_source_refs != candidate.source_refs:
+            raise ValueError("Memory outbox candidate source authority does not match")
+        source_validator = SourceValidator(
+            repo,
+            human_declarations=_replay_human_declarations(
+                request,
+                review_id=review_id,
+                source_refs=allowed_source_refs,
+            ),
+        )
+        lifecycle = MemoryLifecycle(store, source_validator)
+        provenance = TrustedCandidateProvenance(
+            origin=origin,
+            review_id=review_id,
+            target_head_sha=outbox["head_sha"],
+            locator_repository_key=outbox["locator_repository_key"],
+            authority_repository_key=outbox["repository_key"],
+            authority_resolution_hash=outbox["authority_resolution_hash"],
+            binding_id=outbox["binding_id"],
+            allowed_source_refs=allowed_source_refs,
+        )
+        lifecycle_result = lifecycle.submit_candidate(
+            candidate,
+            runtime_provenance=provenance,
+            request_id=entry["request_id"],
+        )
+        was_replayed = _memory_lifecycle_result_was_replayed(lifecycle_result)
+        (replayed if was_replayed else persisted).append(candidate.candidate_id)
+        results.append(
+            {
+                "candidate_id": candidate.candidate_id,
+                "request_id": entry["request_id"],
+                "replayed": was_replayed,
+                "status": lifecycle_result.status.value,
+                "dedupe": lifecycle_result.dedupe.kind.value,
+                "validation_report_hash": lifecycle_result.validation.report_hash,
+                "write_results": [
+                    item.to_dict() for item in lifecycle_result.write_results
+                ],
+            }
+        )
+    if audit is not None:
+        store.record_outbox_replay_audit(
+            outbox["repository_key"],
+            review_id=review_id,
+            outbox_hash=outbox["outbox_digest"],
+            actor=audit.actor,
+            reason=audit.reason,
+            request_id=audit.request_id,
+        )
+    body: dict[str, Any] = {
+        "schema": "memory_persistence_receipt_v1",
+        "success": True,
+        "review_id": review_id,
+        "repository_key": outbox["repository_key"],
+        "locator_repository_key": outbox["locator_repository_key"],
+        "authority_resolution_hash": outbox["authority_resolution_hash"],
+        "binding_id": outbox["binding_id"],
+        "outbox_digest": outbox["outbox_digest"],
+        "batch_digest": batch.batch_digest,
+        "persisted_candidate_ids": sorted(persisted),
+        "replayed_candidate_ids": sorted(replayed),
+        "results": results,
+    }
+    return _memory_persistence_receipt_from_dict(
+        {**body, "receipt_digest": canonical_sha256(body)}
+    )
+
+
+def _memory_lifecycle_result_was_replayed(
+    result: CandidateLifecycleResult,
+) -> bool:
+    """Classify one submission only from its transactional outcome."""
+
+    writes = tuple(result.write_results)
+    if not result.persisted:
+        return False
+    if any(write.applied for write in writes):
+        return False
+    if any(write.replayed for write in writes):
+        return True
+    return result.dedupe.kind in {
+        CandidateDedupeKind.EXACT_REPLAY,
+        CandidateDedupeKind.REJECTED_UNCHANGED,
+    }
+
+
+def _read_session_json(run_dir: Path, relative_path: str) -> dict[str, Any]:
+    path = run_dir.joinpath(*PurePosixPath(relative_path).parts)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Session Memory artifact must be a JSON object")
+    return payload
+
+
+def _quality_gate_check_ids(context: PipelineContext) -> tuple[str, ...]:
+    """Return only gate names frozen into this Session's validated plan."""
+
+    plan = context.quality_gate_plan
+    if plan is None:
+        return ()
+    if (
+        plan.revision.casefold()
+        != context.manifest.revisions.resolved_head_sha.casefold()
+    ):
+        raise ValueError("Quality Gate registry does not match Session Head")
+    return tuple(sorted(gate.name for gate in plan.gates))
+
+
+def _memory_policy_registry(context: PipelineContext) -> RuntimePolicyRegistry:
+    """Build the closed Runtime registry from fixed, pre-Memory Session inputs.
+
+    Quality Gate commands remain owned by the validated ``QualityGatePlan``.
+    Memory receives names only, so an approved effect can require an existing
+    gate but can never introduce a gate, executable, argument, or template.
+    """
+
+    return RuntimePolicyRegistry(
+        contract_ids=tuple(DEFAULT_CONTRACT_ALLOWLIST),
+        check_ids=_quality_gate_check_ids(context),
+        command_template_ids=tuple(DEFAULT_COMMAND_TEMPLATE_ALLOWLIST),
+    )
+
+
+def _memory_required_check_ids(context: PipelineContext) -> frozenset[str]:
+    compilation = context.memory_policy_compilation
+    if compilation is None:
+        return frozenset()
+    return frozenset(
+        action.check_id
+        for action in compilation.actions
+        if action.kind.value == "require_check"
+    )
+
+
+def _memory_curator_fingerprint_catalog(
+    store: MemoryStore,
+    repository_key: str,
+) -> tuple[ExistingFingerprint, ...]:
+    """Project pending Candidates and authoritative Records for Curator hints.
+
+    The lifecycle remains the source-aware dedupe authority.  This catalog is
+    intentionally content-only and therefore cannot suppress a provenance
+    enhancement by itself.
+    """
+
+    candidates = store.list_candidates(repository_key)
+    candidates_by_id = {item.candidate_id: item for item in candidates}
+    states: dict[str, str] = {}
+    for candidate in candidates:
+        if candidate.status in {
+            CandidateStatus.PROPOSED,
+            CandidateStatus.VALIDATED,
+            CandidateStatus.PENDING_APPROVAL,
+        }:
+            states.setdefault(candidate.content_fingerprint, "pending_approval")
+    for record in store.list_records(repository_key):
+        if record.status not in {
+            RecordStatus.ACTIVE,
+            RecordStatus.REVALIDATION_REQUIRED,
+        }:
+            continue
+        candidate = candidates_by_id.get(record.candidate_id)
+        if candidate is None:
+            raise ValueError("active Memory Record has no Candidate projection")
+        states[candidate.content_fingerprint] = "active"
+    return tuple(
+        ExistingFingerprint(fingerprint, states[fingerprint])
+        for fingerprint in sorted(states)
+    )
+
+
+def _memory_diagnostics(
+    context: PipelineContext,
+) -> tuple[MemoryDiagnostic, ...]:
+    config = context.memory_config
+    if config is None:
+        return ()
+    diagnostics: list[MemoryDiagnostic] = []
+    if "memory_unavailable" in context.memory_degradation_codes:
+        diagnostics.append(
+            MemoryDiagnostic(
+                code=MemoryDiagnosticCode.UNAVAILABLE,
+                message=(
+                    "required project Memory is unavailable"
+                    if config.required
+                    else "project Memory is unavailable; review continued without it"
+                ),
+                blocking=config.required,
+            )
+        )
+    return tuple(diagnostics)
+
+
+def _selection_for_stage(
+    context: PipelineContext,
+    stage: RetrievalStage,
+) -> RecordSelection | None:
+    snapshot = context.memory_snapshot
+    selection_input = context.memory_selection_input
+    if snapshot is None or selection_input is None:
+        return None
+    return SnapshotMemorySelector(
+        snapshot,
+        limits=_memory_retrieval_limits(context),
+    ).select(
+        RetrievalRequest.from_selection_input(
+            selection_input,
+            stage=stage,
+        )
+    )
+
+
+def _memory_retrieval_limits(context: PipelineContext) -> RetrievalLimits:
+    config = context.memory_config
+    return (
+        RetrievalLimits()
+        if config is None
+        else RetrievalLimits.from_execution_config(config)
+    )
+
+
+def _intent_memory_projection(
+    context: PipelineContext,
+) -> IntentMemoryProjection | None:
+    selection = _selection_for_stage(context, RetrievalStage.INTENT_DISCOVERY)
+    if selection is None:
+        return None
+    return build_intent_memory_projection(
+        selection.records,
+        diagnostics=_memory_diagnostics(context),
+    )
+
+
+def _risk_memory_projection(
+    context: PipelineContext,
+) -> RiskMemoryProjection | None:
+    snapshot = context.memory_snapshot
+    compilation = context.memory_policy_compilation
+    if snapshot is None or compilation is None:
+        return None
+    return build_risk_memory_projection(
+        snapshot.eligible_records,
+        compilation,
+        diagnostics=_memory_diagnostics(context),
+    )
+
+
+def _memory_reference(record: DurableMemoryRecord) -> MemoryReference:
+    return MemoryReference(
+        memory_id=record.memory_id,
+        kind=record.kind.value,
+        source_refs=tuple(
+            [f"memory:{record.memory_id}"]
+            + [
+                f"memory-source:{canonical_sha256(item.to_dict())}"
+                for item in record.source_refs
+            ]
+        ),
+        local_only=record.sensitivity is Sensitivity.LOCAL_ONLY,
+    )
+
+
+def _planner_memory_projection(
+    context: PipelineContext,
+) -> PlannerMemoryProjection | None:
+    snapshot = context.memory_snapshot
+    compilation = context.memory_policy_compilation
+    if snapshot is None or compilation is None:
+        return None
+    planning_selection = _selection_for_stage(
+        context,
+        RetrievalStage.PORTFOLIO_PLANNING,
+    )
+    selected_by_id = {
+        record.memory_id: record
+        for record in (
+            () if planning_selection is None else planning_selection.records
+        )
+    }
+    planning_policy_ids = {
+        memory_id
+        for action in compilation.actions
+        if action.kind.value
+        in {"require_contract", "require_check", "verification_hint"}
+        for memory_id in action.memory_ids
+    }
+    selected_by_id.update(
+        {
+            record.memory_id: record
+            for record in snapshot.eligible_records
+            if record.memory_id in planning_policy_ids
+        }
+    )
+    projection = build_planner_memory_projection(
+        compilation,
+        registry=_memory_policy_registry(context),
+        perspective_registry=DEFAULT_PERSPECTIVE_ALLOWLIST,
+        selected_memory=tuple(
+            _memory_reference(selected_by_id[memory_id])
+            for memory_id in sorted(selected_by_id)
+        ),
+        diagnostics=_memory_diagnostics(context),
+    )
+    feedback = context.memory_feedback_summary
+    return replace(
+        projection,
+        feedback_summary_hash=(
+            None if feedback is None else feedback.summary_hash
+        ),
+    )
+
+
+def _reviewer_memory_selection(
+    context: PipelineContext,
+    assignment: Assignment,
+) -> RecordSelection | None:
+    snapshot = context.memory_snapshot
+    if snapshot is None:
+        return None
+    return SnapshotMemorySelector(
+        snapshot,
+        limits=_memory_retrieval_limits(context),
+    ).select(
+        RetrievalRequest(
+            stage=RetrievalStage.REVIEWER,
+            paths=tuple(assignment.initial_context.changed_files),
+            contracts=tuple(assignment.assigned_contract),
+            query_text=" ".join(
+                value
+                for value in (
+                    assignment.role,
+                    assignment.mission,
+                    *assignment.required_checks,
+                )
+                if value
+            ),
+        )
+    )
+
+
+def _reviewer_memory_query_service(
+    context: PipelineContext,
+    assignment: Assignment,
+    *,
+    fallback_assignment_id: str,
+) -> SnapshotMemoryQueryService | None:
+    snapshot = context.memory_snapshot
+    if snapshot is None:
+        return None
+    return SnapshotMemoryQueryService(
+        snapshot,
+        assignment_id=assignment.assignment_id or fallback_assignment_id,
+        assignment_scope=MemoryScope(
+            paths=tuple(assignment.initial_context.changed_files),
+            contracts=tuple(assignment.assigned_contract),
+        ),
+        limits=_memory_retrieval_limits(context),
+    )
+
+
+def _reconciler_memory_summary(
+    context: PipelineContext,
+) -> dict[str, Any] | None:
+    selection = _selection_for_stage(context, RetrievalStage.RECONCILER)
+    if selection is None:
+        return None
+    records = [
+        record
+        for record in selection.records
+        if record.sensitivity is Sensitivity.NORMAL
+    ]
+    diagnostics = _memory_diagnostics(context)
+    if not records and not diagnostics:
+        return None
+    return {
+        "schema_version": "reconciler_memory_projection_v1",
+        "records": [
+            {
+                "memory_id": record.memory_id,
+                "kind": record.kind.value,
+                "statement": record.statement,
+                "source_refs": list(_memory_reference(record).source_refs),
+            }
+            for record in records
+        ],
+        "diagnostics": [item.to_dict() for item in diagnostics],
+    }
+
+
+def _append_memory_degradation_code(
+    context: PipelineContext,
+    reason_code: str,
+) -> None:
+    if reason_code not in context.memory_degradation_codes:
+        context.memory_degradation_codes.append(reason_code)
+
+
+def _memory_reporting_status(
+    context: PipelineContext,
+) -> dict[str, Any] | None:
+    config = context.memory_config
+    if config is None:
+        return None
+    compilation = context.memory_policy_compilation
+    reason_map = {
+        "memory_unavailable": "memory_unavailable",
+        "memory_required_unavailable": "memory_unavailable",
+        "curator_failed": "curator_fallback",
+        "outbox_pending": "outbox_pending",
+    }
+    reasons = sorted(
+        {
+            reason_map[code]
+            for code in context.memory_degradation_codes
+            if code in reason_map
+        }
+    )
+    selection_status = (
+        None
+        if context.memory_selection_decision is None
+        else context.memory_selection_decision.get("status")
+    )
+    proposal_status = (
+        None
+        if context.memory_curator_decision is None
+        else context.memory_curator_decision.get("outcome")
+    )
+    return {
+        "mode": config.mode.value,
+        "required": config.required,
+        "available": "memory_unavailable" not in reasons,
+        "memory_unavailable": "memory_unavailable" in reasons,
+        "hard_policy_blocked": bool(
+            compilation is not None and compilation.blocked
+        ),
+        "outbox_pending": "outbox_pending" in reasons,
+        "selection_status": selection_status,
+        "proposal_status": proposal_status,
+        "degraded": bool(reasons),
+        "degradation_reasons": reasons,
+    }
+
+
+def _memory_curator_audit_status(
+    context: PipelineContext,
+) -> dict[str, Any] | None:
+    decision = context.memory_curator_decision
+    if decision is None:
+        return None
+    return {
+        key: decision[key]
+        for key in (
+            "mode",
+            "outcome",
+            "attempt_count",
+            "candidate_ids",
+            "warning_codes",
+            "review_conclusion_impact",
+        )
+        if key in decision
+    }
+
+
+def _memory_candidate_result_rows(
+    context: PipelineContext,
+) -> tuple[tuple[MemoryCandidate, dict[str, Any]], ...]:
+    """Bind Candidate bodies only to authoritative lifecycle result rows."""
+
+    raw_receipt = context.memory_persistence_receipt
+    if raw_receipt is None:
+        return ()
+    batch = _required(
+        context.memory_candidate_batch,
+        "Memory candidate batch for persistence receipt",
+    )
+    outbox = _required(
+        context.memory_outbox,
+        "Memory outbox for persistence receipt",
+    )
+    receipt = _memory_persistence_receipt_for_outbox(
+        raw_receipt,
+        batch=batch,
+        outbox=outbox,
+    )
+    candidates = {
+        candidate.candidate_id: candidate for candidate in batch.candidates
+    }
+    if set(candidates) != {
+        row["candidate_id"] for row in receipt["results"]
+    }:
+        raise ValueError("Memory receipt does not match its Candidate batch")
+    return tuple(
+        (candidates[row["candidate_id"]], row)
+        for row in receipt["results"]
+    )
+
+
+def _memory_pending_candidate_rows(
+    context: PipelineContext,
+) -> list[dict[str, Any]]:
+    """Report only lifecycle-confirmed ``pending_approval`` Candidates."""
+
+    pending: list[dict[str, Any]] = []
+    for candidate, result in _memory_candidate_result_rows(context):
+        if result["status"] != CandidateStatus.PENDING_APPROVAL.value:
+            continue
+        row = candidate.to_dict()
+        row["status"] = CandidateStatus.PENDING_APPROVAL.value
+        pending.append(row)
+    return pending
+
+
+def _memory_candidate_outcome_rows(
+    context: PipelineContext,
+) -> list[dict[str, Any]]:
+    """Return a bounded, content-free audit of every persisted outbox result."""
+
+    return [
+        {
+            "candidate_id": candidate.candidate_id,
+            "status": result["status"],
+            "dedupe": result["dedupe"],
+            "replayed": result["replayed"],
+            "persistence": (
+                "replayed" if result["replayed"] else "persisted"
+            ),
+            "validation_report_hash": result["validation_report_hash"],
+        }
+        for candidate, result in _memory_candidate_result_rows(context)
+    ]
+
+
+def _memory_outbox_audit_status(
+    context: PipelineContext,
+) -> dict[str, Any] | None:
+    if context.memory_config is None:
+        return None
+    outbox = context.memory_outbox
+    if outbox is None:
+        if context.memory_curator_decision is None:
+            return None
+        return {
+            "status": (
+                "disabled"
+                if context.memory_config.mode is MemoryMode.OFF
+                else "skipped"
+            ),
+            "pending": False,
+            "review_id": context.manifest.review_id,
+            "candidate_ids": [],
+        }
+    receipt = context.memory_persistence_receipt
+    if receipt is None:
+        status = "outbox_pending"
+    elif receipt["persisted_candidate_ids"] and receipt[
+        "replayed_candidate_ids"
+    ]:
+        status = "completed"
+    elif receipt["replayed_candidate_ids"]:
+        status = "replayed"
+    else:
+        status = "persisted"
+    return {
+        "status": status,
+        "pending": receipt is None,
+        "review_id": outbox["review_id"],
+        "candidate_ids": [
+            item["candidate_id"] for item in outbox["entries"]
+        ],
+        "candidate_outcomes": _memory_candidate_outcome_rows(context),
+    }
+
+
+def _memory_runtime_binding_from_dict(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = {
+        "schema",
+        "mode",
+        "repository_key",
+        "locator_repository_key",
+        "authority_resolution",
+        "cache_provenance",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected:
+        raise ValueError("Memory runtime binding has unsupported fields")
+    if payload.get("schema") != "memory_runtime_binding_v1":
+        raise ValueError("Memory runtime binding schema is unsupported")
+    if payload.get("mode") not in {item.value for item in MemoryMode}:
+        raise ValueError("Memory runtime binding mode is invalid")
+    for field_name in ("repository_key", "locator_repository_key"):
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"Memory runtime binding {field_name} is invalid"
+            )
+    authority = payload.get("authority_resolution")
+    if authority is not None:
+        if not isinstance(authority, Mapping):
+            raise ValueError("Memory authority resolution must be an object")
+        canonical = RepositoryAuthorityResolution.from_payload(authority)
+        if dict(authority) != canonical.to_payload():
+            raise ValueError("Memory authority resolution is not canonical")
+    cache = payload.get("cache_provenance")
+    if cache is not None:
+        if not isinstance(cache, Mapping):
+            raise ValueError("Memory cache provenance must be an object")
+        expected_cache = {
+            "status",
+            "key_hash",
+            "repository_key",
+            "revision_binding",
+            "capability",
+            "configuration_digest",
+            "input_digest",
+            "analyzer",
+            "entry_id",
+            "blob_hash",
+            "persistent",
+            "session_pinned",
+            "fallback",
+            "corruption_reason",
+        }
+        if set(cache) != expected_cache:
+            raise ValueError("Memory cache provenance has unsupported fields")
+        if cache.get("status") not in {"off", "hit", "miss", "rebuild"}:
+            raise ValueError("Memory cache provenance status is invalid")
+        for field_name in ("persistent", "session_pinned"):
+            if type(cache.get(field_name)) is not bool:
+                raise ValueError(
+                    f"Memory cache provenance {field_name} is invalid"
+                )
+        if not isinstance(cache.get("analyzer"), Mapping) or not isinstance(
+            cache.get("fallback"), Mapping
+        ):
+            raise ValueError("Memory cache provenance metadata is invalid")
+    return {
+        "schema": payload["schema"],
+        "mode": payload["mode"],
+        "repository_key": payload["repository_key"],
+        "locator_repository_key": payload["locator_repository_key"],
+        "authority_resolution": (
+            None if authority is None else dict(authority)
+        ),
+        "cache_provenance": None if cache is None else dict(cache),
+    }
+
+
+def _memory_languages(paths: list[str]) -> tuple[str, ...]:
+    by_suffix = {
+        ".py": "python",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".ts": "typescript",
+        ".tsx": "typescript",
+        ".go": "go",
+        ".rs": "rust",
+        ".java": "java",
+        ".kt": "kotlin",
+        ".cs": "csharp",
+        ".cpp": "cpp",
+        ".cc": "cpp",
+        ".c": "c",
+        ".h": "c",
+    }
+    return tuple(
+        sorted(
+            {
+                language
+                for path in paths
+                if (language := by_suffix.get(PurePosixPath(path).suffix.casefold()))
+                is not None
+            }
+        )
+    )
+
+
+def _repository_knowledge_refs(
+    snapshot: RepositoryIntelligenceSnapshot,
+) -> tuple[str, ...]:
+    provenance = snapshot.cache_provenance
+    if provenance is None or provenance.entry_id is None:
+        return ()
+    return (provenance.entry_id,)
+
+
+def _memory_namespace_for_authority(
+    memory_root: str,
+    authority: RepositoryAuthorityResolution,
+) -> RepositoryMemoryNamespace:
+    if not isinstance(authority, RepositoryAuthorityResolution):
+        raise ValueError("Memory authority resolution is invalid")
+    return RepositoryMemoryNamespace(
+        repository_key=authority.authority_repository_key,
+        memory_root=memory_root,
+        namespace_path=str(
+            repository_namespace_path(
+                memory_root,
+                authority.authority_repository_key,
+            )
+        ),
+        metadata=authority.authority_identity,
+    )
+
+
+def _memory_selection_decision_from_dict(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = {
+        "schema",
+        "mode",
+        "status",
+        "reason_codes",
+        "snapshot_id",
+        "snapshot_hash",
+        "selected_memory_ids",
+        "decision_count",
+        "policy_compilation",
+        "runtime_binding",
+    }
+    if set(payload) != expected:
+        raise ValueError("memory selection decision has unsupported fields")
+    if payload.get("schema") != "memory_selection_decision_v1":
+        raise ValueError("memory selection decision schema is unsupported")
+    if payload.get("mode") not in {item.value for item in MemoryMode}:
+        raise ValueError("memory selection decision mode is invalid")
+    if payload.get("status") not in {"disabled", "selected", "degraded"}:
+        raise ValueError("memory selection decision status is invalid")
+    for field_name in ("reason_codes", "selected_memory_ids"):
+        value = payload.get(field_name)
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item for item in value
+        ):
+            raise ValueError(
+                f"memory selection decision {field_name} must contain strings"
+            )
+    for field_name in ("snapshot_id", "snapshot_hash"):
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"memory selection decision {field_name} must be a string"
+            )
+    if type(payload.get("decision_count")) is not int or payload["decision_count"] < 0:
+        raise ValueError("memory selection decision count is invalid")
+    if not isinstance(payload.get("policy_compilation"), Mapping):
+        raise ValueError("memory selection policy compilation must be an object")
+    _memory_runtime_binding_from_dict(payload.get("runtime_binding"))
+    return dict(payload)
+
+
+def _memory_curator_decision_from_dict(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    skipped = {
+        "schema",
+        "mode",
+        "outcome",
+        "reason_code",
+        "request_digest",
+        "invocation_id",
+        "attempt_count",
+        "candidate_ids",
+        "warning_codes",
+        "review_conclusion_impact",
+    }
+    normal = {
+        "schema",
+        "mode",
+        "outcome",
+        "request_digest",
+        "invocation_id",
+        "attempt_count",
+        "candidate_ids",
+        "duplicate_fingerprints",
+        "warning_codes",
+        "warnings",
+        "review_conclusion_impact",
+    }
+    keys = set(payload)
+    if frozenset(keys) not in {frozenset(skipped), frozenset(normal)}:
+        raise ValueError("memory curator decision has unsupported fields")
+    if payload.get("schema") != "memory_curator_decision_v1":
+        raise ValueError("memory curator decision schema is unsupported")
+    if payload.get("mode") not in {"local", "model"}:
+        raise ValueError("memory curator decision mode is invalid")
+    outcome = payload.get("outcome")
+    if outcome not in {"skipped", "proposed", "empty", "rejected"}:
+        raise ValueError("memory curator decision outcome is invalid")
+    if outcome == "skipped" and payload.get("reason_code") not in {
+        "memory_disabled",
+        "memory_read_only",
+    }:
+        raise ValueError("memory curator skip reason is invalid")
+    if type(payload.get("attempt_count")) is not int or payload["attempt_count"] < 0:
+        raise ValueError("memory curator attempt count is invalid")
+    for field_name in ("candidate_ids", "warning_codes"):
+        value = payload.get(field_name)
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item for item in value
+        ):
+            raise ValueError(f"memory curator {field_name} must contain strings")
+    for field_name in ("request_digest", "invocation_id"):
+        if not isinstance(payload.get(field_name), str):
+            raise ValueError(f"memory curator {field_name} must be a string")
+    if payload.get("review_conclusion_impact") != "none":
+        raise ValueError("memory curator must not affect the review conclusion")
+    return dict(payload)
+
+
+def _memory_proposal_has_reusable_curator_artifacts(
+    session_store: SessionStore,
+    manifest: SessionManifest,
+) -> bool:
+    return bool(
+        {
+            "memory_curator_decision",
+            "memory_candidates",
+        }
+        <= set(_memory_proposal_resume_artifacts(session_store, manifest))
+    )
+
+
+def _memory_proposal_resume_artifacts(
+    session_store: SessionStore,
+    manifest: SessionManifest,
+) -> tuple[str, ...]:
+    """Return only a coherent curator commit set after an interrupted phase.
+
+    Curator output is several independently hashed Session artifacts.  A crash
+    between their registrations must never make the decision/candidate pair look
+    complete while its model audit envelope is missing.  Incoherent pieces are
+    deliberately left unregistered for the next attempt to replace.
+    """
+
+    phase = RunPhase.MEMORY_PROPOSAL
+    descriptors = {
+        name: descriptor
+        for name, descriptor in manifest.artifacts.items()
+        if descriptor.phase is phase
+    }
+
+    def valid(name: str) -> bool:
+        descriptor = descriptors.get(name)
+        return bool(
+            descriptor is not None
+            and descriptor.schema == artifact_schema(name)
+            and session_store.validate_artifact(descriptor)
+        )
+
+    if not valid("memory_curator_decision") or not valid("memory_candidates"):
+        return ()
+    try:
+        decision = _memory_curator_decision_from_dict(
+            _read_session_json(
+                session_store.run_dir,
+                descriptors["memory_curator_decision"].path,
+            )
+        )
+        batch = _memory_candidate_batch_from_dict(
+            _read_session_json(
+                session_store.run_dir,
+                descriptors["memory_candidates"].path,
+            )
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ()
+    if (
+        decision["request_digest"] != batch.request_digest
+        or decision["invocation_id"] != batch.invocation_id
+        or tuple(decision["candidate_ids"])
+        != tuple(item.candidate_id for item in batch.candidates)
+    ):
+        return ()
+
+    preserve = {"memory_curator_decision", "memory_candidates"}
+    if decision["mode"] == "model" and decision["outcome"] != "skipped":
+        if not valid("memory_curator_envelope"):
+            return ()
+        preserve.add("memory_curator_envelope")
+        if decision["attempt_count"] > 0:
+            if not valid("memory_curator_raw_response"):
+                return ()
+            preserve.add("memory_curator_raw_response")
+
+    if batch.candidates and valid("memory_outbox"):
+        try:
+            outbox = _memory_outbox_from_dict(
+                _read_session_json(
+                    session_store.run_dir,
+                    descriptors["memory_outbox"].path,
+                )
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            outbox = None
+        if outbox is not None and (
+            outbox["batch_digest"] == batch.batch_digest
+            and tuple(row["candidate_id"] for row in outbox["entries"])
+            == tuple(item.candidate_id for item in batch.candidates)
+        ):
+            preserve.add("memory_outbox")
+            if valid("memory_persistence_receipt"):
+                try:
+                    receipt = _memory_persistence_receipt_for_outbox(
+                        _read_session_json(
+                            session_store.run_dir,
+                            descriptors["memory_persistence_receipt"].path,
+                        ),
+                        batch=batch,
+                        outbox=outbox,
+                    )
+                except (OSError, ValueError, json.JSONDecodeError):
+                    receipt = None
+                if receipt is not None:
+                    preserve.add("memory_persistence_receipt")
+    return tuple(sorted(preserve))
+
+
+def _memory_candidate_batch_from_dict(
+    payload: Mapping[str, Any],
+) -> MemoryCandidateBatch:
+    expected = {
+        "schema",
+        "request_digest",
+        "invocation_id",
+        "batch_digest",
+        "candidates",
+    }
+    if set(payload) != expected:
+        raise ValueError("memory candidate batch has unsupported fields")
+    if payload.get("schema") != "memory_candidate_batch_v1":
+        raise ValueError("memory candidate batch schema is unsupported")
+    rows = payload.get("candidates")
+    if not isinstance(rows, list):
+        raise ValueError("memory candidate batch candidates must be a list")
+    batch = MemoryCandidateBatch(
+        request_digest=str(payload.get("request_digest")),
+        invocation_id=str(payload.get("invocation_id")),
+        candidates=tuple(MemoryCandidate.from_dict(item) for item in rows),
+    )
+    if batch.to_dict() != dict(payload):
+        raise ValueError("memory candidate batch is not canonical")
+    return batch
 
 
 def _required(value: Any, label: str) -> Any:

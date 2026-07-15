@@ -3,12 +3,33 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import math
+import re
 import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from review_agent.model_adapter import ModelAdapter
 from review_agent.model_protocol import ModelResponseKind, ModelTurnRequest, ModelTurnResponse
-from review_agent.models import RiskAssessment, RiskLevel, ReviewProfile
+from review_agent.memory_policy import (
+    PolicyCompilation,
+    PolicyDiagnosticSeverity,
+    RequireCheckAction,
+    RequireContractAction,
+    RuntimePolicyRegistry,
+    VerificationHintAction,
+)
+from review_agent.models import (
+    CompiledMemoryRequirement,
+    MemoryDiagnostic,
+    MemoryDiagnosticCode,
+    MemoryReference,
+    PlannerMemoryProjection,
+    PlannerPerspectiveHint,
+    RiskAssessment,
+    RiskLevel,
+    ReviewProfile,
+    VerificationTemplateHint,
+    hard_policy_overflow_diagnostic,
+)
 
 
 PORTFOLIO_ROLE_KINDS = ("core", "adversarial", "specialist")
@@ -37,6 +58,15 @@ DEFAULT_CONTRACT_ALLOWLIST = tuple(
             *SPECIALIST_REVIEW_CONTRACT,
         )
     )
+)
+DEFAULT_CHECK_ALLOWLIST: tuple[str, ...] = ()
+DEFAULT_COMMAND_TEMPLATE_ALLOWLIST: tuple[str, ...] = ()
+DEFAULT_PERSPECTIVE_ALLOWLIST = (
+    "core",
+    "adversarial",
+    "dynamic-risk-focus",
+    "security",
+    "domain-invariants",
 )
 PORTFOLIO_SIZE_BOUNDS: dict[RiskLevel, tuple[int, int]] = {
     RiskLevel.LOW: (1, 1),
@@ -187,9 +217,13 @@ class PortfolioPacket:
     allowed_role_kinds: list[str] | None = None
     reviewer_count_bounds: dict[str, int] | None = None
     contract_allowlist: list[str] | None = None
+    check_allowlist: list[str] | None = None
+    command_template_allowlist: list[str] | None = None
+    perspective_allowlist: list[str] | None = None
     ref_allowlist: list[str] = field(default_factory=list)
     ref_catalog: dict[str, str] = field(default_factory=dict)
     budget_policy: dict[str, Any] | None = None
+    memory_projection: PlannerMemoryProjection | None = None
 
     def __post_init__(self) -> None:
         level = _coerce_risk_level(self.risk_level)
@@ -236,6 +270,74 @@ class PortfolioPacket:
                 "packet.contract_allowlist is missing Runtime Contract items: "
                 + ", ".join(sorted(missing_contracts))
             )
+        if self.memory_projection is not None and not isinstance(
+            self.memory_projection, PlannerMemoryProjection
+        ):
+            raise ValueError(
+                "packet.memory_projection must be a PlannerMemoryProjection or None"
+            )
+        if self.memory_projection is not None:
+            missing_memory_contracts = {
+                item.requirement_id
+                for item in self.memory_projection.required_contracts
+            } - set(contracts)
+            if missing_memory_contracts:
+                raise ValueError(
+                    "packet.contract_allowlist is missing memory-required Contract items: "
+                    + ", ".join(sorted(missing_memory_contracts))
+                )
+        checks = (
+            list(DEFAULT_CHECK_ALLOWLIST)
+            if self.check_allowlist is None
+            else list(self.check_allowlist)
+        )
+        templates = (
+            list(DEFAULT_COMMAND_TEMPLATE_ALLOWLIST)
+            if self.command_template_allowlist is None
+            else list(self.command_template_allowlist)
+        )
+        perspectives = (
+            list(DEFAULT_PERSPECTIVE_ALLOWLIST)
+            if self.perspective_allowlist is None
+            else list(self.perspective_allowlist)
+        )
+        _require_unique_string_list(checks, "packet.check_allowlist")
+        _require_unique_string_list(
+            templates,
+            "packet.command_template_allowlist",
+        )
+        _require_unique_string_list(
+            perspectives,
+            "packet.perspective_allowlist",
+        )
+        if self.memory_projection is not None:
+            missing_checks = {
+                item.requirement_id
+                for item in self.memory_projection.required_checks
+            } - set(checks)
+            missing_templates = {
+                item.command_template_id
+                for item in self.memory_projection.verification_hints
+            } - set(templates)
+            missing_perspectives = {
+                item.perspective_id
+                for item in self.memory_projection.perspective_hints
+            } - set(perspectives)
+            if missing_checks:
+                raise ValueError(
+                    "packet.check_allowlist is missing memory-required checks: "
+                    + ", ".join(sorted(missing_checks))
+                )
+            if missing_templates:
+                raise ValueError(
+                    "packet.command_template_allowlist is missing Memory templates: "
+                    + ", ".join(sorted(missing_templates))
+                )
+            if missing_perspectives:
+                raise ValueError(
+                    "packet.perspective_allowlist is missing Memory perspectives: "
+                    + ", ".join(sorted(missing_perspectives))
+                )
 
         refs = list(self.ref_allowlist)
         _require_unique_string_list(refs, "packet.ref_allowlist")
@@ -262,6 +364,9 @@ class PortfolioPacket:
         object.__setattr__(self, "allowed_role_kinds", role_kinds)
         object.__setattr__(self, "reviewer_count_bounds", bounds)
         object.__setattr__(self, "contract_allowlist", contracts)
+        object.__setattr__(self, "check_allowlist", checks)
+        object.__setattr__(self, "command_template_allowlist", templates)
+        object.__setattr__(self, "perspective_allowlist", perspectives)
         object.__setattr__(self, "ref_allowlist", refs)
         object.__setattr__(self, "ref_catalog", dict(self.ref_catalog))
         object.__setattr__(self, "budget_policy", budget)
@@ -282,8 +387,14 @@ class PortfolioPacket:
     def allowed_contracts(self) -> frozenset[str]:
         return frozenset(self.contract_allowlist or ())
 
+    @property
+    def model_allowed_refs(self) -> frozenset[str]:
+        return frozenset(
+            ref for ref in self.ref_allowlist if not _is_memory_ref(ref)
+        )
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "risk": {
                 "level": self.risk_level.value,
                 "dimensions": dict(self.risk_dimensions),
@@ -300,10 +411,84 @@ class PortfolioPacket:
             "allowed_role_kinds": list(self.allowed_role_kinds or ()),
             "reviewer_count_bounds": dict(self.reviewer_count_bounds or {}),
             "contract_allowlist": list(self.contract_allowlist or ()),
+            "check_allowlist": list(self.check_allowlist or ()),
+            "command_template_allowlist": list(
+                self.command_template_allowlist or ()
+            ),
+            "perspective_allowlist": list(self.perspective_allowlist or ()),
             "ref_allowlist": list(self.ref_allowlist),
             "ref_catalog": dict(self.ref_catalog),
             "budget_policy": dict(self.budget_policy or {}),
         }
+        if self.memory_projection is not None:
+            payload["memory_policy"] = self.memory_projection.to_dict()
+        return payload
+
+    def to_model_dict(self) -> dict[str, Any]:
+        """Render the Planner channel without Memory statements or provenance."""
+
+        safe_signal_refs = [
+            ref for ref in self.risk_signal_refs if not _is_memory_ref(ref)
+        ]
+        safe_refs = [ref for ref in self.ref_allowlist if not _is_memory_ref(ref)]
+        safe_catalog = {
+            ref: description
+            for ref, description in self.ref_catalog.items()
+            if not _is_memory_ref(ref) and not _contains_memory_id(description)
+        }
+        payload: dict[str, Any] = {
+            "risk": {
+                "level": self.risk_level.value,
+                "dimensions": dict(self.risk_dimensions),
+                "reasons": [
+                    item
+                    for item in self.risk_reasons
+                    if not _is_memory_derived_text(item)
+                ],
+                "signal_refs": safe_signal_refs,
+                "suggested_focus": [
+                    item
+                    for item in self.suggested_focus
+                    if not _is_memory_derived_text(item)
+                ],
+            },
+            "change_map": dict(self.change_map),
+            "changed_symbols": [dict(symbol) for symbol in self.changed_symbols],
+            "intent": {
+                "summary": dict(self.intent_summary),
+                "uncertainties": [
+                    item
+                    for item in self.intent_uncertainties
+                    if not _is_memory_derived_text(item)
+                ],
+            },
+            "allowed_role_kinds": list(self.allowed_role_kinds or ()),
+            "reviewer_count_bounds": dict(self.reviewer_count_bounds or {}),
+            "contract_allowlist": list(self.contract_allowlist or ()),
+            "check_allowlist": list(self.check_allowlist or ()),
+            "command_template_allowlist": list(
+                self.command_template_allowlist or ()
+            ),
+            "perspective_allowlist": list(self.perspective_allowlist or ()),
+            "ref_allowlist": safe_refs,
+            "ref_catalog": safe_catalog,
+            "budget_policy": dict(self.budget_policy or {}),
+        }
+        if self.memory_projection is not None:
+            payload["memory_policy"] = self.memory_projection.to_dict(for_model=True)
+            payload = _without_memory_ids(
+                payload,
+                self.memory_projection.local_only_memory_ids,
+            )
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            leaked = [
+                memory_id
+                for memory_id in self.memory_projection.local_only_memory_ids
+                if memory_id in encoded
+            ]
+            if leaked:
+                raise ValueError("local-only Memory leaked into Planner model input")
+        return payload
 
 
 @dataclass(frozen=True)
@@ -423,6 +608,10 @@ def build_portfolio_packet(
     ref_allowlist: Iterable[str] | None = None,
     ref_catalog: Mapping[str, str] | None = None,
     contract_allowlist: Iterable[str] | None = None,
+    check_allowlist: Iterable[str] | None = None,
+    command_template_allowlist: Iterable[str] | None = None,
+    perspective_allowlist: Iterable[str] | None = None,
+    memory_projection: PlannerMemoryProjection | None = None,
 ) -> PortfolioPacket:
     if not isinstance(risk_assessment, RiskAssessment):
         raise ValueError("risk_assessment must be a RiskAssessment")
@@ -445,6 +634,10 @@ def build_portfolio_packet(
             *catalog,
         ]
     )
+    if memory_projection is not None and not isinstance(
+        memory_projection, PlannerMemoryProjection
+    ):
+        raise ValueError("memory_projection must be a PlannerMemoryProjection or None")
     return PortfolioPacket(
         risk_level=risk_assessment.level,
         risk_dimensions=dict(risk_assessment.dimensions),
@@ -471,11 +664,135 @@ def build_portfolio_packet(
         contract_allowlist=(
             list(contract_allowlist)
             if contract_allowlist is not None
-            else list(DEFAULT_CONTRACT_ALLOWLIST)
+            else None
+        ),
+        check_allowlist=(
+            list(check_allowlist) if check_allowlist is not None else None
+        ),
+        command_template_allowlist=(
+            list(command_template_allowlist)
+            if command_template_allowlist is not None
+            else None
+        ),
+        perspective_allowlist=(
+            list(perspective_allowlist)
+            if perspective_allowlist is not None
+            else None
         ),
         ref_allowlist=refs,
         ref_catalog=catalog,
+        memory_projection=memory_projection,
     )
+
+
+def build_planner_memory_projection(
+    compilation: PolicyCompilation,
+    *,
+    registry: RuntimePolicyRegistry,
+    perspective_registry: Iterable[str] = (),
+    selected_memory: Sequence[MemoryReference] = (),
+    perspective_hints: Sequence[PlannerPerspectiveHint] = (),
+    diagnostics: Sequence[MemoryDiagnostic] = (),
+    max_hard_policy_items: int = 64,
+    max_hard_policy_bytes: int = 32_768,
+) -> PlannerMemoryProjection:
+    """Re-project compiled actions; no Record statement or command is accepted."""
+
+    if not isinstance(compilation, PolicyCompilation):
+        raise ValueError("compilation must be a PolicyCompilation")
+    if type(registry) is not RuntimePolicyRegistry:
+        raise ValueError("registry must be a RuntimePolicyRegistry")
+    registered_perspectives = tuple(perspective_registry)
+    _require_unique_string_list(
+        list(registered_perspectives),
+        "perspective_registry",
+    )
+    contracts: list[CompiledMemoryRequirement] = []
+    checks: list[CompiledMemoryRequirement] = []
+    hints: list[VerificationTemplateHint] = []
+    for action in compilation.actions:
+        if type(action) is RequireContractAction:
+            if action.contract_id not in registry.contract_ids:
+                raise ValueError(
+                    "compiled contract is absent from the Runtime registry: "
+                    + action.contract_id
+                )
+            contracts.append(
+                CompiledMemoryRequirement(action.contract_id, action.memory_ids)
+            )
+        elif type(action) is RequireCheckAction:
+            if action.check_id not in registry.check_ids:
+                raise ValueError(
+                    "compiled check is absent from the Runtime registry: "
+                    + action.check_id
+                )
+            checks.append(CompiledMemoryRequirement(action.check_id, action.memory_ids))
+        elif type(action) is VerificationHintAction:
+            if action.command_template_id not in registry.command_template_ids:
+                raise ValueError(
+                    "compiled template is absent from the Runtime registry: "
+                    + action.command_template_id
+                )
+            hints.append(
+                VerificationTemplateHint(
+                    action.command_template_id,
+                    action.memory_ids,
+                )
+            )
+    unknown_perspectives = {
+        item.perspective_id for item in perspective_hints
+    } - set(registered_perspectives)
+    if unknown_perspectives:
+        raise ValueError(
+            "Memory perspective is absent from the Runtime registry: "
+            + ", ".join(sorted(unknown_perspectives))
+        )
+    visible = list(diagnostics)
+    visible.extend(
+        MemoryDiagnostic(
+            code=MemoryDiagnosticCode.POLICY_REJECTED,
+            message=item.message,
+            memory_ids=(() if item.memory_id is None else (item.memory_id,)),
+        )
+        for item in compilation.diagnostics
+        if item.severity is PolicyDiagnosticSeverity.BLOCKING
+    )
+    hard_actions = tuple(
+        item
+        for item in compilation.actions
+        if type(item)
+        in {RequireContractAction, RequireCheckAction, VerificationHintAction}
+    )
+    hard_ids = tuple(
+        sorted(
+            {
+                memory_id
+                for item in hard_actions
+                for memory_id in item.memory_ids
+            }
+        )
+    )
+    if hard_actions:
+        overflow = hard_policy_overflow_diagnostic(
+            "portfolio_planning",
+            tuple(item.to_dict() for item in hard_actions),
+            hard_ids,
+            max_items=max_hard_policy_items,
+            max_bytes=max_hard_policy_bytes,
+        )
+        if overflow is not None:
+            visible.append(overflow)
+    return PlannerMemoryProjection(
+        required_contracts=tuple(contracts),
+        required_checks=tuple(checks),
+        verification_hints=tuple(hints),
+        perspective_hints=tuple(perspective_hints),
+        selected_memory=tuple(selected_memory),
+        diagnostics=tuple(visible),
+    )
+
+
+project_memory_for_portfolio = build_planner_memory_projection
 
 
 def parse_portfolio_proposal(
@@ -536,7 +853,7 @@ def validate_portfolio_proposal(
         raise ValueError("packet cannot be combined with explicit parser policy")
 
     if packet is not None:
-        allowed_refs = packet.allowed_refs
+        allowed_refs = packet.model_allowed_refs
         allowed_contracts = packet.allowed_contracts
         allowed_roles = frozenset(packet.allowed_role_kinds or ())
         maximum = packet.maximum_reviewers
@@ -578,6 +895,31 @@ def validate_portfolio_proposal(
                 + ", ".join(sorted(unknown_contract))
             )
 
+    if packet is not None and packet.memory_projection is not None:
+        proposed_contracts = {
+            item for candidate in proposal.candidates for item in candidate.extra_contract
+        }
+        proposed_checks = {
+            item for candidate in proposal.candidates for item in candidate.required_checks
+        }
+        missing_required_contracts = {
+            item.requirement_id
+            for item in packet.memory_projection.required_contracts
+        } - proposed_contracts
+        missing_required_checks = {
+            item.requirement_id for item in packet.memory_projection.required_checks
+        } - proposed_checks
+        if missing_required_contracts:
+            raise ValueError(
+                "proposal omits memory-required Contract items: "
+                + ", ".join(sorted(missing_required_contracts))
+            )
+        if missing_required_checks:
+            raise ValueError(
+                "proposal omits memory-required checks: "
+                + ", ".join(sorted(missing_required_checks))
+            )
+
 
 def run_portfolio_planner(
     adapter: ModelAdapter,
@@ -613,7 +955,7 @@ def run_portfolio_planner(
         {
             "role": "user",
             "content": json.dumps(
-                packet.to_dict(),
+                packet.to_model_dict(),
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -805,6 +1147,12 @@ def portfolio_packet_to_dict(packet: PortfolioPacket) -> dict[str, Any]:
     return packet.to_dict()
 
 
+def portfolio_packet_to_model_input(packet: PortfolioPacket) -> dict[str, Any]:
+    if not isinstance(packet, PortfolioPacket):
+        raise ValueError("packet must be a PortfolioPacket")
+    return packet.to_model_dict()
+
+
 def portfolio_proposal_to_dict(proposal: PortfolioProposal) -> dict[str, Any]:
     if not isinstance(proposal, PortfolioProposal):
         raise ValueError("proposal must be a PortfolioProposal")
@@ -856,6 +1204,16 @@ def _fallback_candidate_templates(packet: PortfolioPacket) -> list[PortfolioCand
     reason_refs = list(packet.risk_signal_refs)
     context_refs = list(packet.risk_signal_refs)
     focus = ", ".join(packet.suggested_focus) or "the highest-risk changed behavior"
+    memory_contracts = (
+        [item.requirement_id for item in packet.memory_projection.required_contracts]
+        if packet.memory_projection is not None
+        else []
+    )
+    memory_checks = (
+        [item.requirement_id for item in packet.memory_projection.required_checks]
+        if packet.memory_projection is not None
+        else []
+    )
     return [
         PortfolioCandidate(
             candidate_id="runtime-core",
@@ -868,11 +1226,13 @@ def _fallback_candidate_templates(packet: PortfolioPacket) -> list[PortfolioCand
             ),
             reason_refs=reason_refs,
             context_refs=context_refs,
+            extra_contract=memory_contracts,
             required_checks=[
                 "map changed behavior to intent",
                 "inspect affected callers or record why unavailable",
                 "inspect direct observations for every assigned Contract item",
                 "record unavailable observations as uncertainty",
+                *memory_checks,
             ],
             priority=100,
         ),
@@ -1097,6 +1457,60 @@ def _require_non_negative_finite_number(value: object, context: str) -> None:
 
 def _dedupe(values: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(values))
+
+
+_MEMORY_ID_PATTERN = re.compile(r"MEM-[0-9a-f]{64}")
+
+
+def _contains_memory_id(value: object) -> bool:
+    return isinstance(value, str) and _MEMORY_ID_PATTERN.search(value) is not None
+
+
+def _is_memory_ref(value: object) -> bool:
+    return isinstance(value, str) and (
+        value.startswith(("memory:", "memory_floor:"))
+        or _contains_memory_id(value)
+    )
+
+
+def _is_memory_derived_text(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.casefold()
+    return (
+        _contains_memory_id(value)
+        or normalized.startswith("approved memory risk signal:")
+        or normalized.startswith("compiled memory risk floor")
+        or normalized.startswith("memory ")
+        or normalized == "approved incident lessons"
+    )
+
+
+_OMITTED_MEMORY_VALUE = object()
+
+
+def _without_memory_ids(value: Any, memory_ids: Sequence[str]) -> Any:
+    if isinstance(value, str):
+        if any(memory_id in value for memory_id in memory_ids):
+            return _OMITTED_MEMORY_VALUE
+        return value
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if any(memory_id in key for memory_id in memory_ids):
+                continue
+            rendered = _without_memory_ids(item, memory_ids)
+            if rendered is not _OMITTED_MEMORY_VALUE:
+                result[key] = rendered
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        result = []
+        for item in value:
+            rendered = _without_memory_ids(item, memory_ids)
+            if rendered is not _OMITTED_MEMORY_VALUE:
+                result.append(rendered)
+        return result
+    return value
 
 
 def _normalize_packet_texts(values: Iterable[str], context: str) -> list[str]:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path, PurePosixPath
 import re
@@ -8,6 +8,20 @@ import subprocess
 from collections.abc import Iterable
 from typing import Any
 
+from review_agent.context import remote_visible_memory_snapshot
+from review_agent.memory_models import (
+    DurableMemoryRecord,
+    MemoryScope,
+    MemorySnapshot,
+)
+from review_agent.memory_retrieval import (
+    HardPolicyBudgetExceeded,
+    MemoryQuery,
+    MemoryRetrievalError,
+    ProjectionBudgetExceeded,
+    RetrievalLimits,
+    SnapshotMemoryQueryService,
+)
 from review_agent.observations import ObservationStore
 from review_agent.repository_intelligence import collect_python_symbols, search_repository_text
 
@@ -41,6 +55,7 @@ SUPPORTED_TOOL_NAMES = (
     "inspect_symbol",
     "find_references",
     "read_commit_messages",
+    "query_project_memory",
 )
 
 
@@ -56,11 +71,19 @@ class ToolGateway:
         max_commit_messages: int = 50,
         max_commit_body_chars: int = 4000,
         allowed_tools: Iterable[str] | None = None,
+        memory_query_service: SnapshotMemoryQueryService | None = None,
+        snapshot_query_service: SnapshotMemoryQueryService | None = None,
+        memory_snapshot: MemorySnapshot | None = None,
+        assignment_id: str | None = None,
+        assignment_scope: MemoryScope | None = None,
+        memory_query_limits: RetrievalLimits | None = None,
     ) -> None:
-        self.repository_path = repository_path
+        self.repository_path = Path(repository_path)
         self.base_revision = base_revision
         self.head_revision = head_revision
         self.observation_store = observation_store
+        if type(max_context_chars) is not int or max_context_chars < 1:
+            raise ValueError("max_context_chars must be a positive integer")
         self.max_context_chars = max_context_chars
         self.timeout_seconds = timeout_seconds
         if type(max_commit_messages) is not int or max_commit_messages < 1:
@@ -84,8 +107,159 @@ class ToolGateway:
                 "unsupported allowed tool(s): " + ", ".join(sorted(unsupported))
             )
         self.allowed_tools = frozenset(requested_tools)
+        if (
+            memory_query_service is not None
+            and snapshot_query_service is not None
+            and memory_query_service is not snapshot_query_service
+        ):
+            raise ValueError(
+                "memory_query_service and snapshot_query_service conflict"
+            )
+        if assignment_id is not None and (
+            not isinstance(assignment_id, str) or not assignment_id.strip()
+        ):
+            raise ValueError("assignment_id must be a non-empty string")
+        if assignment_scope is not None and type(assignment_scope) is not MemoryScope:
+            raise ValueError("assignment_scope must be a canonical MemoryScope")
+        if memory_query_limits is not None and type(memory_query_limits) is not RetrievalLimits:
+            raise ValueError("memory_query_limits must be canonical RetrievalLimits")
+        query_service = (
+            memory_query_service
+            if memory_query_service is not None
+            else snapshot_query_service
+        )
+        source_snapshot: MemorySnapshot | None = None
+        bound_assignment_id: str | None = None
+        bound_assignment_scope: MemoryScope | None = None
+        query_limits: RetrievalLimits | None = None
+        if memory_snapshot is not None:
+            if query_service is not None:
+                raise ValueError(
+                    "provide either a MemorySnapshot or Snapshot query service, not both"
+                )
+            if type(memory_snapshot) is not MemorySnapshot:
+                raise ValueError("memory_snapshot must be a canonical MemorySnapshot")
+            if not isinstance(assignment_id, str) or not assignment_id.strip():
+                raise ValueError(
+                    "assignment_id is required when binding a MemorySnapshot"
+                )
+            if type(assignment_scope) is not MemoryScope:
+                raise ValueError(
+                    "assignment_scope is required when binding a MemorySnapshot"
+                )
+            source_snapshot = MemorySnapshot.from_dict(memory_snapshot.to_dict())
+            bound_assignment_id = assignment_id
+            bound_assignment_scope = MemoryScope.from_dict(assignment_scope.to_dict())
+            query_limits = replace(memory_query_limits or RetrievalLimits())
+        if query_service is not None and not isinstance(
+            query_service,
+            SnapshotMemoryQueryService,
+        ):
+            raise ValueError(
+                "memory query source must be a SnapshotMemoryQueryService; live stores are forbidden"
+            )
+        if query_service is not None:
+            service_snapshot = getattr(query_service, "_snapshot", None)
+            service_assignment_id = getattr(query_service, "_assignment_id", None)
+            service_assignment_scope = getattr(query_service, "_assignment_scope", None)
+            service_limits = getattr(query_service, "limits", None)
+            if type(service_snapshot) is not MemorySnapshot:
+                raise ValueError("memory query service does not hold a canonical Snapshot")
+            if not isinstance(service_assignment_id, str) or not service_assignment_id:
+                raise ValueError("memory query service has no canonical Assignment ID")
+            if type(service_assignment_scope) is not MemoryScope:
+                raise ValueError("memory query service has no canonical Assignment scope")
+            if type(service_limits) is not RetrievalLimits:
+                raise ValueError("memory query service has no canonical retrieval limits")
+            source_snapshot = MemorySnapshot.from_dict(service_snapshot.to_dict())
+            bound_assignment_id = assignment_id or service_assignment_id
+            bound_assignment_scope = (
+                MemoryScope.from_dict(assignment_scope.to_dict())
+                if assignment_scope is not None
+                else MemoryScope.from_dict(service_assignment_scope.to_dict())
+            )
+            query_limits = replace(memory_query_limits or service_limits)
+        elif memory_snapshot is None and any(
+            value is not None
+            for value in (assignment_id, assignment_scope, memory_query_limits)
+        ):
+            raise ValueError("assignment binding options require a MemorySnapshot")
+
+        if query_limits is not None and type(query_limits) is not RetrievalLimits:
+            raise ValueError("memory_query_limits must be canonical RetrievalLimits")
+
+        verified_head_sha: str | None = None
+        remote_snapshot: MemorySnapshot | None = None
+        if source_snapshot is not None:
+            verified_head_sha = _resolve_commit_sha(
+                self.repository_path,
+                self.head_revision,
+                self.timeout_seconds,
+            )
+            if source_snapshot.head_sha.casefold() != verified_head_sha.casefold():
+                raise ValueError(
+                    "memory query Snapshot head does not match the reviewed head revision"
+                )
+            if bound_assignment_id is None or bound_assignment_scope is None:
+                raise ValueError("memory query service is missing its Assignment binding")
+            remote_snapshot = remote_visible_memory_snapshot(source_snapshot)
+            query_service = SnapshotMemoryQueryService(
+                remote_snapshot,
+                assignment_id=bound_assignment_id,
+                assignment_scope=bound_assignment_scope,
+                limits=query_limits,
+            )
+        else:
+            query_service = None
+
+        self.verified_head_sha = verified_head_sha
+        self.memory_snapshot = remote_snapshot
+        self.memory_assignment_id = bound_assignment_id
+        self.memory_assignment_scope = bound_assignment_scope
+        self.memory_query_service = query_service
+        self._memory_context_limit_bytes: int | None = None
+        self._memory_context_used_bytes = 0
         self.attempted_tool_calls = 0
         self.denied_tool_calls = 0
+
+    def bind_memory_context_ledger(
+        self,
+        *,
+        limit_bytes: int,
+        initial_bytes: int,
+    ) -> None:
+        """Bind the initial Memory projection and later tool results to one ledger."""
+
+        if type(limit_bytes) is not int or limit_bytes < 0:
+            raise ValueError("memory context ledger limit must be non-negative")
+        if type(initial_bytes) is not int or not 0 <= initial_bytes <= limit_bytes:
+            raise ValueError("initial Memory bytes exceed the context ledger")
+        service = self.memory_query_service
+        if service is None:
+            if limit_bytes or initial_bytes:
+                raise ValueError("memory context ledger requires a Snapshot service")
+            return
+        if service.call_count or self._memory_context_used_bytes:
+            raise ValueError("memory context ledger must be bound before Memory queries")
+        self._memory_context_limit_bytes = limit_bytes
+        self._memory_context_used_bytes = initial_bytes
+
+    @property
+    def memory_context_limit_bytes(self) -> int | None:
+        return self._memory_context_limit_bytes
+
+    @property
+    def memory_context_used_bytes(self) -> int:
+        return self._memory_context_used_bytes
+
+    @property
+    def memory_context_remaining_bytes(self) -> int | None:
+        if self._memory_context_limit_bytes is None:
+            return None
+        return max(
+            0,
+            self._memory_context_limit_bytes - self._memory_context_used_bytes,
+        )
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolExecutionResult:
         self.attempted_tool_calls += 1
@@ -110,6 +284,8 @@ class ToolGateway:
             return self._find_references(arguments)
         if tool_name == "read_commit_messages":
             return self._read_commit_messages(arguments)
+        if tool_name == "query_project_memory":
+            return self._query_project_memory(arguments)
         self.denied_tool_calls += 1
         raise ToolGatewayError(
             f"unsupported tool: {tool_name}",
@@ -314,6 +490,73 @@ class ToolGateway:
             return "head", self.head_revision
         raise ToolGatewayError(f"unauthorized revision: {revision_label}")
 
+    def _query_project_memory(
+        self,
+        arguments: dict[str, Any],
+    ) -> ToolExecutionResult:
+        service = self.memory_query_service
+        if service is None:
+            raise ToolGatewayError(
+                "query_project_memory is unavailable without an Assignment-bound Snapshot",
+                code="memory_snapshot_unavailable",
+                tool_name="query_project_memory",
+            )
+        query = _memory_query_from_arguments(arguments)
+        try:
+            result = service.query(query)
+        except HardPolicyBudgetExceeded:
+            raise
+        except (MemoryRetrievalError, TypeError, ValueError) as error:
+            raise ToolGatewayError(
+                f"invalid Snapshot memory query: {error}",
+                code="invalid_memory_query",
+                tool_name="query_project_memory",
+            ) from error
+
+        byte_limit = min(service.limits.max_query_bytes, self.max_context_chars)
+        remaining = self.memory_context_remaining_bytes
+        if remaining is not None:
+            byte_limit = min(byte_limit, remaining)
+        try:
+            payload, raw_content, final_size = _fit_memory_tool_payload(
+                assignment_id=result.assignment_id,
+                snapshot_id=result.snapshot_id,
+                call_index=result.call_index,
+                records=result.records,
+                omitted_memory_ids=result.omitted_memory_ids,
+                max_bytes=byte_limit,
+            )
+        except HardPolicyBudgetExceeded:
+            raise
+        except ProjectionBudgetExceeded as error:
+            raise ToolGatewayError(
+                f"Snapshot memory query exceeds the remaining Context budget: {error}",
+                code="memory_context_budget_exceeded",
+                tool_name="query_project_memory",
+            ) from error
+
+        if len(raw_content.encode("utf-8")) != payload["byte_size"]:
+            raise AssertionError("final Memory tool payload byte_size is inconsistent")
+        if final_size > byte_limit:
+            raise AssertionError("final Memory tool payload escaped its byte limit")
+        if self._memory_context_limit_bytes is not None:
+            self._memory_context_used_bytes += final_size
+        observation = self.observation_store.record(
+            source="memory.query_project_memory",
+            revision=f"head@{self.verified_head_sha}",
+            path=query.path,
+            line_start=None,
+            line_end=None,
+            raw_content=raw_content,
+            context_view=raw_content,
+        )
+        return ToolExecutionResult(
+            "query_project_memory",
+            [observation.observation_id],
+            raw_content,
+            False,
+        )
+
 
 def _safe_repo_path(path: str) -> str:
     normalized = path.replace("\\", "/")
@@ -321,6 +564,162 @@ def _safe_repo_path(path: str) -> str:
     if pure.is_absolute() or ".." in pure.parts or not normalized or pure.parts[0] in {".git", ".env"}:
         raise ToolGatewayError(f"unsafe repository path: {path}")
     return normalized
+
+
+def _memory_query_from_arguments(arguments: dict[str, Any]) -> MemoryQuery:
+    if type(arguments) is not dict:
+        raise ToolGatewayError(
+            "query_project_memory arguments must be an object",
+            code="invalid_memory_query",
+            tool_name="query_project_memory",
+        )
+    allowed = {"assignment_id", "path", "symbol", "contract", "query"}
+    unsupported = set(arguments) - allowed
+    if unsupported:
+        raise ToolGatewayError(
+            "query_project_memory received unsupported argument(s): "
+            + ", ".join(sorted(str(item) for item in unsupported)),
+            code="invalid_memory_query",
+            tool_name="query_project_memory",
+        )
+    if "assignment_id" not in arguments:
+        raise ToolGatewayError(
+            "query_project_memory requires assignment_id",
+            code="invalid_memory_query",
+            tool_name="query_project_memory",
+        )
+    for name in allowed.intersection(arguments):
+        if not isinstance(arguments[name], str):
+            raise ToolGatewayError(
+                f"query_project_memory {name} must be a string",
+                code="invalid_memory_query",
+                tool_name="query_project_memory",
+            )
+    try:
+        return MemoryQuery(
+            assignment_id=arguments["assignment_id"],
+            path=arguments.get("path"),
+            symbol=arguments.get("symbol"),
+            contract=arguments.get("contract"),
+            query_text=arguments.get("query", ""),
+        )
+    except (TypeError, ValueError) as error:
+        raise ToolGatewayError(
+            f"invalid query_project_memory arguments: {error}",
+            code="invalid_memory_query",
+            tool_name="query_project_memory",
+        ) from error
+
+
+def _fit_memory_tool_payload(
+    *,
+    assignment_id: str,
+    snapshot_id: str,
+    call_index: int,
+    records: tuple[DurableMemoryRecord, ...],
+    omitted_memory_ids: tuple[str, ...],
+    max_bytes: int,
+) -> tuple[dict[str, Any], str, int]:
+    selected = list(records)
+    omitted = list(dict.fromkeys(omitted_memory_ids))
+    while True:
+        payload, raw_content, byte_size = _serialize_memory_tool_payload(
+            assignment_id=assignment_id,
+            snapshot_id=snapshot_id,
+            call_index=call_index,
+            records=selected,
+            omitted_memory_ids=omitted,
+        )
+        if byte_size <= max_bytes:
+            return payload, raw_content, byte_size
+
+        ordinary = [
+            record for record in reversed(selected) if record.policy_effect is None
+        ]
+        if ordinary:
+            dropped = ordinary[0]
+            selected.remove(dropped)
+            if dropped.memory_id not in omitted:
+                omitted.append(dropped.memory_id)
+            continue
+
+        hard_policy_ids = [
+            record.memory_id
+            for record in selected
+            if record.policy_effect is not None
+        ]
+        if hard_policy_ids:
+            raise HardPolicyBudgetExceeded(
+                boundary="query_tool",
+                budget="utf8_bytes",
+                limit=max_bytes,
+                required=byte_size,
+                memory_ids=hard_policy_ids,
+            )
+        raise ProjectionBudgetExceeded(
+            boundary="query_tool",
+            limit=max_bytes,
+            required=byte_size,
+        )
+
+
+def _serialize_memory_tool_payload(
+    *,
+    assignment_id: str,
+    snapshot_id: str,
+    call_index: int,
+    records: list[DurableMemoryRecord],
+    omitted_memory_ids: list[str],
+) -> tuple[dict[str, Any], str, int]:
+    byte_size = 0
+    for _ in range(16):
+        payload = {
+            "assignment_id": assignment_id,
+            "snapshot_id": snapshot_id,
+            "call_index": call_index,
+            "byte_size": byte_size,
+            "records": [record.to_dict() for record in records],
+            "omitted_memory_ids": list(omitted_memory_ids),
+        }
+        raw_content = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        measured = len(raw_content.encode("utf-8"))
+        if measured == byte_size:
+            return payload, raw_content, measured
+        byte_size = measured
+    raise AssertionError("Memory payload byte_size did not converge")
+
+
+def _is_full_git_object_id(value: str) -> bool:
+    return re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value) is not None
+
+
+def _resolve_commit_sha(
+    repo: Path,
+    revision: str,
+    timeout_seconds: int,
+) -> str:
+    if (
+        not isinstance(revision, str)
+        or not revision.strip()
+        or revision != revision.strip()
+        or revision.startswith("-")
+        or "\x00" in revision
+    ):
+        raise ValueError("head revision must be a canonical Git revision")
+    resolved = _run_git(
+        repo,
+        ["rev-parse", "--verify", f"{revision}^{{commit}}"],
+        timeout_seconds,
+        allow_exit_codes={0},
+    ).strip()
+    if not _is_full_git_object_id(resolved):
+        raise ValueError("head revision did not resolve to a commit SHA")
+    return resolved.casefold()
 
 
 def _git_show(repo: Path, revision: str, path: str, timeout_seconds: int) -> str:

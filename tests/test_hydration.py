@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from enum import Enum
 import json
+from typing import Any
 
 import pytest
 
-from review_agent.brief import ReviewBrief, build_review_brief, review_brief_to_dict
+from review_agent.brief import (
+    ReviewBrief,
+    build_memory_audit_projection,
+    build_review_brief,
+    review_brief_to_dict,
+)
 from review_agent.completion import CompletionResult, completion_to_dict
 from review_agent.evidence import (
     CanonicalFinding,
@@ -19,8 +26,12 @@ from review_agent.final_risk import FinalRiskAssessment, final_risk_to_dict
 from review_agent.hydration import (
     assignments_from_dict,
     completion_from_dict,
+    feedback_calibration_summary_from_dict,
     final_risk_from_dict,
     intent_from_dict,
+    memory_selection_decision_from_dict,
+    memory_selection_input_from_dict,
+    memory_snapshot_from_dict,
     quality_gate_plan_from_dict,
     quality_results_from_dict,
     reconciliation_from_dict,
@@ -33,11 +44,21 @@ from review_agent.hydration import (
     risk_packet_from_dict,
     semantic_reconciliation_from_dict,
 )
+from review_agent.memory_models import (
+    Applicability,
+    FeedbackCalibrationSummary,
+    GenerationMetadata,
+    MemoryScope,
+    MemorySelectionDecision,
+    MemorySelectionInput,
+    MemorySnapshot,
+)
 from review_agent.model_protocol import ModelResponse
 from review_agent.models import (
     Assignment,
     ClarificationQuestion,
     ClarificationStatus,
+    CompiledRiskFloor,
     ContractAssessment,
     ContractItemStatus,
     DEFAULT_REVIEWER_MAX_ELAPSED_SECONDS,
@@ -52,6 +73,10 @@ from review_agent.models import (
     IntentPacket,
     IntentSource,
     IntentStatus,
+    MemoryDiagnostic,
+    MemoryDiagnosticCode,
+    MemoryReference,
+    MemoryRiskSignal,
     ModelInvocationEnvelope,
     QualityGateResult,
     ReviewRequest,
@@ -63,6 +88,7 @@ from review_agent.models import (
     RiskAssessment,
     RiskAssessmentPacket,
     RiskLevel,
+    RiskMemoryProjection,
 )
 from review_agent.repository_intelligence import ChangedSymbol, RepositoryIntelligenceSnapshot
 from review_agent.quality import (
@@ -84,6 +110,94 @@ def _json(value: object) -> object:
     )
 
 
+def _memory_hydration_cases() -> list[
+    tuple[Callable[[Mapping[str, Any]], object], dict[str, Any], object]
+]:
+    generations = GenerationMetadata(
+        store_schema_version=1,
+        memory_generation=2,
+        feedback_generation=3,
+        knowledge_generation=4,
+    )
+    selection_input = MemorySelectionInput(
+        review_id="review-memory-hydration",
+        repository_key="4" * 64,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        changed_paths=("src/review_agent/artifacts.py",),
+        changed_symbols=("review_agent.artifacts.artifact_schema",),
+        contracts=("artifact_integrity",),
+        languages=("python",),
+        generations=generations,
+    )
+    decision = MemorySelectionDecision(
+        memory_id="MEM-" + "c" * 64,
+        applicability=Applicability.OUT_OF_SCOPE,
+        matched_scope=MemoryScope(paths=("src/legacy/**",)),
+        reason_codes=("path_mismatch",),
+        rank=0,
+    )
+    feedback_summary = FeedbackCalibrationSummary(
+        repository_key="4" * 64,
+        feedback_generation=generations.feedback_generation,
+        policy_version="feedback_aggregation_v1",
+        eligible=False,
+        source_feedback_ids=(),
+        source_review_ids=(),
+        decision_counts=(),
+        signals=(),
+        created_at="2026-07-15T00:00:00Z",
+    )
+    snapshot = MemorySnapshot(
+        repository_key="4" * 64,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        generations=generations,
+        selection_policy_version="memory_selection_v1",
+        eligible_records=(),
+        applicability_decisions=(decision,),
+        feedback_calibration_summary=feedback_summary,
+        repository_knowledge_refs=(),
+        created_at="2026-07-15T00:00:00Z",
+    )
+    return [
+        (
+            memory_selection_input_from_dict,
+            selection_input.to_dict(),
+            selection_input,
+        ),
+        (memory_snapshot_from_dict, snapshot.to_dict(), snapshot),
+        (memory_selection_decision_from_dict, decision.to_dict(), decision),
+        (
+            feedback_calibration_summary_from_dict,
+            feedback_summary.to_dict(),
+            feedback_summary,
+        ),
+    ]
+
+
+def test_memory_hydration_boundaries_round_trip_strict_models() -> None:
+    for loader, payload, model in _memory_hydration_cases():
+        assert loader(payload) == model
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_memory_hydration_boundaries_do_not_guess_or_default_fields(
+    mutation: str,
+) -> None:
+    for loader, serialized, _ in _memory_hydration_cases():
+        payload = dict(serialized)
+        if mutation == "missing":
+            del payload["schema_version"]
+            message = "missing required field"
+        else:
+            payload["legacy_default"] = True
+            message = "unsupported field"
+
+        with pytest.raises(ValueError, match=message):
+            loader(payload)
+
+
 def _assignment() -> Assignment:
     return Assignment(
         role="core",
@@ -98,6 +212,8 @@ def _assignment() -> Assignment:
             quality_gate_summary={"compile": "passed"},
             observation_refs=["O-1"],
             signal_refs=["changed_file:a.py"],
+            selected_memory_refs=["MEM-" + "4" * 64],
+            verification_template_hints=["pytest_idempotency"],
         ),
         max_turns=3,
         max_tool_calls=4,
@@ -280,7 +396,12 @@ def test_risk_packet_and_assignment_hydration_defaults_legacy_additive_fields() 
         "diff_excerpt": ["+pass"],
     }
     assignment_payload = _json(asdict(_assignment()))
-    assignment_payload["initial_context"].pop("signal_refs")
+    for name in (
+        "signal_refs",
+        "selected_memory_refs",
+        "verification_template_hints",
+    ):
+        assignment_payload["initial_context"].pop(name)
     for name in (
         "assignment_id",
         "role_kind",
@@ -299,6 +420,52 @@ def test_risk_packet_and_assignment_hydration_defaults_legacy_additive_fields() 
     assert assignment.perspective_key == "legacy"
     assert assignment.planner_source == "legacy"
     assert assignment.initial_context.signal_refs == []
+    assert assignment.initial_context.selected_memory_refs == []
+    assert assignment.initial_context.verification_template_hints == []
+
+
+def test_risk_packet_hydrates_typed_memory_projection_strictly() -> None:
+    memory_id = "MEM-" + "5" * 64
+    projection = RiskMemoryProjection(
+        signals=(
+            MemoryRiskSignal(
+                signal_ref=f"memory:{memory_id}",
+                summary="Prior incidents require elevated review depth.",
+                memory=MemoryReference(
+                    memory_id=memory_id,
+                    kind="incident_lesson",
+                    source_refs=("source:incident-5",),
+                    local_only=True,
+                ),
+            ),
+        ),
+        risk_floor=CompiledRiskFloor(
+            minimum_level=RiskLevel.HIGH,
+            memory_ids=(memory_id,),
+        ),
+        diagnostics=(
+            MemoryDiagnostic(
+                code=MemoryDiagnosticCode.STALE,
+                message="A non-authoritative memory entry was omitted.",
+                memory_ids=(),
+            ),
+        ),
+    )
+    packet = RiskAssessmentPacket(
+        change_summary={"changed_files": ["a.py"]},
+        deterministic_signals={"changed_file_count": 1},
+        intent_status=IntentStatus.SUFFICIENT,
+        intent_uncertainties=[],
+        diff_excerpt=["+pass"],
+        memory_projection=projection,
+    )
+
+    payload = _json(asdict(packet))
+    assert risk_packet_from_dict(payload) == packet
+
+    payload["memory_projection"]["signals"][0]["memory"]["content"] = "leak"
+    with pytest.raises(ValueError, match="unsupported field.*content"):
+        risk_packet_from_dict(payload)
 
 
 def test_repository_and_reviewer_artifacts_round_trip() -> None:
@@ -442,6 +609,101 @@ def test_downstream_artifacts_round_trip() -> None:
     assert completion_from_dict(_json(completion_to_dict(completion))) == completion
     assert final_risk_from_dict(_json(final_risk_to_dict(final_risk))) == final_risk
     assert review_brief_from_dict(_json(review_brief_to_dict(brief))) == brief
+
+
+def test_downstream_memory_fields_round_trip_and_legacy_defaults_are_empty() -> None:
+    memory_id = "MEM-" + "d" * 64
+    reference = MemoryReference(
+        memory_id=memory_id,
+        kind="incident_lesson",
+        source_refs=("memory-source:" + "e" * 64,),
+        local_only=True,
+    )
+    diagnostic = MemoryDiagnostic(
+        code=MemoryDiagnosticCode.STALE,
+        message="record requires revalidation",
+        memory_ids=(memory_id,),
+    )
+    completion = CompletionResult(
+        "completed_with_uncertainties",
+        "manual_review",
+        [],
+        ["memory requires revalidation"],
+        [],
+        (diagnostic,),
+    )
+    final_risk = FinalRiskAssessment(
+        "reassessed",
+        RiskLevel.LOW,
+        RiskLevel.HIGH,
+        ["compiled floor retained"],
+        ["compiled floor retained"],
+        [],
+        ["record requires revalidation"],
+        ["memory_diagnostic:stale"],
+        (reference,),
+        (diagnostic,),
+        ("manual verification remains",),
+    )
+
+    assert completion_from_dict(_json(completion_to_dict(completion))) == completion
+    assert final_risk_from_dict(_json(final_risk_to_dict(final_risk))) == final_risk
+
+    legacy_completion = completion_from_dict(
+        {
+            "status": "completed",
+            "recommendation": "approve",
+            "blockers": [],
+            "uncertainties": [],
+            "missing_perspectives": [],
+        }
+    )
+    legacy_final = final_risk_from_dict(
+        {
+            "status": "reassessed",
+            "initial_level": "low",
+            "level": "low",
+            "reasons": ["legacy"],
+            "escalations": [],
+            "deescalations": [],
+            "uncertainties": [],
+            "signal_refs": [],
+        }
+    )
+    assert legacy_completion.memory_diagnostics == ()
+    assert legacy_final.applied_memory == ()
+    assert legacy_final.memory_diagnostics == ()
+    assert legacy_final.residual_risk == ()
+
+
+def test_review_brief_memory_audit_hydration_is_strict_and_round_trips() -> None:
+    memory_id = "MEM-" + "f" * 64
+    audit = build_memory_audit_projection(
+        {
+            "applied_memory": [
+                {
+                    "memory_id": memory_id,
+                    "kind": "review_rule",
+                    "scope": {"paths": ["src/app.py"]},
+                    "authority": "runtime_compiled_policy",
+                    "source_refs": ["memory-source:" + "1" * 64],
+                    "validity": {"applicability": "selected"},
+                }
+            ],
+            "status": {"available": True},
+        }
+    )
+    payload = _json(review_brief_to_dict(_review_brief()))
+    payload["memory_audit"] = audit
+
+    hydrated = review_brief_from_dict(payload)
+
+    assert hydrated.memory_audit == audit
+    assert review_brief_to_dict(hydrated)["memory_audit"] == audit
+
+    payload["memory_audit"]["invented"] = True
+    with pytest.raises(ValueError, match="unsupported field"):
+        review_brief_from_dict(payload)
 
 
 def test_semantic_reconciliation_hydrates_through_the_shared_boundary() -> None:

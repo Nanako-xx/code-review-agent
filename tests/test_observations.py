@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import review_agent.observations as observations_module
 from review_agent.observations import ObservationStore
 
 
@@ -294,3 +295,119 @@ def test_observation_ids_distinguish_delimiters_and_null_from_empty_path(tmp_pat
         tmp_path,
         {"c", "b|c", "revision"},
     ).list_observations() == observations
+
+
+def test_observation_hydration_enforces_record_count_before_opening_raw_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ObservationStore(tmp_path)
+    for index in range(2):
+        store.record(
+            source="git.read_range",
+            revision="head@abc",
+            path=f"src/file-{index}.py",
+            line_start=1,
+            line_end=1,
+            raw_content=f"value = {index}\n",
+            context_view=f"file {index}",
+        )
+    raw_paths = {
+        (tmp_path / item.raw_artifact_ref).resolve()
+        for item in store.list_observations()
+    }
+    opened_paths: list[Path] = []
+    real_open = observations_module.os.open
+
+    def recording_open(path: object, flags: int, *args: object) -> int:
+        opened_paths.append(Path(path).resolve())
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(observations_module.os, "open", recording_open)
+
+    with pytest.raises(ValueError, match="record count"):
+        ObservationStore.load(
+            tmp_path,
+            {"head@abc"},
+            max_observations=1,
+        )
+
+    assert not raw_paths.intersection(opened_paths)
+
+
+def test_observation_hydration_enforces_total_bytes_before_opening_raw_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ObservationStore(tmp_path)
+    for index in range(2):
+        store.record(
+            source="git.read_range",
+            revision="head@abc",
+            path=f"src/file-{index}.py",
+            line_start=1,
+            line_end=1,
+            raw_content="0123456789",
+            context_view=f"file {index}",
+        )
+    raw_paths = {
+        (tmp_path / item.raw_artifact_ref).resolve()
+        for item in store.list_observations()
+    }
+    opened_paths: list[Path] = []
+    real_open = observations_module.os.open
+
+    def recording_open(path: object, flags: int, *args: object) -> int:
+        opened_paths.append(Path(path).resolve())
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(observations_module.os, "open", recording_open)
+
+    with pytest.raises(ValueError, match="total byte bound"):
+        ObservationStore.load(
+            tmp_path,
+            {"head@abc"},
+            max_total_raw_bytes=15,
+        )
+
+    assert not raw_paths.intersection(opened_paths)
+
+
+def test_observation_hydration_checks_log_size_before_reading_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _record(tmp_path)
+    read_calls = 0
+    real_read = observations_module.os.read
+
+    def recording_read(descriptor: int, size: int) -> bytes:
+        nonlocal read_calls
+        read_calls += 1
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(observations_module.os, "read", recording_read)
+
+    with pytest.raises(ValueError, match="byte bound"):
+        ObservationStore.load(
+            tmp_path,
+            {"base..head"},
+            max_log_bytes=1,
+        )
+
+    assert read_calls == 0
+
+
+def test_observation_hydration_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    observation = _record(tmp_path)
+    jsonl = tmp_path / "observations.jsonl"
+    payload = json.loads(jsonl.read_text(encoding="utf-8"))
+    fields = [
+        f'"observation_id": {json.dumps(observation.observation_id)}',
+        f'"observation_id": {json.dumps(observation.observation_id)}',
+        *(f"{json.dumps(key)}: {json.dumps(value)}" for key, value in payload.items() if key != "observation_id"),
+    ]
+    jsonl.write_text("{" + ",".join(fields) + "}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate"):
+        ObservationStore.load(tmp_path, {"base..head"})

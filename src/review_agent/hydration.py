@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import math
+import re
 from typing import Any, TypeVar
 
-from review_agent.brief import BriefFinding, RejectedHypothesis, ReviewBrief
+from review_agent.brief import (
+    BriefFinding,
+    RejectedHypothesis,
+    ReviewBrief,
+    build_memory_audit_projection,
+)
 from review_agent.completion import CompletionResult
 from review_agent.evidence import (
     CanonicalFinding,
@@ -12,16 +18,23 @@ from review_agent.evidence import (
     EvidenceReconciliation,
     RejectedFinding,
 )
-from review_agent.final_risk import FinalRiskAssessment
+from review_agent.final_risk import FinalRiskAssessment, final_risk_to_dict
 from review_agent.incremental import (
     incremental_priority_from_dict,
     incremental_priority_to_dict,
+)
+from review_agent.memory_models import (
+    FeedbackCalibrationSummary,
+    MemorySelectionDecision,
+    MemorySelectionInput,
+    MemorySnapshot,
 )
 from review_agent.model_protocol import ModelResponse
 from review_agent.models import (
     Assignment,
     ClarificationQuestion,
     ClarificationStatus,
+    CompiledRiskFloor,
     ConclusionImpact,
     ContractAssessment,
     ContractItemStatus,
@@ -40,6 +53,10 @@ from review_agent.models import (
     IntentPacket,
     IntentSource,
     IntentStatus,
+    MemoryDiagnostic,
+    MemoryDiagnosticCode,
+    MemoryReference,
+    MemoryRiskSignal,
     ModelInvocationEnvelope,
     QualityGateResult,
     ReviewRequest,
@@ -50,6 +67,7 @@ from review_agent.models import (
     ReviewerTerminationReason,
     RiskAssessment,
     RiskAssessmentPacket,
+    RiskMemoryProjection,
     RiskLevel,
 )
 from review_agent.orchestrator import ReviewerExecution
@@ -71,6 +89,36 @@ def semantic_reconciliation_from_dict(
     """Hydrate the authoritative semantic reconciliation artifact strictly."""
 
     return _semantic_reconciliation_from_dict(payload)
+
+
+def memory_selection_input_from_dict(
+    payload: Mapping[str, Any],
+) -> MemorySelectionInput:
+    """Hydrate a Memory Selection input through its strict model boundary."""
+
+    return MemorySelectionInput.from_dict(payload)
+
+
+def memory_snapshot_from_dict(payload: Mapping[str, Any]) -> MemorySnapshot:
+    """Hydrate a pinned Memory Snapshot through its strict model boundary."""
+
+    return MemorySnapshot.from_dict(payload)
+
+
+def memory_selection_decision_from_dict(
+    payload: Mapping[str, Any],
+) -> MemorySelectionDecision:
+    """Hydrate a Memory Selection decision through its strict model boundary."""
+
+    return MemorySelectionDecision.from_dict(payload)
+
+
+def feedback_calibration_summary_from_dict(
+    payload: Mapping[str, Any],
+) -> FeedbackCalibrationSummary:
+    """Hydrate feedback calibration through its strict model boundary."""
+
+    return FeedbackCalibrationSummary.from_dict(payload)
 
 
 def review_request_from_dict(payload: Mapping[str, Any]) -> ReviewRequest:
@@ -316,7 +364,7 @@ def risk_packet_from_dict(payload: Mapping[str, Any]) -> RiskAssessmentPacket:
             "intent_uncertainties",
             "diff_excerpt",
         },
-        {"changed_symbols", "signal_catalog"},
+        {"changed_symbols", "signal_catalog", "memory_projection"},
         "risk_packet",
     )
     changed_symbols: list[dict[str, object]] = []
@@ -348,6 +396,100 @@ def risk_packet_from_dict(payload: Mapping[str, Any]) -> RiskAssessmentPacket:
             if "signal_catalog" in item
             else {}
         ),
+        memory_projection=(
+            _risk_memory_projection(
+                item["memory_projection"],
+                "risk_packet.memory_projection",
+            )
+            if item.get("memory_projection") is not None
+            else None
+        ),
+    )
+
+
+def _risk_memory_projection(value: Any, context: str) -> RiskMemoryProjection:
+    item = _object(value, context)
+    _required_with_optional(
+        item,
+        {"signals", "risk_floor", "diagnostics"},
+        {"policy_sources"},
+        context,
+    )
+
+    signals: list[MemoryRiskSignal] = []
+    for index, raw_signal in enumerate(_list_field(item, "signals", context)):
+        signal_context = f"{context}.signals[{index}]"
+        signal = _object(raw_signal, signal_context)
+        _exact(signal, {"signal_ref", "summary", "memory"}, signal_context)
+        signals.append(
+            MemoryRiskSignal(
+                signal_ref=_string(signal, "signal_ref", signal_context),
+                summary=_string(signal, "summary", signal_context),
+                memory=_memory_reference(
+                    signal["memory"],
+                    f"{signal_context}.memory",
+                ),
+            )
+        )
+
+    raw_floor = item["risk_floor"]
+    risk_floor: CompiledRiskFloor | None = None
+    if raw_floor is not None:
+        floor_context = f"{context}.risk_floor"
+        floor = _object(raw_floor, floor_context)
+        _exact(floor, {"minimum_level", "memory_ids"}, floor_context)
+        risk_floor = CompiledRiskFloor(
+            minimum_level=_enum_field(
+                RiskLevel,
+                floor,
+                "minimum_level",
+                floor_context,
+            ),
+            memory_ids=tuple(_string_list(floor, "memory_ids", floor_context)),
+        )
+
+    if "policy_sources" in item and not isinstance(item["policy_sources"], list):
+        raise ValueError(f"{context}.policy_sources must be a list")
+    policy_sources = tuple(
+        _memory_reference(raw, f"{context}.policy_sources[{index}]")
+        for index, raw in enumerate(item.get("policy_sources", []))
+    )
+    diagnostics = tuple(
+        _memory_diagnostic(raw, f"{context}.diagnostics[{index}]")
+        for index, raw in enumerate(_list_field(item, "diagnostics", context))
+    )
+
+    return RiskMemoryProjection(
+        signals=tuple(signals),
+        risk_floor=risk_floor,
+        policy_sources=policy_sources,
+        diagnostics=diagnostics,
+    )
+
+
+def _memory_diagnostic(value: Any, context: str) -> MemoryDiagnostic:
+    diagnostic = _object(value, context)
+    _exact(
+        diagnostic,
+        {"code", "message", "memory_ids", "blocking"},
+        context,
+    )
+    return MemoryDiagnostic(
+        code=_enum_field(MemoryDiagnosticCode, diagnostic, "code", context),
+        message=_string(diagnostic, "message", context),
+        memory_ids=tuple(_string_list(diagnostic, "memory_ids", context)),
+        blocking=_boolean(diagnostic, "blocking", context),
+    )
+
+
+def _memory_reference(value: Any, context: str) -> MemoryReference:
+    item = _object(value, context)
+    _exact(item, {"memory_id", "kind", "source_refs", "local_only"}, context)
+    return MemoryReference(
+        memory_id=_string(item, "memory_id", context),
+        kind=_string(item, "kind", context),
+        source_refs=tuple(_string_list(item, "source_refs", context)),
+        local_only=_boolean(item, "local_only", context),
     )
 
 
@@ -713,10 +855,19 @@ def reconciliation_from_dict(payload: Mapping[str, Any]) -> EvidenceReconciliati
 
 def completion_from_dict(payload: Mapping[str, Any]) -> CompletionResult:
     item = _object(payload, "completion")
-    _exact(
+    _required_with_optional(
         item,
         {"status", "recommendation", "blockers", "uncertainties", "missing_perspectives"},
+        {"memory_diagnostics"},
         "completion",
+    )
+    diagnostics = tuple(
+        _memory_diagnostic(raw, f"completion.memory_diagnostics[{index}]")
+        for index, raw in enumerate(
+            _list_field(item, "memory_diagnostics", "completion")
+            if "memory_diagnostics" in item
+            else []
+        )
     )
     return CompletionResult(
         status=_string(item, "status", "completion"),
@@ -724,12 +875,13 @@ def completion_from_dict(payload: Mapping[str, Any]) -> CompletionResult:
         blockers=_string_list(item, "blockers", "completion"),
         uncertainties=_string_list(item, "uncertainties", "completion"),
         missing_perspectives=_string_list(item, "missing_perspectives", "completion"),
+        memory_diagnostics=diagnostics,
     )
 
 
 def final_risk_from_dict(payload: Mapping[str, Any]) -> FinalRiskAssessment:
     item = _object(payload, "final_risk")
-    _exact(
+    _required_with_optional(
         item,
         {
             "status",
@@ -741,7 +893,31 @@ def final_risk_from_dict(payload: Mapping[str, Any]) -> FinalRiskAssessment:
             "uncertainties",
             "signal_refs",
         },
+        {"applied_memory", "memory_diagnostics", "residual_risk"},
         "final_risk",
+    )
+    memory_fields = {"applied_memory", "memory_diagnostics", "residual_risk"}
+    present_memory_fields = memory_fields.intersection(item)
+    if present_memory_fields and present_memory_fields != memory_fields:
+        missing = ", ".join(sorted(memory_fields - present_memory_fields))
+        raise ValueError(
+            "final_risk is missing required Memory field(s): " + missing
+        )
+    applied_memory = tuple(
+        _serialized_memory_reference(raw, f"final_risk.applied_memory[{index}]")
+        for index, raw in enumerate(
+            _list_field(item, "applied_memory", "final_risk")
+            if "applied_memory" in item
+            else []
+        )
+    )
+    diagnostics = tuple(
+        _memory_diagnostic(raw, f"final_risk.memory_diagnostics[{index}]")
+        for index, raw in enumerate(
+            _list_field(item, "memory_diagnostics", "final_risk")
+            if "memory_diagnostics" in item
+            else []
+        )
     )
     return FinalRiskAssessment(
         status=_string(item, "status", "final_risk"),
@@ -752,6 +928,30 @@ def final_risk_from_dict(payload: Mapping[str, Any]) -> FinalRiskAssessment:
         deescalations=_string_list(item, "deescalations", "final_risk"),
         uncertainties=_string_list(item, "uncertainties", "final_risk"),
         signal_refs=_string_list(item, "signal_refs", "final_risk"),
+        applied_memory=applied_memory,
+        memory_diagnostics=diagnostics,
+        residual_risk=(
+            tuple(_string_list(item, "residual_risk", "final_risk"))
+            if "residual_risk" in item
+            else ()
+        ),
+    )
+
+
+def _serialized_memory_reference(value: Any, context: str) -> MemoryReference:
+    item = _object(value, context)
+    _exact(
+        item,
+        {"memory_id", "kind", "authority", "source_refs", "local_only"},
+        context,
+    )
+    if _string(item, "authority", context) != "human_approved_project_memory":
+        raise ValueError(f"{context}.authority is unsupported")
+    return MemoryReference(
+        memory_id=_string(item, "memory_id", context),
+        kind=_string(item, "kind", context),
+        source_refs=tuple(_string_list(item, "source_refs", context)),
+        local_only=_boolean(item, "local_only", context),
     )
 
 
@@ -777,7 +977,7 @@ def review_brief_from_dict(payload: Mapping[str, Any]) -> ReviewBrief:
             "human_review_checklist_and_reading_order",
             "non_binding_recommendation",
         },
-        {"orchestration", "semantic_reconciliation"},
+        {"orchestration", "semantic_reconciliation", "memory_audit"},
         "review_brief",
     )
     findings = [
@@ -814,6 +1014,11 @@ def review_brief_from_dict(payload: Mapping[str, Any]) -> ReviewBrief:
             semantic_reconciliation = _semantic_reconciliation_from_dict(
                 semantic_payload
             ).to_dict()
+    memory_audit = (
+        _review_brief_memory_audit(item["memory_audit"])
+        if "memory_audit" in item
+        else {}
+    )
     return ReviewBrief(
         review_id=_string(item, "review_id", "review_brief"),
         base_revision=_string(item, "base_revision", "review_brief"),
@@ -849,7 +1054,143 @@ def review_brief_from_dict(payload: Mapping[str, Any]) -> ReviewBrief:
             else {}
         ),
         semantic_reconciliation=semantic_reconciliation,
+        memory_audit=memory_audit,
     )
+
+
+_AUDIT_MEMORY_ID = re.compile(r"^MEM-[0-9a-f]{64}$")
+_AUDIT_CANDIDATE_ID = re.compile(r"^MC-[0-9a-f]{64}$")
+_AUDIT_MEMORY_KINDS = {
+    "architecture_boundary",
+    "business_invariant",
+    "review_rule",
+    "compatibility_requirement",
+    "verification_command",
+    "incident_lesson",
+    "high_risk_module",
+    "unknown",
+}
+
+
+def _review_brief_memory_audit(value: Any) -> dict[str, Any]:
+    context = "review_brief.memory_audit"
+    item = dict(_object(value, context))
+    if not item:
+        return {}
+    _exact(
+        item,
+        {
+            "schema_version",
+            "applied_memory",
+            "not_applied_memory",
+            "compiled_policy",
+            "cache_provenance",
+            "warnings",
+            "feedback_summary",
+            "pending_candidates",
+            "status",
+        }
+        | ({"snapshot"} if "snapshot" in item else set()),
+        context,
+    )
+    if _string(item, "schema_version", context) != "memory_audit_v1":
+        raise ValueError(f"{context}.schema_version is unsupported")
+    canonical = build_memory_audit_projection(item)
+    if canonical != item:
+        raise ValueError(f"{context} is not a canonical typed Memory audit projection")
+    _validate_audit_json(item, context)
+
+    for index, raw in enumerate(_list_field(item, "applied_memory", context)):
+        row_context = f"{context}.applied_memory[{index}]"
+        row = _object(raw, row_context)
+        memory_id = _string(row, "memory_id", row_context)
+        if _AUDIT_MEMORY_ID.fullmatch(memory_id) is None:
+            raise ValueError(f"{row_context}.memory_id must be a stable Memory ID")
+        if _string(row, "kind", row_context) not in _AUDIT_MEMORY_KINDS:
+            raise ValueError(f"{row_context}.kind is unsupported")
+        if _string(row, "authority", row_context) not in {
+            "human_approved_context",
+            "runtime_compiled_policy",
+        }:
+            raise ValueError(f"{row_context}.authority is unsupported")
+
+    for index, raw in enumerate(_list_field(item, "not_applied_memory", context)):
+        row_context = f"{context}.not_applied_memory[{index}]"
+        row = _object(raw, row_context)
+        memory_id = _string(row, "memory_id", row_context)
+        if _AUDIT_MEMORY_ID.fullmatch(memory_id) is None:
+            raise ValueError(f"{row_context}.memory_id must be a stable Memory ID")
+        if _string(row, "authority", row_context) != "not_applied":
+            raise ValueError(f"{row_context}.authority is unsupported")
+
+    policy = _object_field(item, "compiled_policy", context)
+    if policy:
+        for collection in ("actions", "provenance"):
+            for index, raw in enumerate(policy.get(collection, [])):
+                row_context = f"{context}.compiled_policy.{collection}[{index}]"
+                row = _object(raw, row_context)
+                memory_ids = (
+                    row.get("memory_ids", [])
+                    if collection == "actions"
+                    else [row.get("memory_id")]
+                )
+                if not isinstance(memory_ids, list):
+                    raise ValueError(f"{row_context}.memory_ids must be a list")
+                for memory_id in memory_ids:
+                    if (
+                        not isinstance(memory_id, str)
+                        or _AUDIT_MEMORY_ID.fullmatch(memory_id) is None
+                    ):
+                        raise ValueError(
+                            f"{row_context} contains an invalid Memory ID"
+                        )
+
+    for collection in ("warnings",):
+        for index, raw in enumerate(_list_field(item, collection, context)):
+            row = _object(raw, f"{context}.{collection}[{index}]")
+            memory_id = row.get("memory_id")
+            if memory_id is not None and (
+                not isinstance(memory_id, str)
+                or _AUDIT_MEMORY_ID.fullmatch(memory_id) is None
+            ):
+                raise ValueError(
+                    f"{context}.{collection}[{index}].memory_id is invalid"
+                )
+    for index, raw in enumerate(_list_field(item, "pending_candidates", context)):
+        row_context = f"{context}.pending_candidates[{index}]"
+        row = _object(raw, row_context)
+        candidate_id = _string(row, "candidate_id", row_context)
+        if _AUDIT_CANDIDATE_ID.fullmatch(candidate_id) is None:
+            raise ValueError(f"{row_context}.candidate_id is invalid")
+        if row.get("active") is not False:
+            raise ValueError(f"{row_context}.active must be false")
+    return canonical
+
+
+def _validate_audit_json(value: Any, context: str, *, depth: int = 0) -> None:
+    if depth > 12:
+        raise ValueError(f"{context} exceeds the maximum nesting depth")
+    if value is None or isinstance(value, (str, bool, int)):
+        if isinstance(value, str) and len(value) > 8192:
+            raise ValueError(f"{context} text exceeds the audit limit")
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{context} contains a non-finite number")
+        return
+    if isinstance(value, list):
+        if len(value) > 256:
+            raise ValueError(f"{context} exceeds the audit item limit")
+        for index, item in enumerate(value):
+            _validate_audit_json(item, f"{context}[{index}]", depth=depth + 1)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError(f"{context} keys must be non-empty strings")
+            _validate_audit_json(item, f"{context}.{key}", depth=depth + 1)
+        return
+    raise ValueError(f"{context} contains an unsupported value")
 
 
 def _review_brief_change_intent(value: Any) -> dict[str, Any]:
@@ -1036,35 +1377,19 @@ def _review_brief_final_risk(value: Any) -> dict[str, Any]:
             "level": _enum_field(RiskLevel, item, "level", context).value,
             "reasons": _string_list(item, "reasons", context),
         }
-    _exact(
-        item,
-        {
-            "status",
-            "initial_level",
-            "level",
-            "reasons",
-            "escalations",
-            "deescalations",
-            "uncertainties",
-            "signal_refs",
-        },
-        context,
-    )
-    return {
-        "status": _string(item, "status", context),
-        "initial_level": _enum_field(
-            RiskLevel,
-            item,
-            "initial_level",
-            context,
-        ).value,
-        "level": _enum_field(RiskLevel, item, "level", context).value,
-        "reasons": _string_list(item, "reasons", context),
-        "escalations": _string_list(item, "escalations", context),
-        "deescalations": _string_list(item, "deescalations", context),
-        "uncertainties": _string_list(item, "uncertainties", context),
-        "signal_refs": _string_list(item, "signal_refs", context),
-    }
+    canonical = final_risk_to_dict(final_risk_from_dict(item))
+    if not {
+        "applied_memory",
+        "memory_diagnostics",
+        "residual_risk",
+    }.intersection(item):
+        for field_name in (
+            "applied_memory",
+            "memory_diagnostics",
+            "residual_risk",
+        ):
+            canonical.pop(field_name, None)
+    return canonical
 
 
 def _review_brief_quality_gates(value: Any) -> list[dict[str, Any]]:
@@ -1399,7 +1724,11 @@ def _assignment_from_dict(value: Any, context: str) -> Assignment:
             "quality_gate_summary",
             "observation_refs",
         },
-        {"signal_refs"},
+        {
+            "signal_refs",
+            "selected_memory_refs",
+            "verification_template_hints",
+        },
         initial_context,
     )
     return Assignment(
@@ -1425,6 +1754,24 @@ def _assignment_from_dict(value: Any, context: str) -> Assignment:
             signal_refs=(
                 _string_list(initial_payload, "signal_refs", initial_context)
                 if "signal_refs" in initial_payload
+                else []
+            ),
+            selected_memory_refs=(
+                _string_list(
+                    initial_payload,
+                    "selected_memory_refs",
+                    initial_context,
+                )
+                if "selected_memory_refs" in initial_payload
+                else []
+            ),
+            verification_template_hints=(
+                _string_list(
+                    initial_payload,
+                    "verification_template_hints",
+                    initial_context,
+                )
+                if "verification_template_hints" in initial_payload
                 else []
             ),
         ),
@@ -1558,7 +1905,7 @@ def _canonical_finding(value: Any, context: str) -> CanonicalFinding:
     _required_with_optional(
         item,
         {"claim", "severity", "confidence", "evidence_refs", "reviewer_indices", "roles", "suggested_action"},
-        {"path", "line", "impact", "verification_performed"},
+        {"path", "line", "impact", "verification_performed", "finding_id"},
         context,
     )
     line = item.get("line")
@@ -1583,6 +1930,11 @@ def _canonical_finding(value: Any, context: str) -> CanonicalFinding:
             _string_list(item, "verification_performed", context)
             if "verification_performed" in item
             else []
+        ),
+        finding_id=(
+            _string(item, "finding_id", context)
+            if "finding_id" in item
+            else None
         ),
     )
 
@@ -1631,7 +1983,7 @@ def _brief_finding(value: Any, context: str) -> BriefFinding:
     _required_with_optional(
         item,
         {"claim", "severity", "confidence", "evidence_refs", "reviewer_indices", "roles", "suggested_action"},
-        {"path", "line", "impact", "verification_performed"},
+        {"path", "line", "impact", "verification_performed", "finding_id"},
         context,
     )
     line = item.get("line")
@@ -1656,6 +2008,11 @@ def _brief_finding(value: Any, context: str) -> BriefFinding:
             _string_list(item, "verification_performed", context)
             if "verification_performed" in item
             else []
+        ),
+        finding_id=(
+            _string(item, "finding_id", context)
+            if "finding_id" in item
+            else None
         ),
     )
 
