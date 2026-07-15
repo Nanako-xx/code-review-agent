@@ -19,7 +19,9 @@ from review_agent.memory_models import (
     HumanDeclarationSourceRef,
     MemoryCandidate,
     MemoryConfidence,
+    MemoryExecutionConfig,
     MemoryKind,
+    MemoryMode,
     MemoryScope,
     ObservationSourceRef,
     Producer,
@@ -106,6 +108,10 @@ def _create_session(
                 reviewer_mode="single",
                 reviewer_loop="single-shot",
                 non_interactive=True,
+                memory=MemoryExecutionConfig(
+                    mode=MemoryMode.READ,
+                    root_path=str((repo.parent / "memory-root").resolve()),
+                ),
             ),
             now=NOW,
         )
