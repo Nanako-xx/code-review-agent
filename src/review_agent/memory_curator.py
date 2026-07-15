@@ -634,10 +634,6 @@ class MemoryCuratorEnvelope:
             tuple(sorted(kinds, key=lambda item: item.value)),
         )
         payload = self._request_payload()
-        if len(canonical_json(payload).encode("utf-8")) > MAX_CURATOR_ENVELOPE_BYTES:
-            raise ValueError(
-                "memory curator envelope exceeds the total input byte budget"
-            )
         digest = canonical_sha256(payload)
         object.__setattr__(self, "request_digest", digest)
         object.__setattr__(
@@ -651,6 +647,10 @@ class MemoryCuratorEnvelope:
                 }
             ),
         )
+        if len(canonical_json(self.to_dict()).encode("utf-8")) > MAX_CURATOR_ENVELOPE_BYTES:
+            raise ValueError(
+                "memory curator envelope exceeds the total input byte budget"
+            )
 
     def _request_payload(self) -> Dict[str, Any]:
         return {
