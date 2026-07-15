@@ -486,6 +486,7 @@ class MemorySnapshotBuilder:
                 target = self._applicability_evaluator.evaluate(
                     record,
                     target_head=selection.head_sha,
+                    evaluated_at=created_at,
                     changed_paths=selection.changed_paths,
                     changed_symbols=selection.changed_symbols,
                     changed_contracts=selection.contracts,

@@ -25,6 +25,7 @@ import sqlite3
 import stat
 import threading
 import time
+import unicodedata
 from typing import (
     Any,
     Callable,
@@ -101,9 +102,11 @@ _TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:+/@-]{0,511}$")
 _MEDIA_TYPE_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$"
 )
-_SUBJECT_TYPES = frozenset(
+_PROJECTED_SUBJECT_TYPES = frozenset(
     {"candidate", "record", "feedback", "knowledge", "source_bundle"}
 )
+_AUDIT_ONLY_SUBJECT_TYPES = frozenset({"outbox_replay"})
+_SUBJECT_TYPES = _PROJECTED_SUBJECT_TYPES | _AUDIT_ONLY_SUBJECT_TYPES
 _PIN_TYPES = frozenset({"session", "source_bundle", "manual", "knowledge"})
 
 
@@ -674,6 +677,99 @@ class MemoryStoreReadView:
     knowledge_entries: Tuple[RepositoryKnowledgeEntry, ...]
 
 
+class MemoryStoreAuditSchema(str, Enum):
+    """The frozen schema understood by a metadata-only audit view."""
+
+    CURRENT = "current"
+    LEGACY_V1 = "legacy_v1"
+
+
+@dataclass(frozen=True)
+class MemoryStoreAuditStatus:
+    """Typed, row-content-free status for current or frozen legacy stores.
+
+    A legacy result deliberately exposes counts and verified storage metadata
+    only.  It never deserializes legacy Candidate, Record, Feedback, or
+    Repository Knowledge rows into current authority models.
+    """
+
+    audit_schema: MemoryStoreAuditSchema
+    schema_name: str
+    schema_version: int
+    schema_definition_hash: str
+    read_only: bool
+    migration_required: bool
+    repository_count: int
+    candidate_count: int
+    record_count: int
+    feedback_count: int
+    knowledge_count: int
+    source_bundle_count: int
+    event_count: int
+    blob_count: int
+    request_receipt_count: int
+    event_chain_verified: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "audit_schema": self.audit_schema.value,
+            "schema_name": self.schema_name,
+            "schema_version": self.schema_version,
+            "schema_definition_hash": self.schema_definition_hash,
+            "read_only": self.read_only,
+            "migration_required": self.migration_required,
+            "repository_count": self.repository_count,
+            "candidate_count": self.candidate_count,
+            "record_count": self.record_count,
+            "feedback_count": self.feedback_count,
+            "knowledge_count": self.knowledge_count,
+            "source_bundle_count": self.source_bundle_count,
+            "event_count": self.event_count,
+            "blob_count": self.blob_count,
+            "request_receipt_count": self.request_receipt_count,
+            "event_chain_verified": self.event_chain_verified,
+        }
+
+
+@dataclass(frozen=True)
+class OutboxReplayAuditReceipt:
+    """Canonical receipt for one explicit, human-attributed outbox replay."""
+
+    repository_key: str
+    review_id: str
+    outbox_hash: str
+    actor: str
+    reason: str
+    request_id: str
+    created_at: str
+    write_result: WriteResult
+
+    @property
+    def event_id(self) -> Optional[str]:
+        return self.write_result.event_id
+
+    @property
+    def applied(self) -> bool:
+        return self.write_result.applied
+
+    @property
+    def replayed(self) -> bool:
+        return self.write_result.replayed
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "repository_key": self.repository_key,
+            "review_id": self.review_id,
+            "outbox_hash": self.outbox_hash,
+            "actor": self.actor,
+            "reason": self.reason,
+            "request_id": self.request_id,
+            "created_at": self.created_at,
+            "write_result": self.write_result.to_dict(),
+            "replayed": self.write_result.replayed,
+        }
+
+
 @dataclass(frozen=True)
 class ImportPlan:
     repository_keys: Tuple[str, ...]
@@ -780,6 +876,8 @@ class MemoryStore:
         self._memory_lock_path = namespace_path / ".memory-store.lock"
         self._busy_timeout_ms = busy_timeout_ms
         self._read_only = read_only
+        self._schema_state = "unknown"
+        self._authority_transaction_state = threading.local()
 
         if not read_only:
             try:
@@ -793,21 +891,6 @@ class MemoryStore:
                 self._busy_timeout_ms,
             ):
                 pass
-        else:
-            try:
-                lock_status = self._memory_lock_path.stat()
-            except OSError:
-                raise MemoryStoreUnavailableError(
-                    "read-only memory store coordination lock is unavailable"
-                ) from None
-            if (
-                self._memory_lock_path.is_symlink()
-                or not stat.S_ISREG(lock_status.st_mode)
-                or lock_status.st_size < 1
-            ):
-                raise MemoryStoreUnavailableError(
-                    "read-only memory store coordination lock is unavailable"
-                )
         self._initialize_or_validate()
         if not read_only:
             try:
@@ -816,6 +899,10 @@ class MemoryStore:
                 raise MemoryStoreUnavailableError() from None
         if descriptor is not None:
             if read_only:
+                if self._schema_state != "current":
+                    raise MemoryStoreSchemaError(
+                        "legacy memory audit does not expose current repository models"
+                    )
                 self._require_registered_repository(descriptor)
             else:
                 self.register_repository(descriptor)
@@ -971,6 +1058,11 @@ class MemoryStore:
                 uri_path = self.database_path.as_posix().replace("?", "%3f").replace(
                     "#", "%23"
                 )
+                # A quiescent read-only Store can use SQLite's immutable path,
+                # which guarantees that merely reading does not create or
+                # touch WAL/SHM coordination files.  If a live WAL exists (or
+                # appears while connecting), fall back to SQLite's normal
+                # read-only WAL snapshot so committed frames remain visible.
                 use_immutable = self._read_only and not _database_has_live_wal(
                     self.database_path
                 )
@@ -1053,17 +1145,17 @@ class MemoryStore:
 
     @contextmanager
     def _reader(self) -> Iterator[sqlite3.Connection]:
-        if self._read_only:
-            # immutable=1 is the only SQLite read path that is guaranteed not to
-            # create WAL/SHM files, but it ignores a WAL created after connect.
-            # Holding the same lock as every authority write closes that race for
-            # the entire query, not merely while the connection is opened.
-            with _exclusive_file_lock(
-                self._memory_lock_path,
-                self._busy_timeout_ms,
-            ):
-                with self._reader_connection() as connection:
-                    yield connection
+        if self._schema_state == "v1":
+            raise MemoryStoreSchemaError(
+                "legacy memory store supports typed audit_status() only"
+            )
+        active = getattr(
+            self._authority_transaction_state,
+            "connection",
+            None,
+        )
+        if active is not None:
+            yield active
             return
         with self._reader_connection() as connection:
             yield connection
@@ -1081,9 +1173,49 @@ class MemoryStore:
             connection.close()
 
     @contextmanager
+    def candidate_submission_transaction(self) -> Iterator[None]:
+        """Serialize and atomically commit one validated Candidate lifecycle.
+
+        Lifecycle performs source validation before entering this boundary.
+        Inside it, exact-ID lookup, content-fingerprint dedupe, Candidate
+        insertion, authority receipt insertion, and status transitions reuse
+        one ``BEGIN IMMEDIATE`` transaction.  Existing Store APIs keep their
+        event and idempotency-receipt semantics while concurrent submissions
+        cannot both observe an unclaimed fingerprint.
+        """
+
+        if self._read_only:
+            raise MemoryStoreReadOnlyError()
+        active = getattr(
+            self._authority_transaction_state,
+            "connection",
+            None,
+        )
+        if active is not None:
+            yield
+            return
+        with self._authority() as connection:
+            self._authority_transaction_state.connection = connection
+            try:
+                yield
+            finally:
+                try:
+                    del self._authority_transaction_state.connection
+                except AttributeError:
+                    pass
+
+    @contextmanager
     def _authority(self) -> Iterator[sqlite3.Connection]:
         if self._read_only:
             raise MemoryStoreReadOnlyError()
+        active = getattr(
+            self._authority_transaction_state,
+            "connection",
+            None,
+        )
+        if active is not None:
+            yield active
+            return
         with self.lock_namespaces(
             self.namespace_path,
             busy_timeout_ms=self._busy_timeout_ms,
@@ -1112,21 +1244,14 @@ class MemoryStore:
         if self._read_only and not self.database_path.is_file():
             raise MemoryStoreUnavailableError()
         if self._read_only:
-            with _exclusive_file_lock(
-                self._memory_lock_path,
-                self._busy_timeout_ms,
-            ):
-                connection = self._connect(read_only=True)
-                try:
-                    state = self._inspect_store_connection(connection)
-                finally:
-                    connection.close()
-            if state == "v1":
-                raise MemoryStoreSchemaError(
-                    "memory store schema v1 requires a writable staged migration"
-                )
+            connection = self._connect(read_only=True)
+            try:
+                state = self._inspect_store_connection(connection)
+            finally:
+                connection.close()
             if state == "empty":
                 raise MemoryStoreSchemaError()
+            self._schema_state = state
             return
 
         # Existing stores are first inspected through a real read-only
@@ -1139,6 +1264,7 @@ class MemoryStore:
             finally:
                 connection.close()
             if state == "current":
+                self._schema_state = state
                 return
             if state == "v1":
                 self._migrate_v1_store()
@@ -1156,6 +1282,7 @@ class MemoryStore:
                 finally:
                     connection.close()
                 if state == "current":
+                    self._schema_state = state
                     return
                 migrate_v1 = state == "v1"
 
@@ -1206,6 +1333,7 @@ class MemoryStore:
                             connection.rollback()
                         raise
                     self._inspect_store_connection(connection)
+                    self._schema_state = "current"
                 except MemoryStoreError:
                     raise
                 except sqlite3.Error as error:
@@ -1370,6 +1498,80 @@ class MemoryStore:
             ),
         )
         connection.execute("PRAGMA user_version = %d" % STORE_SCHEMA_VERSION)
+
+    def audit_status(self) -> MemoryStoreAuditStatus:
+        """Return a typed, non-hydrating audit view of the Store.
+
+        This is the only domain read available on a frozen v1 ``read_only``
+        instance.  It validates the exact frozen schema, SQLite integrity,
+        foreign keys, and event chains, then returns counts only.  Legacy model
+        JSON is never deserialized as a current Candidate/Record/Feedback or
+        Repository Knowledge object.
+        """
+
+        with self._reader_connection() as connection:
+            state = self._inspect_store_connection(connection)
+            if state not in {"current", "v1"} or state != self._schema_state:
+                raise MemoryStoreCorruptionError(
+                    "memory store schema changed during audit"
+                )
+            integrity = connection.execute("PRAGMA integrity_check").fetchall()
+            if len(integrity) != 1 or str(integrity[0][0]).casefold() != "ok":
+                raise MemoryStoreCorruptionError(
+                    "SQLite integrity validation failed"
+                )
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise MemoryStoreCorruptionError(
+                    "memory foreign-key validation failed"
+                )
+            metadata = {
+                str(row["key"]): str(row["value"])
+                for row in connection.execute(
+                    "SELECT key, value FROM metadata ORDER BY key"
+                )
+            }
+            repository_keys = tuple(
+                str(row["repository_key"])
+                for row in connection.execute(
+                    "SELECT repository_key FROM repositories ORDER BY repository_key"
+                )
+            )
+            for repository_key in repository_keys:
+                self._verify_event_chain_connection(connection, repository_key)
+
+            def count(table: str) -> int:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS value FROM %s" % table
+                ).fetchone()
+                if row is None or type(row["value"]) is not int:
+                    raise MemoryStoreCorruptionError(
+                        "memory audit count is invalid"
+                    )
+                return int(row["value"])
+
+            legacy = state == "v1"
+            return MemoryStoreAuditStatus(
+                audit_schema=(
+                    MemoryStoreAuditSchema.LEGACY_V1
+                    if legacy
+                    else MemoryStoreAuditSchema.CURRENT
+                ),
+                schema_name=metadata["schema_name"],
+                schema_version=int(metadata["schema_version"]),
+                schema_definition_hash=metadata["schema_definition_hash"],
+                read_only=self._read_only,
+                migration_required=legacy,
+                repository_count=len(repository_keys),
+                candidate_count=count("candidates"),
+                record_count=count("records"),
+                feedback_count=count("feedback"),
+                knowledge_count=count("knowledge_entries"),
+                source_bundle_count=count("source_bundles"),
+                event_count=count("events"),
+                blob_count=count("blobs"),
+                request_receipt_count=count("outbox_receipts"),
+                event_chain_verified=True,
+            )
 
     def metadata(self) -> Dict[str, str]:
         with self._reader() as connection:
@@ -1946,6 +2148,137 @@ class MemoryStore:
         )
         return event
 
+    def record_outbox_replay_audit(
+        self,
+        repository_key: str,
+        *,
+        review_id: str,
+        outbox_hash: str,
+        actor: str,
+        reason: str,
+        request_id: str,
+        created_at: Optional[str] = None,
+    ) -> OutboxReplayAuditReceipt:
+        """Persist one distinct, idempotent explicit-replay audit event.
+
+        Callers must invoke this only after the authoritative replay service has
+        validated the Session/outbox binding.  ``outbox_hash`` is that service's
+        canonical artifact digest; this method does not parse Session or outbox
+        payloads.  The stable ``request_id`` provides idempotency.  Reuse with
+        different repository/review/hash/actor/reason/time is a conflict.
+        """
+
+        key = _repository_key(repository_key)
+        checked_review = _required_text(review_id, "review_id", 512)
+        checked_outbox_hash = _digest(outbox_hash, "outbox_hash")
+        checked_actor = _required_token(actor, "actor")
+        checked_reason = _canonical_audit_reason(reason)
+        checked_request = _request_id(request_id)
+        timestamp = _timestamp(created_at or _utc_now(), "created_at")
+        operation = "record_outbox_replay_audit"
+        payload = {
+            "operation": operation,
+            "repository_key": key,
+            "review_id": checked_review,
+            "outbox_hash": checked_outbox_hash,
+            "actor": checked_actor,
+            "reason": checked_reason,
+            "created_at": None if created_at is None else timestamp,
+        }
+        request_hash, legacy_request_hash = _request_hash_pair(
+            payload,
+            expected_generation=None,
+        )
+
+        with self._authority() as connection:
+            if connection.execute(
+                "SELECT 1 FROM repositories WHERE repository_key = ?",
+                (key,),
+            ).fetchone() is None:
+                raise MemoryStoreNotFoundError(
+                    "outbox replay repository was not found"
+                )
+            replay = self._request_receipt(
+                connection,
+                request_id=checked_request,
+                repository_key=key,
+                operation=operation,
+                request_hash=request_hash,
+                legacy_request_hash=legacy_request_hash,
+            )
+            if replay is None:
+                generation = self._bump_generation(connection, key, "memory")
+                event = self._append_event(
+                    connection,
+                    repository_key=key,
+                    subject_type="outbox_replay",
+                    subject_id=checked_review,
+                    action="outbox_replay_audited",
+                    actor_type="human",
+                    actor_id=checked_actor,
+                    reason_code="explicit_outbox_replay",
+                    reason=checked_reason,
+                    previous_status=None,
+                    new_status=None,
+                    request_id=checked_request,
+                    created_at=timestamp,
+                    generation_kind="memory",
+                    generation=generation,
+                )
+                replay = WriteResult(
+                    operation=operation,
+                    subject_id=checked_review,
+                    event_id=event.event_id,
+                    generations=self._generations_from_connection(connection, key),
+                    applied=True,
+                )
+                self._store_request_receipt(
+                    connection,
+                    request_id=checked_request,
+                    repository_key=key,
+                    operation=operation,
+                    request_hash=request_hash,
+                    result=replay,
+                    created_at=timestamp,
+                )
+            if replay.event_id is None:
+                raise MemoryStoreCorruptionError(
+                    "outbox replay audit receipt is missing its event"
+                )
+            event_row = connection.execute(
+                "SELECT * FROM events WHERE event_id = ?",
+                (replay.event_id,),
+            ).fetchone()
+            if event_row is None:
+                raise MemoryStoreCorruptionError(
+                    "outbox replay audit event is missing"
+                )
+            event = _event_from_row(event_row)
+            if (
+                event.repository_key != key
+                or event.subject_type != "outbox_replay"
+                or event.subject_id != checked_review
+                or event.action != "outbox_replay_audited"
+                or event.actor_type != "human"
+                or event.actor_id != checked_actor
+                or event.reason_code != "explicit_outbox_replay"
+                or event.reason != checked_reason
+                or event.request_id != checked_request
+            ):
+                raise MemoryStoreCorruptionError(
+                    "outbox replay audit event is inconsistent"
+                )
+            return OutboxReplayAuditReceipt(
+                repository_key=key,
+                review_id=checked_review,
+                outbox_hash=checked_outbox_hash,
+                actor=checked_actor,
+                reason=checked_reason,
+                request_id=checked_request,
+                created_at=event.created_at,
+                write_result=replay,
+            )
+
     def list_events(
         self,
         repository_key: str,
@@ -2204,6 +2537,8 @@ class MemoryStore:
             "knowledge": knowledge_ids,
         }
         for (subject_type, subject_id), event in latest.items():
+            if subject_type in _AUDIT_ONLY_SUBJECT_TYPES:
+                continue
             if subject_type == "knowledge" and event.new_status == "deleted":
                 if subject_id in knowledge_ids:
                     raise MemoryStoreCorruptionError(
@@ -2226,6 +2561,7 @@ class MemoryStore:
         actor_id: Optional[str] = None,
         reason_code: str = "candidate_submitted",
         reason: Optional[str] = None,
+        require_no_authority_receipts: bool = False,
     ) -> WriteResult:
         if not isinstance(candidate, MemoryCandidate):
             raise MemoryStoreValidationError(
@@ -2243,6 +2579,14 @@ class MemoryStore:
             authority_receipt,
             candidate,
         )
+        if type(require_no_authority_receipts) is not bool:
+            raise MemoryStoreValidationError(
+                "require_no_authority_receipts must be a bool"
+            )
+        if require_no_authority_receipts and checked_authority is None:
+            raise MemoryStoreValidationError(
+                "authority receipt is required for empty-authority recovery"
+            )
         legacy_payload = {
             "operation": operation,
             "candidate": candidate.to_dict(),
@@ -2255,6 +2599,8 @@ class MemoryStore:
         semantic_payload["authority_receipt"] = (
             None if checked_authority is None else checked_authority.to_dict()
         )
+        if require_no_authority_receipts:
+            semantic_payload["require_no_authority_receipts"] = True
         request_hash, legacy_request_hash = _request_hash_pair(
             semantic_payload,
             expected_generation=expected_generation,
@@ -2298,6 +2644,14 @@ class MemoryStore:
                 ):
                     raise MemoryStoreConflictError(
                         "candidate ID already exists with different canonical content"
+                    )
+                if require_no_authority_receipts and connection.execute(
+                    "SELECT 1 FROM candidate_authority_receipts "
+                    "WHERE candidate_id = ? LIMIT 1",
+                    (candidate.candidate_id,),
+                ).fetchone() is not None:
+                    raise MemoryStoreConflictError(
+                        "migrated candidate authority recovery requires an empty receipt set"
                     )
                 authority_applied = False
                 if checked_authority is not None:
@@ -2362,6 +2716,10 @@ class MemoryStore:
                 )
                 return result
 
+            if require_no_authority_receipts:
+                raise MemoryStoreConflictError(
+                    "migrated candidate authority recovery requires an existing candidate"
+                )
             generation = self._bump_generation(
                 connection, candidate.repository_key, "memory"
             )
@@ -2590,6 +2948,26 @@ class MemoryStore:
                 _candidate_from_row(row)
                 for row in connection.execute(query, tuple(parameters))
             )
+
+    def find_request_receipt_operation(self, request_id: str) -> Optional[str]:
+        """Return one canonical request-receipt operation without exposing SQL."""
+
+        checked_request = _request_id(request_id)
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT operation FROM outbox_receipts WHERE request_id = ?",
+                (checked_request,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            operation = row["operation"]
+            checked_operation = _required_token(operation, "operation")
+            if checked_operation != operation:
+                raise ValueError
+            return checked_operation
+        except (TypeError, ValueError, MemoryStoreError):
+            raise MemoryStoreCorruptionError("memory request receipt is invalid")
 
     def transition_candidate(
         self,
@@ -4957,7 +5335,14 @@ class MemoryStore:
             return False
 
     def read_view(self, repository_key: str) -> MemoryStoreReadView:
-        """Capture validated projections and generations in one read snapshot."""
+        """Capture Project Memory projections in one validated read snapshot.
+
+        Repository Knowledge manifests are returned for compatibility, but
+        their content-addressed blobs are deliberately not opened here.  Cache
+        blob integrity belongs to an exact-key RepositoryKnowledgeCache lookup;
+        an unrelated old cache entry must not make active Records or Feedback
+        unavailable.
+        """
 
         key = _repository_key(repository_key)
         with self._reader() as connection:
@@ -5002,10 +5387,6 @@ class MemoryStore:
                     bundle = _validated_source_bundle_from_row(connection, bundle_row)
                     self._blob_info_from_connection(
                         connection, bundle.blob_hash, validate_file=True
-                    )
-                for entry in knowledge:
-                    self._blob_info_from_connection(
-                        connection, entry.blob_hash, validate_file=True
                     )
                 connection.commit()
                 return MemoryStoreReadView(
@@ -6529,6 +6910,21 @@ def _optional_text(value: Any, field_name: str, max_length: int) -> Optional[str
     return _required_text(value, field_name, max_length)
 
 
+def _canonical_audit_reason(value: Any) -> str:
+    if not isinstance(value, str):
+        raise MemoryStoreValidationError("reason must be text")
+    normalized = unicodedata.normalize("NFC", value)
+    if any(
+        unicodedata.category(character) == "Cc" and not character.isspace()
+        for character in normalized
+    ):
+        raise MemoryStoreValidationError("reason contains unsupported control text")
+    canonical = re.sub(r"\s+", " ", normalized).strip()
+    if not canonical or len(canonical) > 2_048:
+        raise MemoryStoreValidationError("reason is outside the supported bounds")
+    return canonical
+
+
 def _required_token(value: Any, field_name: str) -> str:
     token = _required_text(value, field_name, 512)
     if _TOKEN_PATTERN.fullmatch(token) is None:
@@ -7649,6 +8045,8 @@ def _validate_manifest_relationships(manifest: Mapping[str, Any]) -> None:
         "knowledge": knowledge_ids,
     }
     for (subject_type, subject_id), event in latest_events.items():
+        if subject_type in _AUDIT_ONLY_SUBJECT_TYPES:
+            continue
         if subject_type == "knowledge" and event.new_status == "deleted":
             if subject_id in knowledge_ids:
                 raise MemoryStoreValidationError(
@@ -7881,6 +8279,8 @@ __all__ = [
     "IntegrityReport",
     "MemoryEvent",
     "MemoryStore",
+    "MemoryStoreAuditSchema",
+    "MemoryStoreAuditStatus",
     "MemoryStoreBusyError",
     "MemoryStoreConflictError",
     "MemoryStoreCorruptionError",
@@ -7893,6 +8293,7 @@ __all__ = [
     "MemoryStoreSchemaError",
     "MemoryStoreUnavailableError",
     "MemoryStoreValidationError",
+    "OutboxReplayAuditReceipt",
     "PreparedImport",
     "RepositoryAuthoritySnapshot",
     "SCHEMA_DEFINITION_HASH",

@@ -6,10 +6,12 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Optional, Tuple
 
 import pytest
 
@@ -24,6 +26,8 @@ from review_agent.memory_models import (
     CandidateAuthorityReceipt,
     CandidateStatus,
     DurableMemoryRecord,
+    ExpiryCondition,
+    ExpiryConditionKind,
     FeedbackDecision,
     FeedbackReasonCode,
     FeedbackRecord,
@@ -56,6 +60,7 @@ from review_agent.memory_store import (
     STORE_SCHEMA_NAME,
     STORE_SCHEMA_VERSION,
     MemoryStore,
+    MemoryStoreAuditSchema,
     MemoryStoreBusyError,
     MemoryStoreConflictError,
     MemoryStoreCorruptionError,
@@ -186,6 +191,26 @@ def _record(
     )
 
 
+def _record_v2(
+    candidate: MemoryCandidate,
+    bundle: SourceBundleDescriptor,
+    request_id: str,
+    *,
+    expiry_conditions: Optional[Tuple[ExpiryCondition, ...]] = None,
+) -> DurableMemoryRecord:
+    conditions = expiry_conditions or (
+        ExpiryCondition(
+            condition_kind=ExpiryConditionKind.AT_TIME,
+            value="2027-01-01T00:00:00Z",
+        ),
+    )
+    return replace(
+        _record(candidate, bundle, request_id),
+        schema_version=2,
+        expiry_conditions=conditions,
+    )
+
+
 def _feedback() -> FeedbackRecord:
     finding = FindingSnapshot(
         finding_id="F-" + "5" * 32,
@@ -251,12 +276,24 @@ def _downgrade_store_to_frozen_v1(store: MemoryStore) -> None:
             connection.execute("DROP TRIGGER IF EXISTS " + trigger)
         connection.execute("DROP TABLE candidate_authority_receipts")
         connection.execute("ALTER TABLE outbox_receipts RENAME TO outbox_receipts_v2")
-        v1_outbox = next(
-            statement
-            for statement in memory_store_module._V1_SCHEMA_STATEMENTS
-            if "CREATE TABLE outbox_receipts" in statement
+        # Frozen hand-written v1 shape: this compatibility fixture must not be
+        # regenerated from the current serializer/schema builder.
+        connection.execute(
+            """
+            CREATE TABLE outbox_receipts (
+                request_id TEXT PRIMARY KEY,
+                repository_key TEXT NOT NULL
+                    REFERENCES repositories(repository_key) ON DELETE CASCADE,
+                operation TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                event_id TEXT REFERENCES events(event_id) ON DELETE RESTRICT,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                CHECK (length(request_hash) = 64)
+            )
+            """
         )
-        connection.execute(v1_outbox)
         connection.execute(
             """
             INSERT INTO outbox_receipts(
@@ -682,6 +719,73 @@ def test_candidate_authority_receipts_are_atomic_multi_context_and_immutable(
     store.validate_integrity()
 
 
+def test_candidate_authority_empty_set_guard_is_atomic(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    recoverable = _candidate(statement="Recover only from an empty receipt set.")
+    store.put_candidate(
+        recoverable,
+        request_id=stable_request_id("legacy-candidate", recoverable.candidate_id),
+    )
+    recovered_receipt = _authority_receipt(recoverable)
+    recovery_request = stable_request_id(
+        "legacy-authority-recovery",
+        recovered_receipt.receipt_id,
+    )
+    recovered = store.put_candidate(
+        recoverable,
+        recovered_receipt,
+        request_id=recovery_request,
+        require_no_authority_receipts=True,
+    )
+    replayed = store.put_candidate(
+        recoverable,
+        recovered_receipt,
+        request_id=recovery_request,
+        require_no_authority_receipts=True,
+    )
+
+    assert recovered.applied and not recovered.replayed
+    assert replayed.replayed and not replayed.applied
+    assert store.list_candidate_authority_receipts(recoverable.candidate_id) == (
+        recovered_receipt,
+    )
+
+    competing = _candidate(statement="Reject recovery after a competing receipt.")
+    store.put_candidate(
+        competing,
+        request_id=stable_request_id("legacy-candidate", competing.candidate_id),
+    )
+    competing_receipt = _authority_receipt(
+        competing,
+        authority_resolution_hash="8" * 64,
+    )
+    store.put_candidate(
+        competing,
+        competing_receipt,
+        request_id=stable_request_id(
+            "competing-authority",
+            competing_receipt.receipt_id,
+        ),
+    )
+    attempted = _authority_receipt(competing)
+
+    with pytest.raises(MemoryStoreConflictError, match="empty receipt set"):
+        store.put_candidate(
+            competing,
+            attempted,
+            request_id=stable_request_id(
+                "legacy-authority-recovery",
+                attempted.receipt_id,
+            ),
+            require_no_authority_receipts=True,
+        )
+    assert store.list_candidate_authority_receipts(competing.candidate_id) == (
+        competing_receipt,
+    )
+
+
 def test_candidate_and_authority_receipt_insert_roll_back_together(
     tmp_path: Path,
 ) -> None:
@@ -728,6 +832,49 @@ def test_failed_event_insert_rolls_back_projection_and_generation(tmp_path: Path
 
     assert store.find_candidate(candidate.candidate_id) is None
     assert store.get_generations(REPOSITORY_KEY).memory_generation == 0
+
+
+def test_find_request_receipt_operation_is_canonical_and_read_only(
+    tmp_path: Path,
+) -> None:
+    namespace = tmp_path / "memory"
+    writer = MemoryStore(namespace)
+    candidate = _candidate()
+    request_id = stable_request_id("receipt-operation", candidate.candidate_id)
+    writer.put_candidate(candidate, request_id=request_id)
+    writer.checkpoint("TRUNCATE")
+    before = writer.database_path.read_bytes()
+
+    read_only = MemoryStore(namespace, read_only=True)
+    assert read_only.find_request_receipt_operation(request_id) == "put_candidate"
+    assert (
+        read_only.find_request_receipt_operation(
+            stable_request_id("missing-receipt-operation", candidate.candidate_id)
+        )
+        is None
+    )
+    with pytest.raises(MemoryStoreValidationError, match="request_id"):
+        read_only.find_request_receipt_operation("not-a-canonical-request-id")
+    assert writer.database_path.read_bytes() == before
+
+    with writer._maintenance_connection() as connection:
+        connection.execute("DROP TRIGGER outbox_receipts_no_update")
+        connection.execute(
+            "UPDATE outbox_receipts SET operation = ? WHERE request_id = ?",
+            (" put_candidate", request_id),
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER outbox_receipts_no_update
+            BEFORE UPDATE ON outbox_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'request receipts are immutable');
+            END
+            """
+        )
+
+    with pytest.raises(MemoryStoreCorruptionError, match="request receipt"):
+        read_only.find_request_receipt_operation(request_id)
 
 
 def test_approval_uses_generation_and_status_cas_without_duplicate_record(
@@ -889,6 +1036,183 @@ def test_atomic_lifecycle_approval_rolls_back_bundle_pin_and_authority(
             (blob.blob_hash,),
         ).fetchone()
     assert tuple(pin) == ("source_bundle", bundle.bundle_hash)
+
+
+def test_v2_record_expiry_is_approved_audited_and_projection_only(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate(status=CandidateStatus.PENDING_APPROVAL)
+    store.put_candidate(
+        candidate,
+        _authority_receipt(candidate),
+        request_id=stable_request_id("expiry-candidate", candidate.candidate_id),
+    )
+    content = b'{"schema":"memory_source_bundle_v1","sources":[]}'
+    store.put_blob(
+        content,
+        media_type="application/vnd.review-agent.source-bundle+json",
+        created_at=CREATED_AT,
+    )
+    bundle = _bundle(candidate, content)
+    approval_request = stable_request_id("expiry-approval", candidate.candidate_id)
+    record = _record_v2(
+        candidate,
+        bundle,
+        approval_request,
+        expiry_conditions=(
+            ExpiryCondition(
+                condition_kind=ExpiryConditionKind.AT_TIME,
+                value="2027-01-01T00:00:00Z",
+            ),
+            ExpiryCondition(
+                condition_kind=ExpiryConditionKind.AT_COMMIT,
+                value="b" * 40,
+            ),
+        ),
+    )
+
+    assert "expiry_conditions" not in candidate.to_dict()
+    assert record.memory_id == _record(candidate, bundle, approval_request).memory_id
+    result = store.approve_candidate_with_source_bundle(
+        record,
+        bundle,
+        request_id=approval_request,
+        expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
+        authority_resolution_hash=AUTHORITY_RESOLUTION,
+    )
+
+    assert result.applied
+    assert store.get_record(record.memory_id) == record
+    assert store.list_records(REPOSITORY_KEY) == (record,)
+    assert store.read_view(REPOSITORY_KEY).records == (record,)
+    assert store.verify_event_chain(REPOSITORY_KEY) == 3
+    assert store.validate_integrity().record_count == 1
+    with store.open_connection() as connection:
+        before = connection.execute(
+            "SELECT model_json, body_hash FROM records WHERE memory_id = ?",
+            (record.memory_id,),
+        ).fetchone()
+
+    transition_request = stable_request_id("expire-record", record.memory_id)
+    store.transition_record(
+        record.memory_id,
+        expected_status=RecordStatus.ACTIVE,
+        new_status=RecordStatus.EXPIRED,
+        action="expire",
+        actor_type="runtime",
+        actor_id="memory_lifecycle",
+        reason_code="expiry_condition_matched",
+        request_id=transition_request,
+        created_at="2027-01-01T00:00:00Z",
+    )
+
+    expired = replace(record, status=RecordStatus.EXPIRED)
+    assert store.get_record(record.memory_id) == expired
+    assert store.read_view(REPOSITORY_KEY).records == (expired,)
+    with store.open_connection() as connection:
+        after = connection.execute(
+            "SELECT model_json, body_hash FROM records WHERE memory_id = ?",
+            (record.memory_id,),
+        ).fetchone()
+    assert tuple(after) == tuple(before)
+    assert json.loads(after["model_json"])["status"] == RecordStatus.ACTIVE.value
+    assert json.loads(after["model_json"])["expiry_conditions"] == [
+        condition.to_dict() for condition in record.expiry_conditions
+    ]
+    assert store.verify_event_chain(REPOSITORY_KEY) == 4
+    assert store.validate_integrity().record_count == 1
+
+    changed_expiry = _record_v2(
+        candidate,
+        bundle,
+        approval_request,
+        expiry_conditions=(
+            ExpiryCondition(
+                condition_kind=ExpiryConditionKind.AT_TIME,
+                value="2028-01-01T00:00:00Z",
+            ),
+        ),
+    )
+    assert changed_expiry.memory_id == record.memory_id
+    with pytest.raises(MemoryStoreConflictError):
+        store.approve_candidate_with_source_bundle(
+            changed_expiry,
+            bundle,
+            request_id=stable_request_id(
+                "duplicate-expiry-approval",
+                candidate.candidate_id,
+            ),
+            expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
+            authority_resolution_hash=AUTHORITY_RESOLUTION,
+        )
+    assert store.count_records(REPOSITORY_KEY) == 1
+
+
+@pytest.mark.parametrize("tamper", ["expiry_condition", "body_hash"])
+def test_v2_record_expiry_body_tampering_fails_closed(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    store = MemoryStore(tmp_path / tamper)
+    candidate = _candidate(status=CandidateStatus.PENDING_APPROVAL)
+    store.put_candidate(
+        candidate,
+        _authority_receipt(candidate),
+        request_id=stable_request_id("tamper-candidate", candidate.candidate_id),
+    )
+    content = b'{"schema":"memory_source_bundle_v1","sources":[]}'
+    store.put_blob(
+        content,
+        media_type="application/vnd.review-agent.source-bundle+json",
+        created_at=CREATED_AT,
+    )
+    bundle = _bundle(candidate, content)
+    approval_request = stable_request_id("tamper-approval", candidate.candidate_id)
+    record = _record_v2(candidate, bundle, approval_request)
+    store.approve_candidate_with_source_bundle(
+        record,
+        bundle,
+        request_id=approval_request,
+        expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
+        authority_resolution_hash=AUTHORITY_RESOLUTION,
+    )
+
+    with store._maintenance_connection() as connection:
+        connection.execute("DROP TRIGGER records_body_immutable")
+        if tamper == "body_hash":
+            connection.execute(
+                "UPDATE records SET body_hash = ? WHERE memory_id = ?",
+                (HASH_1, record.memory_id),
+            )
+        else:
+            payload = record.to_dict()
+            payload["expiry_conditions"] = [
+                ExpiryCondition(
+                    condition_kind=ExpiryConditionKind.AT_TIME,
+                    value="2028-01-01T00:00:00Z",
+                ).to_dict()
+            ]
+            connection.execute(
+                "UPDATE records SET model_json = ? WHERE memory_id = ?",
+                (canonical_json(payload), record.memory_id),
+            )
+        connection.execute(
+            """
+            CREATE TRIGGER records_body_immutable
+            BEFORE UPDATE OF memory_id, candidate_id, repository_key,
+                             source_bundle_hash, model_json, body_hash, created_at
+            ON records
+            BEGIN
+                SELECT RAISE(ABORT, 'record bodies are immutable');
+            END
+            """
+        )
+
+    with pytest.raises(MemoryStoreCorruptionError, match="canonical memory row"):
+        store.get_record(record.memory_id)
+    with pytest.raises(MemoryStoreCorruptionError, match="canonical memory row"):
+        store.validate_integrity(validate_blob_files=False)
 
 
 @pytest.mark.parametrize(
@@ -1102,14 +1426,23 @@ def test_read_only_blob_read_does_not_create_a_blob_lock_file(
     assert not lock_path.exists()
 
 
-def test_read_only_store_rejects_a_missing_coordination_lock_without_writing(
+def test_genuinely_read_only_store_reads_without_coordination_file_or_mutation(
     tmp_path: Path,
 ) -> None:
     namespace = tmp_path / "memory"
     writer = MemoryStore(namespace)
+    candidate = _candidate(statement="A read-only filesystem remains auditable.")
+    writer.put_candidate(
+        candidate,
+        request_id=stable_request_id("read-only-root", candidate.candidate_id),
+    )
     writer.checkpoint("TRUNCATE")
     lock_path = namespace / ".memory-store.lock"
     lock_path.unlink()
+    database_mode = writer.database_path.stat().st_mode
+    namespace_mode = namespace.stat().st_mode
+    writer.database_path.chmod(stat.S_IREAD)
+    namespace.chmod(stat.S_IREAD | stat.S_IEXEC)
     before = {
         path.relative_to(namespace).as_posix(): (
             path.stat().st_size,
@@ -1118,20 +1451,23 @@ def test_read_only_store_rejects_a_missing_coordination_lock_without_writing(
         for path in namespace.rglob("*")
         if path.is_file()
     }
-
-    with pytest.raises(MemoryStoreUnavailableError, match="coordination lock"):
-        MemoryStore(namespace, read_only=True)
-
-    after = {
-        path.relative_to(namespace).as_posix(): (
-            path.stat().st_size,
-            path.stat().st_mtime_ns,
-        )
-        for path in namespace.rglob("*")
-        if path.is_file()
-    }
-    assert before == after
-    assert not lock_path.exists()
+    try:
+        read_only = MemoryStore(namespace, read_only=True)
+        assert read_only.get_candidate(candidate.candidate_id) == candidate
+        assert read_only.audit_status().read_only is True
+        after = {
+            path.relative_to(namespace).as_posix(): (
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+            )
+            for path in namespace.rglob("*")
+            if path.is_file()
+        }
+        assert before == after
+        assert not lock_path.exists()
+    finally:
+        namespace.chmod(namespace_mode)
+        writer.database_path.chmod(database_mode)
 
 
 def test_public_namespace_locks_are_ordered_reentrant_and_database_free(
@@ -1533,43 +1869,35 @@ def test_read_only_store_reads_committed_frames_from_a_live_wal(
         snapshot_reader.close()
 
 
-def test_immutable_read_serializes_a_writer_that_would_create_the_first_wal(
+def test_read_only_reader_uses_sqlite_snapshot_without_blocking_writer(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     namespace = tmp_path / "memory"
     writer = MemoryStore(namespace, busy_timeout_ms=2_000)
     writer.checkpoint("TRUNCATE")
     read_only = MemoryStore(namespace, read_only=True, busy_timeout_ms=2_000)
-    candidate = _candidate(statement="The first WAL write is serialized.")
-    probed = threading.Event()
+    candidate = _candidate(statement="A WAL writer can commit beside a reader.")
+    reader_started = threading.Event()
     release_reader = threading.Event()
-    reader_result: list[MemoryCandidate | None] = []
+    writer_finished = threading.Event()
+    reader_counts: list[int] = []
     reader_errors: list[Exception] = []
     writer_errors: list[Exception] = []
-    real_has_live_wal = memory_store_module._database_has_live_wal
-    calls = 0
-
-    def pause_after_second_probe(path: Path) -> bool:
-        nonlocal calls
-        result = real_has_live_wal(path)
-        if threading.current_thread().name == "immutable-reader":
-            calls += 1
-            if calls == 2:
-                probed.set()
-                if not release_reader.wait(timeout=2):
-                    raise RuntimeError("test did not release immutable reader")
-        return result
-
-    monkeypatch.setattr(
-        memory_store_module,
-        "_database_has_live_wal",
-        pause_after_second_probe,
-    )
 
     def read() -> None:
         try:
-            reader_result.append(read_only.find_candidate(candidate.candidate_id))
+            with read_only.open_connection() as connection:
+                connection.execute("BEGIN")
+                reader_counts.append(
+                    int(connection.execute("SELECT COUNT(*) FROM candidates").fetchone()[0])
+                )
+                reader_started.set()
+                if not release_reader.wait(timeout=3):
+                    raise RuntimeError("test did not release WAL reader")
+                reader_counts.append(
+                    int(connection.execute("SELECT COUNT(*) FROM candidates").fetchone()[0])
+                )
+                connection.rollback()
         except Exception as error:  # pragma: no cover - asserted below
             reader_errors.append(error)
 
@@ -1579,16 +1907,17 @@ def test_immutable_read_serializes_a_writer_that_would_create_the_first_wal(
                 candidate,
                 request_id=stable_request_id("first-wal", candidate.candidate_id),
             )
+            writer_finished.set()
         except Exception as error:  # pragma: no cover - asserted below
             writer_errors.append(error)
 
-    reader_thread = threading.Thread(target=read, name="immutable-reader")
+    reader_thread = threading.Thread(target=read, name="snapshot-reader")
     writer_thread = threading.Thread(target=write, name="first-wal-writer")
     reader_thread.start()
-    assert probed.wait(timeout=2)
+    assert reader_started.wait(timeout=2)
     writer_thread.start()
     try:
-        assert writer_thread.is_alive()
+        assert writer_finished.wait(timeout=2)
     finally:
         release_reader.set()
         reader_thread.join(timeout=3)
@@ -1596,8 +1925,46 @@ def test_immutable_read_serializes_a_writer_that_would_create_the_first_wal(
 
     assert not reader_thread.is_alive() and not writer_thread.is_alive()
     assert reader_errors == [] and writer_errors == []
-    assert reader_result == [None]
+    assert reader_counts == [0, 0]
     assert read_only.get_candidate(candidate.candidate_id) == candidate
+
+
+def test_read_only_readers_are_not_serialized_by_namespace_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = tmp_path / "memory"
+    MemoryStore(namespace).checkpoint("TRUNCATE")
+    read_only = MemoryStore(namespace, read_only=True, busy_timeout_ms=2_000)
+    rendezvous = threading.Barrier(2, timeout=2)
+    real_connect = read_only._connect
+    results: list[int] = []
+    errors: list[Exception] = []
+
+    def concurrent_connect(*, read_only: bool):
+        if read_only:
+            rendezvous.wait()
+        return real_connect(read_only=read_only)
+
+    monkeypatch.setattr(read_only, "_connect", concurrent_connect)
+
+    def read() -> None:
+        try:
+            results.append(
+                read_only.get_generations(REPOSITORY_KEY).memory_generation
+            )
+        except Exception as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    readers = [threading.Thread(target=read) for _ in range(2)]
+    for reader in readers:
+        reader.start()
+    for reader in readers:
+        reader.join(timeout=3)
+
+    assert all(not reader.is_alive() for reader in readers)
+    assert errors == []
+    assert results == [0, 0]
 
 
 def test_feedback_and_knowledge_update_only_their_generations(tmp_path: Path) -> None:
@@ -1627,6 +1994,63 @@ def test_feedback_and_knowledge_update_only_their_generations(tmp_path: Path) ->
         store.get_knowledge_entry(knowledge.entry_id)
 
 
+def test_project_memory_read_ignores_an_unrelated_missing_knowledge_blob(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate(status=CandidateStatus.PENDING_APPROVAL)
+    authority = _authority_receipt(candidate)
+    store.put_candidate(
+        candidate,
+        authority,
+        request_id=stable_request_id("memory-view-candidate", candidate.candidate_id),
+    )
+    source_content = b'{"schema":"memory_source_bundle_v1","sources":[]}'
+    store.put_blob(
+        source_content,
+        media_type="application/vnd.review-agent.source-bundle+json",
+        created_at=CREATED_AT,
+    )
+    bundle = _bundle(candidate, source_content)
+    approval_request = stable_request_id(
+        "memory-view-approval",
+        candidate.candidate_id,
+    )
+    record = _record(candidate, bundle, approval_request)
+    store.approve_candidate_with_source_bundle(
+        record,
+        bundle,
+        request_id=approval_request,
+        expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
+        authority_resolution_hash=authority.authority_resolution_hash,
+    )
+    feedback = _feedback()
+    store.put_feedback(
+        feedback,
+        request_id=stable_request_id("memory-view-feedback", feedback.feedback_id),
+    )
+    old_cache_content = b'{"symbols":["old"]}'
+    store.put_blob(
+        old_cache_content,
+        media_type="application/json",
+        created_at=CREATED_AT,
+    )
+    old_cache = _knowledge(old_cache_content)
+    store.put_knowledge_entry(
+        old_cache,
+        request_id=stable_request_id("memory-view-cache", old_cache.entry_id),
+    )
+    store.blob_path(old_cache.blob_hash).unlink()
+
+    view = store.read_view(REPOSITORY_KEY)
+
+    assert view.records == (record,)
+    assert view.feedback == (feedback,)
+    assert view.knowledge_entries == (old_cache,)
+    with pytest.raises(MemoryStoreCorruptionError):
+        store.get_knowledge_entry(old_cache.entry_id)
+
+
 def test_busy_authority_writer_has_stable_error_and_reader_remains_available(
     tmp_path: Path,
 ) -> None:
@@ -1645,6 +2069,279 @@ def test_busy_authority_writer_has_stable_error_and_reader_remains_available(
     finally:
         writer.rollback()
         writer.close()
+
+
+def test_outbox_replay_audit_is_canonical_idempotent_and_projection_free(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    candidate = _candidate(statement="Replay audit has an owning repository.")
+    store.put_candidate(
+        candidate,
+        request_id=stable_request_id("replay-audit-candidate", candidate.candidate_id),
+    )
+    replay_request = stable_request_id("explicit-outbox-replay", "review-001")
+
+    first = store.record_outbox_replay_audit(
+        REPOSITORY_KEY,
+        review_id="review-001",
+        outbox_hash=HASH_1,
+        actor="  amy  ",
+        reason="  Maintainer\r\n requested   a deterministic replay.  ",
+        request_id=replay_request,
+        created_at=CREATED_AT,
+    )
+    replay = store.record_outbox_replay_audit(
+        REPOSITORY_KEY,
+        review_id="review-001",
+        outbox_hash=HASH_1,
+        actor="amy",
+        reason="Maintainer requested a deterministic replay.",
+        request_id=replay_request,
+        created_at=CREATED_AT,
+    )
+
+    assert first.applied and not first.replayed
+    assert not replay.applied and replay.replayed
+    assert replay.event_id == first.event_id
+    assert first.actor == "amy"
+    assert first.reason == "Maintainer requested a deterministic replay."
+    events = store.list_events(
+        REPOSITORY_KEY,
+        subject_type="outbox_replay",
+        subject_id="review-001",
+    )
+    assert len(events) == 1
+    assert events[0].reason == first.reason
+    assert store.read_view(REPOSITORY_KEY).generations.memory_generation == 2
+    integrity = store.validate_integrity(validate_blob_files=False)
+    assert integrity.event_count == 2
+
+    manifest = store.build_export_manifest(redact=False, created_at=CREATED_AT)
+    target = MemoryStore(tmp_path / "imported")
+    preview = target.import_manifest(manifest, dry_run=True)
+    assert preview.event_count == 2
+    assert preview.outbox_receipt_count == 2
+    applied = target.import_manifest(manifest, dry_run=False)
+    assert applied.applied
+    imported_replay = target.record_outbox_replay_audit(
+        REPOSITORY_KEY,
+        review_id="review-001",
+        outbox_hash=HASH_1,
+        actor="amy",
+        reason=first.reason,
+        request_id=replay_request,
+        created_at=CREATED_AT,
+    )
+    assert imported_replay.replayed
+    assert imported_replay.event_id == first.event_id
+    assert target.validate_integrity(validate_blob_files=False).event_count == 2
+
+    with pytest.raises(MemoryStoreConflictError, match="request ID"):
+        store.record_outbox_replay_audit(
+            REPOSITORY_KEY,
+            review_id="review-001",
+            outbox_hash=HASH_2,
+            actor="amy",
+            reason=first.reason,
+            request_id=replay_request,
+            created_at=CREATED_AT,
+        )
+
+
+def test_mixed_v1_v2_records_round_trip_export_state_token_and_backup(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    resolver = RevisionResolver()
+    namespace = materialize_repository_memory_namespace(
+        plan_repository_memory_namespace(
+            resolver.repository_identity(git_repo),
+            tmp_path / "memory-root",
+            revision_resolver=resolver,
+        ),
+        revision_resolver=resolver,
+    )
+    source = MemoryStore(namespace)
+
+    def approve(
+        candidate: MemoryCandidate,
+        content: bytes,
+        *,
+        v2: bool,
+    ) -> DurableMemoryRecord:
+        source.put_candidate(
+            candidate,
+            _authority_receipt(candidate),
+            request_id=stable_request_id(
+                "mixed-schema-candidate",
+                candidate.candidate_id,
+            ),
+        )
+        source.put_blob(
+            content,
+            media_type="application/vnd.review-agent.source-bundle+json",
+            created_at=CREATED_AT,
+        )
+        bundle = _bundle(candidate, content)
+        request_id = stable_request_id(
+            "mixed-schema-approval",
+            candidate.candidate_id,
+        )
+        record = (
+            _record_v2(candidate, bundle, request_id)
+            if v2
+            else _record(candidate, bundle, request_id)
+        )
+        source.approve_candidate_with_source_bundle(
+            record,
+            bundle,
+            request_id=request_id,
+            expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
+            authority_resolution_hash=AUTHORITY_RESOLUTION,
+        )
+        return record
+
+    v1_candidate = replace(
+        _candidate(
+            statement="Schema v1 records remain readable beside expiring records.",
+            status=CandidateStatus.PENDING_APPROVAL,
+        ),
+        repository_key=namespace.repository_key,
+    )
+    v2_candidate = replace(
+        _candidate(
+            statement="Schema v2 records retain immutable expiry predicates.",
+            status=CandidateStatus.PENDING_APPROVAL,
+        ),
+        repository_key=namespace.repository_key,
+    )
+    v1_record = approve(
+        v1_candidate,
+        b'{"schema":"memory_source_bundle_v1","record":1}',
+        v2=False,
+    )
+    v2_record = approve(
+        v2_candidate,
+        b'{"schema":"memory_source_bundle_v1","record":2}',
+        v2=True,
+    )
+    source.transition_record(
+        v2_record.memory_id,
+        expected_status=RecordStatus.ACTIVE,
+        new_status=RecordStatus.EXPIRED,
+        action="expire",
+        actor_type="runtime",
+        actor_id="memory_lifecycle",
+        reason_code="expiry_condition_matched",
+        request_id=stable_request_id("mixed-schema-expiry", v2_record.memory_id),
+        created_at="2027-01-01T00:00:00Z",
+    )
+    expired_v2 = replace(v2_record, status=RecordStatus.EXPIRED)
+    expected_records = tuple(sorted((v1_record, expired_v2), key=lambda item: item.memory_id))
+    source_token = source.repository_authority_state_token(
+        namespace.repository_key
+    )
+
+    with source.open_connection() as connection:
+        stored_hashes = {
+            str(row["memory_id"]): str(row["body_hash"])
+            for row in connection.execute(
+                "SELECT memory_id, body_hash FROM records ORDER BY memory_id"
+            )
+        }
+    redacted = source.build_export_manifest(redact=True, created_at=CREATED_AT)
+    assert all(envelope["model"] is None for envelope in redacted["records"])
+    assert {
+        envelope["id"]: envelope["body_hash"] for envelope in redacted["records"]
+    } == stored_hashes
+    assert {
+        envelope["id"]: envelope["current_status"]
+        for envelope in redacted["records"]
+    }[v2_record.memory_id] == RecordStatus.EXPIRED.value
+    redacted_plan = MemoryStore(tmp_path / "redacted-target").import_manifest(
+        redacted,
+        dry_run=True,
+    )
+    assert redacted_plan.record_count == 2
+    assert redacted_plan.redacted and not redacted_plan.restorable
+
+    portable_directory = tmp_path / "portable-export"
+    portable = source.export_to_directory(
+        portable_directory,
+        redact=False,
+        include_blobs=True,
+        created_at=CREATED_AT,
+    )
+    portable_records = {
+        envelope["id"]: envelope for envelope in portable["records"]
+    }
+    assert portable_records[v1_record.memory_id]["model"]["schema_version"] == 1
+    assert "expiry_conditions" not in portable_records[v1_record.memory_id]["model"]
+    assert portable_records[v2_record.memory_id]["model"]["schema_version"] == 2
+    assert portable_records[v2_record.memory_id]["model"]["expiry_conditions"] == [
+        condition.to_dict() for condition in v2_record.expiry_conditions
+    ]
+
+    def rehash_manifest(manifest: dict[str, object]) -> None:
+        body = {
+            key: value for key, value in manifest.items() if key != "manifest_hash"
+        }
+        manifest["manifest_hash"] = hashlib.sha256(
+            canonical_json(body).encode("utf-8")
+        ).hexdigest()
+
+    for tamper in ("expiry_condition", "body_hash"):
+        tampered = json.loads(canonical_json(portable))
+        envelope = next(
+            item
+            for item in tampered["records"]
+            if item["id"] == v2_record.memory_id
+        )
+        if tamper == "expiry_condition":
+            envelope["model"]["expiry_conditions"] = [
+                ExpiryCondition(
+                    condition_kind=ExpiryConditionKind.AT_TIME,
+                    value="2028-01-01T00:00:00Z",
+                ).to_dict()
+            ]
+        else:
+            envelope["body_hash"] = HASH_1
+        rehash_manifest(tampered)
+        with pytest.raises(MemoryStoreValidationError, match="model hash"):
+            MemoryStore(tmp_path / ("tampered-" + tamper)).import_manifest(
+                tampered,
+                dry_run=True,
+            )
+
+    imported = MemoryStore(tmp_path / "imported")
+    plan = imported.import_manifest(
+        portable_directory / "manifest.json",
+        dry_run=False,
+        blob_source_root=portable_directory,
+    )
+    assert plan.applied and plan.record_count == 2
+    assert imported.read_view(namespace.repository_key).records == expected_records
+    assert imported.validate_integrity().record_count == 2
+    assert imported.verify_event_chain(namespace.repository_key) == 7
+    assert (
+        imported.repository_authority_state_token(namespace.repository_key)
+        == source_token
+    )
+
+    backup_path = source.backup_to(tmp_path / "backups" / "memory.sqlite3")
+    backup = MemoryStore(backup_path, read_only=True)
+    assert backup.validate_integrity(validate_blob_files=False).record_count == 2
+    with backup.open_connection() as connection:
+        backup_records = tuple(
+            memory_store_module._record_from_row(row)
+            for row in connection.execute("SELECT * FROM records ORDER BY memory_id")
+        )
+    assert backup_records == expected_records
+    assert (
+        backup.repository_authority_state_token(namespace.repository_key)
+        == source_token
+    )
 
 
 def test_export_is_canonical_hashed_and_import_dry_run_never_writes(
@@ -2080,6 +2777,77 @@ def test_export_import_round_trips_multiple_candidate_authority_contexts(
         second,
     )
     assert target.validate_integrity().candidate_count == 1
+
+
+def test_legacy_v1_audit_is_metadata_only_byte_preserving_and_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = tmp_path / "memory"
+    writer = MemoryStore(namespace)
+    candidate = _candidate()
+    writer.put_candidate(
+        candidate,
+        request_id=stable_request_id("legacy-audit", candidate.candidate_id),
+    )
+    _downgrade_store_to_frozen_v1(writer)
+
+    def snapshot() -> dict[str, tuple[bytes, int]]:
+        return {
+            path.relative_to(namespace).as_posix(): (
+                path.read_bytes(),
+                path.stat().st_mtime_ns,
+            )
+            for path in namespace.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+
+    def reject_current_model_hydration(*args, **kwargs):
+        raise AssertionError("legacy audit hydrated a current authority model")
+
+    for helper in (
+        "_candidate_from_row",
+        "_record_from_row",
+        "_feedback_from_row",
+        "_knowledge_from_row",
+    ):
+        monkeypatch.setattr(
+            memory_store_module,
+            helper,
+            reject_current_model_hydration,
+        )
+
+    legacy = MemoryStore(namespace, read_only=True)
+    status = legacy.audit_status()
+
+    assert status.audit_schema is MemoryStoreAuditSchema.LEGACY_V1
+    assert status.schema_name == "memory_store_schema_v1"
+    assert status.schema_version == 1
+    assert status.read_only
+    assert status.migration_required
+    assert status.repository_count == 1
+    assert status.candidate_count == 1
+    assert status.event_count == 1
+    assert status.request_receipt_count == 1
+    assert status.event_chain_verified
+    with pytest.raises(MemoryStoreSchemaError, match="audit_status"):
+        legacy.get_candidate(candidate.candidate_id)
+    with pytest.raises(MemoryStoreReadOnlyError):
+        legacy.put_candidate(
+            candidate,
+            request_id=stable_request_id(
+                "legacy-audit-mutation",
+                candidate.candidate_id,
+            ),
+        )
+    with pytest.raises(MemoryStoreReadOnlyError):
+        legacy.put_blob(b"forbidden", media_type="application/octet-stream")
+
+    assert snapshot() == before
+    assert not Path(str(writer.database_path) + "-wal").exists()
+    assert not Path(str(writer.database_path) + "-shm").exists()
 
 
 def test_v1_to_v2_migration_preserves_authority_data_and_event_bytes(

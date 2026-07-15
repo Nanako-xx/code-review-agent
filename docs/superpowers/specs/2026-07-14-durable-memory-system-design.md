@@ -2,7 +2,9 @@
 
 **日期：** 2026-07-14
 
-**状态：** 已确认（2026-07-14）
+**状态：** 已实现并通过全量回归（2026-07-15）
+
+**实现提交：** 本文档与实现同一提交（`feat(memory): complete durable memory system`）
 
 **设计来源：** `2026-06-22-evidence-driven-multi-agent-code-review-design.md` 第 15、16、17、18、23 节
 
@@ -159,6 +161,18 @@ repository_key = sha256(
 
 数据库启用 foreign keys、WAL 和 busy timeout。审批、撤销、revalidate、candidate import 等权威写操作使用 `BEGIN IMMEDIATE` 串行化，并通过当前状态与 generation 做 compare-and-swap 校验。
 
+当前落地协议版本固定如下；这些版本属于不同边界，不能混成一个“Memory v2”：
+
+| 边界 | 当前版本 | 兼容语义 |
+|---|---|---|
+| canonical model 与 Session artifact | v1 | 严格字段、canonical JSON 和 hash 校验 |
+| Durable Memory Record | v1 / v2 | v1 不含 expiry；v2 必须包含 typed expiry conditions，v1 继续原样读取和序列化 |
+| SQLite Store / export manifest | v2 | 可审计或迁移 v1 Store；未知版本 fail closed |
+| Review Session | v5 | v1 只读审计；v2-v4 保留原阶段与恢复语义 |
+| Memory selection policy | `memory_selection_v2` | 继续读取 `memory_selection_v1` 的固定 Snapshot，不把旧策略静默升级 |
+
+Store v2 用于 authority receipt、严格 persistence receipt、Record v2 与生命周期投影；它不把所有 canonical model/artifact 的 `schema_version` 一并提升。Record schema v2 同样不要求 SQLite Store 再升到 v3。
+
 ### 6.2 内容寻址 blob
 
 较大的文件索引、符号图、调用图、测试映射和 Git 摘要写入：
@@ -301,6 +315,8 @@ created_at: ...
 
 `content_fingerprint` 不包含 source refs、review ID 和 producer，用于发现“同一规则换了一份来源”或“不同 Review 重复提出”的语义重复。它不直接决定合并，最终由确定性规则和人工审批决定。
 
+Candidate 不携带 expiry。`producer.type` 只说明由 human/local/model 中的谁提出 Candidate，不代表其 source authority；过期条件只能由人工在 approve/revalidate 时设置，不能由 Curator 或模型预埋。
+
 ### 8.5 Durable Memory Record
 
 人工批准 Candidate 后，在同一事务内创建不可变 Record：
@@ -308,7 +324,7 @@ created_at: ...
 ```yaml
 memory_id: MEM-<sha256(candidate_id)>
 candidate_id: MC-...
-record_schema_version: 1
+schema_version: 1 | 2
 kind: ...
 statement: ...
 scope: ...
@@ -320,10 +336,11 @@ policy_effect: ...
 approved_by: ...
 approval_event_id: ...
 status: active | revalidation_required | superseded | revoked | expired
+expiry_conditions: [...] # 仅 v2；at_time / at_commit
 created_at: ...
 ```
 
-Record 正文不会原地编辑。修改 statement、scope、来源、validity policy 或 policy effect 必须产生新 Candidate、新 Record，并把旧 Record 标记为 `superseded`。
+Record v1 不含 `expiry_conditions`，继续保持原 canonical bytes；Record v2 必须至少包含一个 typed expiry condition。无 expiry 的新 Record 仍使用 v1，有 expiry 才使用 v2。Record 正文不会原地编辑。修改 statement、scope、来源、validity policy 或 policy effect 必须产生新 Candidate、新 Record，并把旧 Record 标记为 `superseded`。
 
 ## 9. Candidate 校验、去重与审批
 
@@ -376,6 +393,16 @@ Review Pipeline、Reviewer、Reconciler 和 Memory Curator 都没有这些权限
 - content fingerprint 与 active Record 相同且来源未增强时，Candidate 标记为 duplicate，不再次要求审批。
 - 与 rejected Candidate 相同且来源、producer schema 和正文均未变化时，不允许模型反复重新提出。
 - 来源增强、scope 改变或 policy effect 改变时允许新 Candidate，但审批界面必须显示与旧记录的差异。
+
+### 9.5 Authority receipt 与审批恢复
+
+Candidate 只有在验证成功后才生成 `CandidateAuthorityReceipt`，固定 candidate、authority/locator repository、origin review、proposal HEAD、授权 source refs、校验报告 hash、authority-resolution hash，以及与其中 `HumanDeclarationSourceRef` 子集一一匹配的 `HumanDeclarationAuthority`。Receipt 中的 `origin` 是 Candidate producer，不是来源 authority；因此 local/model Curator 可以提出基于显式人类声明的 Candidate，但只有 receipt 内独立验证过的 human declaration 才能在审批时恢复 authority。
+
+早期 local/model receipt 可能包含 `human_declaration` SourceRef、但其必需的 `human_declarations` 字段为空。兼容恢复不得修改旧 receipt，也不得从当前 CLI 参数或相似文本猜测：Runtime 只能读取 receipt 精确绑定的、已完成且 artifact hash 校验通过的 Session `request.json`，逐项验证 review ID、request ID、actor 和 declaration hash。Session 缺失、未完成、descriptor/hash 不符或声明集合不完整时一律 fail closed。
+
+Store v1 迁移到 v2 后，历史 pending Candidate 还可能完全没有 authority receipt。CLI 只有在该 Candidate 没有任何 receipt、当前 HEAD 仍等于原 proposal HEAD，且原 Session 的 `request.json` 与 `memory_outbox.json` 均已完成、hash/revision/repository/authority 绑定有效时，才在用户确认后通过 Lifecycle 幂等补写 receipt，再执行审批；预览阶段保持只读。Store 在同一 `BEGIN IMMEDIATE` 中重新断言整个 receipt 集合为空并插入，关闭并发 authority context 的检查/写入窗口；补写后 CLI 再次读取 HEAD，漂移则不创建 active Record。无法满足任一条件时明确拒绝，不能从 Candidate producer 推导 authority。
+
+审批和 outbox persistence receipt 也必须通过严格状态矩阵校验。空写入、`proposed/validated` Candidate、冲突 dedupe 结果或不合法的 replay/write 组合不能伪装成持久化成功。
 
 ## 10. 有效性、失效与重新验证
 
@@ -433,6 +460,19 @@ active
 - revoke 只由人工执行。
 - expiry 可以来自审批时设置的时间/commit 条件，命中后由 Runtime 确定性标记。
 
+### 10.4 自动过期协议
+
+审批时只允许两种 typed condition：
+
+- `at_time`：canonical UTC timestamp；冻结的 Runtime clock 到达该时间即到期。
+- `at_commit`：完整 commit SHA；目标 HEAD 等于该 commit 或是其后代即到期。边界 commit 必须存在，并且不能早于 Record 的 `valid_from_sha`。
+
+同一 Record 每种类型最多一个条件；多个条件按 OR 计算，任一命中即到期。`memory approve` 和 `memory revalidate` 使用 `--expires-at`、`--expires-at-commit` 与 `--no-expiry`。Revalidate 默认继承 predecessor 的条件，只有显式 `--no-expiry` 才清除；`--no-expiry` 不能与其他 expiry 参数并用。
+
+Runtime 对 due 的 `active` Record 使用状态 compare-and-swap 写入 `active -> expired` 事件，并在同一事务内递增 generation；重试幂等，并发扫描最终收敛到同一事件/状态，不生成第二个生命周期事实。`read-write` 在 Selection 前先尝试有界持久化 expiry，再冻结 Snapshot generation；扫描失败、超过 512 条或受 snapshot 上限截断时，未落盘的 due Record 仍在内存中确定性排除，并形成 `expiry_sweep_failed`、`expiry_sweep_truncated` 或 `expiry_persistence_deferred` 诊断。`read` 不修改 Store，但同样在固定时钟和目标 HEAD 下排除 due Record；`off` 不读取或评估 Store。Expiry 无法解析时不会继续使用该 Record，并形成可见诊断。
+
+同 revision resume 复用已完成的 Snapshot，不因墙钟推进或 Store 后续 expiry 事件改变输入。新 Review 或 revision-drift child 使用新的冻结时钟、目标 revision 和 generation 重新计算。
+
 ## 11. MemorySnapshot 与确定性检索
 
 ### 11.1 Snapshot 时机
@@ -453,11 +493,11 @@ snapshot_id: MSNAP-<sha256>
 repository_key: ...
 base_sha: ...
 head_sha: ...
-store_schema_version: 1
+store_schema_version: 2
 memory_generation: ...
 feedback_generation: ...
 knowledge_generation: ...
-selection_policy_version: memory_selection_v1
+selection_policy_version: memory_selection_v2
 eligible_records: [...canonical record copies...]
 applicability_decisions: [...]
 feedback_calibration_summary: ...
@@ -467,6 +507,8 @@ snapshot_hash: ...
 ```
 
 Snapshot 保存足以重放的 Record 正文、scope、source refs 摘要、policy effect 和 applicability 决定，而不是只保存数据库行号。持久数据库在 Review 过程中被批准、撤销或损坏，都不能改变已经固定的 Review 输入。
+
+`memory_selection_v2` 增加 typed expiry 评估与相关诊断。Runtime 仍接受由 `memory_selection_v1` 固定的 legacy selection input/Snapshot，并按其原策略重放；恢复时不会把 v1 artifact 重写成 v2。
 
 ### 11.3 检索流程
 
@@ -643,7 +685,7 @@ REPORTING
 mode: off | read | read-write
 root_path: <canonical absolute path>
 required: false
-selection_policy_version: memory_selection_v1
+selection_policy_version: memory_selection_v2
 feedback_policy_version: feedback_aggregation_v1
 max_snapshot_records: 2000
 max_snapshot_bytes: 8388608
@@ -663,7 +705,7 @@ read-write 读取并写 revision cache，生成并持久化 pending Candidate
 
 默认是 `read-write`。该模式只会产生 cache、pending Candidate 和审计事件，永远不会自动产生 active Memory。需要 hermetic 或隐私隔离的运行使用 `read` 或 `off`。Feedback 只由独立人工命令写入，不会因为 Review 使用 `read-write` 而自动推断人工决定。
 
-v5 的两个 Memory phase 始终存在，以保持单一阶段布局。`off` 模式的 Selection 提交带 `disabled` 原因的空 Snapshot，Proposal 提交 `skipped` decision 和空 candidate batch；`read` 模式正常 Selection，但 Proposal 同样不调用 Curator、不创建 outbox。
+v5 的两个 Memory phase 始终存在，以保持单一阶段布局。`off` 模式的 Selection 提交带 `disabled` 原因的空 Snapshot，Proposal 提交 `skipped` decision 和空 candidate batch；`read` 模式正常 Selection，确定性排除 due Record 但不把 expiry 写回 Store，Proposal 同样不调用 Curator、不创建 outbox；`read-write` 先尝试有界提交 due expiry，再冻结新的 generation 和 Snapshot，未落盘项仍被排除并产生诊断。
 
 ### 15.4 Memory Curator
 
@@ -683,7 +725,7 @@ v5 的两个 Memory phase 始终存在，以保持单一阶段布局。`off` 模
 - 数据库已写入，但 phase 尚未标记 completed。
 - Provider 重试或 resume 重复提交同一 Candidate。
 
-数据库写失败时 Review 继续，Reporting 显示“Candidate pending local replay”。`memory replay-outbox <review-id>` 可以在之后重放；candidate ID 和 request ID 保证幂等。
+数据库写失败时 Review 继续，Reporting 显示“Candidate pending local replay”。`memory replay-outbox <review-id>` 可以在之后重放；candidate ID 和 request ID 保证幂等。`memory_persistence_receipt.json` 只有在每项 Candidate 的终态、dedupe decision 与 replay/write 标志组成合法成功矩阵时才代表持久化成功；空结果或中间状态不能冒充成功。
 
 ## 16. Context 与模型调用集成
 
@@ -773,6 +815,16 @@ memory gc --dry-run
 memory relink ...
 ```
 
+`approve` 与 `revalidate` 还接受：
+
+```text
+--expires-at <canonical-utc-timestamp>
+--expires-at-commit <revision>
+--no-expiry
+```
+
+commit 参数在预览时固定为完整 object ID，提交前再次验证 repository authority 与 expiry 条件没有漂移。Revalidate 默认继承 predecessor expiry；显式 `--no-expiry` 才清除。
+
 所有命令接收 `--repo` 和 `--memory-root`。修改类命令必须使用 actor；交互模式显示 diff 并询问确认，脚本模式必须额外提供 `--yes`。任何管理命令都不能通过自由文本改变工具权限。
 
 ## 18. Session Artifacts 与 Brief
@@ -852,6 +904,7 @@ Brief 不内嵌完整 Memory DB、原始 Feedback 或大型 cache blob。
 ### 19.3 Resume
 
 - `MEMORY_SELECTION` 已 completed：先验证 artifact hash，再加载原 Snapshot，不访问最新 generation。
+- 已完成 Snapshot 的冻结时钟与 expiry 决定一并复用；同 revision resume 不重新按当前时间过期记录。
 - Selection artifact 损坏：从 `MEMORY_SELECTION` 起失效并重跑下游阶段。
 - `MEMORY_PROPOSAL` 中断：保留已提交 outbox，重启 attempt 后幂等重放。
 - 已 completed Session 不追加 Candidate 或 Feedback；这些外部动作通过 memory 管理命令形成独立事件。
@@ -865,7 +918,8 @@ Revision drift 创建 v5 child Session，从 Preflight 重新执行 Repository I
 - 多个 Review 可以并行读同一数据库。
 - Cache 和 Candidate 写入按 stable key 幂等。
 - approve/reject/revoke/revalidate 使用事务与 generation compare-and-swap。
-- 同一 Candidate 的并发审批最多一个成功，其余返回当前最终状态，不产生冲突 Record。
+- 同一 Candidate 的并发审批最多一个成功；actor、reason、reason code、expiry、predecessor 等完全相同的同决策 loser 保存独立、可重放的 no-op request receipt，返回 winner 的最终状态，不产生第二条审批事件、第二个 Record 或覆盖 attribution。不同决策、不同 expiry 或相同 request ID 的冲突 payload 仍拒绝。
+- 并发 expiry 扫描使用同样的 CAS/幂等语义，最终只保留一个 `active -> expired` 生命周期事实。
 - migration 与 relink 获取 repository-level exclusive lock。
 
 ## 20. 安全与隐私
@@ -955,7 +1009,7 @@ Store 和 Validator 不依赖 Pipeline 或模型 Provider，避免业务逻辑�
 
 ### Batch A：持久化内核与 Repository Cache
 
-- 最终 Memory schema v1、repository identity 和 storage root。
+- canonical model/artifact v1、Record v1/v2、Store/export v2、repository identity 和 storage root。
 - SQLite migrations、event log、blob store、并发与 corruption handling。
 - Candidate/Record/SourceRef/Feedback/Snapshot 完整模型。
 - source validator、审批状态机、dedupe、revoke/revalidate。
@@ -1004,6 +1058,7 @@ Store 和 Validator 不依赖 Pipeline 或模型 Provider，避免业务逻辑�
 
 - proposed/validated/pending/approved/rejected 转移。
 - active/revalidation-required/superseded/revoked/expired 转移。
+- at-time/at-commit OR expiry、commit boundary、READ/READ_WRITE、幂等与并发收敛。
 - duplicate、re-proposal 和 changed evidence。
 - ancestor、historical HEAD、diverged branch 和 revision drift applicability。
 - revalidate 创建新 Record，不修改旧正文。
@@ -1031,6 +1086,7 @@ Store 和 Validator 不依赖 Pipeline 或模型 Provider，避免业务逻辑�
 - 新 v5 happy path、local/model curator、empty memory、read/off 模式。
 - store unavailable、corrupt cache、candidate write failure 和 outbox replay。
 - Memory Selection resume 固定旧 generation。
+- selection policy v2 与 v1 Snapshot 兼容；同 revision resume 固定旧 expiry 决定。
 - Snapshot tamper 从正确 phase 失效。
 - revision drift child 重新 selection。
 - v1 只读；v2-v4 按原阶段恢复且不调用 Memory。
@@ -1054,10 +1110,11 @@ Store 和 Validator 不依赖 Pipeline 或模型 Provider，避免业务逻辑�
 12. v1-v4 Session 的审计和恢复语义保持不变。
 13. JSON/Markdown Brief 能解释用了哪些 Memory、为何适用、哪些被排除，以及有哪些 Candidate 待审批。
 14. 全量单元、集成、安全、恢复和并发测试通过。
+15. 时间/commit expiry 在 read-write 中先尝试有界落盘再冻结 Snapshot；失败或截断时仍确定性排除并报告诊断。在 read 中不写 Store 但同样排除，并在并发和 resume 下保持单一、可重放结果。
 
 ## 25. 后续关系
 
-本设计确认并实现后，主 Spec 第 15 节对应的 Durable Project Memory、Repository Knowledge Cache 和 Review Feedback Memory 可标记为已落地。
+本设计已经实现；主 Spec 第 15 节对应的 Durable Project Memory、Repository Knowledge Cache 和 Review Feedback Memory 已落地，并通过 Memory 定向、跨模块集成和项目全量回归。
 
 之后剩余的独立工作仍是：
 

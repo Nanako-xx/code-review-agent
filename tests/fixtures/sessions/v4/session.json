@@ -1,0 +1,95 @@
+{
+  "schema_version": 4,
+  "review_id": "fixture-session-v4",
+  "parent_review_id": null,
+  "root_review_id": "fixture-session-v4",
+  "repository": {
+    "canonical_path": "C:\\fixtures\\legacy-session-v4",
+    "git_common_dir": "C:\\fixtures\\legacy-session-v4\\.git",
+    "origin_url": null
+  },
+  "revisions": {
+    "requested_base": "fixture-base-v4",
+    "requested_head": "fixture-head-v4",
+    "resolved_base_sha": "1111111111111111111111111111111111111111",
+    "resolved_head_sha": "2222222222222222222222222222222222222222",
+    "original_base_sha": "1111111111111111111111111111111111111111",
+    "incremental_from_sha": null,
+    "change_kind": "initial"
+  },
+  "execution": {
+    "reviewer_provider": "fake",
+    "reviewer_model": "fixture-reviewer-v4",
+    "reviewer_base_url": null,
+    "reviewer_api_key_env": "FIXTURE_REVIEWER_API_KEY",
+    "reviewer_mode": "multi",
+    "reviewer_loop": "agent",
+    "non_interactive": true,
+    "risk_assessor": {
+      "mode": "model",
+      "provider": "fake",
+      "model": "fixture-risk-v4",
+      "base_url": null,
+      "api_key_env": "FIXTURE_RISK_API_KEY",
+      "max_output_tokens": 1024,
+      "max_provider_attempts": 2,
+      "max_elapsed_seconds": 30.0
+    },
+    "portfolio_planner": {
+      "mode": "model",
+      "provider": "fake",
+      "model": "fixture-planner-v4",
+      "base_url": null,
+      "api_key_env": "FIXTURE_PLANNER_API_KEY",
+      "max_output_tokens": 2048,
+      "max_provider_attempts": 3,
+      "max_elapsed_seconds": 45.0
+    },
+    "semantic_reconciler": {
+      "mode": "model",
+      "provider": "fake",
+      "model": "fixture-reconciler-v4",
+      "base_url": null,
+      "api_key_env": "FIXTURE_RECONCILER_API_KEY",
+      "max_output_tokens": 3072,
+      "max_provider_attempts": 2,
+      "max_elapsed_seconds": 50.0
+    },
+    "supplemental_policy": {
+      "version": "supplemental_policy_v1",
+      "risk_level": "high",
+      "max_waves": 2,
+      "max_tasks": 4,
+      "max_tasks_per_wave": 2,
+      "max_concurrency": 2,
+      "max_turns_per_task": 8,
+      "max_tool_calls_per_task": 16,
+      "max_tokens_per_task": 32768,
+      "max_total_tokens": 131072,
+      "max_elapsed_seconds": 300.0
+    }
+  },
+  "status": "created",
+  "current_phase": "created",
+  "last_successful_phase": null,
+  "phases": {
+    "preflight": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}},
+    "quality_gates": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}},
+    "repository_intelligence": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}},
+    "intent_discovery": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}},
+    "intent_resolution": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}},
+    "planning": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}},
+    "reviewers": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}},
+    "reconciliation_analysis": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}},
+    "supplemental_investigation": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}},
+    "reconciliation": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}},
+    "completion": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}},
+    "final_risk": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}},
+    "reporting": {"status": "pending", "attempts": 0, "started_at": null, "completed_at": null, "artifacts": [], "error": null, "tasks": {}, "user_decisions": {}}
+  },
+  "artifacts": {},
+  "errors": [],
+  "created_at": "2026-04-01T00:00:00Z",
+  "updated_at": "2026-04-01T00:00:00Z",
+  "supplemental_waves": {}
+}

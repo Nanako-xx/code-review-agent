@@ -38,15 +38,17 @@ from review_agent.memory_feedback import (
 )
 from review_agent.memory_lifecycle import (
     ApprovalResult,
-    CandidateDedupeKind,
     MemoryLifecycle,
     MemoryLifecycleError,
     MemoryLifecycleErrorCode,
 )
 from review_agent.memory_models import (
+    CandidateAuthorityReceipt,
     CandidateStatus,
     CURRENT_MEMORY_STORE_SCHEMA_VERSION,
     DurableMemoryRecord,
+    ExpiryCondition,
+    ExpiryConditionKind,
     FeedbackDecision,
     FeedbackReasonCode,
     FeedbackStatus,
@@ -66,6 +68,7 @@ from review_agent.memory_models import (
     stable_request_id,
     validate_stable_id,
 )
+from review_agent.hydration import review_request_from_dict
 from review_agent.memory_relink import (
     RepositoryAuthorityResolution,
     RepositoryRelinkConflictError,
@@ -93,9 +96,13 @@ from review_agent.memory_store import (
 from review_agent.model_adapter_factory import build_model_adapter_factory_from_config
 from review_agent.models import IntentPacket, QualityGateResult, ReviewRequest, RiskAssessment
 from review_agent.pipeline import (
+    MemoryOutboxReplayPreview,
     PipelineConfigurationError,
     PipelineError,
     ReviewPipeline,
+    validate_memory_outbox_for_replay,
+    validate_memory_outbox_replay_audit,
+    validate_memory_outbox_replay_receipt,
 )
 from review_agent.revision import RevisionResolver
 from review_agent.resume import ResumeAction, ResumeBlockedError, ReviewSessionResumer
@@ -343,6 +350,7 @@ def _add_memory_parser(subparsers: Any) -> None:
     _add_memory_common_arguments(approve, suppress_defaults=True)
     approve.add_argument("candidate_id", help="Stable MC- identifier")
     _add_memory_decision_arguments(approve)
+    _add_memory_expiry_arguments(approve)
     approve.set_defaults(memory_action="approve")
 
     reject = commands.add_parser("reject", help="Reject a validated or pending candidate")
@@ -371,6 +379,7 @@ def _add_memory_parser(subparsers: Any) -> None:
         help="Stable MC- identifier for the immutable replacement",
     )
     _add_memory_decision_arguments(revalidate)
+    _add_memory_expiry_arguments(revalidate)
     revalidate.set_defaults(memory_action="revalidate")
 
     feedback = commands.add_parser(
@@ -587,6 +596,27 @@ def _add_memory_parser(subparsers: Any) -> None:
     relink.set_defaults(memory_action="relink")
 
 
+def _add_memory_expiry_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--expires-at",
+        metavar="UTC_TIMESTAMP",
+        help="Expire when the frozen Runtime clock reaches this canonical UTC time",
+    )
+    parser.add_argument(
+        "--expires-at-commit",
+        metavar="REVISION",
+        help=(
+            "Expire when the target HEAD reaches this commit or one of its "
+            "descendants; the revision is pinned to a full object ID at preview"
+        ),
+    )
+    parser.add_argument(
+        "--no-expiry",
+        action="store_true",
+        help="Explicitly approve without expiry (or clear inherited revalidation expiry)",
+    )
+
+
 def _add_memory_common_arguments(
     parser: argparse.ArgumentParser,
     *,
@@ -761,7 +791,6 @@ _MEMORY_EXIT_USAGE = 2
 _MEMORY_EXIT_NOT_FOUND = 3
 _MEMORY_EXIT_CONFLICT = 4
 _MEMORY_OUTBOX_SCHEMA = "memory_candidate_outbox_v1"
-_MEMORY_PERSISTENCE_RECEIPT_SCHEMA = "memory_persistence_receipt_v1"
 
 _FEEDBACK_ERROR_EXIT_CODES = {
     FeedbackErrorCode.INVALID_INPUT: _MEMORY_EXIT_USAGE,
@@ -777,6 +806,7 @@ _FEEDBACK_ERROR_EXIT_CODES = {
     FeedbackErrorCode.HUMAN_DECLARATION_REQUIRED: _MEMORY_EXIT_USAGE,
     FeedbackErrorCode.VERIFIABLE_SOURCE_REQUIRED: _MEMORY_EXIT_USAGE,
     FeedbackErrorCode.SOURCE_VALIDATION_FAILED: _MEMORY_EXIT_CONFLICT,
+    FeedbackErrorCode.PROMPT_INJECTION: _MEMORY_EXIT_CONFLICT,
     FeedbackErrorCode.CONFLICTING_DECISION: _MEMORY_EXIT_CONFLICT,
     FeedbackErrorCode.AGGREGATION_LIMIT_EXCEEDED: _MEMORY_EXIT_OPERATIONAL,
     FeedbackErrorCode.DURABLE_MEMORY_CONVERSION_PROHIBITED: _MEMORY_EXIT_USAGE,
@@ -790,6 +820,7 @@ _SOURCE_ERROR_EXIT_CODES = {
     SourceValidationCode.RUNTIME_PROVENANCE_REQUIRED: _MEMORY_EXIT_CONFLICT,
     SourceValidationCode.SENSITIVITY_BLOCKED: _MEMORY_EXIT_CONFLICT,
     SourceValidationCode.SENSITIVE_CONTENT: _MEMORY_EXIT_CONFLICT,
+    SourceValidationCode.PROMPT_INJECTION: _MEMORY_EXIT_CONFLICT,
     SourceValidationCode.VALIDATION_SKIPPED: _MEMORY_EXIT_CONFLICT,
     SourceValidationCode.UNSAFE_PATH: _MEMORY_EXIT_CONFLICT,
     SourceValidationCode.REPOSITORY_UNAVAILABLE: _MEMORY_EXIT_OPERATIONAL,
@@ -869,13 +900,7 @@ class _MemoryCommandContext:
 class _CandidateRuntimeAuthority:
     provenance: TrustedCandidateProvenance
     validator: SourceValidator
-
-
-@dataclass(frozen=True)
-class _PreparedOutboxReplay:
-    outbox_digest: str
-    batch_digest: str
-    entries: tuple[tuple[str, str], ...]
+    receipt_recovery_digest: str | None = None
 
 
 def _run_memory(args: argparse.Namespace) -> int:
@@ -1296,6 +1321,7 @@ def _memory_approve(args: argparse.Namespace) -> int:
     generations = preview_context.store.get_generations(
         preview_context.repository_key
     )
+    expiry_conditions = _approval_expiry_conditions(preview_context, args)
     proposed_candidate = replace(candidate, status=CandidateStatus.PROPOSED)
     authority = _candidate_runtime_authority(preview_context, proposed_candidate)
     validation = authority.validator.validate_candidate(
@@ -1309,7 +1335,10 @@ def _memory_approve(args: argparse.Namespace) -> int:
         generations=generations,
         validation=validation,
         policy_before=None,
+        expiry_conditions=expiry_conditions,
     )
+    if authority.receipt_recovery_digest is not None:
+        preview["authority_receipt_recovery"] = True
     _emit_memory_document(
         args,
         preview,
@@ -1322,10 +1351,12 @@ def _memory_approve(args: argparse.Namespace) -> int:
     current = context.store.get_candidate(candidate.candidate_id)
     _require_repository_subject(current.repository_key, context.repository_key)
     current_head = RevisionResolver().resolve_commit(context.repository, "HEAD")
+    current_expiry_conditions = _approval_expiry_conditions(context, args)
     if (
         context.authority_resolution_hash
         != preview_context.authority_resolution_hash
         or current_head != authority.provenance.target_head_sha
+        or current_expiry_conditions != expiry_conditions
     ):
         raise _MemoryCLIError(
             "repository_changed",
@@ -1343,12 +1374,23 @@ def _memory_approve(args: argparse.Namespace) -> int:
             "the candidate authority changed after the approval preview",
             _MEMORY_EXIT_CONFLICT,
         )
+    current_authority = _persist_missing_candidate_authority_receipt(
+        context,
+        current,
+        current_authority,
+    )
+    _require_repository_head_unchanged(
+        context,
+        expected_head=current_head,
+        action="approval",
+    )
     lifecycle = MemoryLifecycle(context.store, current_authority.validator)
     result = lifecycle.approve_candidate(
         current.candidate_id,
         runtime_provenance=current_authority.provenance,
         actor=actor,
         reason=reason,
+        expiry_conditions=current_expiry_conditions,
         request_id=_decision_request_id(
             args,
             "approve",
@@ -1356,6 +1398,11 @@ def _memory_approve(args: argparse.Namespace) -> int:
             actor,
             "approved",
             reason,
+            decision_context=(
+                None
+                if not current_expiry_conditions
+                else [item.to_dict() for item in current_expiry_conditions]
+            ),
         ),
         expected_generation=generations.memory_generation,
     )
@@ -1365,6 +1412,10 @@ def _memory_approve(args: argparse.Namespace) -> int:
         "Repository: %s" % context.repository_key,
         "Candidate: %s" % result.record.candidate_id,
         "Memory: %s" % result.record.memory_id,
+        "Expiry: %s"
+        % _terminal_json(
+            [item.to_dict() for item in result.record.expiry_conditions]
+        ),
         "Event: %s" % result.write_result.event_id,
         "Generation: %d" % result.write_result.generations.memory_generation,
     ]
@@ -1520,6 +1571,11 @@ def _memory_revalidate(args: argparse.Namespace) -> int:
     generations = preview_context.store.get_generations(
         preview_context.repository_key
     )
+    expiry_conditions = _approval_expiry_conditions(
+        preview_context,
+        args,
+        inherited=predecessor.expiry_conditions,
+    )
     authority = _candidate_runtime_authority(
         preview_context,
         proposed_replacement,
@@ -1539,10 +1595,13 @@ def _memory_revalidate(args: argparse.Namespace) -> int:
             if predecessor.policy_effect is None
             else predecessor.policy_effect.to_dict()
         ),
+        expiry_conditions=expiry_conditions,
     )
     preview["predecessor_memory_id"] = predecessor.memory_id
     preview["predecessor_candidate_id"] = predecessor.candidate_id
     preview["predecessor_status"] = predecessor.status.value
+    if authority.receipt_recovery_digest is not None:
+        preview["authority_receipt_recovery"] = True
     _emit_memory_document(
         args,
         preview,
@@ -1566,10 +1625,16 @@ def _memory_revalidate(args: argparse.Namespace) -> int:
         context.repository_key,
     )
     current_head = RevisionResolver().resolve_commit(context.repository, "HEAD")
+    current_expiry_conditions = _approval_expiry_conditions(
+        context,
+        args,
+        inherited=current_predecessor.expiry_conditions,
+    )
     if (
         context.authority_resolution_hash
         != preview_context.authority_resolution_hash
         or current_head != authority.provenance.target_head_sha
+        or current_expiry_conditions != expiry_conditions
     ):
         raise _MemoryCLIError(
             "repository_changed",
@@ -1587,6 +1652,16 @@ def _memory_revalidate(args: argparse.Namespace) -> int:
             "the candidate authority changed after the revalidation preview",
             _MEMORY_EXIT_CONFLICT,
         )
+    current_authority = _persist_missing_candidate_authority_receipt(
+        context,
+        current_replacement,
+        current_authority,
+    )
+    _require_repository_head_unchanged(
+        context,
+        expected_head=current_head,
+        action="revalidation",
+    )
     lifecycle = MemoryLifecycle(context.store, current_authority.validator)
     result = lifecycle.revalidate_record(
         current_predecessor.memory_id,
@@ -1594,6 +1669,7 @@ def _memory_revalidate(args: argparse.Namespace) -> int:
         runtime_provenance=current_authority.provenance,
         actor=actor,
         reason=reason,
+        expiry_conditions=current_expiry_conditions,
         request_id=_decision_request_id(
             args,
             "revalidate",
@@ -1601,6 +1677,11 @@ def _memory_revalidate(args: argparse.Namespace) -> int:
             actor,
             current_replacement.candidate_id,
             reason,
+            decision_context=(
+                None
+                if not current_expiry_conditions
+                else [item.to_dict() for item in current_expiry_conditions]
+            ),
         ),
         expected_generation=generations.memory_generation,
     )
@@ -1612,6 +1693,10 @@ def _memory_revalidate(args: argparse.Namespace) -> int:
         "Predecessor: %s" % current_predecessor.memory_id,
         "Replacement candidate: %s" % result.record.candidate_id,
         "Replacement memory: %s" % result.record.memory_id,
+        "Expiry: %s"
+        % _terminal_json(
+            [item.to_dict() for item in result.record.expiry_conditions]
+        ),
         "Event: %s" % result.write_result.event_id,
         "Generation: %d" % result.write_result.generations.memory_generation,
     ]
@@ -1955,6 +2040,14 @@ def _memory_replay_outbox(args: argparse.Namespace) -> int:
             "the outbox replay request ID is not canonical",
             _MEMORY_EXIT_USAGE,
         ) from error
+    audit = validate_memory_outbox_replay_audit(
+        actor=actor,
+        reason=reason,
+        request_id=request_id,
+    )
+    actor = audit.actor
+    reason = audit.reason
+    request_id = audit.request_id
     generations = _context_generations(context)
     preview = _memory_envelope(
         context,
@@ -2025,7 +2118,7 @@ def _memory_replay_outbox(args: argparse.Namespace) -> int:
 def _prepare_outbox_replay(
     context: _MemoryCommandContext,
     review_id: str,
-) -> _PreparedOutboxReplay:
+) -> MemoryOutboxReplayPreview:
     """Read and bind one completed, hash-valid Session outbox for CAS."""
 
     if (
@@ -2196,144 +2289,25 @@ def _hydrate_memory_outbox(
     expected_authority_resolution_hash: str,
     expected_binding_id: str | None,
     expected_head_sha: str,
-) -> _PreparedOutboxReplay:
-    fields = {
-        "schema",
-        "review_id",
-        "repository_key",
-        "locator_repository_key",
-        "authority_resolution_hash",
-        "binding_id",
-        "head_sha",
-        "snapshot_id",
-        "batch_digest",
-        "actor_type",
-        "actor_id",
-        "reason_code",
-        "entries",
-        "outbox_digest",
-    }
-    if type(payload) is not dict or set(payload) != fields:
-        raise _MemoryCLIError(
-            "outbox_untrusted",
-            "the Session Memory outbox schema is invalid",
-            _MEMORY_EXIT_CONFLICT,
-        )
-    if (
-        payload["schema"] != _MEMORY_OUTBOX_SCHEMA
-        or payload["review_id"] != review_id
-        or payload["repository_key"] != expected_repository_key
-        or payload["locator_repository_key"]
-        != expected_locator_repository_key
-        or payload["authority_resolution_hash"]
-        != expected_authority_resolution_hash
-        or payload["binding_id"] != expected_binding_id
-        or payload["head_sha"] != expected_head_sha
-        or not _is_canonical_sha256(payload["batch_digest"])
-        or not _is_canonical_sha256(payload["outbox_digest"])
-        or not _canonical_outbox_text(payload["actor_type"])
-        or not _canonical_outbox_text(payload["actor_id"])
-        or not _canonical_outbox_text(payload["reason_code"])
-    ):
-        raise _MemoryCLIError(
-            "outbox_untrusted",
-            "the Session Memory outbox authority binding is invalid",
-            _MEMORY_EXIT_CONFLICT,
-        )
+) -> MemoryOutboxReplayPreview:
     try:
-        validate_stable_id(payload["snapshot_id"], "MSNAP", "outbox snapshot_id")
+        return validate_memory_outbox_for_replay(
+            payload,
+            review_id=review_id,
+            expected_repository_key=expected_repository_key,
+            expected_locator_repository_key=expected_locator_repository_key,
+            expected_authority_resolution_hash=(
+                expected_authority_resolution_hash
+            ),
+            expected_binding_id=expected_binding_id,
+            expected_head_sha=expected_head_sha,
+        )
     except (TypeError, ValueError) as error:
         raise _MemoryCLIError(
             "outbox_untrusted",
-            "the Session Memory outbox snapshot binding is invalid",
+            "the Session Memory outbox failed strict domain validation",
             _MEMORY_EXIT_CONFLICT,
         ) from error
-
-    raw_entries = payload["entries"]
-    if not isinstance(raw_entries, list) or len(raw_entries) > 64:
-        raise _MemoryCLIError(
-            "outbox_untrusted",
-            "the Session Memory outbox entries are invalid",
-            _MEMORY_EXIT_CONFLICT,
-        )
-    entries: list[tuple[str, str]] = []
-    candidate_ids: list[str] = []
-    request_ids: list[str] = []
-    try:
-        for entry in raw_entries:
-            if type(entry) is not dict or set(entry) != {
-                "candidate_id",
-                "candidate_hash",
-                "request_id",
-                "origin",
-                "allowed_source_refs",
-            }:
-                raise ValueError("outbox entry fields are invalid")
-            candidate_id = validate_stable_id(
-                entry["candidate_id"],
-                "MC",
-                "outbox candidate_id",
-            )
-            request_id = validate_stable_id(
-                entry["request_id"],
-                "REQ",
-                "outbox request_id",
-            )
-            if not _is_canonical_sha256(entry["candidate_hash"]):
-                raise ValueError("outbox candidate_hash is invalid")
-            if entry["origin"] not in {
-                ProducerType.LOCAL.value,
-                ProducerType.MODEL.value,
-            }:
-                raise ValueError("outbox candidate origin is invalid")
-            raw_source_refs = entry["allowed_source_refs"]
-            if not isinstance(raw_source_refs, list) or not raw_source_refs:
-                raise ValueError("outbox source allowlist is invalid")
-            source_refs = tuple(
-                SourceRef.from_dict(item) for item in raw_source_refs
-            )
-            if [item.to_dict() for item in source_refs] != raw_source_refs:
-                raise ValueError("outbox source allowlist is not canonical")
-            candidate_ids.append(candidate_id)
-            request_ids.append(request_id)
-            entries.append((candidate_id, request_id))
-    except (TypeError, ValueError) as error:
-        raise _MemoryCLIError(
-            "outbox_untrusted",
-            "the Session Memory outbox entries failed strict hydration",
-            _MEMORY_EXIT_CONFLICT,
-        ) from error
-    if (
-        candidate_ids != sorted(set(candidate_ids))
-        or len(request_ids) != len(set(request_ids))
-    ):
-        raise _MemoryCLIError(
-            "outbox_untrusted",
-            "the Session Memory outbox entries are not canonical",
-            _MEMORY_EXIT_CONFLICT,
-        )
-
-    body = {key: value for key, value in payload.items() if key != "outbox_digest"}
-    if canonical_sha256(body) != payload["outbox_digest"]:
-        raise _MemoryCLIError(
-            "outbox_untrusted",
-            "the Session Memory outbox digest is invalid",
-            _MEMORY_EXIT_CONFLICT,
-        )
-    return _PreparedOutboxReplay(
-        outbox_digest=payload["outbox_digest"],
-        batch_digest=payload["batch_digest"],
-        entries=tuple(entries),
-    )
-
-
-def _canonical_outbox_text(value: Any) -> bool:
-    return (
-        type(value) is str
-        and value == value.strip()
-        and 1 <= len(value) <= 512
-        and all(character.isprintable() for character in value)
-    )
 
 
 def _replay_memory_outbox_via_service(
@@ -2412,6 +2386,7 @@ def _replay_memory_outbox_via_service(
         _MemoryCLIError,
         MemoryStoreError,
         RepositoryRelinkConflictError,
+        SourceValidationError,
     ):
         raise
     except Exception as error:
@@ -2434,161 +2409,22 @@ def _validate_outbox_replay_receipt(
     expected_batch_digest: str,
     expected_entries: tuple[tuple[str, str], ...],
 ) -> Mapping[str, Any]:
-    required_fields = {
-        "schema",
-        "success",
-        "review_id",
-        "repository_key",
-        "locator_repository_key",
-        "authority_resolution_hash",
-        "binding_id",
-        "outbox_digest",
-        "batch_digest",
-        "persisted_candidate_ids",
-        "replayed_candidate_ids",
-        "results",
-        "receipt_digest",
-    }
-    if type(receipt) is not dict or set(receipt) != required_fields:
-        raise _invalid_outbox_receipt()
-    if (
-        receipt["schema"] != _MEMORY_PERSISTENCE_RECEIPT_SCHEMA
-        or receipt["success"] is not True
-        or receipt["review_id"] != review_id
-        or receipt["repository_key"] != expected_repository_key
-        or receipt["locator_repository_key"]
-        != expected_locator_repository_key
-        or receipt["authority_resolution_hash"]
-        != expected_authority_resolution_hash
-        or receipt["binding_id"] != expected_binding_id
-        or receipt["outbox_digest"] != expected_outbox_digest
-        or receipt["batch_digest"] != expected_batch_digest
-        or not _is_canonical_sha256(receipt["receipt_digest"])
-    ):
-        raise _invalid_outbox_receipt()
-
-    receipt_body = {
-        key: value for key, value in receipt.items() if key != "receipt_digest"
-    }
-    if canonical_sha256(receipt_body) != receipt["receipt_digest"]:
-        raise _invalid_outbox_receipt()
-
-    persisted = _canonical_candidate_id_list(
-        receipt["persisted_candidate_ids"]
-    )
-    replayed = _canonical_candidate_id_list(
-        receipt["replayed_candidate_ids"]
-    )
-    if persisted is None or replayed is None or set(persisted) & set(replayed):
-        raise _invalid_outbox_receipt()
-    expected_entry_map = dict(expected_entries)
-    expected_results = set(expected_entry_map)
-    if {*persisted, *replayed} != expected_results:
-        raise _invalid_outbox_receipt()
-    raw_results = receipt["results"]
-    if not isinstance(raw_results, list) or len(raw_results) != len(
-        expected_results
-    ):
-        raise _invalid_outbox_receipt()
-    hydrated_results: list[
-        tuple[
-            str,
-            str,
-            bool,
-            CandidateStatus,
-            CandidateDedupeKind,
-            tuple[WriteResult, ...],
-        ]
-    ] = []
     try:
-        for row in raw_results:
-            if type(row) is not dict or set(row) != {
-                "candidate_id",
-                "request_id",
-                "replayed",
-                "status",
-                "dedupe",
-                "validation_report_hash",
-                "write_results",
-            }:
-                raise ValueError("receipt result fields are invalid")
-            candidate_id = validate_stable_id(
-                row["candidate_id"],
-                "MC",
-                "receipt candidate_id",
-            )
-            row_request_id = validate_stable_id(
-                row["request_id"],
-                "REQ",
-                "receipt request_id",
-            )
-            if type(row["replayed"]) is not bool:
-                raise ValueError("receipt replayed flag is invalid")
-            status = CandidateStatus(row["status"])
-            dedupe = CandidateDedupeKind(row["dedupe"])
-            if not _is_canonical_sha256(row["validation_report_hash"]):
-                raise ValueError("receipt validation report hash is invalid")
-            raw_write_results = row["write_results"]
-            if not isinstance(raw_write_results, list) or len(raw_write_results) > 4:
-                raise ValueError("receipt write results are invalid")
-            write_results = tuple(
-                WriteResult.from_dict(item) for item in raw_write_results
-            )
-            if [item.to_dict() for item in write_results] != raw_write_results:
-                raise ValueError("non-canonical write result")
-            hydrated_results.append(
-                (
-                    candidate_id,
-                    row_request_id,
-                    row["replayed"],
-                    status,
-                    dedupe,
-                    write_results,
-                )
-            )
+        return validate_memory_outbox_replay_receipt(
+            receipt,
+            review_id=review_id,
+            expected_repository_key=expected_repository_key,
+            expected_locator_repository_key=expected_locator_repository_key,
+            expected_authority_resolution_hash=(
+                expected_authority_resolution_hash
+            ),
+            expected_binding_id=expected_binding_id,
+            expected_outbox_digest=expected_outbox_digest,
+            expected_batch_digest=expected_batch_digest,
+            expected_entries=expected_entries,
+        )
     except (MemoryStoreError, TypeError, ValueError):
         raise _invalid_outbox_receipt() from None
-    result_ids = [candidate_id for candidate_id, *_ in hydrated_results]
-    if (
-        len(result_ids) != len(set(result_ids))
-        or result_ids != [candidate_id for candidate_id, _ in expected_entries]
-        or set(result_ids) != expected_results
-        or any(
-            expected_entry_map[candidate_id] != row_request_id
-            or replayed_flag != (candidate_id in set(replayed))
-            or (not replayed_flag and not write_results)
-            or any(
-                result.operation not in {"put_candidate", "transition_candidate"}
-                or result.subject_id != candidate_id
-                for result in write_results
-            )
-            for (
-                candidate_id,
-                row_request_id,
-                replayed_flag,
-                _status,
-                _dedupe,
-                write_results,
-            ) in hydrated_results
-        )
-    ):
-        raise _invalid_outbox_receipt()
-    return receipt
-
-
-def _canonical_candidate_id_list(value: Any) -> list[str] | None:
-    if not isinstance(value, list):
-        return None
-    try:
-        canonical = [
-            validate_stable_id(item, "MC", "replay candidate_id")
-            for item in value
-        ]
-    except (TypeError, ValueError):
-        return None
-    if canonical != sorted(set(canonical)):
-        return None
-    return canonical
 
 
 def _is_canonical_sha256(value: Any) -> bool:
@@ -3143,6 +2979,8 @@ def _record_human_lines(
         "Valid from: %s" % record.valid_from_sha,
         "Validity: %s"
         % ", ".join(item.value for item in record.validity_policies),
+        "Expiry: %s"
+        % _terminal_json([item.to_dict() for item in record.expiry_conditions]),
         "Policy: %s"
         % _terminal_json(
             None if record.policy_effect is None else record.policy_effect.to_dict()
@@ -3199,10 +3037,21 @@ def _candidate_runtime_authority(
         if target_head is None
         else target_head
     )
-    receipt = context.store.select_candidate_authority_receipt(
-        candidate.candidate_id,
-        authority_resolution_hash=context.authority_resolution_hash,
-    )
+    try:
+        receipt = context.store.select_candidate_authority_receipt(
+            candidate.candidate_id,
+            authority_resolution_hash=context.authority_resolution_hash,
+        )
+    except MemoryStoreError as error:
+        if error.code is not MemoryStoreErrorCode.NOT_FOUND:
+            raise
+        if context.store.list_candidate_authority_receipts(candidate.candidate_id):
+            raise
+        return _legacy_v1_candidate_runtime_authority(
+            context,
+            candidate,
+            current_target=current_target,
+        )
     if (
         receipt.locator_repository_key != context.locator_repository_key
         or receipt.authority_repository_key != context.repository_key
@@ -3223,9 +3072,22 @@ def _candidate_runtime_authority(
         binding_id=context.binding_id,
         allowed_source_refs=receipt.authorized_source_refs,
     )
+    declarations = receipt.human_declarations
+    legacy_receipt_ids: tuple[str, ...] = ()
+    if not declarations and any(
+        isinstance(source_ref, HumanDeclarationSourceRef)
+        for source_ref in candidate.source_refs
+    ):
+        declarations = _legacy_session_bound_declarations(
+            context,
+            candidate,
+            receipt,
+        )
+        legacy_receipt_ids = (receipt.receipt_id,)
     validator = SourceValidator(
         context.repository,
-        human_declarations=receipt.human_declarations,
+        human_declarations=declarations,
+        legacy_missing_declaration_receipt_ids=legacy_receipt_ids,
     )
     restoration = validator.restore_candidate_authority(
         receipt,
@@ -3239,11 +3101,396 @@ def _candidate_runtime_authority(
     )
 
 
+def _legacy_v1_candidate_runtime_authority(
+    context: _MemoryCommandContext,
+    candidate: MemoryCandidate,
+    *,
+    current_target: str,
+) -> _CandidateRuntimeAuthority:
+    """Prepare receipt restoration only from the Candidate's exact v5 Session.
+
+    A migrated v1 Store legitimately has no candidate-authority table contents.
+    Candidate producer metadata is never substituted for authority: the original
+    completed, hash-valid outbox supplies origin and source allowlist, while the
+    original request supplies any human declaration text.  This function is
+    read-only so an interactive approval preview cannot mutate the Store.
+    """
+
+    review_id = candidate.origin_review_id
+    try:
+        before = _prepare_outbox_replay(context, review_id)
+        checkpoint = CheckpointStore(context.repository, review_id, create=False)
+        session_store = SessionStore(checkpoint.run_dir)
+        manifest = session_store.load()
+        descriptor = manifest.artifacts.get("memory_outbox")
+        if descriptor is None:
+            raise ValueError("legacy candidate Session has no Memory outbox")
+        payload = _read_bounded_session_json(
+            session_store,
+            descriptor,
+            max_bytes=8 * 1024 * 1024,
+        )
+        hydrated = _hydrate_memory_outbox(
+            payload,
+            review_id=review_id,
+            expected_repository_key=context.repository_key,
+            expected_locator_repository_key=context.locator_repository_key,
+            expected_authority_resolution_hash=context.authority_resolution_hash,
+            expected_binding_id=context.binding_id,
+            expected_head_sha=manifest.revisions.resolved_head_sha,
+        )
+        after = _prepare_outbox_replay(context, review_id)
+        if before != hydrated or after != hydrated:
+            raise ValueError("legacy candidate Session changed during authority recovery")
+
+        matching = [
+            row
+            for row in payload["entries"]
+            if row["candidate_id"] == candidate.candidate_id
+        ]
+        if len(matching) != 1:
+            raise ValueError("legacy candidate is not uniquely bound to its outbox")
+        entry = matching[0]
+        origin = ProducerType(entry["origin"])
+        allowed_source_refs = tuple(
+            SourceRef.from_dict(item) for item in entry["allowed_source_refs"]
+        )
+        proposal_head = str(payload["head_sha"])
+        if (
+            candidate.origin_review_id != review_id
+            or candidate.valid_from_sha != proposal_head
+            or current_target != proposal_head
+            or candidate.repository_key != payload["repository_key"]
+            or canonical_sha256(candidate.to_dict()) != entry["candidate_hash"]
+            or candidate.source_refs != allowed_source_refs
+        ):
+            raise ValueError("legacy candidate does not match its trusted outbox")
+
+        declarations = _session_bound_candidate_declarations(
+            context,
+            candidate,
+            review_id=review_id,
+            proposal_head_sha=proposal_head,
+            locator_repository_key=str(payload["locator_repository_key"]),
+            origin=origin,
+        )
+        provenance = TrustedCandidateProvenance(
+            origin=origin,
+            review_id=review_id,
+            target_head_sha=current_target,
+            locator_repository_key=context.locator_repository_key,
+            authority_repository_key=context.repository_key,
+            authority_resolution_hash=context.authority_resolution_hash,
+            binding_id=context.binding_id,
+            allowed_source_refs=allowed_source_refs,
+        )
+        recovery_digest = canonical_sha256(
+            {
+                "schema": "legacy_v1_candidate_authority_recovery_v1",
+                "candidate_id": candidate.candidate_id,
+                "outbox_digest": payload["outbox_digest"],
+                "entry_request_id": entry["request_id"],
+            }
+        )
+        return _CandidateRuntimeAuthority(
+            provenance=provenance,
+            validator=SourceValidator(
+                context.repository,
+                human_declarations=declarations,
+            ),
+            receipt_recovery_digest=recovery_digest,
+        )
+    except _MemoryCLIError:
+        raise
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise _MemoryCLIError(
+            "legacy_authority_session_untrusted",
+            "the migrated candidate requires its exact trusted Session request and outbox",
+            _MEMORY_EXIT_CONFLICT,
+        ) from error
+
+
+def _persist_missing_candidate_authority_receipt(
+    context: _MemoryCommandContext,
+    candidate: MemoryCandidate,
+    authority: _CandidateRuntimeAuthority,
+) -> _CandidateRuntimeAuthority:
+    """Persist a prepared v1 recovery after confirmation, then re-read it."""
+
+    recovery_digest = authority.receipt_recovery_digest
+    if recovery_digest is None:
+        return authority
+    if context.store is None:
+        raise _MemoryCLIError(
+            "store_not_found",
+            "candidate authority recovery requires an existing Memory Store",
+            _MEMORY_EXIT_NOT_FOUND,
+        )
+    proposed = replace(candidate, status=CandidateStatus.PROPOSED)
+    receipt_provenance = replace(
+        authority.provenance,
+        target_head_sha=proposed.valid_from_sha,
+    )
+    try:
+        restored = MemoryLifecycle(context.store, authority.validator).submit_candidate(
+            proposed,
+            runtime_provenance=receipt_provenance,
+            request_id=stable_request_id(
+                "legacy_v1_candidate_authority_recovery",
+                candidate.candidate_id,
+                recovery_digest,
+            ),
+            require_no_authority_receipts=True,
+        )
+    except (MemoryLifecycleError, MemoryStoreError) as error:
+        raise _MemoryCLIError(
+            "legacy_authority_restore_failed",
+            "the migrated candidate authority receipt could not be restored",
+            _MEMORY_EXIT_CONFLICT,
+        ) from error
+    if (
+        not restored.persisted
+        or restored.candidate_id != candidate.candidate_id
+        or not restored.write_results
+        or any(
+            write.operation != "put_candidate"
+            or write.subject_id != candidate.candidate_id
+            for write in restored.write_results
+        )
+    ):
+        raise _MemoryCLIError(
+            "legacy_authority_restore_failed",
+            "the migrated candidate authority restoration was not auditable",
+            _MEMORY_EXIT_CONFLICT,
+        )
+
+    refreshed = _candidate_runtime_authority(
+        context,
+        proposed,
+        target_head=authority.provenance.target_head_sha,
+    )
+    if (
+        refreshed.receipt_recovery_digest is not None
+        or refreshed.provenance != authority.provenance
+    ):
+        raise _MemoryCLIError(
+            "legacy_authority_restore_failed",
+            "the migrated candidate authority changed during restoration",
+            _MEMORY_EXIT_CONFLICT,
+        )
+    return refreshed
+
+
+def _legacy_session_bound_declarations(
+    context: _MemoryCommandContext,
+    candidate: MemoryCandidate,
+    receipt: CandidateAuthorityReceipt,
+) -> tuple[HumanDeclarationAuthority, ...]:
+    """Recover a pre-fix Curator receipt only from its hash-bound Session request.
+
+    Candidate text and persisted SourceRefs never supply declaration authority.
+    This compatibility path is deliberately narrow: it accepts only LOCAL/MODEL
+    receipts that omitted declarations under the previous writer and requires the
+    original, completed Session request artifact to reproduce every declaration.
+    """
+
+    human_refs = tuple(
+        source_ref
+        for source_ref in candidate.source_refs
+        if isinstance(source_ref, HumanDeclarationSourceRef)
+    )
+    if (
+        not human_refs
+        or receipt.origin not in {ProducerType.LOCAL, ProducerType.MODEL}
+        or receipt.human_declarations
+        or receipt.review_id != candidate.origin_review_id
+    ):
+        raise _MemoryCLIError(
+            "legacy_authority_invalid",
+            "the stored legacy candidate authority is not eligible for Session restoration",
+            _MEMORY_EXIT_CONFLICT,
+        )
+    return _session_bound_candidate_declarations(
+        context,
+        candidate,
+        review_id=receipt.review_id,
+        proposal_head_sha=receipt.proposal_head_sha,
+        locator_repository_key=receipt.locator_repository_key,
+        origin=receipt.origin,
+    )
+
+
+def _session_bound_candidate_declarations(
+    context: _MemoryCommandContext,
+    candidate: MemoryCandidate,
+    *,
+    review_id: str,
+    proposal_head_sha: str,
+    locator_repository_key: str,
+    origin: ProducerType,
+) -> tuple[HumanDeclarationAuthority, ...]:
+    """Validate the exact Session request and recover its project-rule text."""
+
+    human_refs = tuple(
+        source_ref
+        for source_ref in candidate.source_refs
+        if isinstance(source_ref, HumanDeclarationSourceRef)
+    )
+    if (
+        origin not in {ProducerType.LOCAL, ProducerType.MODEL}
+        or review_id != candidate.origin_review_id
+    ):
+        raise _MemoryCLIError(
+            "legacy_authority_invalid",
+            "the stored legacy candidate authority is not eligible for Session restoration",
+            _MEMORY_EXIT_CONFLICT,
+        )
+
+    try:
+        checkpoint = CheckpointStore(
+            context.repository,
+            review_id,
+            create=False,
+        )
+        session_store = SessionStore(checkpoint.run_dir)
+        manifest = session_store.load()
+        request_descriptor = manifest.artifacts.get("request")
+        preflight = manifest.phases.get(RunPhase.PREFLIGHT.value)
+        if (
+            manifest.review_id != review_id
+            or manifest.status is not RunStatus.COMPLETED
+            or canonical_repository_key(manifest.repository)
+            != locator_repository_key
+            or manifest.revisions.resolved_head_sha.casefold()
+            != proposal_head_sha.casefold()
+            or request_descriptor is None
+            or request_descriptor.schema != artifact_schema("request")
+            or request_descriptor.phase is not RunPhase.PREFLIGHT
+            or preflight is None
+            or preflight.status is not PhaseStatus.COMPLETED
+            or request_descriptor.name not in preflight.artifacts
+            or not session_store.validate_artifact(request_descriptor)
+        ):
+            raise ValueError("legacy authority Session binding is invalid")
+        request = review_request_from_dict(
+            _read_bounded_session_json(
+                session_store,
+                request_descriptor,
+                max_bytes=8 * 1024 * 1024,
+            )
+        )
+
+        declarations: list[HumanDeclarationAuthority] = []
+        for source_ref in human_refs:
+            matches = [
+                statement
+                for index, statement in enumerate(request.project_rules)
+                if stable_request_id(
+                    "memory_project_rule",
+                    review_id,
+                    index,
+                    statement,
+                )
+                == source_ref.request_id
+            ]
+            if len(matches) != 1:
+                raise ValueError("legacy authority declaration is not Session-bound")
+            statement = matches[0]
+            if (
+                source_ref.review_id != review_id
+                or source_ref.actor != "review-cli"
+                or hashlib.sha256(statement.encode("utf-8")).hexdigest()
+                != source_ref.declaration_hash
+            ):
+                raise ValueError("legacy authority declaration does not match")
+            declarations.append(
+                HumanDeclarationAuthority(
+                    source_ref=source_ref,
+                    origin=HumanDeclarationOrigin.CLI_REQUEST,
+                    declaration=statement,
+                )
+            )
+        canonical = tuple(sorted(declarations, key=lambda item: item.to_json()))
+        if len(canonical) != len(human_refs):
+            raise ValueError("legacy authority declaration set is incomplete")
+        return canonical
+    except _MemoryCLIError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise _MemoryCLIError(
+            "legacy_authority_session_untrusted",
+            "the legacy candidate authority requires its exact trusted Session request",
+            _MEMORY_EXIT_CONFLICT,
+        ) from error
+
+
+def _require_repository_head_unchanged(
+    context: _MemoryCommandContext,
+    *,
+    expected_head: str,
+    action: str,
+) -> None:
+    current_head = RevisionResolver().resolve_commit(context.repository, "HEAD")
+    if current_head != expected_head:
+        raise _MemoryCLIError(
+            "repository_changed",
+            "the repository HEAD changed during Memory %s" % action,
+            _MEMORY_EXIT_CONFLICT,
+        )
+
+
 def _decision_fields(args: argparse.Namespace) -> tuple[str, str]:
     return (
         _required_cli_text(args.actor, "actor"),
         _required_cli_text(args.reason, "reason"),
     )
+
+
+def _approval_expiry_conditions(
+    context: _MemoryCommandContext,
+    args: argparse.Namespace,
+    *,
+    inherited: tuple[ExpiryCondition, ...] = (),
+) -> tuple[ExpiryCondition, ...]:
+    conditions: list[ExpiryCondition] = []
+    expires_at = getattr(args, "expires_at", None)
+    expires_at_commit = getattr(args, "expires_at_commit", None)
+    no_expiry = bool(getattr(args, "no_expiry", False))
+    if no_expiry and (expires_at is not None or expires_at_commit is not None):
+        raise _MemoryCLIError(
+            "expiry_condition_invalid",
+            "--no-expiry cannot be combined with an expiry condition",
+            _MEMORY_EXIT_USAGE,
+        )
+    if no_expiry:
+        return ()
+    if expires_at is None and expires_at_commit is None:
+        return tuple(inherited)
+    try:
+        if expires_at is not None:
+            conditions.append(
+                ExpiryCondition(
+                    condition_kind=ExpiryConditionKind.AT_TIME,
+                    value=expires_at,
+                )
+            )
+        if expires_at_commit is not None:
+            conditions.append(
+                ExpiryCondition(
+                    condition_kind=ExpiryConditionKind.AT_COMMIT,
+                    value=RevisionResolver().resolve_commit(
+                        context.repository,
+                        expires_at_commit,
+                    ),
+                )
+            )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise _MemoryCLIError(
+            "expiry_condition_invalid",
+            "the approval expiry condition is not a canonical time or repository commit",
+            _MEMORY_EXIT_USAGE,
+        ) from error
+    return tuple(sorted(conditions, key=lambda item: item.condition_kind.value))
 
 
 def _required_cli_text(value: Any, label: str) -> str:
@@ -3263,18 +3510,23 @@ def _decision_request_id(
     actor: str,
     reason_code: str,
     reason: str,
+    *,
+    decision_context: Any = None,
 ) -> str:
     supplied = getattr(args, "request_id", None)
     if supplied is not None:
         return supplied
-    return stable_request_id(
+    identity: list[Any] = [
         _MEMORY_CLI_SCHEMA,
         action,
         subject_id,
         actor,
         reason_code,
         reason,
-    )
+    ]
+    if decision_context is not None:
+        identity.append(decision_context)
+    return stable_request_id(*identity)
 
 
 def _candidate_decision_preview(
@@ -3285,6 +3537,7 @@ def _candidate_decision_preview(
     generations: GenerationMetadata,
     validation: SourceValidationReport,
     policy_before: Mapping[str, Any] | None,
+    expiry_conditions: tuple[ExpiryCondition, ...],
 ) -> dict[str, Any]:
     policy_after = (
         None
@@ -3306,6 +3559,9 @@ def _candidate_decision_preview(
             "validity": {
                 "valid_from_sha": candidate.valid_from_sha,
                 "policies": [item.value for item in candidate.validity_policies],
+                "expiry_conditions": [
+                    item.to_dict() for item in expiry_conditions
+                ],
             },
             "policy_diff": {
                 "before": policy_before,
@@ -3330,6 +3586,10 @@ def _candidate_preview_human_lines(preview: Mapping[str, Any]) -> list[str]:
     ]
     if "predecessor_memory_id" in preview:
         lines.append("Predecessor: %s" % preview["predecessor_memory_id"])
+    if preview.get("authority_receipt_recovery") is True:
+        lines.append(
+            "Authority receipt: restore from exact completed Session after confirmation"
+        )
     lines.extend(
         [
             "Candidate: %s" % preview["candidate_id"],
@@ -3431,6 +3691,9 @@ def _approval_result_payload(
             "applied": result.write_result.applied,
             "replayed": result.write_result.replayed,
             "status": result.record.status.value,
+            "expiry_conditions": [
+                item.to_dict() for item in result.record.expiry_conditions
+            ],
         }
     )
     return payload

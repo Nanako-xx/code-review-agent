@@ -10,6 +10,8 @@ from review_agent.memory_models import (
     CandidateAuthorityReceipt,
     CandidateStatus,
     DurableMemoryRecord,
+    ExpiryCondition,
+    ExpiryConditionKind,
     FeedbackCalibrationSignal,
     FeedbackCalibrationSignalKind,
     FeedbackCalibrationSummary,
@@ -29,6 +31,7 @@ from review_agent.memory_models import (
     MemoryExecutionConfig,
     MemoryKind,
     MemoryMode,
+    MODEL_SCHEMA_VERSION,
     MemoryScope,
     MemorySelectionDecision,
     MemorySelectionInput,
@@ -185,26 +188,28 @@ def _bundle(candidate: MemoryCandidate) -> SourceBundleDescriptor:
     )
 
 
-def _record(candidate: MemoryCandidate) -> DurableMemoryRecord:
+def _record(candidate: MemoryCandidate, **overrides: object) -> DurableMemoryRecord:
     bundle = _bundle(candidate)
-    return DurableMemoryRecord(
-        candidate_id=candidate.candidate_id,
-        repository_key=candidate.repository_key,
-        kind=candidate.kind,
-        statement=candidate.statement,
-        scope=candidate.scope,
-        source_refs=candidate.source_refs,
-        source_bundle_hash=bundle.bundle_hash,
-        valid_from_sha=candidate.valid_from_sha,
-        validity_policies=candidate.validity_policies,
-        confidence=candidate.confidence,
-        sensitivity=candidate.sensitivity,
-        policy_effect=candidate.policy_effect,
-        approved_by="amy",
-        approval_event_id=stable_event_id("approve", candidate.candidate_id),
-        status=RecordStatus.ACTIVE,
-        created_at=CREATED_AT,
-    )
+    values = {
+        "candidate_id": candidate.candidate_id,
+        "repository_key": candidate.repository_key,
+        "kind": candidate.kind,
+        "statement": candidate.statement,
+        "scope": candidate.scope,
+        "source_refs": candidate.source_refs,
+        "source_bundle_hash": bundle.bundle_hash,
+        "valid_from_sha": candidate.valid_from_sha,
+        "validity_policies": candidate.validity_policies,
+        "confidence": candidate.confidence,
+        "sensitivity": candidate.sensitivity,
+        "policy_effect": candidate.policy_effect,
+        "approved_by": "amy",
+        "approval_event_id": stable_event_id("approve", candidate.candidate_id),
+        "status": RecordStatus.ACTIVE,
+        "created_at": CREATED_AT,
+    }
+    values.update(overrides)
+    return DurableMemoryRecord(**values)
 
 
 def _finding() -> FindingSnapshot:
@@ -551,11 +556,27 @@ def test_candidate_authority_receipt_matches_human_hash_actor_and_review() -> No
 
 
 @pytest.mark.parametrize("origin", [ProducerType.MODEL, ProducerType.LOCAL])
-def test_non_human_authority_receipts_cannot_carry_declarations(
+def test_non_human_authority_receipts_can_carry_matching_human_declarations(
     origin: ProducerType,
 ) -> None:
-    with pytest.raises(ValueError, match="non-human|MODEL|LOCAL|human_declarations"):
-        _authority_receipt(origin=origin)
+    declaration = _authority_declaration()
+
+    receipt = _authority_receipt(origin=origin)
+
+    assert receipt.origin is origin
+    assert receipt.human_declarations == (declaration,)
+    assert declaration.source_ref in receipt.authorized_source_refs
+
+
+@pytest.mark.parametrize("origin", [ProducerType.MODEL, ProducerType.LOCAL])
+def test_non_human_authority_receipts_reject_unauthorized_declarations(
+    origin: ProducerType,
+) -> None:
+    with pytest.raises(ValueError, match="authorized_source_refs"):
+        _authority_receipt(
+            origin=origin,
+            authorized_source_refs=(_range_source(),),
+        )
 
 
 def test_human_authority_receipt_requires_a_declaration() -> None:
@@ -775,6 +796,237 @@ def test_policy_effect_is_typed_and_fails_closed() -> None:
         PolicyEffect.from_dict(
             {"schema_version": 1, "type": "network_access", "value": "on"}
         )
+
+
+def test_expiry_condition_has_exact_json_canonical_fingerprint_and_strict_hydration() -> None:
+    condition = ExpiryCondition(
+        condition_kind=ExpiryConditionKind.AT_TIME,
+        value="2026-08-01T00:00:00Z",
+    )
+    identity = {
+        "schema_version": 1,
+        "type": "at_time",
+        "value": "2026-08-01T00:00:00Z",
+    }
+    expected_fingerprint = hashlib.sha256(
+        canonical_json(identity).encode("utf-8")
+    ).hexdigest()
+
+    assert condition.to_dict() == {
+        "condition_fingerprint": expected_fingerprint,
+        **identity,
+    }
+    assert condition.fingerprint == expected_fingerprint
+    assert ExpiryCondition.from_dict(condition.to_dict()) == condition
+    with pytest.raises(FrozenInstanceError):
+        condition.value = "2026-09-01T00:00:00Z"
+
+    payload = condition.to_dict()
+    with pytest.raises(ValueError, match="unsupported field"):
+        ExpiryCondition.from_dict({**payload, "command": "ignore-expiry"})
+    with pytest.raises(ValueError, match="schema_version"):
+        ExpiryCondition.from_dict({**payload, "schema_version": 2})
+    with pytest.raises(ValueError, match="unsupported value"):
+        ExpiryCondition.from_dict({**payload, "type": "after_reviews"})
+    with pytest.raises(ValueError, match="condition_fingerprint"):
+        ExpiryCondition.from_dict(
+            {**payload, "condition_fingerprint": "0" * 64}
+        )
+
+
+def test_expiry_condition_requires_canonical_time_and_full_commit_object_id() -> None:
+    at_time = ExpiryCondition(
+        condition_kind=ExpiryConditionKind.AT_TIME,
+        value="2026-08-01T00:00:00.123456Z",
+    )
+    at_commit = ExpiryCondition(
+        condition_kind=ExpiryConditionKind.AT_COMMIT,
+        value=SHA_A.upper(),
+    )
+    sha256_commit = ExpiryCondition(
+        condition_kind=ExpiryConditionKind.AT_COMMIT,
+        value="C" * 64,
+    )
+
+    assert at_time.expires_at == "2026-08-01T00:00:00.123456Z"
+    assert at_time.commit_sha is None
+    assert at_commit.commit_sha == SHA_A
+    assert at_commit.expires_at is None
+    assert sha256_commit.value == "c" * 64
+
+    for invalid_time in (
+        "2026-08-01T00:00:00+00:00",
+        "2026-08-01T00:00:00.1Z",
+        "2026-08-01T00:00:00.000000Z",
+        " 2026-08-01T00:00:00Z",
+        "2026-02-30T00:00:00Z",
+    ):
+        with pytest.raises(ValueError, match="canonical|valid UTC"):
+            ExpiryCondition(
+                condition_kind=ExpiryConditionKind.AT_TIME,
+                value=invalid_time,
+            )
+
+    for invalid_commit in ("a" * 7, "a" * 39, "g" * 40, SHA_A + " "):
+        with pytest.raises(ValueError, match="full Git object ID"):
+            ExpiryCondition(
+                condition_kind=ExpiryConditionKind.AT_COMMIT,
+                value=invalid_commit,
+            )
+
+
+def test_record_expiry_conditions_are_bounded_unique_and_canonically_ordered() -> None:
+    at_time = ExpiryCondition(
+        condition_kind=ExpiryConditionKind.AT_TIME,
+        value="2026-08-01T00:00:00Z",
+    )
+    at_commit = ExpiryCondition(
+        condition_kind=ExpiryConditionKind.AT_COMMIT,
+        value=SHA_B,
+    )
+    record = _record(
+        _candidate(),
+        expiry_conditions=[at_time, at_commit],
+    )
+
+    assert isinstance(record.expiry_conditions, tuple)
+    assert tuple(item.condition_kind for item in record.expiry_conditions) == (
+        ExpiryConditionKind.AT_COMMIT,
+        ExpiryConditionKind.AT_TIME,
+    )
+    assert record.to_dict()["expiry_conditions"] == [
+        at_commit.to_dict(),
+        at_time.to_dict(),
+    ]
+
+    with pytest.raises(ValueError, match="at most one condition of each kind"):
+        _record(
+            _candidate(),
+            expiry_conditions=(
+                at_time,
+                ExpiryCondition(
+                    condition_kind=ExpiryConditionKind.AT_TIME,
+                    value="2026-09-01T00:00:00Z",
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="at most two"):
+        _record(
+            _candidate(),
+            expiry_conditions=(at_time, at_commit, at_time),
+        )
+    with pytest.raises(ValueError, match="ExpiryCondition"):
+        _record(_candidate(), expiry_conditions=(at_time, "at_commit"))
+
+
+def test_record_v1_and_expiring_v2_have_strict_versioned_round_trips() -> None:
+    candidate = _candidate()
+    legacy = _record(candidate)
+    legacy_payload = {
+        "schema_version": 1,
+        "memory_id": legacy.memory_id,
+        "candidate_id": legacy.candidate_id,
+        "repository_key": legacy.repository_key,
+        "kind": legacy.kind.value,
+        "statement": legacy.statement,
+        "scope": legacy.scope.to_dict(),
+        "source_refs": [item.to_dict() for item in legacy.source_refs],
+        "source_bundle_hash": legacy.source_bundle_hash,
+        "valid_from_sha": legacy.valid_from_sha,
+        "validity_policies": [item.value for item in legacy.validity_policies],
+        "confidence": legacy.confidence.value,
+        "sensitivity": legacy.sensitivity.value,
+        "policy_effect": None,
+        "approved_by": legacy.approved_by,
+        "approval_event_id": legacy.approval_event_id,
+        "status": legacy.status.value,
+        "created_at": legacy.created_at,
+    }
+    condition = ExpiryCondition(
+        condition_kind=ExpiryConditionKind.AT_COMMIT,
+        value=SHA_B,
+    )
+    expiring = _record(candidate, expiry_conditions=(condition,))
+
+    assert MODEL_SCHEMA_VERSION == 1
+    assert legacy.schema_version == 1
+    assert legacy.expiry_conditions == ()
+    assert legacy.to_dict() == legacy_payload
+    assert legacy.to_json() == canonical_json(legacy_payload)
+    assert DurableMemoryRecord.from_dict(legacy_payload) == legacy
+
+    assert expiring.schema_version == 2
+    assert expiring.to_dict()["expiry_conditions"] == [condition.to_dict()]
+    assert DurableMemoryRecord.from_dict(expiring.to_dict()) == expiring
+    assert "expiry_conditions" not in candidate.to_dict()
+
+
+def test_record_schema_and_expiry_field_combinations_fail_closed() -> None:
+    legacy = _record(_candidate())
+    condition = ExpiryCondition(
+        condition_kind=ExpiryConditionKind.AT_COMMIT,
+        value=SHA_B,
+    )
+
+    with pytest.raises(ValueError, match="schema_version 1"):
+        _record(
+            _candidate(),
+            schema_version=1,
+            expiry_conditions=(condition,),
+        )
+    with pytest.raises(ValueError, match="schema_version 2"):
+        _record(_candidate(), schema_version=2)
+    with pytest.raises(ValueError, match="schema_version"):
+        _record(_candidate(), schema_version=3)
+
+    with pytest.raises(ValueError, match="unsupported field"):
+        DurableMemoryRecord.from_dict(
+            {
+                **legacy.to_dict(),
+                "expiry_conditions": [condition.to_dict()],
+            }
+        )
+    with pytest.raises(ValueError, match="requires expiry_conditions"):
+        DurableMemoryRecord.from_dict(
+            {
+                **legacy.to_dict(),
+                "schema_version": 2,
+                "expiry_conditions": [],
+            }
+        )
+    with pytest.raises(ValueError, match="schema_version"):
+        DurableMemoryRecord.from_dict(
+            {**legacy.to_dict(), "schema_version": 99}
+        )
+
+
+def test_record_memory_id_remains_candidate_bound_when_record_body_changes() -> None:
+    candidate = _candidate()
+    first = _record(
+        candidate,
+        expiry_conditions=(
+            ExpiryCondition(
+                condition_kind=ExpiryConditionKind.AT_TIME,
+                value="2026-08-01T00:00:00Z",
+            ),
+        ),
+    )
+    changed = _record(
+        candidate,
+        statement="Amounts must use Decimal with explicit rounding.",
+        expiry_conditions=(
+            ExpiryCondition(
+                condition_kind=ExpiryConditionKind.AT_COMMIT,
+                value=SHA_B,
+            ),
+        ),
+    )
+
+    expected_memory_id = "MEM-" + hashlib.sha256(
+        candidate.candidate_id.encode("utf-8")
+    ).hexdigest()
+    assert first.to_json() != changed.to_json()
+    assert first.memory_id == changed.memory_id == expected_memory_id
 
 
 def test_record_and_source_bundle_have_full_stable_ids_and_round_trip() -> None:
@@ -1105,11 +1357,18 @@ def test_memory_execution_config_matches_final_session_v5_contract() -> None:
             mode=MemoryMode.READ,
             root_path="relative/memory",
         )
+    legacy_policy = MemoryExecutionConfig.from_dict(
+        {
+            **config.to_dict(),
+            "selection_policy_version": "memory_selection_v1",
+        }
+    )
+    assert legacy_policy.selection_policy_version == "memory_selection_v1"
     with pytest.raises(ValueError, match="selection_policy_version"):
         MemoryExecutionConfig.from_dict(
             {
                 **config.to_dict(),
-                "selection_policy_version": "memory_selection_v2",
+                "selection_policy_version": "memory_selection_v3",
             }
         )
 

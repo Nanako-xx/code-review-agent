@@ -39,6 +39,7 @@ from review_agent.memory_models import (
     RepositoryKnowledgeEntry,
     SessionArtifactSourceRef,
     SourceRefType,
+    SUPPORTED_MEMORY_SELECTION_POLICY_VERSIONS,
     ValidityPolicy,
 )
 from review_agent.memory_policy import (
@@ -576,6 +577,9 @@ _AUDIT_SAFE_REASON_CODES = frozenset(
         "record_revoked",
         "record_superseded",
         "record_expired",
+        "expiry_time_reached",
+        "expiry_commit_reached",
+        "expiry_condition_unresolved",
         "record_status_not_authoritative",
         "target_validity_unavailable",
         "target_head_missing",
@@ -661,6 +665,19 @@ _AUDIT_SAFE_OUTBOX_CODES = frozenset(
         "persistence_failed",
         "outbox_invalid",
     }
+)
+_AUDIT_SAFE_CANDIDATE_DEDUPE = frozenset(
+    {
+        "unique",
+        "exact_replay",
+        "active_duplicate",
+        "pending_duplicate",
+        "rejected_unchanged",
+        "enhanced_provenance",
+    }
+)
+_AUDIT_SAFE_CANDIDATE_PERSISTENCE = frozenset(
+    {"persisted", "replayed"}
 )
 _AUDIT_SAFE_REVIEW_IMPACTS = frozenset(
     {"none", "no_change", "uncertainty_only", "manual_review"}
@@ -1148,14 +1165,6 @@ def build_memory_audit_projection(
 
     feedback = _project_feedback_summary(feedback_value)
     candidates = _project_pending_candidates(candidates_value)
-    if not candidates:
-        curator_map = _audit_mapping(curator_value)
-        decision_map = _audit_mapping(curator_map.get("decision"))
-        candidate_ids = _safe_id_list(
-            decision_map.get("candidate_ids") or curator_map.get("candidate_ids"),
-            "MC",
-        )
-        candidates = _project_pending_candidates(candidate_ids)
 
     curator_projection = _project_curator(curator_value)
     outbox_projection = _project_outbox(outbox_value)
@@ -2096,23 +2105,14 @@ def _project_pending_candidates(value: Any) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for item in _audit_values(value):
         source = _audit_mapping(item)
-        if not source and type(item) is str:
-            source = {"candidate_id": item}
         candidate_id = _audit_id(
             source.get("candidate_id") or source.get("id"), "MC"
         )
         if not candidate_id:
             continue
         status = _audit_enum(source.get("status"), CandidateStatus)
-        if not status:
-            status = CandidateStatus.PENDING_APPROVAL.value
-        if status in {CandidateStatus.APPROVED.value, CandidateStatus.REJECTED.value}:
+        if status != CandidateStatus.PENDING_APPROVAL.value:
             continue
-        if status in {
-            CandidateStatus.PROPOSED.value,
-            CandidateStatus.VALIDATED.value,
-        }:
-            status = CandidateStatus.PENDING_APPROVAL.value
         sensitivity = _audit_token(source.get("sensitivity"))
         projected: dict[str, Any] = {
             "candidate_id": candidate_id,
@@ -2129,6 +2129,42 @@ def _project_pending_candidates(value: Any) -> list[dict[str, Any]]:
             projected["statement"] = statement
         result.append(projected)
     return sorted(result, key=lambda item: item["candidate_id"])[:_AUDIT_MAX_ITEMS]
+
+
+def _project_candidate_outcomes(value: Any) -> list[dict[str, Any]]:
+    """Project lifecycle outcomes without exposing Candidate content."""
+
+    outcomes: dict[str, dict[str, Any]] = {}
+    for item in _audit_values(value):
+        source = _audit_mapping(item)
+        candidate_id = _audit_id(source.get("candidate_id"), "MC")
+        status = _audit_enum(source.get("status"), CandidateStatus)
+        dedupe = _audit_token(source.get("dedupe"))
+        replayed = _audit_bool(source.get("replayed"))
+        persistence = _audit_token(source.get("persistence"))
+        validation_hash = _audit_digest(
+            source.get("validation_report_hash")
+        )
+        if (
+            not candidate_id
+            or not status
+            or dedupe not in _AUDIT_SAFE_CANDIDATE_DEDUPE
+            or replayed is None
+            or persistence not in _AUDIT_SAFE_CANDIDATE_PERSISTENCE
+            or (replayed and persistence != "replayed")
+            or (not replayed and persistence != "persisted")
+            or not validation_hash
+        ):
+            continue
+        outcomes[candidate_id] = {
+            "candidate_id": candidate_id,
+            "status": status,
+            "dedupe": dedupe,
+            "replayed": replayed,
+            "persistence": persistence,
+            "validation_report_hash": validation_hash,
+        }
+    return [outcomes[key] for key in sorted(outcomes)][:_AUDIT_MAX_ITEMS]
 
 
 def _project_outbox(value: Any) -> dict[str, Any]:
@@ -2156,6 +2192,10 @@ def _project_outbox(value: Any) -> dict[str, Any]:
         result["error_code"] = error_code
     if row.get("candidate_ids") is not None:
         result["candidate_ids"] = _safe_id_list(row["candidate_ids"], "MC")
+    if row.get("candidate_outcomes") is not None:
+        result["candidate_outcomes"] = _project_candidate_outcomes(
+            row["candidate_outcomes"]
+        )
     pending = _audit_bool(row.get("pending"))
     if pending is not None:
         result["pending"] = pending
@@ -2323,8 +2363,9 @@ def _project_snapshot(row: Mapping[str, Any]) -> dict[str, Any]:
         revision = _audit_git(row.get(key))
         if revision:
             result[key] = revision
-    if _audit_text(row.get("selection_policy_version")) == "memory_selection_v1":
-        result["selection_policy_version"] = "memory_selection_v1"
+    selection_policy = _audit_text(row.get("selection_policy_version"))
+    if selection_policy in SUPPORTED_MEMORY_SELECTION_POLICY_VERSIONS:
+        result["selection_policy_version"] = selection_policy
     for key in (
         "store_schema_version",
         "memory_generation",

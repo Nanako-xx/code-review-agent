@@ -919,6 +919,16 @@ Reviewer 遗漏
 - 只属于当前 PR 的临时结论。
 - 已失效的代码片段。
 
+### 15.6 已落地协议与运行语义（2026-07-15）
+
+Durable Memory System 已进入本地审查主路径。当前协议边界明确为：canonical model 与 Session artifact v1；Durable Memory Record v1（无 expiry）/v2（typed expiry）；SQLite Store 与 export v2；Review Session v5；selection policy 为 `memory_selection_v2`。Store v1 只能做不 hydrate domain model 的只读审计，或经校验过的 staging migration 升级至 v2；Record v1、`memory_selection_v1` Snapshot 与 Session v1-v4 继续按各自兼容语义处理。
+
+Candidate producer 与 source authority 相互独立。local/model Curator 可以提出基于显式人类声明的 Candidate，但 producer 身份本身不产生 authority；Candidate 验证成功后生成的 `CandidateAuthorityReceipt` 固定授权 source refs、与 HumanDeclarationSourceRef 子集匹配的 HumanDeclaration、origin Review/HEAD 与校验 hash。早期 local/model receipt 的 `human_declarations` 为空时，只能从其精确绑定、已完成且 artifact hash 有效的 Session `request.json` 恢复，旧 receipt 不被改写。Store v1 迁移后完全无 receipt 的 pending Candidate 还必须校验精确 `memory_outbox.json`、未漂移的 proposal HEAD 和当前 repository authority，并只在用户确认后补写；Store 在同一事务中重新断言 receipt 集合仍为空，CLI 补写后再次检查 HEAD，任何竞争 authority 或 revision drift 都在创建 active Record 前 fail closed。
+
+Expiry 只在人工 approve/revalidate 时设置，Candidate 不携带该字段。Record v2 支持 `at_time` 与 `at_commit`，多条件按 OR 计算，每种类型最多一个。`read-write` 在 Memory Selection 前先按 active 状态 CAS 尝试有界持久化 due Record，并在同一事务递增 generation，再冻结 Snapshot；扫描失败或截断的未落盘项仍在内存中确定性排除并产生诊断。`read` 不修改 Store，但同样在固定时钟和目标 HEAD 下排除 due Record；同 revision resume 复用原 Snapshot，revision drift child 与新 Review 重新计算。同决策并发审批 loser 与并发 expiry 扫描保留幂等、可重放的单一权威结果，不同审批决策仍冲突。
+
+Candidate outbox、Replay Preview 与 persistence receipt 经过严格非空、终态、dedupe、replay/write 矩阵校验；空写入或 `proposed/validated` 中间状态不能伪装成持久化成功。任何 Candidate 都不会自动变成 active Memory，Review Feedback 也不会自动生成 suppression rule。
+
 ## 16. Context & Model Invocation System
 
 本系统不改变标准模型调用结构。一次模型调用仍然只由四类输入组成：
@@ -1310,7 +1320,7 @@ M1 完成时，应能在一个本地 Python Git 仓库中：
 11. 生成人类可审计的 Markdown/JSON Review Brief。
 12. 不修改代码、不自动发布评论、不自动合并。
 
-### 23.1 实现状态（2026-07-14）
+### 23.1 实现状态（2026-07-15）
 
 Runtime Review Contract Enforcement 已落地：合法 Observation revision allowlist、严格新 Finding 输出、assigned Contract completion validator、Agent Loop completion 拒绝/重试、single/multi/no-provider 统一 reconciliation/completion，以及无 Core Reviewer 时 `blocked` 均已进入主路径。`Session.status=completed` 仅表示执行生命周期结束，审查结论以 `completion.json` 为准。
 
@@ -1324,7 +1334,9 @@ Model-Assisted Risk Assessor 与 Portfolio Planner 已落地：Session schema v3
 
 Semantic Evidence Reconciler 与有界补充调查已落地：Session schema v4 增加独立语义分析和补充调查阶段；确定性 pre-pass、严格模型 proposal 编译、严重 Finding 保守保留、stable request/wave/task/invocation ID、按风险编译且持久化的 effective policy、全局预算与有限波次、single/limited-multi 稳定调度、失败证据隔离、unknown consumption、最小范围恢复和 revision-drift 重算均进入主路径。权威 `semantic_reconciliation.json` 同时投影兼容的 `reconciliation.json`，Completion、Final Risk 与 JSON/Markdown Brief 会完整消费 fallback、冲突、补充状态、预算和 policy action。v1/v2/v3 Session 保持原 phase 与 resume 语义，不会隐式调用 Semantic Reconciler。
 
-仍待后续独立批次实现：Durable Project/Review Feedback Memory、Eval Harness，以及 GitHub/PR 集成。自动修复、自动发布评论和自动合并继续不在当前本地审查路径内。
+Durable Memory System 已落地：revision-bound Repository Knowledge Cache、来源校验与人工审批的 Durable Project Memory、非抑制性的 Review Feedback Memory、Session v5 Memory Selection/Proposal、Snapshot-only 查询、local/model Curator、outbox/replay、Context/Runtime/CLI/Brief 集成均进入主路径。最终协议为 model/artifact v1、Record v1/v2、Store/export v2、Session v5 和 `memory_selection_v2`（兼容 v1）；Candidate producer/source authority 解耦、旧空声明 receipt 与 v1 迁移后无 receipt Candidate 的 Session-bound 恢复、严格非空 persistence receipt、时间/commit 自动过期、READ/READ_WRITE 差异、状态 CAS 并发收敛与 same-revision Snapshot 恢复均有单元、集成和全量回归覆盖。
+
+仍待后续独立批次实现：Eval Harness，以及 GitHub/PR 集成。自动修复、自动发布评论和自动合并继续不在当前本地审查路径内。
 
 ## 24. 实现同步原则
 

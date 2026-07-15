@@ -225,6 +225,7 @@ class SourceValidationCode(str, Enum):
     RUNTIME_PROVENANCE_REQUIRED = "runtime_provenance_required"
     SENSITIVITY_BLOCKED = "sensitivity_blocked"
     SENSITIVE_CONTENT = "sensitive_content"
+    PROMPT_INJECTION = "prompt_injection"
     VALIDATION_SKIPPED = "validation_skipped"
     UNSAFE_PATH = "unsafe_path"
     REPOSITORY_UNAVAILABLE = "repository_unavailable"
@@ -268,6 +269,7 @@ _ISSUE_MESSAGES = {
     SourceValidationCode.RUNTIME_PROVENANCE_REQUIRED: "candidate validation requires trusted Runtime provenance",
     SourceValidationCode.SENSITIVITY_BLOCKED: "blocked content cannot be validated or persisted",
     SourceValidationCode.SENSITIVE_CONTENT: "sensitive content was detected and must not be retained",
+    SourceValidationCode.PROMPT_INJECTION: "control or authority-escalation instructions were detected and must not be retained",
     SourceValidationCode.VALIDATION_SKIPPED: "source validation was skipped after a fail-closed decision",
     SourceValidationCode.UNSAFE_PATH: "source path is not a safe canonical relative path",
     SourceValidationCode.REPOSITORY_UNAVAILABLE: "repository authority is unavailable",
@@ -311,6 +313,7 @@ class SensitiveContentKind(str, Enum):
     AUTHORIZATION_HEADER = "authorization_header"
     AUTHENTICATED_URL = "authenticated_url"
     DUPLICATE_JSON_KEY = "duplicate_json_key"
+    PROMPT_INJECTION = "prompt_injection"
 
 
 @dataclass(frozen=True)
@@ -856,6 +859,7 @@ class SourceValidator:
         human_declarations: Iterable[
             TrustedHumanDeclaration | HumanDeclarationAuthority
         ] = (),
+        legacy_missing_declaration_receipt_ids: Iterable[str] = (),
         allowed_source_refs: Optional[Iterable[SourceRef]] = None,
         revision_resolver: Optional[RevisionResolver] = None,
         max_source_bytes: int = DEFAULT_MAX_SOURCE_BYTES,
@@ -924,6 +928,34 @@ class SourceValidator:
                 )
             declarations[request_id] = declaration
         self._human_declarations = declarations
+
+        try:
+            legacy_receipt_ids = tuple(legacy_missing_declaration_receipt_ids)
+        except TypeError:
+            raise SourceValidationError(
+                SourceValidationCode.INVALID_CONFIGURATION
+            ) from None
+        if len(legacy_receipt_ids) > MAX_VALIDATION_SOURCE_REFS:
+            raise SourceValidationError(SourceValidationCode.INVALID_CONFIGURATION)
+        checked_legacy_receipt_ids: List[str] = []
+        for receipt_id in legacy_receipt_ids:
+            try:
+                checked_legacy_receipt_ids.append(
+                    validate_stable_id(
+                        receipt_id,
+                        "CAR",
+                        "legacy missing-declaration receipt_id",
+                    )
+                )
+            except (TypeError, ValueError):
+                raise SourceValidationError(
+                    SourceValidationCode.INVALID_CONFIGURATION
+                ) from None
+        if len(checked_legacy_receipt_ids) != len(set(checked_legacy_receipt_ids)):
+            raise SourceValidationError(SourceValidationCode.INVALID_CONFIGURATION)
+        self._legacy_missing_declaration_receipt_ids = frozenset(
+            checked_legacy_receipt_ids
+        )
 
         self._allowed_source_ref_keys: Optional[frozenset] = None
         if allowed_source_refs is not None:
@@ -1099,13 +1131,14 @@ class SourceValidator:
             candidate,
             runtime_provenance.review_id,
         )
-        receipt_declarations: Tuple[HumanDeclarationAuthority, ...] = ()
-        if runtime_provenance.origin is ProducerType.HUMAN:
-            if not trusted_declarations:
-                raise SourceValidationError(
-                    SourceValidationCode.HUMAN_DECLARATION_UNAUTHORIZED
-                )
-            receipt_declarations = trusted_declarations
+        receipt_declarations = trusted_declarations
+        if (
+            runtime_provenance.origin is ProducerType.HUMAN
+            and not receipt_declarations
+        ):
+            raise SourceValidationError(
+                SourceValidationCode.HUMAN_DECLARATION_UNAUTHORIZED
+            )
 
         return CandidateAuthorityReceipt(
             candidate_id=candidate.candidate_id,
@@ -1198,17 +1231,19 @@ class SourceValidator:
             candidate,
             current_provenance.review_id,
         )
-        if current_provenance.origin is ProducerType.HUMAN:
-            if (
-                not trusted_declarations
-                or receipt.human_declarations != trusted_declarations
-            ):
-                raise SourceValidationError(
-                    SourceValidationCode.HUMAN_DECLARATION_UNAUTHORIZED
-                )
-        elif receipt.human_declarations:
+        legacy_session_restoration = (
+            receipt.receipt_id
+            in self._legacy_missing_declaration_receipt_ids
+            and receipt.origin in {ProducerType.LOCAL, ProducerType.MODEL}
+            and not receipt.human_declarations
+            and bool(trusted_declarations)
+        )
+        if (
+            receipt.human_declarations != trusted_declarations
+            and not legacy_session_restoration
+        ):
             raise SourceValidationError(
-                SourceValidationCode.AUTHORITY_RECEIPT_INVALID
+                SourceValidationCode.HUMAN_DECLARATION_UNAUTHORIZED
             )
 
         restored_provenance = current_provenance
@@ -1307,7 +1342,7 @@ class SourceValidator:
                     blocked = True
                     issues.append(
                         _issue(
-                            SourceValidationCode.SENSITIVE_CONTENT,
+                            _validation_code_for_scan(scan),
                             field_name=field_name,
                         )
                     )
@@ -1362,7 +1397,10 @@ class SourceValidator:
                 results.append(
                     _failed_result(index, source_ref, result_issue)
                 )
-                if error.code is SourceValidationCode.SENSITIVE_CONTENT:
+                if error.code in {
+                    SourceValidationCode.SENSITIVE_CONTENT,
+                    SourceValidationCode.PROMPT_INJECTION,
+                }:
                     blocked = True
                 continue
             except Exception:
@@ -1900,6 +1938,14 @@ def scan_sensitive_text(
     structured_values, duplicate_json_key = _structured_values(text, schema)
     if duplicate_json_key:
         add(SensitiveContentKind.DUPLICATE_JSON_KEY, field_name)
+    prompt_texts = [text]
+    prompt_texts.extend(
+        item
+        for structured in structured_values
+        for item in _structured_strings(structured)
+    )
+    if any(_contains_explicit_prompt_injection(item) for item in prompt_texts):
+        add(SensitiveContentKind.PROMPT_INJECTION, field_name)
     assignment_texts = [text]
     assignment_texts.extend(
         item
@@ -1921,6 +1967,17 @@ def scan_sensitive_text(
     return SensitiveContentScan(
         tuple(sorted(findings, key=lambda item: (item.kind.value, item.field_name)))
     )
+
+
+def _validation_code_for_scan(
+    scan: SensitiveContentScan,
+) -> SourceValidationCode:
+    if any(
+        finding.kind is SensitiveContentKind.PROMPT_INJECTION
+        for finding in scan.findings
+    ):
+        return SourceValidationCode.PROMPT_INJECTION
+    return SourceValidationCode.SENSITIVE_CONTENT
 
 
 _PRIVATE_KEY_PATTERN = re.compile(
@@ -2002,6 +2059,177 @@ _SENSITIVE_FIELD_NAMES = frozenset(
 )
 
 
+_ENGLISH_CONTROL_TARGET = (
+    r"(?:runtime\s+)?tools?|shell(?:\s+access)?|terminal|powershell|cmd(?:\.exe)?|"
+    r"bash|command(?:s|\s+execution)?|network(?:\s+access)?|internet(?:\s+access)?|"
+    r"permissions?|privileges?|token\s+budgets?|budgets?|token\s+limits?|timeouts?|"
+    r"review\s+contracts?|completion(?:\s+(?:rules?|requirements?|checks?|state))?|"
+    r"system\s+prompts?|developer\s+messages?|safety(?:\s+(?:rules?|polic(?:y|ies)))?|"
+    r"evidence\s+validation"
+)
+_ENGLISH_CLAUSE_PREFIX = (
+    r"(?:^|[\n.!?;:])\s*(?:please\s+)?"
+    r"(?:(?:you|the\s+(?:assistant|reviewer|agent|model))\s+"
+    r"(?:must|should|shall|may|can|need\s+to|are\s+to)\s+(?:now\s+)?)?"
+)
+_PROMPT_INJECTION_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    for pattern in (
+        # Explicit precedence attacks.  This pattern is intentionally narrower
+        # than a keyword list: both an override verb and an instruction/authority
+        # target must be present.
+        (
+            r"\b(?:ignore|disregard|forget|override|bypass|supersede|discard|"
+            r"replace)\s+(?:(?:all|any|the)\s+)?(?:previous|prior|earlier|above|"
+            r"system|developer|runtime|safety)\s+(?:instructions?|prompts?|"
+            r"messages?|rules?|polic(?:y|ies)|constraints?|contracts?|requirements?)\b"
+        ),
+        # Direct attempts to alter Runtime-owned controls or capabilities.
+        (
+            _ENGLISH_CLAUSE_PREFIX
+            + r"(?:(?:do\s+not|don't|never)\s+)?(?:enable|disable|grant|revoke|"
+            r"allow|unlock|increase|extend|change|modify|override|bypass|remove|"
+            r"skip|ignore)\b[^\n.!?;]{0,48}\b(?:"
+            + _ENGLISH_CONTROL_TARGET
+            + r")\b"
+        ),
+        # Capability use is kept separate so ordinary phrases such as "run the
+        # network tests" are not classified as prompt injection.
+        (
+            _ENGLISH_CLAUSE_PREFIX
+            + r"(?:(?:do\s+not|don't|never)\s+)?(?:use|invoke|execute|run|open|"
+            r"access)\b[^\n.!?;]{0,40}\b(?:shell|terminal|powershell|cmd(?:\.exe)?|"
+            r"bash|command(?:s|\s+execution)?|(?:external\s+)?network\s+access|"
+            r"internet\s+access|unregistered\s+tools?)\b"
+        ),
+        # Role/authority substitution.
+        (
+            _ENGLISH_CLAUSE_PREFIX
+            + r"(?:act\s+as|pretend\s+(?:to\s+be|you\s+are)|switch(?:\s+your)?\s+"
+            r"role(?:\s+to)?|assume(?:\s+the)?\s+role(?:\s+of)?|you\s+are\s+now|"
+            r"from\s+now\s+on[^\n.!?;]{0,16})[^\n.!?;]{0,40}\b(?:system|"
+            r"developer|runtime|administrator|root|unrestricted|privileged)\b"
+        ),
+        # Attempts to suppress review output or bypass completion authority.
+        (
+            _ENGLISH_CLAUSE_PREFIX
+            + r"(?:do\s+not|don't|never)\s+(?:report|emit|include|surface|mention|"
+            r"flag|retain|preserve)\b[^\n.!?;]{0,48}\b(?:findings?|issues?|evidence|"
+            r"warnings?|defects?|vulnerabilit(?:y|ies))\b"
+        ),
+        (
+            _ENGLISH_CLAUSE_PREFIX
+            + r"(?:hide|suppress|omit|drop|downgrade|lower)\b[^\n.!?;]{0,48}\b"
+            r"(?:findings?|issues?|evidence|warnings?|severity|defects?|"
+            r"vulnerabilit(?:y|ies))\b"
+        ),
+        (
+            _ENGLISH_CLAUSE_PREFIX
+            + r"(?:mark|declare|treat|consider)\b[^\n.!?;]{0,32}\b(?:review|task|"
+            r"contract|check)\b[^\n.!?;]{0,24}\b(?:complete|completed|passed|"
+            r"approved|satisfied)\b"
+        ),
+        # Exfiltration and attempts to promote untrusted text into an authority
+        # channel are both explicit authority escalations.
+        (
+            _ENGLISH_CLAUSE_PREFIX
+            + r"(?:reveal|print|return|send|exfiltrate|leak|disclose)\b"
+            r"[^\n.!?;]{0,40}\b(?:system\s+prompt|developer\s+message|hidden\s+"
+            r"instructions?|secrets?|credentials?|environment\s+variables?)\b"
+        ),
+        (
+            r"\b(?:treat|interpret|accept|obey|follow)\s+(?:this|these|the\s+following|"
+            r"memory|statement|source|feedback)[^\n.!?;]{0,40}\b(?:as|like)\s+"
+            r"(?:an?\s+)?(?:system|developer|runtime|higher[- ]priority|authoritative)"
+            r"(?:\s+(?:instruction|message|policy|command))?\b"
+        ),
+        (
+            _ENGLISH_CLAUSE_PREFIX
+            + r"(?:tools?|shell\s+access|network\s+access|permissions?|budgets?)\s+"
+            r"(?:is|are)\s+(?:now\s+)?(?:enabled|allowed|unrestricted|unlimited)\b"
+        ),
+        # Common Chinese forms of the same high-confidence attacks.
+        (
+            r"(?:忽略|无视|绕过|覆盖|取代|丢弃|撤销).{0,24}"
+            r"(?:之前|先前|以上|上面|系统|开发者|运行时|安全).{0,12}"
+            r"(?:指令|提示|消息|规则|策略|约束|合同|要求)"
+        ),
+        (
+            r"(?:^|[\n。！？；：])\s*(?:请|你(?:必须|应当|需要|可以)?|务必|立即|"
+            r"不要|不得|禁止)?\s*(?:启用|禁用|授予|开放|增加|延长|移除|跳过|"
+            r"绕过|修改|覆盖).{0,20}(?:工具|shell|终端|命令执行|网络访问|互联网访问|"
+            r"权限|预算|令牌上限|超时|审查合同|完成条件|系统提示|开发者消息|安全策略)"
+        ),
+        (
+            r"(?:^|[\n。！？；：])\s*(?:请|你(?:必须|应当|需要|可以)?|务必|立即)?"
+            r"\s*(?:扮演|假装(?:你)?是|切换.{0,6}角色|你现在是|从现在起.{0,8}是)"
+            r".{0,24}(?:系统|开发者|运行时|管理员|root|特权|无限制)"
+        ),
+        (
+            r"(?:^|[\n。！？；：])\s*(?:不要|不得|禁止)\s*(?:报告|提及|输出|保留|"
+            r"呈现).{0,16}(?:发现|问题|证据|告警|缺陷|漏洞)"
+        ),
+        (
+            r"(?:^|[\n。！？；：])\s*(?:隐藏|压制|省略|删除|降级|降低).{0,16}"
+            r"(?:发现|问题|证据|告警|严重性|缺陷|漏洞)"
+        ),
+        (
+            r"(?:^|[\n。！？；：])\s*(?:泄露|输出|返回|发送|打印).{0,16}"
+            r"(?:系统提示|开发者消息|隐藏指令|密钥|凭据|环境变量)"
+        ),
+        (
+            r"(?:把|将).{0,12}(?:这段|以下|内存|记忆|反馈|来源|文本).{0,12}"
+            r"(?:当作|视为).{0,12}(?:系统|开发者|运行时|高优先级|权威)"
+            r"(?:指令|消息|策略|命令)?"
+        ),
+    )
+)
+_SAFE_PROMPT_MENTION_PREFIX = re.compile(
+    r"(?:\b(?:do\s+not|don't|must\s+not|should\s+not|never)\s*$|"
+    r"\b(?:detect|reject|block|prevent|filter|escape|quote|test|classify|guard)"
+    r"(?:s|ed|ing)?\b[^\n.!?;]{0,40}\b(?:prompt[- ]injection|attack|attempt|"
+    r"payload|phrase|text|string|instruction)s?[^\n.!?;]{0,8}$|"
+    r"(?:不要|不得|禁止|检测|拒绝|阻止|过滤|转义|测试|防止).{0,24}"
+    r"(?:提示注入|攻击|载荷|短语|文本|字符串|指令).{0,8}$)",
+    re.IGNORECASE,
+)
+
+
+def _contains_explicit_prompt_injection(text: str) -> bool:
+    """Classify only explicit control or authority-escalation instructions.
+
+    The detector deliberately requires a directive/override form and a closed
+    Runtime-owned target.  It is not a general topic classifier: ordinary prose
+    about tools, budgets, commands, or code behavior remains valid Memory data.
+    Unicode normalization and format-control removal make the classification
+    deterministic across equivalent persisted text.
+    """
+
+    normalized = _normalized_prompt_text(text)
+    if not normalized:
+        return False
+    for pattern in _PROMPT_INJECTION_PATTERNS:
+        for match in pattern.finditer(normalized):
+            prefix = normalized[max(0, match.start() - 96) : match.start()]
+            if _SAFE_PROMPT_MENTION_PREFIX.search(prefix):
+                continue
+            return True
+    return False
+
+
+def _normalized_prompt_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    normalized = "".join(
+        " " if unicodedata.category(character).startswith("Z") else character
+        for character in normalized
+        if unicodedata.category(character) != "Cf"
+    )
+    return "\n".join(
+        re.sub(r"[^\S\n]+", " ", line).strip()
+        for line in normalized.splitlines()
+    )
+
+
 def _scan_structured_credentials(
     value: Any,
     field_name: str,
@@ -2054,7 +2282,7 @@ def _structured_values(
                     parsed_lines.append(_strict_json_value(line))
         except _DuplicateJsonKey:
             return [], True
-        except (json.JSONDecodeError, TypeError, ValueError):
+        except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
             return [], False
         return parsed_lines, False
     if stripped[0] not in "[{":
@@ -2063,7 +2291,7 @@ def _structured_values(
         values.append(_strict_json_value(stripped))
     except _DuplicateJsonKey:
         return [], True
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
         return [], False
     return values, False
 
@@ -2749,7 +2977,7 @@ def _require_safe_content(
 ) -> None:
     scan = scan_sensitive_text(text, schema=schema, field_name=field_name)
     if not scan.safe:
-        raise _Failure(SourceValidationCode.SENSITIVE_CONTENT, field_name)
+        raise _Failure(_validation_code_for_scan(scan), field_name)
 
 
 def _session_observation_bindings(manifest: SessionManifest) -> frozenset:

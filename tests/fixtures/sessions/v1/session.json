@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "review_id": "fixture-session-v1",
+  "parent_review_id": null,
+  "root_review_id": "fixture-session-v1",
+  "repository": {
+    "canonical_path": "C:\\fixtures\\legacy-session-v1",
+    "git_common_dir": "C:\\fixtures\\legacy-session-v1\\.git",
+    "origin_url": null
+  },
+  "revisions": {
+    "requested_base": "fixture-base-v1",
+    "requested_head": "fixture-head-v1",
+    "resolved_base_sha": "1111111111111111111111111111111111111111",
+    "resolved_head_sha": "2222222222222222222222222222222222222222",
+    "original_base_sha": "1111111111111111111111111111111111111111",
+    "incremental_from_sha": null,
+    "change_kind": "initial"
+  },
+  "execution": {
+    "reviewer_provider": "fake",
+    "reviewer_model": "fixture-reviewer-v1",
+    "reviewer_base_url": null,
+    "reviewer_api_key_env": "FIXTURE_REVIEWER_API_KEY",
+    "reviewer_mode": "single",
+    "reviewer_loop": "single-shot",
+    "non_interactive": true
+  },
+  "status": "completed",
+  "current_phase": "completed",
+  "last_successful_phase": "reporting",
+  "phases": {
+    "preflight": {
+      "status": "completed",
+      "attempts": 1,
+      "started_at": "2026-01-01T00:00:01Z",
+      "completed_at": "2026-01-01T00:00:02Z",
+      "artifacts": [],
+      "error": null,
+      "tasks": {}
+    },
+    "repository_intelligence": {
+      "status": "completed",
+      "attempts": 1,
+      "started_at": "2026-01-01T00:00:03Z",
+      "completed_at": "2026-01-01T00:00:04Z",
+      "artifacts": [],
+      "error": null,
+      "tasks": {}
+    },
+    "reviewers": {
+      "status": "completed",
+      "attempts": 1,
+      "started_at": "2026-01-01T00:00:05Z",
+      "completed_at": "2026-01-01T00:00:06Z",
+      "artifacts": [],
+      "error": null,
+      "tasks": {}
+    },
+    "reconciliation": {
+      "status": "completed",
+      "attempts": 1,
+      "started_at": "2026-01-01T00:00:07Z",
+      "completed_at": "2026-01-01T00:00:08Z",
+      "artifacts": [],
+      "error": null,
+      "tasks": {}
+    },
+    "completion": {
+      "status": "completed",
+      "attempts": 1,
+      "started_at": "2026-01-01T00:00:09Z",
+      "completed_at": "2026-01-01T00:00:10Z",
+      "artifacts": [],
+      "error": null,
+      "tasks": {}
+    },
+    "final_risk": {
+      "status": "completed",
+      "attempts": 1,
+      "started_at": "2026-01-01T00:00:11Z",
+      "completed_at": "2026-01-01T00:00:12Z",
+      "artifacts": [],
+      "error": null,
+      "tasks": {}
+    },
+    "reporting": {
+      "status": "completed",
+      "attempts": 1,
+      "started_at": "2026-01-01T00:00:13Z",
+      "completed_at": "2026-01-01T00:00:14Z",
+      "artifacts": [],
+      "error": null,
+      "tasks": {}
+    }
+  },
+  "artifacts": {},
+  "errors": [],
+  "created_at": "2026-01-01T00:00:00Z",
+  "updated_at": "2026-01-01T00:00:14Z"
+}

@@ -57,6 +57,7 @@ from review_agent.memory_models import (
     validate_stable_id,
 )
 from review_agent.memory_sources import (
+    SensitiveContentKind,
     SourceValidationReport,
     SourceValidator,
     scan_sensitive_text,
@@ -111,6 +112,7 @@ class FeedbackErrorCode(str, Enum):
     HUMAN_DECLARATION_REQUIRED = "human_declaration_required"
     VERIFIABLE_SOURCE_REQUIRED = "verifiable_source_required"
     SOURCE_VALIDATION_FAILED = "source_validation_failed"
+    PROMPT_INJECTION = "prompt_injection"
     CONFLICTING_DECISION = "conflicting_decision"
     AGGREGATION_LIMIT_EXCEEDED = "aggregation_limit_exceeded"
     DURABLE_MEMORY_CONVERSION_PROHIBITED = "durable_memory_conversion_prohibited"
@@ -1549,7 +1551,16 @@ def _require_safe_feedback_text(
         ("feedback.reason", reason),
         ("feedback.actor", actor),
     ):
-        if not scan_sensitive_text(value, field_name=field_name).safe:
+        scan = scan_sensitive_text(value, field_name=field_name)
+        if any(
+            finding.kind is SensitiveContentKind.PROMPT_INJECTION
+            for finding in scan.findings
+        ):
+            raise FeedbackError(
+                "feedback contains prohibited control instructions",
+                FeedbackErrorCode.PROMPT_INJECTION,
+            )
+        if not scan.safe:
             raise FeedbackError(
                 "feedback contains sensitive text and cannot be persisted",
                 FeedbackErrorCode.SOURCE_VALIDATION_FAILED,

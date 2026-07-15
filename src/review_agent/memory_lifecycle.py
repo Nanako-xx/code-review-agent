@@ -30,6 +30,8 @@ from review_agent.memory_models import (
     CandidateAuthorityReceipt,
     CandidateStatus,
     DurableMemoryRecord,
+    ExpiryCondition,
+    ExpiryConditionKind,
     GitCommitSourceRef,
     MemoryCandidate,
     RecordStatus,
@@ -69,6 +71,7 @@ SOURCE_BUNDLE_SCHEMA_VERSION = 1
 SOURCE_BUNDLE_MEDIA_TYPE = "application/vnd.review-agent.source-bundle+json"
 
 _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+MAX_EXPIRY_SWEEP_RECORDS = 512
 
 
 class MemoryLifecycleErrorCode(str, Enum):
@@ -132,6 +135,63 @@ class ApprovalResult:
     bundle_payload: bytes = field(repr=False)
     validation: Optional[SourceValidationReport] = field(repr=False)
     write_result: WriteResult
+    converged: bool = False
+
+
+class ExpiryEvaluationStatus(str, Enum):
+    NOT_CONFIGURED = "not_configured"
+    NOT_DUE = "not_due"
+    DUE = "due"
+    UNRESOLVED = "unresolved"
+
+
+@dataclass(frozen=True)
+class ExpiryEvaluationResult:
+    status: ExpiryEvaluationStatus
+    evaluated_at: str
+    target_head: str
+    target_commit: Optional[str] = None
+    due_condition: Optional[ExpiryCondition] = None
+    unresolved_conditions: Tuple[ExpiryCondition, ...] = ()
+
+    @property
+    def due(self) -> bool:
+        return self.status is ExpiryEvaluationStatus.DUE
+
+    @property
+    def unresolved(self) -> bool:
+        return self.status is ExpiryEvaluationStatus.UNRESOLVED
+
+    @property
+    def reason_code(self) -> Optional[str]:
+        if self.due_condition is None:
+            return None
+        if self.due_condition.condition_kind is ExpiryConditionKind.AT_TIME:
+            return "expiry_time_reached"
+        return "expiry_commit_reached"
+
+
+@dataclass(frozen=True)
+class RecordExpiryResult:
+    memory_id: str
+    evaluation: ExpiryEvaluationResult
+    current_status: RecordStatus
+    expired: bool
+    write_result: Optional[WriteResult] = None
+    converged: bool = False
+
+
+@dataclass(frozen=True)
+class ExpirySweepResult:
+    repository_key: str
+    target_head: str
+    evaluated_at: str
+    max_records: int
+    scanned_ids: Tuple[str, ...]
+    expired_ids: Tuple[str, ...]
+    unresolved_ids: Tuple[str, ...]
+    write_results: Tuple[WriteResult, ...]
+    truncated: bool
 
 
 class RecordAuditStatus(str, Enum):
@@ -162,6 +222,99 @@ class ApplicabilityDecision:
     source_validation: Optional[SourceValidationReport] = field(
         default=None,
         repr=False,
+    )
+
+
+def evaluate_expiry_conditions(
+    conditions: Sequence[ExpiryCondition],
+    *,
+    repository: Path,
+    target_head: str,
+    evaluated_at: datetime | str,
+    revision_resolver: Optional[RevisionResolver] = None,
+) -> ExpiryEvaluationResult:
+    """Evaluate canonical expiry predicates without mutating lifecycle state.
+
+    Conditions are disjunctive.  A due condition wins over any condition whose
+    Git lineage cannot be resolved; unresolved wins only when no condition is
+    due.  The result is therefore stable for the same repository object graph,
+    target commit, and timezone-aware evaluation instant.
+    """
+
+    canonical_conditions = _canonical_requested_expiry_conditions(conditions)
+    target = _bounded_target_head(target_head)
+    evaluated_utc = _aware_utc_datetime(evaluated_at)
+    evaluated_text = _canonical_utc_datetime(evaluated_utc)
+    if not canonical_conditions:
+        return ExpiryEvaluationResult(
+            status=ExpiryEvaluationStatus.NOT_CONFIGURED,
+            evaluated_at=evaluated_text,
+            target_head=target,
+        )
+
+    resolver = revision_resolver or RevisionResolver()
+    target_commit: Optional[str]
+    try:
+        target_commit = resolver.resolve_commit(Path(repository), target).casefold()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        target_commit = None
+
+    due_conditions: List[ExpiryCondition] = []
+    unresolved_conditions: List[ExpiryCondition] = []
+    for condition in canonical_conditions:
+        if condition.condition_kind is ExpiryConditionKind.AT_TIME:
+            boundary = datetime.fromisoformat(
+                condition.value[:-1] + "+00:00"
+            )
+            if evaluated_utc >= boundary:
+                due_conditions.append(condition)
+            continue
+
+        if target_commit is None:
+            unresolved_conditions.append(condition)
+            continue
+        try:
+            boundary_commit = resolver.resolve_commit(
+                Path(repository),
+                condition.value,
+            ).casefold()
+            if boundary_commit == target_commit or resolver.is_ancestor(
+                Path(repository),
+                boundary_commit,
+                target_commit,
+            ):
+                due_conditions.append(condition)
+            elif not resolver.is_ancestor(
+                Path(repository),
+                target_commit,
+                boundary_commit,
+            ):
+                unresolved_conditions.append(condition)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            unresolved_conditions.append(condition)
+
+    if due_conditions:
+        return ExpiryEvaluationResult(
+            status=ExpiryEvaluationStatus.DUE,
+            evaluated_at=evaluated_text,
+            target_head=target,
+            target_commit=target_commit,
+            due_condition=due_conditions[0],
+            unresolved_conditions=tuple(unresolved_conditions),
+        )
+    if unresolved_conditions:
+        return ExpiryEvaluationResult(
+            status=ExpiryEvaluationStatus.UNRESOLVED,
+            evaluated_at=evaluated_text,
+            target_head=target,
+            target_commit=target_commit,
+            unresolved_conditions=tuple(unresolved_conditions),
+        )
+    return ExpiryEvaluationResult(
+        status=ExpiryEvaluationStatus.NOT_DUE,
+        evaluated_at=evaluated_text,
+        target_head=target,
+        target_commit=target_commit,
     )
 
 
@@ -275,6 +428,7 @@ class MemoryLifecycle:
         *,
         runtime_provenance: TrustedCandidateProvenance,
         request_id: str,
+        require_no_authority_receipts: bool = False,
     ) -> CandidateLifecycleResult:
         if type(candidate) is not MemoryCandidate:
             raise MemoryLifecycleError(
@@ -291,136 +445,172 @@ class MemoryLifecycle:
                 "trusted Runtime provenance is required",
                 MemoryLifecycleErrorCode.INVALID_INPUT,
             )
+        if type(require_no_authority_receipts) is not bool:
+            raise MemoryLifecycleError(
+                "require_no_authority_receipts must be a bool",
+                MemoryLifecycleErrorCode.INVALID_INPUT,
+            )
 
         validation = self.source_validator.validate_candidate(
             candidate,
             runtime_provenance=runtime_provenance,
         )
-        existing = self.store.find_candidate(candidate.candidate_id)
-        if not validation.valid:
-            return self._reject_invalid_candidate(
+        authority_receipt = (
+            self._build_candidate_authority_receipt(
                 candidate,
-                validation,
-                request_id=request_id,
-                existing=existing,
                 runtime_provenance=runtime_provenance,
+                validation=validation,
             )
-
-        authority_receipt = self._build_candidate_authority_receipt(
-            candidate,
-            runtime_provenance=runtime_provenance,
-            validation=validation,
+            if validation.valid
+            else None
         )
+        # Validation is intentionally outside the write transaction.  Once its
+        # immutable report and authority receipt are ready, every Store read and
+        # write participating in dedupe and status advancement shares one
+        # BEGIN IMMEDIATE transaction.  A concurrent same-content proposal can
+        # therefore observe either the complete winner or no winner, never the
+        # old read-before-write gap.
+        with self.store.candidate_submission_transaction():
+            existing = self.store.find_candidate(candidate.candidate_id)
+            if require_no_authority_receipts and existing is None:
+                raise MemoryLifecycleError(
+                    "authority recovery requires an existing migrated candidate",
+                    MemoryLifecycleErrorCode.INVALID_INPUT,
+                )
+            if not validation.valid:
+                return self._reject_invalid_candidate(
+                    candidate,
+                    validation,
+                    request_id=request_id,
+                    existing=existing,
+                    runtime_provenance=runtime_provenance,
+                )
 
-        dedupe = self._dedupe_candidate(candidate, existing=existing)
-        if existing is not None:
-            writes: Tuple[WriteResult, ...] = ()
-            if replace(existing, status=CandidateStatus.PROPOSED) == candidate:
-                writes = (
-                    self.store.put_candidate(
-                        candidate,
-                        authority_receipt,
-                        request_id=stable_request_id(
-                            "memory_lifecycle",
-                            "candidate_authority",
-                            authority_receipt.receipt_id,
+            if authority_receipt is None:  # pragma: no cover - guarded above
+                raise MemoryLifecycleError(
+                    "valid candidate authority receipt is missing",
+                    MemoryLifecycleErrorCode.SOURCE_VALIDATION_FAILED,
+                )
+
+            dedupe = self._dedupe_candidate(candidate, existing=existing)
+            if existing is not None:
+                writes: Tuple[WriteResult, ...] = ()
+                if replace(existing, status=CandidateStatus.PROPOSED) == candidate:
+                    writes = (
+                        self.store.put_candidate(
+                            candidate,
+                            authority_receipt,
+                            request_id=stable_request_id(
+                                "memory_lifecycle",
+                                "candidate_authority",
+                                authority_receipt.receipt_id,
+                            ),
+                            actor_type=runtime_provenance.origin.value,
+                            actor_id="memory_lifecycle",
+                            reason_code="candidate_authority_revalidated",
+                            require_no_authority_receipts=(
+                                require_no_authority_receipts
+                            ),
                         ),
-                        actor_type=runtime_provenance.origin.value,
-                        actor_id="memory_lifecycle",
-                        reason_code="candidate_authority_revalidated",
+                    )
+                return CandidateLifecycleResult(
+                    candidate_id=existing.candidate_id,
+                    status=existing.status,
+                    validation=validation,
+                    dedupe=dedupe,
+                    persisted=True,
+                    write_results=writes,
+                )
+
+            if dedupe.suppressed:
+                writes = self._persist_then_reject(
+                    candidate,
+                    request_id=request_id,
+                    runtime_provenance=runtime_provenance,
+                    authority_receipt=authority_receipt,
+                    action="duplicate",
+                    reason_code=dedupe.kind.value,
+                    reason=(
+                        "Candidate content was deterministically suppressed "
+                        "as a duplicate."
                     ),
                 )
-            return CandidateLifecycleResult(
-                candidate_id=existing.candidate_id,
-                status=existing.status,
-                validation=validation,
-                dedupe=dedupe,
-                persisted=True,
-                write_results=writes,
-            )
+                return CandidateLifecycleResult(
+                    candidate_id=candidate.candidate_id,
+                    status=CandidateStatus.REJECTED,
+                    validation=validation,
+                    dedupe=dedupe,
+                    persisted=True,
+                    write_results=writes,
+                )
 
-        if dedupe.suppressed:
-            writes = self._persist_then_reject(
-                candidate,
-                request_id=request_id,
-                runtime_provenance=runtime_provenance,
-                authority_receipt=authority_receipt,
-                action="duplicate",
-                reason_code=dedupe.kind.value,
-                reason="Candidate content was deterministically suppressed as a duplicate.",
+            writes_list: List[WriteResult] = []
+            writes_list.append(
+                self.store.put_candidate(
+                    candidate,
+                    authority_receipt,
+                    request_id=_child_request_id(
+                        request_id,
+                        candidate.candidate_id,
+                        "put",
+                    ),
+                    actor_type=runtime_provenance.origin.value,
+                    actor_id="memory_lifecycle",
+                    reason_code="candidate_submitted",
+                )
             )
+            current = self.store.get_candidate(candidate.candidate_id)
+            if current.status is CandidateStatus.PROPOSED:
+                writes_list.append(
+                    self.store.transition_candidate(
+                        candidate.candidate_id,
+                        expected_status=CandidateStatus.PROPOSED,
+                        new_status=CandidateStatus.VALIDATED,
+                        action="validate",
+                        actor_type="runtime",
+                        actor_id="memory_lifecycle",
+                        reason_code="source_validation_passed",
+                        request_id=_child_request_id(
+                            request_id,
+                            candidate.candidate_id,
+                            "validate",
+                        ),
+                        created_at=candidate.created_at,
+                    )
+                )
+                current = self.store.get_candidate(candidate.candidate_id)
+            if current.status is CandidateStatus.VALIDATED:
+                writes_list.append(
+                    self.store.transition_candidate(
+                        candidate.candidate_id,
+                        expected_status=CandidateStatus.VALIDATED,
+                        new_status=CandidateStatus.PENDING_APPROVAL,
+                        action="request_approval",
+                        actor_type="runtime",
+                        actor_id="memory_lifecycle",
+                        reason_code="human_approval_required",
+                        request_id=_child_request_id(
+                            request_id,
+                            candidate.candidate_id,
+                            "pending",
+                        ),
+                        created_at=candidate.created_at,
+                    )
+                )
+                current = self.store.get_candidate(candidate.candidate_id)
+            if current.status is not CandidateStatus.PENDING_APPROVAL:
+                raise MemoryLifecycleError(
+                    "candidate did not reach pending approval",
+                    MemoryLifecycleErrorCode.INVALID_TRANSITION,
+                )
             return CandidateLifecycleResult(
                 candidate_id=candidate.candidate_id,
-                status=CandidateStatus.REJECTED,
+                status=current.status,
                 validation=validation,
                 dedupe=dedupe,
                 persisted=True,
-                write_results=writes,
+                write_results=tuple(writes_list),
             )
-
-        writes: List[WriteResult] = []
-        writes.append(
-            self.store.put_candidate(
-                candidate,
-                authority_receipt,
-                request_id=_child_request_id(request_id, candidate.candidate_id, "put"),
-                actor_type=runtime_provenance.origin.value,
-                actor_id="memory_lifecycle",
-                reason_code="candidate_submitted",
-            )
-        )
-        current = self.store.get_candidate(candidate.candidate_id)
-        if current.status is CandidateStatus.PROPOSED:
-            writes.append(
-                self.store.transition_candidate(
-                    candidate.candidate_id,
-                    expected_status=CandidateStatus.PROPOSED,
-                    new_status=CandidateStatus.VALIDATED,
-                    action="validate",
-                    actor_type="runtime",
-                    actor_id="memory_lifecycle",
-                    reason_code="source_validation_passed",
-                    request_id=_child_request_id(
-                        request_id,
-                        candidate.candidate_id,
-                        "validate",
-                    ),
-                    created_at=candidate.created_at,
-                )
-            )
-            current = self.store.get_candidate(candidate.candidate_id)
-        if current.status is CandidateStatus.VALIDATED:
-            writes.append(
-                self.store.transition_candidate(
-                    candidate.candidate_id,
-                    expected_status=CandidateStatus.VALIDATED,
-                    new_status=CandidateStatus.PENDING_APPROVAL,
-                    action="request_approval",
-                    actor_type="runtime",
-                    actor_id="memory_lifecycle",
-                    reason_code="human_approval_required",
-                    request_id=_child_request_id(
-                        request_id,
-                        candidate.candidate_id,
-                        "pending",
-                    ),
-                    created_at=candidate.created_at,
-                )
-            )
-            current = self.store.get_candidate(candidate.candidate_id)
-        if current.status is not CandidateStatus.PENDING_APPROVAL:
-            raise MemoryLifecycleError(
-                "candidate did not reach pending approval",
-                MemoryLifecycleErrorCode.INVALID_TRANSITION,
-            )
-        return CandidateLifecycleResult(
-            candidate_id=candidate.candidate_id,
-            status=current.status,
-            validation=validation,
-            dedupe=dedupe,
-            persisted=True,
-            write_results=tuple(writes),
-        )
 
     propose_candidate = submit_candidate
     propose = submit_candidate
@@ -436,8 +626,12 @@ class MemoryLifecycle:
         reason_code: str = "approved",
         created_at: Optional[str] = None,
         expected_generation: Optional[int] = None,
+        expiry_conditions: Sequence[ExpiryCondition] = (),
     ) -> ApprovalResult:
         checked_actor, checked_reason = _human_decision(actor, reason)
+        canonical_expiry = _canonical_requested_expiry_conditions(
+            expiry_conditions
+        )
         candidate = self.store.get_candidate(candidate_id)
         replay = self._replay_approval(
             candidate,
@@ -445,9 +639,32 @@ class MemoryLifecycle:
             actor=checked_actor,
             reason=checked_reason,
             reason_code=reason_code,
+            expiry_conditions=canonical_expiry,
         )
         if replay is not None:
             return replay
+        if candidate.status is CandidateStatus.APPROVED:
+            if type(runtime_provenance) is not TrustedCandidateProvenance:
+                raise MemoryLifecycleError(
+                    "trusted Runtime provenance is required",
+                    MemoryLifecycleErrorCode.INVALID_INPUT,
+                )
+            converged = self._converged_approval(
+                candidate.candidate_id,
+                authority_resolution_hash=(
+                    runtime_provenance.authority_resolution_hash
+                ),
+                actor=checked_actor,
+                reason=checked_reason,
+                reason_code=reason_code,
+                request_id=request_id,
+                created_at=created_at,
+                expected_generation=expected_generation,
+                expiry_conditions=canonical_expiry,
+                require_existing_receipt=True,
+            )
+            if converged is not None:
+                return converged
         if candidate.status is not CandidateStatus.PENDING_APPROVAL:
             raise MemoryLifecycleError(
                 "only a pending candidate can be approved",
@@ -462,6 +679,7 @@ class MemoryLifecycle:
             request_id=request_id,
             created_at=created_at,
             expected_generation=expected_generation,
+            expiry_conditions=canonical_expiry,
         )
 
     approve = approve_candidate
@@ -600,8 +818,12 @@ class MemoryLifecycle:
         request_id: str,
         created_at: Optional[str] = None,
         expected_generation: Optional[int] = None,
+        expiry_conditions: Sequence[ExpiryCondition] = (),
     ) -> ApprovalResult:
         checked_actor, checked_reason = _human_decision(actor, reason)
+        canonical_expiry = _canonical_requested_expiry_conditions(
+            expiry_conditions
+        )
         if type(replacement) is not MemoryCandidate:
             raise MemoryLifecycleError(
                 "replacement must be a canonical MemoryCandidate",
@@ -616,6 +838,7 @@ class MemoryLifecycle:
                 actor=checked_actor,
                 reason=checked_reason,
                 reason_code="revalidated",
+                expiry_conditions=canonical_expiry,
             )
             if replay is not None:
                 predecessor = self.store.get_record(memory_id)
@@ -624,6 +847,34 @@ class MemoryLifecycle:
                         "revalidation replay did not supersede its predecessor"
                     )
                 return replay
+            if existing_replacement.status is CandidateStatus.APPROVED:
+                if type(runtime_provenance) is not TrustedCandidateProvenance:
+                    raise MemoryLifecycleError(
+                        "trusted Runtime provenance is required",
+                        MemoryLifecycleErrorCode.INVALID_INPUT,
+                    )
+                converged = self._converged_approval(
+                    existing_replacement.candidate_id,
+                    authority_resolution_hash=(
+                        runtime_provenance.authority_resolution_hash
+                    ),
+                    actor=checked_actor,
+                    reason=checked_reason,
+                    reason_code="revalidated",
+                    request_id=request_id,
+                    created_at=created_at,
+                    expected_generation=expected_generation,
+                    supersede_memory_id=memory_id,
+                    expiry_conditions=canonical_expiry,
+                    require_existing_receipt=True,
+                )
+                if converged is not None:
+                    predecessor = self.store.get_record(memory_id)
+                    if predecessor.status is not RecordStatus.SUPERSEDED:
+                        raise MemoryStoreCorruptionError(
+                            "revalidation convergence did not supersede its predecessor"
+                        )
+                    return converged
 
         predecessor = self.store.get_record(memory_id)
         if predecessor.status not in {
@@ -644,6 +895,10 @@ class MemoryLifecycle:
                 "revalidation must create a new immutable candidate",
                 MemoryLifecycleErrorCode.INVALID_REPLACEMENT,
             )
+        self._validate_approval_expiry_conditions(
+            replacement,
+            canonical_expiry,
+        )
         if expected_generation is not None:
             current_generation = self.store.get_generations(
                 predecessor.repository_key
@@ -682,9 +937,202 @@ class MemoryLifecycle:
             expected_generation=approval_generation,
             supersede_memory_id=predecessor.memory_id,
             expected_supersede_status=predecessor.status,
+            expiry_conditions=canonical_expiry,
         )
 
     revalidate = revalidate_record
+
+    def expire_due_records(
+        self,
+        repository_key: str,
+        *,
+        target_head: str,
+        evaluated_at: datetime | str,
+        max_records: int = MAX_EXPIRY_SWEEP_RECORDS,
+    ) -> ExpirySweepResult:
+        """Evaluate and CAS-expire a bounded prefix of ACTIVE records."""
+
+        if (
+            type(max_records) is not int
+            or max_records < 1
+            or max_records > MAX_EXPIRY_SWEEP_RECORDS
+        ):
+            raise MemoryLifecycleError(
+                "max_records must be between 1 and %d"
+                % MAX_EXPIRY_SWEEP_RECORDS,
+                MemoryLifecycleErrorCode.INVALID_INPUT,
+            )
+        target = _bounded_target_head(target_head)
+        evaluated_utc = _aware_utc_datetime(evaluated_at)
+        evaluated_text = _canonical_utc_datetime(evaluated_utc)
+        active_records = self.store.list_records(
+            repository_key,
+            status=RecordStatus.ACTIVE,
+        )
+        selected = active_records[:max_records]
+        expired_ids: List[str] = []
+        unresolved_ids: List[str] = []
+        writes: List[WriteResult] = []
+        for record in selected:
+            result = self.expire_record_if_due(
+                record.memory_id,
+                target_head=target,
+                evaluated_at=evaluated_utc,
+            )
+            if result.expired:
+                expired_ids.append(record.memory_id)
+            if result.evaluation.unresolved:
+                unresolved_ids.append(record.memory_id)
+            if result.write_result is not None:
+                writes.append(result.write_result)
+        return ExpirySweepResult(
+            repository_key=repository_key,
+            target_head=target,
+            evaluated_at=evaluated_text,
+            max_records=max_records,
+            scanned_ids=tuple(record.memory_id for record in selected),
+            expired_ids=tuple(expired_ids),
+            unresolved_ids=tuple(unresolved_ids),
+            write_results=tuple(writes),
+            truncated=len(active_records) > max_records,
+        )
+
+    def expire_record_if_due(
+        self,
+        memory_id: str,
+        *,
+        target_head: str,
+        evaluated_at: datetime | str,
+    ) -> RecordExpiryResult:
+        """Evaluate one record and perform only an ACTIVE-to-EXPIRED CAS."""
+
+        record = self.store.get_record(memory_id)
+        evaluation = evaluate_expiry_conditions(
+            record.expiry_conditions,
+            repository=self.source_validator.repository,
+            target_head=target_head,
+            evaluated_at=evaluated_at,
+            revision_resolver=self.source_validator.revision_resolver,
+        )
+        if not evaluation.due or record.status not in {
+            RecordStatus.ACTIVE,
+            RecordStatus.EXPIRED,
+        }:
+            return RecordExpiryResult(
+                memory_id=record.memory_id,
+                evaluation=evaluation,
+                current_status=record.status,
+                expired=False,
+            )
+
+        condition = evaluation.due_condition
+        reason_code = evaluation.reason_code
+        if condition is None or reason_code is None:  # pragma: no cover
+            raise MemoryStoreCorruptionError(
+                "due expiry evaluation is missing its triggering condition"
+            )
+        target_label = _expiry_target_label(evaluation)
+        reason = _expiry_event_reason(
+            evaluated_at=evaluation.evaluated_at,
+            target=target_label,
+            condition_fingerprint=condition.condition_fingerprint,
+        )
+        request_id = stable_request_id(
+            "memory_expiry",
+            "expire",
+            record.memory_id,
+            evaluation.evaluated_at,
+            target_label,
+            condition.condition_fingerprint,
+        )
+        try:
+            write = self.store.transition_record(
+                record.memory_id,
+                expected_status=RecordStatus.ACTIVE,
+                new_status=RecordStatus.EXPIRED,
+                action="expire",
+                actor_type="runtime",
+                actor_id="memory_expiry",
+                reason_code=reason_code,
+                reason=reason,
+                request_id=request_id,
+                created_at=evaluation.evaluated_at,
+            )
+            return RecordExpiryResult(
+                memory_id=record.memory_id,
+                evaluation=evaluation,
+                current_status=RecordStatus.EXPIRED,
+                expired=True,
+                write_result=write,
+                converged=not write.applied,
+            )
+        except MemoryStoreConflictError:
+            current = self.store.get_record(record.memory_id)
+            if current.status is not RecordStatus.EXPIRED:
+                return RecordExpiryResult(
+                    memory_id=record.memory_id,
+                    evaluation=evaluation,
+                    current_status=current.status,
+                    expired=False,
+                )
+            converged_write = self._converged_expiry_write(
+                current,
+                request_id=request_id,
+                reason_code=reason_code,
+                reason=reason,
+            )
+            if converged_write is None:
+                return RecordExpiryResult(
+                    memory_id=record.memory_id,
+                    evaluation=evaluation,
+                    current_status=current.status,
+                    expired=False,
+                )
+            return RecordExpiryResult(
+                memory_id=record.memory_id,
+                evaluation=evaluation,
+                current_status=current.status,
+                expired=True,
+                write_result=converged_write,
+                converged=True,
+            )
+
+    def _converged_expiry_write(
+        self,
+        record: DurableMemoryRecord,
+        *,
+        request_id: str,
+        reason_code: str,
+        reason: str,
+    ) -> Optional[WriteResult]:
+        matching = [
+            event
+            for event in self.store.list_events(
+                record.repository_key,
+                subject_type="record",
+                subject_id=record.memory_id,
+            )
+            if (
+                event.action == "expire"
+                and event.actor_type == "runtime"
+                and event.actor_id == "memory_expiry"
+                and event.reason_code == reason_code
+                and event.reason == reason
+                and event.previous_status == RecordStatus.ACTIVE.value
+                and event.new_status == RecordStatus.EXPIRED.value
+            )
+        ]
+        if len(matching) != 1:
+            return None
+        event = matching[0]
+        return WriteResult(
+            operation="transition_record",
+            subject_id=record.memory_id,
+            event_id=event.event_id,
+            generations=self.store.get_generations(record.repository_key),
+            applied=False,
+            replayed=event.request_id == request_id,
+        )
 
     def audit_record(self, memory_id: str) -> RecordAuditResult:
         try:
@@ -728,6 +1176,7 @@ class MemoryLifecycle:
         request_id: str,
         created_at: Optional[str],
         expected_generation: Optional[int],
+        expiry_conditions: Tuple[ExpiryCondition, ...],
         supersede_memory_id: Optional[str] = None,
         expected_supersede_status: Optional[RecordStatus] = None,
     ) -> ApprovalResult:
@@ -736,6 +1185,7 @@ class MemoryLifecycle:
                 "trusted Runtime provenance is required",
                 MemoryLifecycleErrorCode.INVALID_INPUT,
             )
+        self._validate_approval_expiry_conditions(candidate, expiry_conditions)
         proposal = replace(candidate, status=CandidateStatus.PROPOSED)
         try:
             receipt = self.store.select_candidate_authority_receipt(
@@ -830,29 +1280,280 @@ class MemoryLifecycle:
             approval_event_id=approval_event_id,
             status=RecordStatus.ACTIVE,
             created_at=timestamp,
+            expiry_conditions=expiry_conditions,
         )
-        write = self.store.approve_candidate_with_source_bundle(
-            record,
-            bundle,
-            request_id=request_id,
-            expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
-            expected_generation=expected_generation,
-            authority_resolution_hash=(
-                restoration.provenance.authority_resolution_hash
-            ),
-            actor_type="human",
-            actor_id=actor,
-            reason_code=reason_code,
-            reason=reason,
-            supersede_memory_id=supersede_memory_id,
-            expected_supersede_status=expected_supersede_status,
-        )
+        try:
+            write = self.store.approve_candidate_with_source_bundle(
+                record,
+                bundle,
+                request_id=request_id,
+                expected_candidate_status=CandidateStatus.PENDING_APPROVAL,
+                expected_generation=expected_generation,
+                authority_resolution_hash=(
+                    restoration.provenance.authority_resolution_hash
+                ),
+                actor_type="human",
+                actor_id=actor,
+                reason_code=reason_code,
+                reason=reason,
+                supersede_memory_id=supersede_memory_id,
+                expected_supersede_status=expected_supersede_status,
+            )
+        except MemoryStoreConflictError:
+            converged = self._converged_approval(
+                candidate.candidate_id,
+                authority_resolution_hash=(
+                    restoration.provenance.authority_resolution_hash
+                ),
+                actor=actor,
+                reason=reason,
+                reason_code=reason_code,
+                request_id=request_id,
+                created_at=created_at,
+                expected_generation=expected_generation,
+                supersede_memory_id=supersede_memory_id,
+                expiry_conditions=expiry_conditions,
+            )
+            if converged is None:
+                raise
+            return converged
         return ApprovalResult(
             record=record,
             bundle=bundle,
             bundle_payload=payload,
             validation=validation,
             write_result=write,
+        )
+
+    def _converged_approval(
+        self,
+        candidate_id: str,
+        *,
+        authority_resolution_hash: str,
+        actor: str,
+        reason: str,
+        reason_code: str,
+        request_id: str,
+        created_at: Optional[str],
+        expected_generation: Optional[int],
+        supersede_memory_id: Optional[str] = None,
+        expiry_conditions: Tuple[ExpiryCondition, ...] = (),
+        require_existing_receipt: bool = False,
+    ) -> Optional[ApprovalResult]:
+        """Persist or replay one same-decision concurrent approval receipt."""
+
+        current = self.store.find_candidate(candidate_id)
+        if current is None or current.status is not CandidateStatus.APPROVED:
+            return None
+        receipt_operation = self._request_receipt_operation(request_id)
+        if require_existing_receipt:
+            if receipt_operation is None:
+                return None
+            if receipt_operation != "transition_candidate":
+                raise MemoryStoreConflictError(
+                    "request ID was reused for different content"
+                )
+        elif receipt_operation is not None:
+            # This path may create only the receipt for the fresh request that
+            # just lost the approval CAS.  Existing receipts retain their Store
+            # request-reuse semantics.
+            return None
+        memory_id = _memory_id(candidate_id)
+        try:
+            record = self.store.get_record(memory_id)
+            if (
+                record.candidate_id != candidate_id
+                or record.status is not RecordStatus.ACTIVE
+            ):
+                return None
+            bundle = self.store.get_source_bundle(record.source_bundle_hash)
+            payload = self.store.read_blob(bundle.blob_hash)
+            _validate_source_bundle_payload(payload, record, bundle)
+        except (MemoryStoreError, UnicodeError, ValueError, json.JSONDecodeError):
+            return None
+        if record.expiry_conditions != expiry_conditions:
+            raise MemoryStoreConflictError(
+                "approval expiry conditions differ from the winning record"
+            )
+
+        approval_event = self._winning_approval_event(record)
+        supersede_event = self._approval_supersede_event(record, approval_event)
+        if require_existing_receipt:
+            write = self._write_converged_approval_receipt(
+                record,
+                authority_resolution_hash=authority_resolution_hash,
+                actor=actor,
+                reason=reason,
+                reason_code=reason_code,
+                request_id=request_id,
+                created_at=created_at,
+                expected_generation=expected_generation,
+                supersede_memory_id=supersede_memory_id,
+                expiry_conditions=expiry_conditions,
+            )
+            if not write.replayed:
+                raise MemoryStoreCorruptionError(
+                    "converged approval receipt was not replayed"
+                )
+        else:
+            if (
+                approval_event.actor_type != "human"
+                or approval_event.actor_id != actor
+                or approval_event.reason_code != reason_code
+                or approval_event.reason != reason
+                or (created_at is not None and approval_event.created_at != created_at)
+                or record.approved_by != actor
+                or (
+                    None if supersede_event is None else supersede_event.subject_id
+                )
+                != supersede_memory_id
+            ):
+                # A concurrent request with a different human decision or a
+                # different predecessor is a real conflict, not convergence.
+                return None
+            write = self._write_converged_approval_receipt(
+                record,
+                authority_resolution_hash=authority_resolution_hash,
+                actor=actor,
+                reason=reason,
+                reason_code=reason_code,
+                request_id=request_id,
+                created_at=created_at,
+                expected_generation=expected_generation,
+                supersede_memory_id=supersede_memory_id,
+                expiry_conditions=expiry_conditions,
+            )
+            if write.applied or write.event_id is not None:
+                raise MemoryStoreCorruptionError(
+                    "converged approval receipt changed authoritative state"
+                )
+        return ApprovalResult(
+            record=record,
+            bundle=bundle,
+            bundle_payload=payload,
+            validation=None,
+            write_result=write,
+            converged=True,
+        )
+
+    def _request_receipt_operation(self, request_id: str) -> Optional[str]:
+        """Read only enough receipt metadata to distinguish replay from create."""
+
+        return self.store.find_request_receipt_operation(request_id)
+
+    def _winning_approval_event(
+        self,
+        record: DurableMemoryRecord,
+    ) -> MemoryEvent:
+        matching = [
+            event
+            for event in self.store.list_events(
+                record.repository_key,
+                subject_type="candidate",
+                subject_id=record.candidate_id,
+            )
+            if event.event_id == record.approval_event_id
+        ]
+        if len(matching) != 1:
+            raise MemoryStoreCorruptionError(
+                "approved record does not have one winning approval event"
+            )
+        event = matching[0]
+        if (
+            event.action != "approve"
+            or event.previous_status != CandidateStatus.PENDING_APPROVAL.value
+            or event.new_status != CandidateStatus.APPROVED.value
+        ):
+            raise MemoryStoreCorruptionError(
+                "approved record winning event is invalid"
+            )
+        return event
+
+    def _approval_supersede_event(
+        self,
+        record: DurableMemoryRecord,
+        approval_event: MemoryEvent,
+    ) -> Optional[MemoryEvent]:
+        matching = []
+        for event in self.store.list_events(
+            record.repository_key,
+            subject_type="record",
+        ):
+            if event.action != "supersede":
+                continue
+            expected_request_id = stable_request_id(
+                "approve_candidate_with_source_bundle",
+                "supersede",
+                approval_event.request_id,
+                event.subject_id,
+                record.memory_id,
+            )
+            if event.request_id == expected_request_id:
+                matching.append(event)
+        if len(matching) > 1:
+            raise MemoryStoreCorruptionError(
+                "approval has multiple predecessor supersession events"
+            )
+        if not matching:
+            return None
+        event = matching[0]
+        if (
+            event.actor_type != approval_event.actor_type
+            or event.actor_id != approval_event.actor_id
+            or event.reason != approval_event.reason
+            or event.new_status != RecordStatus.SUPERSEDED.value
+        ):
+            raise MemoryStoreCorruptionError(
+                "approval predecessor supersession event is invalid"
+            )
+        return event
+
+    def _write_converged_approval_receipt(
+        self,
+        record: DurableMemoryRecord,
+        *,
+        authority_resolution_hash: str,
+        actor: str,
+        reason: str,
+        reason_code: str,
+        request_id: str,
+        created_at: Optional[str],
+        expected_generation: Optional[int],
+        supersede_memory_id: Optional[str],
+        expiry_conditions: Tuple[ExpiryCondition, ...],
+    ) -> WriteResult:
+        decision_hash = canonical_sha256(
+            {
+                "operation": "approve_candidate_with_source_bundle",
+                "candidate_id": record.candidate_id,
+                "winning_memory_id": record.memory_id,
+                "winning_approval_event_id": record.approval_event_id,
+                "winning_source_bundle_hash": record.source_bundle_hash,
+                "authority_resolution_hash": authority_resolution_hash,
+                "actor_type": "human",
+                "actor_id": actor,
+                "reason_code": reason_code,
+                "reason": reason,
+                "created_at": created_at,
+                "expected_generation": expected_generation,
+                "supersede_memory_id": supersede_memory_id,
+                "expiry_conditions": [
+                    condition.to_dict() for condition in expiry_conditions
+                ],
+            }
+        )
+        return self.store.transition_candidate(
+            record.candidate_id,
+            expected_status=CandidateStatus.APPROVED,
+            new_status=CandidateStatus.APPROVED,
+            action="approve_converged",
+            actor_type="human",
+            actor_id=actor,
+            reason_code="approval_converged:" + decision_hash,
+            reason=reason,
+            request_id=request_id,
+            created_at=created_at,
+            authority_resolution_hash=authority_resolution_hash,
         )
 
     def _build_candidate_authority_receipt(
@@ -893,6 +1594,39 @@ class MemoryLifecycle:
                 MemoryLifecycleErrorCode.SOURCE_VALIDATION_FAILED,
             ) from None
 
+    def _validate_approval_expiry_conditions(
+        self,
+        candidate: MemoryCandidate,
+        expiry_conditions: Tuple[ExpiryCondition, ...],
+    ) -> None:
+        resolver = self.source_validator.revision_resolver
+        repository = self.source_validator.repository
+        for condition in expiry_conditions:
+            if condition.condition_kind is not ExpiryConditionKind.AT_COMMIT:
+                continue
+            try:
+                valid_from = resolver.resolve_commit(
+                    repository,
+                    candidate.valid_from_sha,
+                ).casefold()
+                boundary = resolver.resolve_commit(
+                    repository,
+                    condition.value,
+                ).casefold()
+                valid_boundary = boundary == valid_from or resolver.is_ancestor(
+                    repository,
+                    valid_from,
+                    boundary,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                valid_boundary = False
+            if not valid_boundary:
+                raise MemoryLifecycleError(
+                    "at_commit expiry boundary must exist at or after "
+                    "valid_from_sha on the same lineage",
+                    MemoryLifecycleErrorCode.INVALID_INPUT,
+                )
+
     def _reject_failed_approval_validation(
         self,
         candidate: MemoryCandidate,
@@ -927,6 +1661,7 @@ class MemoryLifecycle:
         actor: str,
         reason: str,
         reason_code: str,
+        expiry_conditions: Tuple[ExpiryCondition, ...],
     ) -> Optional[ApprovalResult]:
         matching = [
             event
@@ -952,6 +1687,10 @@ class MemoryLifecycle:
             )
         memory_id = _memory_id(candidate.candidate_id)
         record = self.store.get_record(memory_id)
+        if record.expiry_conditions != expiry_conditions:
+            raise MemoryStoreConflictError(
+                "request ID was reused with different expiry conditions"
+            )
         bundle = self.store.get_source_bundle(record.source_bundle_hash)
         payload = self.store.read_blob(bundle.blob_hash)
         _validate_source_bundle_payload(payload, record, bundle)
@@ -1021,6 +1760,7 @@ class MemoryLifecycle:
                         related_memory_id=record.memory_id,
                     )
             if prior.status in {
+                CandidateStatus.PROPOSED,
                 CandidateStatus.VALIDATED,
                 CandidateStatus.PENDING_APPROVAL,
             }:
@@ -1236,6 +1976,7 @@ class TargetHeadApplicabilityEvaluator:
         record: DurableMemoryRecord,
         *,
         target_head: str,
+        evaluated_at: Optional[datetime | str] = None,
         changed_paths: Optional[Sequence[str]] = None,
         changed_symbols: Optional[Sequence[str]] = None,
         changed_contracts: Optional[Sequence[str]] = None,
@@ -1246,6 +1987,47 @@ class TargetHeadApplicabilityEvaluator:
                 "record must be a canonical DurableMemoryRecord",
                 MemoryLifecycleErrorCode.INVALID_INPUT,
             )
+
+        status_decision = self._status_decision(record, str(target_head))
+        if status_decision is not None:
+            return status_decision
+
+        if record.expiry_conditions:
+            if evaluated_at is None:
+                return self._decision(
+                    record,
+                    str(target_head),
+                    Applicability.SOURCE_MISSING,
+                    "expiry_condition_unresolved",
+                    requires_revalidation=True,
+                )
+            expiry = evaluate_expiry_conditions(
+                record.expiry_conditions,
+                repository=self.repository,
+                target_head=target_head,
+                evaluated_at=evaluated_at,
+                revision_resolver=self.revision_resolver,
+            )
+            if expiry.due:
+                reason_code = expiry.reason_code
+                if reason_code is None:  # pragma: no cover
+                    raise MemoryStoreCorruptionError(
+                        "due expiry evaluation is missing its reason"
+                    )
+                return self._decision(
+                    record,
+                    expiry.target_commit or expiry.target_head,
+                    Applicability.EXPIRED,
+                    reason_code,
+                )
+            if expiry.unresolved:
+                return self._decision(
+                    record,
+                    expiry.target_commit or expiry.target_head,
+                    Applicability.SOURCE_MISSING,
+                    "expiry_condition_unresolved",
+                    requires_revalidation=True,
+                )
         try:
             target = self.revision_resolver.resolve_commit(
                 self.repository,
@@ -1259,10 +2041,6 @@ class TargetHeadApplicabilityEvaluator:
                 "target_head_missing",
                 requires_revalidation=True,
             )
-
-        status_decision = self._status_decision(record, target)
-        if status_decision is not None:
-            return status_decision
 
         try:
             if record.valid_from_sha == target:
@@ -1595,6 +2373,114 @@ def _validate_source_bundle_payload(
     return payload
 
 
+def _canonical_requested_expiry_conditions(
+    values: Sequence[ExpiryCondition],
+) -> Tuple[ExpiryCondition, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple)):
+        raise MemoryLifecycleError(
+            "expiry_conditions must be a list or tuple of ExpiryCondition values",
+            MemoryLifecycleErrorCode.INVALID_INPUT,
+        )
+    if len(values) > len(ExpiryConditionKind):
+        raise MemoryLifecycleError(
+            "expiry_conditions must contain at most two conditions",
+            MemoryLifecycleErrorCode.INVALID_INPUT,
+        )
+    by_kind: Dict[ExpiryConditionKind, ExpiryCondition] = {}
+    for condition in values:
+        if type(condition) is not ExpiryCondition:
+            raise MemoryLifecycleError(
+                "expiry_conditions must contain canonical ExpiryCondition values",
+                MemoryLifecycleErrorCode.INVALID_INPUT,
+            )
+        if condition.condition_kind in by_kind:
+            raise MemoryLifecycleError(
+                "expiry_conditions must contain at most one condition of each kind",
+                MemoryLifecycleErrorCode.INVALID_INPUT,
+            )
+        by_kind[condition.condition_kind] = condition
+    return tuple(
+        by_kind[kind]
+        for kind in sorted(by_kind, key=lambda item: item.value)
+    )
+
+
+def _aware_utc_datetime(value: datetime | str) -> datetime:
+    if isinstance(value, str):
+        if not value or len(value) > 64 or "\0" in value:
+            raise MemoryLifecycleError(
+                "evaluated_at must carry an explicit timezone",
+                MemoryLifecycleErrorCode.INVALID_INPUT,
+            )
+        try:
+            value = datetime.fromisoformat(
+                value[:-1] + "+00:00" if value.endswith("Z") else value
+            )
+        except ValueError:
+            raise MemoryLifecycleError(
+                "evaluated_at must carry an explicit timezone",
+                MemoryLifecycleErrorCode.INVALID_INPUT,
+            ) from None
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise MemoryLifecycleError(
+            "evaluated_at must carry an explicit timezone",
+            MemoryLifecycleErrorCode.INVALID_INPUT,
+        )
+    try:
+        offset = value.utcoffset()
+        if offset is None:
+            raise ValueError
+        return value.astimezone(timezone.utc)
+    except (OverflowError, TypeError, ValueError):
+        raise MemoryLifecycleError(
+            "evaluated_at must carry an explicit timezone",
+            MemoryLifecycleErrorCode.INVALID_INPUT,
+        ) from None
+
+
+def _canonical_utc_datetime(value: datetime) -> str:
+    timespec = "microseconds" if value.microsecond else "seconds"
+    return value.isoformat(timespec=timespec).replace("+00:00", "Z")
+
+
+def _bounded_target_head(value: str) -> str:
+    if not isinstance(value, str):
+        raise MemoryLifecycleError(
+            "target_head must be bounded text",
+            MemoryLifecycleErrorCode.INVALID_INPUT,
+        )
+    normalized = value.strip()
+    if not normalized or len(normalized) > 512 or "\0" in normalized:
+        raise MemoryLifecycleError(
+            "target_head must be bounded text",
+            MemoryLifecycleErrorCode.INVALID_INPUT,
+        )
+    return normalized
+
+
+def _expiry_target_label(evaluation: ExpiryEvaluationResult) -> str:
+    if evaluation.target_commit is not None:
+        return evaluation.target_commit
+    return "unresolved:" + canonical_sha256(
+        {"target_head": evaluation.target_head}
+    )
+
+
+def _expiry_event_reason(
+    *,
+    evaluated_at: str,
+    target: str,
+    condition_fingerprint: str,
+) -> str:
+    return canonical_json(
+        {
+            "condition_fingerprint": condition_fingerprint,
+            "evaluated_at": evaluated_at,
+            "target": target,
+        }
+    )
+
+
 def _human_decision(actor: str, reason: str) -> Tuple[str, str]:
     try:
         checked_actor = _required_nonempty(actor, "actor")
@@ -1751,13 +2637,19 @@ __all__ = [
     "CandidateDedupeDecision",
     "CandidateDedupeKind",
     "CandidateLifecycleResult",
+    "ExpiryEvaluationResult",
+    "ExpiryEvaluationStatus",
+    "ExpirySweepResult",
+    "MAX_EXPIRY_SWEEP_RECORDS",
     "MemoryLifecycle",
     "MemoryLifecycleError",
     "MemoryLifecycleErrorCode",
     "RecordAuditResult",
     "RecordAuditStatus",
+    "RecordExpiryResult",
     "SOURCE_BUNDLE_MEDIA_TYPE",
     "SOURCE_BUNDLE_SCHEMA",
     "TargetHeadApplicabilityEvaluator",
     "build_canonical_source_bundle",
+    "evaluate_expiry_conditions",
 ]

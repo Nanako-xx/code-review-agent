@@ -97,7 +97,9 @@ from review_agent.memory_identity import (
     repository_namespace_path,
 )
 from review_agent.memory_lifecycle import (
+    MAX_EXPIRY_SWEEP_RECORDS,
     CandidateDedupeKind,
+    CandidateLifecycleResult,
     MemoryLifecycle,
     TargetHeadApplicabilityEvaluator,
 )
@@ -110,6 +112,7 @@ from review_agent.memory_models import (
     HumanDeclarationOrigin,
     HumanDeclarationSourceRef,
     DurableMemoryRecord,
+    MEMORY_SELECTION_POLICY_VERSION,
     MemoryExecutionConfig,
     MemoryCandidate,
     CandidateStatus,
@@ -127,6 +130,7 @@ from review_agent.memory_models import (
     ValidityPolicy,
     canonical_sha256,
     stable_request_id,
+    validate_stable_id,
 )
 from review_agent.memory_policy import (
     PolicyCompilation,
@@ -150,7 +154,14 @@ from review_agent.memory_retrieval import (
     build_disabled_snapshot,
     build_memory_snapshot,
 )
-from review_agent.memory_sources import SourceValidator, TrustedCandidateProvenance
+from review_agent.memory_sources import (
+    SensitiveContentKind,
+    SourceValidationCode,
+    SourceValidationError,
+    SourceValidator,
+    TrustedCandidateProvenance,
+    scan_sensitive_text,
+)
 from review_agent.memory_store import MemoryStore, MemoryStoreError, WriteResult
 from review_agent.incremental import (
     IncrementalPriorityMap,
@@ -219,7 +230,6 @@ from review_agent.quality_runner import (
     skipped_quality_gate_execution,
 )
 from review_agent.portfolio import (
-    DEFAULT_CHECK_ALLOWLIST,
     DEFAULT_COMMAND_TEMPLATE_ALLOWLIST,
     DEFAULT_CONTRACT_ALLOWLIST,
     DEFAULT_PERSPECTIVE_ALLOWLIST,
@@ -350,6 +360,57 @@ class PipelineAwaitingUser(PipelineError):
         self.questions = list(questions)
         self.artifact_names = artifact_names
         self.submitted_decisions = submitted_decisions
+
+
+@dataclass(frozen=True)
+class MemoryOutboxReplayPreview:
+    """Strict, content-free projection used by the CLI replay seam."""
+
+    outbox_digest: str
+    batch_digest: str
+    entries: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if not _is_sha256(self.outbox_digest) or not _is_sha256(
+            self.batch_digest
+        ):
+            raise ValueError("Memory outbox replay digests are invalid")
+        entries = tuple(self.entries)
+        if not entries:
+            raise ValueError("Memory outbox replay entries must not be empty")
+        candidate_ids: list[str] = []
+        request_ids: list[str] = []
+        for entry in entries:
+            if type(entry) is not tuple or len(entry) != 2:
+                raise ValueError("Memory outbox replay entries are invalid")
+            candidate_id, request_id = entry
+            validate_stable_id(
+                candidate_id,
+                "MC",
+                "Memory outbox candidate_id",
+            )
+            validate_stable_id(
+                request_id,
+                "REQ",
+                "Memory outbox request_id",
+            )
+            candidate_ids.append(candidate_id)
+            request_ids.append(request_id)
+        if (
+            candidate_ids != sorted(set(candidate_ids))
+            or len(request_ids) != len(set(request_ids))
+        ):
+            raise ValueError("Memory outbox replay entries are not canonical")
+        object.__setattr__(self, "entries", entries)
+
+
+@dataclass(frozen=True)
+class MemoryOutboxReplayAudit:
+    """Canonical human attribution for one explicit replay request."""
+
+    actor: str
+    reason: str
+    request_id: str
 
 
 @dataclass
@@ -1194,6 +1255,7 @@ class ReviewPipeline:
             raise ValueError("repository observation artifact is unavailable")
 
     def _run_memory_selection(self) -> dict[str, str]:
+        created_at = self._clock()
         config = _required(self.context.memory_config, "Memory execution config")
         manifest = self.context.manifest
         summary = _required(self.context.change_summary, "change summary")
@@ -1226,6 +1288,36 @@ class ReviewPipeline:
                     knowledge_generation=0,
                 )
             else:
+                if config.mode is MemoryMode.READ_WRITE:
+                    try:
+                        sweep = MemoryLifecycle(
+                            store,
+                            SourceValidator(self.context.repository),
+                        ).expire_due_records(
+                            repository_key,
+                            target_head=manifest.revisions.resolved_head_sha,
+                            evaluated_at=created_at,
+                            max_records=min(
+                                config.max_snapshot_records,
+                                MAX_EXPIRY_SWEEP_RECORDS,
+                            ),
+                        )
+                    except Exception:
+                        _append_memory_degradation_code(
+                            self.context,
+                            "expiry_sweep_failed",
+                        )
+                    else:
+                        if sweep.truncated:
+                            _append_memory_degradation_code(
+                                self.context,
+                                "expiry_sweep_truncated",
+                            )
+                        if sweep.unresolved_ids:
+                            _append_memory_degradation_code(
+                                self.context,
+                                "expiry_condition_unresolved",
+                            )
                 try:
                     read_view = store.read_view(repository_key)
                 except (MemoryStoreError, OSError):
@@ -1276,8 +1368,8 @@ class ReviewPipeline:
             contracts=tuple(DEFAULT_CONTRACT_ALLOWLIST),
             languages=_memory_languages(summary.changed_files),
             generations=generations,
+            selection_policy_version=MEMORY_SELECTION_POLICY_VERSION,
         )
-        created_at = self._clock()
         feedback = feedback_aggregation_v1(
             feedback_records,
             repository_key=repository_key,
@@ -1306,6 +1398,23 @@ class ReviewPipeline:
                 feedback_calibration_summary=feedback,
                 repository_knowledge_refs=knowledge_refs,
             )
+            snapshot_reason_codes = {
+                reason_code
+                for applicability in snapshot.applicability_decisions
+                for reason_code in applicability.reason_codes
+            }
+            if "expiry_condition_unresolved" in snapshot_reason_codes:
+                _append_memory_degradation_code(
+                    self.context,
+                    "expiry_condition_unresolved",
+                )
+            if snapshot_reason_codes.intersection(
+                {"expiry_time_reached", "expiry_commit_reached"}
+            ):
+                _append_memory_degradation_code(
+                    self.context,
+                    "expiry_persistence_deferred",
+                )
             status = (
                 "degraded"
                 if self.context.memory_degradation_codes
@@ -1315,7 +1424,7 @@ class ReviewPipeline:
         policy_compilation = compile_memory_policy(
             snapshot.eligible_records,
             current_risk_floor=RiskLevel.LOW,
-            registry=_memory_policy_registry(),
+            registry=_memory_policy_registry(self.context),
         )
         cache_provenance = intelligence.cache_provenance
         runtime_binding = {
@@ -1407,7 +1516,7 @@ class ReviewPipeline:
         policy_compilation = compile_memory_policy(
             snapshot.eligible_records,
             current_risk_floor=RiskLevel.LOW,
-            registry=_memory_policy_registry(),
+            registry=_memory_policy_registry(self.context),
         )
         if stored_compilation != policy_compilation.to_dict():
             raise ValueError(
@@ -1669,8 +1778,10 @@ class ReviewPipeline:
             self.context.memory_outbox = outbox
             receipt = None
             if "memory_persistence_receipt" in self.context.manifest.artifacts:
-                receipt = _memory_persistence_receipt_from_dict(
-                    self._read_json_artifact("memory_persistence_receipt")
+                receipt = _memory_persistence_receipt_for_outbox(
+                    self._read_json_artifact("memory_persistence_receipt"),
+                    batch=batch,
+                    outbox=outbox,
                 )
             else:
                 try:
@@ -1688,6 +1799,11 @@ class ReviewPipeline:
                     if "outbox_pending" not in self.context.memory_degradation_codes:
                         self.context.memory_degradation_codes.append("outbox_pending")
             if receipt is not None:
+                receipt = _memory_persistence_receipt_for_outbox(
+                    receipt,
+                    batch=batch,
+                    outbox=outbox,
+                )
                 workspace.write_json(
                     "memory_persistence_receipt.json",
                     dict(receipt),
@@ -1825,13 +1941,12 @@ class ReviewPipeline:
         existing: list[ExistingFingerprint] = []
         if self.context.memory_store is not None:
             existing.extend(
-                ExistingFingerprint(item.content_fingerprint, "pending_approval")
-                for item in self.context.memory_store.list_candidates(
+                _memory_curator_fingerprint_catalog(
+                    self.context.memory_store,
                     _required(
                         self.context.memory_repository_key,
                         "Memory repository key",
                     ),
-                    status=CandidateStatus.PROPOSED,
                 )
             )
         return MemoryCuratorInput(
@@ -1892,17 +2007,13 @@ class ReviewPipeline:
                 raise ValueError("Memory outbox does not match candidate batch")
             self.context.memory_outbox = outbox
         if "memory_persistence_receipt" in self.context.manifest.artifacts:
-            receipt = _memory_persistence_receipt_from_dict(
-                self._read_json_artifact("memory_persistence_receipt")
+            if self.context.memory_outbox is None:
+                raise ValueError("Memory receipt has no committed outbox")
+            receipt = _memory_persistence_receipt_for_outbox(
+                self._read_json_artifact("memory_persistence_receipt"),
+                batch=batch,
+                outbox=self.context.memory_outbox,
             )
-            if self.context.memory_outbox is None or (
-                receipt["outbox_digest"]
-                != self.context.memory_outbox["outbox_digest"]
-                or receipt["batch_digest"] != batch.batch_digest
-                or receipt["repository_key"]
-                != self.context.memory_outbox["repository_key"]
-            ):
-                raise ValueError("Memory receipt does not match its outbox")
             self.context.memory_persistence_receipt = receipt
 
     def _run_intent_discovery(self) -> dict[str, str]:
@@ -2242,7 +2353,7 @@ class ReviewPipeline:
             ref_allowlist=portfolio_ref_catalog,
             ref_catalog=portfolio_ref_catalog,
             contract_allowlist=DEFAULT_CONTRACT_ALLOWLIST,
-            check_allowlist=DEFAULT_CHECK_ALLOWLIST,
+            check_allowlist=_quality_gate_check_ids(self.context),
             command_template_allowlist=DEFAULT_COMMAND_TEMPLATE_ALLOWLIST,
             perspective_allowlist=DEFAULT_PERSPECTIVE_ALLOWLIST,
             memory_projection=planner_memory_projection,
@@ -2319,15 +2430,23 @@ class ReviewPipeline:
         workspace = self._phase_workspace(RunPhase.PLANNING)
         deep_observations = ObservationStore(workspace.path / "quality-obs")
         deep_results: list[QualityGateResult] = []
+        memory_required_checks = _memory_required_check_ids(self.context)
         if self.context.quality_gate_plan is not None:
             for gate in self.context.quality_gate_plan.gates:
                 if gate.cost != "expensive":
                     continue
-                should_run, reason = quality_gate_policy_decision(
-                    gate,
-                    risk,
-                    assignments,
-                )
+                if gate.name in memory_required_checks:
+                    should_run, reason = (
+                        True,
+                        "required by approved project Memory in the frozen "
+                        "Quality Gate plan",
+                    )
+                else:
+                    should_run, reason = quality_gate_policy_decision(
+                        gate,
+                        risk,
+                        assignments,
+                    )
                 execution = (
                     self._execute_quality_gate(gate)
                     if should_run
@@ -4708,7 +4827,9 @@ class ReviewPipeline:
                 or self.context.memory_cache_provenance
             ),
             feedback_summary=self.context.memory_feedback_summary,
-            pending_memory_candidates=self.context.memory_candidate_batch,
+            pending_memory_candidates=_memory_pending_candidate_rows(
+                self.context
+            ),
             memory_status=_memory_reporting_status(self.context),
             curator_status=_memory_curator_audit_status(self.context),
             outbox_status=_memory_outbox_audit_status(self.context),
@@ -5427,29 +5548,60 @@ def _memory_outbox_from_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
     body = {key: payload[key] for key in expected if key != "outbox_digest"}
     if payload.get("schema") != "memory_candidate_outbox_v1":
         raise ValueError("Memory outbox schema is unsupported")
+    review_id = payload.get("review_id")
+    if (
+        type(review_id) is not str
+        or not 1 <= len(review_id) <= 128
+        or not review_id[0].isalnum()
+        or any(
+            not (character.isalnum() or character in "._-")
+            for character in review_id
+        )
+    ):
+        raise ValueError("Memory outbox review_id is invalid")
     for field_name in (
-        "review_id",
         "repository_key",
         "locator_repository_key",
         "authority_resolution_hash",
-        "head_sha",
-        "snapshot_id",
         "batch_digest",
-        "actor_type",
-        "actor_id",
-        "reason_code",
         "outbox_digest",
     ):
-        if not isinstance(payload.get(field_name), str) or not payload[field_name]:
+        if not _is_sha256(payload.get(field_name)):
             raise ValueError(f"Memory outbox {field_name} is invalid")
-    if payload["binding_id"] is not None and (
-        not isinstance(payload["binding_id"], str) or not payload["binding_id"]
+    head_sha = payload.get("head_sha")
+    if not isinstance(head_sha, str) or (
+        len(head_sha) not in {40, 64}
+        or head_sha != head_sha.casefold()
+        or any(character not in "0123456789abcdef" for character in head_sha)
     ):
-        raise ValueError("Memory outbox binding_id is invalid")
+        raise ValueError("Memory outbox head_sha is invalid")
+    try:
+        validate_stable_id(
+            payload.get("snapshot_id"),
+            "MSNAP",
+            "Memory outbox snapshot_id",
+        )
+        if payload["binding_id"] is not None:
+            validate_stable_id(
+                payload["binding_id"],
+                "RB",
+                "Memory outbox binding_id",
+            )
+    except (TypeError, ValueError):
+        raise ValueError("Memory outbox authority binding is invalid") from None
+    for field_name in ("actor_type", "actor_id", "reason_code"):
+        value = payload.get(field_name)
+        if (
+            type(value) is not str
+            or value != value.strip()
+            or not 1 <= len(value) <= 512
+            or any(not character.isprintable() for character in value)
+        ):
+            raise ValueError(f"Memory outbox {field_name} is invalid")
     rows = payload.get("entries")
-    if not isinstance(rows, list) or len(rows) > 64:
+    if not isinstance(rows, list) or not rows or len(rows) > 64:
         raise ValueError("Memory outbox entries are invalid")
-    candidate_ids: set[str] = set()
+    candidate_ids: list[str] = []
     request_ids: set[str] = set()
     for row in rows:
         if not isinstance(row, Mapping) or set(row) != {
@@ -5460,11 +5612,21 @@ def _memory_outbox_from_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
             "allowed_source_refs",
         }:
             raise ValueError("Memory outbox entry is invalid")
-        if any(
-            not isinstance(row.get(name), str) or not row[name]
-            for name in ("candidate_id", "candidate_hash", "request_id")
-        ):
+        try:
+            candidate_id = validate_stable_id(
+                row.get("candidate_id"),
+                "MC",
+                "Memory outbox candidate_id",
+            )
+            request_id = validate_stable_id(
+                row.get("request_id"),
+                "REQ",
+                "Memory outbox request_id",
+            )
+        except (TypeError, ValueError):
             raise ValueError("Memory outbox entry identity is invalid")
+        if not _is_sha256(row.get("candidate_hash")):
+            raise ValueError("Memory outbox candidate hash is invalid")
         if row["origin"] not in {
             ProducerType.LOCAL.value,
             ProducerType.MODEL.value,
@@ -5479,13 +5641,91 @@ def _memory_outbox_from_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("Memory outbox entry source allowlist is invalid") from None
         if [item.to_dict() for item in hydrated_sources] != source_refs:
             raise ValueError("Memory outbox entry source allowlist is not canonical")
-        if row["candidate_id"] in candidate_ids or row["request_id"] in request_ids:
+        if candidate_id in candidate_ids or request_id in request_ids:
             raise ValueError("Memory outbox entries are not unique")
-        candidate_ids.add(row["candidate_id"])
-        request_ids.add(row["request_id"])
+        candidate_ids.append(candidate_id)
+        request_ids.add(request_id)
+    if candidate_ids != sorted(candidate_ids):
+        raise ValueError("Memory outbox entries are not canonical")
     if canonical_sha256(body) != payload["outbox_digest"]:
         raise ValueError("Memory outbox digest is invalid")
     return dict(payload)
+
+
+def validate_memory_outbox_for_replay(
+    payload: Mapping[str, Any],
+    *,
+    review_id: str,
+    expected_repository_key: str,
+    expected_locator_repository_key: str,
+    expected_authority_resolution_hash: str,
+    expected_binding_id: str | None,
+    expected_head_sha: str,
+) -> MemoryOutboxReplayPreview:
+    """Validate one outbox payload at the shared Pipeline/CLI boundary."""
+
+    outbox = _memory_outbox_from_dict(payload)
+    if (
+        outbox["review_id"] != review_id
+        or outbox["repository_key"] != expected_repository_key
+        or outbox["locator_repository_key"]
+        != expected_locator_repository_key
+        or outbox["authority_resolution_hash"]
+        != expected_authority_resolution_hash
+        or outbox["binding_id"] != expected_binding_id
+        or outbox["head_sha"].casefold() != expected_head_sha.casefold()
+    ):
+        raise ValueError("Memory outbox does not match expected authority")
+    return MemoryOutboxReplayPreview(
+        outbox_digest=outbox["outbox_digest"],
+        batch_digest=outbox["batch_digest"],
+        entries=tuple(
+            (row["candidate_id"], row["request_id"])
+            for row in outbox["entries"]
+        ),
+    )
+
+
+# The outer flag classifies this submission, not whether the Candidate exists.
+# An exact submission can therefore be non-replayed when it applies a new
+# authority receipt (or a rejection transition), while an already-rejected
+# Candidate can be a legitimate write-free ``rejected_unchanged`` replay.
+_MEMORY_PERSISTENCE_RESULT_STATUS_MATRIX = {
+    False: {
+        CandidateDedupeKind.UNIQUE: frozenset(
+            {
+                CandidateStatus.PENDING_APPROVAL,
+                CandidateStatus.REJECTED,
+            }
+        ),
+        CandidateDedupeKind.EXACT_REPLAY: frozenset(
+            {
+                CandidateStatus.PENDING_APPROVAL,
+                CandidateStatus.APPROVED,
+            }
+        ),
+        CandidateDedupeKind.ACTIVE_DUPLICATE: frozenset(
+            {CandidateStatus.REJECTED}
+        ),
+        CandidateDedupeKind.PENDING_DUPLICATE: frozenset(
+            {CandidateStatus.REJECTED}
+        ),
+        CandidateDedupeKind.ENHANCED_PROVENANCE: frozenset(
+            {CandidateStatus.PENDING_APPROVAL}
+        ),
+    },
+    True: {
+        CandidateDedupeKind.EXACT_REPLAY: frozenset(
+            {
+                CandidateStatus.PENDING_APPROVAL,
+                CandidateStatus.APPROVED,
+            }
+        ),
+        CandidateDedupeKind.REJECTED_UNCHANGED: frozenset(
+            {CandidateStatus.REJECTED}
+        ),
+    },
+}
 
 
 def _memory_persistence_receipt_from_dict(
@@ -5513,8 +5753,10 @@ def _memory_persistence_receipt_from_dict(
         or payload.get("success") is not True
     ):
         raise ValueError("Memory persistence receipt is not successful")
+    review_id = payload.get("review_id")
+    if not isinstance(review_id, str) or not review_id:
+        raise ValueError("Memory persistence receipt review_id is invalid")
     for field_name in (
-        "review_id",
         "repository_key",
         "locator_repository_key",
         "authority_resolution_hash",
@@ -5522,26 +5764,58 @@ def _memory_persistence_receipt_from_dict(
         "batch_digest",
         "receipt_digest",
     ):
-        if not isinstance(payload.get(field_name), str) or not payload[field_name]:
+        if not _is_sha256(payload.get(field_name)):
             raise ValueError(f"Memory persistence receipt {field_name} is invalid")
-    if payload["binding_id"] is not None and (
-        not isinstance(payload["binding_id"], str) or not payload["binding_id"]
-    ):
-        raise ValueError("Memory persistence receipt binding_id is invalid")
+    if payload["binding_id"] is not None:
+        try:
+            validate_stable_id(
+                payload["binding_id"],
+                "RB",
+                "Memory persistence receipt binding_id",
+            )
+        except (TypeError, ValueError):
+            raise ValueError(
+                "Memory persistence receipt binding_id is invalid"
+            ) from None
     all_ids: list[str] = []
     for field_name in ("persisted_candidate_ids", "replayed_candidate_ids"):
         values = payload.get(field_name)
-        if not isinstance(values, list) or any(
-            not isinstance(item, str) or not item for item in values
-        ):
+        if not isinstance(values, list) or len(values) > 64:
             raise ValueError(f"Memory persistence receipt {field_name} is invalid")
+        try:
+            canonical_ids = [
+                validate_stable_id(
+                    item,
+                    "MC",
+                    f"Memory persistence receipt {field_name}",
+                )
+                for item in values
+            ]
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Memory persistence receipt {field_name} is invalid"
+            ) from None
+        if canonical_ids != sorted(set(canonical_ids)):
+            raise ValueError(
+                f"Memory persistence receipt {field_name} is not canonical"
+            )
         all_ids.extend(values)
     if len(all_ids) != len(set(all_ids)):
         raise ValueError("Memory persistence receipt candidate IDs overlap")
+    if not all_ids:
+        raise ValueError("Memory persistence receipt candidate IDs are empty")
     results = payload.get("results")
-    if not isinstance(results, list) or len(results) != len(all_ids):
+    if (
+        not isinstance(results, list)
+        or not results
+        or len(results) != len(all_ids)
+        or len(results) > 64
+    ):
         raise ValueError("Memory persistence receipt results are invalid")
     result_ids: list[str] = []
+    result_request_ids: set[str] = set()
+    persisted_ids = set(payload["persisted_candidate_ids"])
+    replayed_ids = set(payload["replayed_candidate_ids"])
     for row in results:
         if not isinstance(row, Mapping) or set(row) != {
             "candidate_id",
@@ -5555,33 +5829,144 @@ def _memory_persistence_receipt_from_dict(
             raise ValueError("Memory persistence result is invalid")
         if type(row.get("replayed")) is not bool:
             raise ValueError("Memory persistence replay flag is invalid")
+        try:
+            candidate_id = validate_stable_id(
+                row.get("candidate_id"),
+                "MC",
+                "Memory persistence result candidate_id",
+            )
+            row_request_id = validate_stable_id(
+                row.get("request_id"),
+                "REQ",
+                "Memory persistence result request_id",
+            )
+        except (TypeError, ValueError):
+            raise ValueError("Memory persistence result identity is invalid") from None
+        try:
+            status = CandidateStatus(row.get("status"))
+            dedupe = CandidateDedupeKind(row.get("dedupe"))
+        except (TypeError, ValueError):
+            raise ValueError("Memory persistence result identity is invalid") from None
         if (
-            not isinstance(row.get("candidate_id"), str)
-            or not row["candidate_id"]
-            or not isinstance(row.get("request_id"), str)
-            or not row["request_id"]
-            or row.get("status") not in {item.value for item in CandidateStatus}
-            or row.get("dedupe") not in {
-                item.value for item in CandidateDedupeKind
-            }
-            or not _is_sha256(row.get("validation_report_hash"))
+            not _is_sha256(row.get("validation_report_hash"))
             or not isinstance(row.get("write_results"), list)
             or len(row["write_results"]) > 4
         ):
             raise ValueError("Memory persistence result identity is invalid")
+        if (
+            row["replayed"] != (candidate_id in replayed_ids)
+            or (not row["replayed"]) != (candidate_id in persisted_ids)
+        ):
+            raise ValueError("Memory persistence replay classification is invalid")
+        allowed_statuses = _MEMORY_PERSISTENCE_RESULT_STATUS_MATRIX[
+            row["replayed"]
+        ].get(dedupe)
+        if allowed_statuses is None or status not in allowed_statuses:
+            raise ValueError("Memory persistence result outcome is invalid")
+        hydrated_writes: list[WriteResult] = []
         for raw_write_result in row["write_results"]:
             if not isinstance(raw_write_result, Mapping):
                 raise ValueError("Memory persistence write result is invalid")
-            write_result = WriteResult.from_dict(raw_write_result)
-            if write_result.subject_id != row["candidate_id"]:
+            try:
+                write_result = WriteResult.from_dict(raw_write_result)
+            except (MemoryStoreError, TypeError, ValueError):
+                raise ValueError(
+                    "Memory persistence write result is invalid"
+                ) from None
+            if (
+                write_result.to_dict() != dict(raw_write_result)
+                or write_result.operation
+                not in {"put_candidate", "transition_candidate"}
+                or write_result.subject_id != candidate_id
+            ):
                 raise ValueError("Memory persistence result subject is invalid")
-        result_ids.append(row["candidate_id"])
-    if sorted(result_ids) != sorted(all_ids):
+            hydrated_writes.append(write_result)
+        applied_writes = tuple(
+            item for item in hydrated_writes if item.applied
+        )
+        if row["replayed"] and applied_writes:
+            raise ValueError("Memory persistence replay writes are invalid")
+        if not row["replayed"] and not applied_writes:
+            raise ValueError("Memory persistence applied writes are invalid")
+        if row_request_id in result_request_ids:
+            raise ValueError("Memory persistence request IDs are not unique")
+        result_request_ids.add(row_request_id)
+        result_ids.append(candidate_id)
+    if result_ids != sorted(result_ids) or sorted(result_ids) != sorted(all_ids):
         raise ValueError("Memory persistence receipt results do not match IDs")
     body = {key: payload[key] for key in expected if key != "receipt_digest"}
     if canonical_sha256(body) != payload["receipt_digest"]:
         raise ValueError("Memory persistence receipt digest is invalid")
     return dict(payload)
+
+
+def validate_memory_outbox_replay_receipt(
+    payload: Mapping[str, Any],
+    *,
+    review_id: str,
+    expected_repository_key: str,
+    expected_locator_repository_key: str,
+    expected_authority_resolution_hash: str,
+    expected_binding_id: str | None,
+    expected_outbox_digest: str,
+    expected_batch_digest: str,
+    expected_entries: tuple[tuple[str, str], ...],
+) -> dict[str, Any]:
+    """Validate and bind a service receipt without duplicating CLI logic."""
+
+    receipt = _memory_persistence_receipt_from_dict(payload)
+    preview = MemoryOutboxReplayPreview(
+        outbox_digest=expected_outbox_digest,
+        batch_digest=expected_batch_digest,
+        entries=expected_entries,
+    )
+    if (
+        receipt["review_id"] != review_id
+        or receipt["repository_key"] != expected_repository_key
+        or receipt["locator_repository_key"]
+        != expected_locator_repository_key
+        or receipt["authority_resolution_hash"]
+        != expected_authority_resolution_hash
+        or receipt["binding_id"] != expected_binding_id
+        or receipt["outbox_digest"] != preview.outbox_digest
+        or receipt["batch_digest"] != preview.batch_digest
+    ):
+        raise ValueError("Memory persistence receipt authority is invalid")
+    result_entries = tuple(
+        (row["candidate_id"], row["request_id"])
+        for row in receipt["results"]
+    )
+    if result_entries != preview.entries:
+        raise ValueError("Memory persistence receipt entries are invalid")
+    return receipt
+
+
+def _memory_persistence_receipt_for_outbox(
+    payload: Mapping[str, Any],
+    *,
+    batch: MemoryCandidateBatch,
+    outbox: Mapping[str, Any],
+) -> dict[str, Any]:
+    if tuple(row["candidate_id"] for row in outbox["entries"]) != tuple(
+        candidate.candidate_id for candidate in batch.candidates
+    ):
+        raise ValueError("Memory outbox does not match its Candidate batch")
+    return validate_memory_outbox_replay_receipt(
+        payload,
+        review_id=outbox["review_id"],
+        expected_repository_key=outbox["repository_key"],
+        expected_locator_repository_key=outbox["locator_repository_key"],
+        expected_authority_resolution_hash=outbox[
+            "authority_resolution_hash"
+        ],
+        expected_binding_id=outbox["binding_id"],
+        expected_outbox_digest=outbox["outbox_digest"],
+        expected_batch_digest=batch.batch_digest,
+        expected_entries=tuple(
+            (row["candidate_id"], row["request_id"])
+            for row in outbox["entries"]
+        ),
+    )
 
 
 def _is_sha256(value: Any) -> bool:
@@ -5590,6 +5975,75 @@ def _is_sha256(value: Any) -> bool:
         and len(value) == 64
         and value == value.casefold()
         and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_memory_outbox_replay_audit(
+    *,
+    actor: str,
+    reason: str,
+    request_id: str,
+) -> MemoryOutboxReplayAudit:
+    """Scan and canonicalize explicit replay attribution without retaining it.
+
+    This boundary intentionally lives above :class:`MemoryStore`: the Store
+    cannot import the source scanner, while both direct service callers and the
+    CLI must reject secrets and prompt-injection text before any audit write.
+    """
+
+    if not isinstance(actor, str) or not isinstance(reason, str):
+        raise SourceValidationError(SourceValidationCode.INVALID_INPUT)
+    scans = (
+        scan_sensitive_text(actor, field_name="outbox_replay.actor"),
+        scan_sensitive_text(reason, field_name="outbox_replay.reason"),
+    )
+    unsafe_findings = tuple(
+        finding
+        for scan in scans
+        for finding in scan.findings
+    )
+    if unsafe_findings:
+        code = (
+            SourceValidationCode.PROMPT_INJECTION
+            if any(
+                finding.kind is SensitiveContentKind.PROMPT_INJECTION
+                for finding in unsafe_findings
+            )
+            else SourceValidationCode.SENSITIVE_CONTENT
+        )
+        raise SourceValidationError(code)
+
+    checked_actor = actor.strip()
+    checked_reason = " ".join(reason.split())
+    if (
+        not 1 <= len(checked_actor) <= 512
+        or not checked_actor[0].isalnum()
+        or any(
+            not (
+                character.isalnum()
+                or character in "_.:+/@-"
+            )
+            for character in checked_actor
+        )
+        or not 1 <= len(checked_reason) <= 2_048
+        or any(
+            not character.isprintable() and not character.isspace()
+            for character in reason
+        )
+    ):
+        raise SourceValidationError(SourceValidationCode.INVALID_INPUT)
+    try:
+        checked_request_id = validate_stable_id(
+            request_id,
+            "REQ",
+            "outbox replay request_id",
+        )
+    except (TypeError, ValueError):
+        raise SourceValidationError(SourceValidationCode.INVALID_INPUT) from None
+    return MemoryOutboxReplayAudit(
+        actor=checked_actor,
+        reason=checked_reason,
+        request_id=checked_request_id,
     )
 
 
@@ -5644,7 +6098,9 @@ def replay_memory_outbox(
     expected_repository_key: str,
     expected_authority_resolution_hash: str,
     expected_outbox_digest: str,
-    **_audit: Any,
+    actor: str | None = None,
+    reason: str | None = None,
+    request_id: str | None = None,
 ) -> Mapping[str, Any]:
     """Replay one hash-verified Session outbox through idempotent Store writes."""
 
@@ -5724,6 +6180,17 @@ def replay_memory_outbox(
         ):
             raise ValueError("Memory outbox candidate binding is invalid")
 
+    audit_values = (actor, reason, request_id)
+    audit = None
+    if any(value is not None for value in audit_values):
+        if not all(value is not None for value in audit_values):
+            raise SourceValidationError(SourceValidationCode.INVALID_INPUT)
+        audit = validate_memory_outbox_replay_audit(
+            actor=actor,
+            reason=reason,
+            request_id=request_id,
+        )
+
     plan = plan_repository_memory_namespace(live_identity, memory_root)
     authority = resolve_repository_authority(memory_root, plan.locator.identity)
     if (
@@ -5761,7 +6228,6 @@ def replay_memory_outbox(
             raise ValueError("Memory outbox candidate authority is invalid") from None
         if allowed_source_refs != candidate.source_refs:
             raise ValueError("Memory outbox candidate source authority does not match")
-        existing = store.find_candidate(candidate.candidate_id)
         source_validator = SourceValidator(
             repo,
             human_declarations=_replay_human_declarations(
@@ -5786,14 +6252,13 @@ def replay_memory_outbox(
             runtime_provenance=provenance,
             request_id=entry["request_id"],
         )
-        (replayed if existing is not None else persisted).append(
-            candidate.candidate_id
-        )
+        was_replayed = _memory_lifecycle_result_was_replayed(lifecycle_result)
+        (replayed if was_replayed else persisted).append(candidate.candidate_id)
         results.append(
             {
                 "candidate_id": candidate.candidate_id,
                 "request_id": entry["request_id"],
-                "replayed": existing is not None,
+                "replayed": was_replayed,
                 "status": lifecycle_result.status.value,
                 "dedupe": lifecycle_result.dedupe.kind.value,
                 "validation_report_hash": lifecycle_result.validation.report_hash,
@@ -5801,6 +6266,15 @@ def replay_memory_outbox(
                     item.to_dict() for item in lifecycle_result.write_results
                 ],
             }
+        )
+    if audit is not None:
+        store.record_outbox_replay_audit(
+            outbox["repository_key"],
+            review_id=review_id,
+            outbox_hash=outbox["outbox_digest"],
+            actor=audit.actor,
+            reason=audit.reason,
+            request_id=audit.request_id,
         )
     body: dict[str, Any] = {
         "schema": "memory_persistence_receipt_v1",
@@ -5821,6 +6295,24 @@ def replay_memory_outbox(
     )
 
 
+def _memory_lifecycle_result_was_replayed(
+    result: CandidateLifecycleResult,
+) -> bool:
+    """Classify one submission only from its transactional outcome."""
+
+    writes = tuple(result.write_results)
+    if not result.persisted:
+        return False
+    if any(write.applied for write in writes):
+        return False
+    if any(write.replayed for write in writes):
+        return True
+    return result.dedupe.kind in {
+        CandidateDedupeKind.EXACT_REPLAY,
+        CandidateDedupeKind.REJECTED_UNCHANGED,
+    }
+
+
 def _read_session_json(run_dir: Path, relative_path: str) -> dict[str, Any]:
     path = run_dir.joinpath(*PurePosixPath(relative_path).parts)
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -5829,13 +6321,80 @@ def _read_session_json(run_dir: Path, relative_path: str) -> dict[str, Any]:
     return payload
 
 
-def _memory_policy_registry() -> RuntimePolicyRegistry:
-    """Return the fixed Runtime allowlists Memory may reference, never expand."""
+def _quality_gate_check_ids(context: PipelineContext) -> tuple[str, ...]:
+    """Return only gate names frozen into this Session's validated plan."""
+
+    plan = context.quality_gate_plan
+    if plan is None:
+        return ()
+    if (
+        plan.revision.casefold()
+        != context.manifest.revisions.resolved_head_sha.casefold()
+    ):
+        raise ValueError("Quality Gate registry does not match Session Head")
+    return tuple(sorted(gate.name for gate in plan.gates))
+
+
+def _memory_policy_registry(context: PipelineContext) -> RuntimePolicyRegistry:
+    """Build the closed Runtime registry from fixed, pre-Memory Session inputs.
+
+    Quality Gate commands remain owned by the validated ``QualityGatePlan``.
+    Memory receives names only, so an approved effect can require an existing
+    gate but can never introduce a gate, executable, argument, or template.
+    """
 
     return RuntimePolicyRegistry(
         contract_ids=tuple(DEFAULT_CONTRACT_ALLOWLIST),
-        check_ids=tuple(DEFAULT_CHECK_ALLOWLIST),
+        check_ids=_quality_gate_check_ids(context),
         command_template_ids=tuple(DEFAULT_COMMAND_TEMPLATE_ALLOWLIST),
+    )
+
+
+def _memory_required_check_ids(context: PipelineContext) -> frozenset[str]:
+    compilation = context.memory_policy_compilation
+    if compilation is None:
+        return frozenset()
+    return frozenset(
+        action.check_id
+        for action in compilation.actions
+        if action.kind.value == "require_check"
+    )
+
+
+def _memory_curator_fingerprint_catalog(
+    store: MemoryStore,
+    repository_key: str,
+) -> tuple[ExistingFingerprint, ...]:
+    """Project pending Candidates and authoritative Records for Curator hints.
+
+    The lifecycle remains the source-aware dedupe authority.  This catalog is
+    intentionally content-only and therefore cannot suppress a provenance
+    enhancement by itself.
+    """
+
+    candidates = store.list_candidates(repository_key)
+    candidates_by_id = {item.candidate_id: item for item in candidates}
+    states: dict[str, str] = {}
+    for candidate in candidates:
+        if candidate.status in {
+            CandidateStatus.PROPOSED,
+            CandidateStatus.VALIDATED,
+            CandidateStatus.PENDING_APPROVAL,
+        }:
+            states.setdefault(candidate.content_fingerprint, "pending_approval")
+    for record in store.list_records(repository_key):
+        if record.status not in {
+            RecordStatus.ACTIVE,
+            RecordStatus.REVALIDATION_REQUIRED,
+        }:
+            continue
+        candidate = candidates_by_id.get(record.candidate_id)
+        if candidate is None:
+            raise ValueError("active Memory Record has no Candidate projection")
+        states[candidate.content_fingerprint] = "active"
+    return tuple(
+        ExistingFingerprint(fingerprint, states[fingerprint])
+        for fingerprint in sorted(states)
     )
 
 
@@ -5963,7 +6522,7 @@ def _planner_memory_projection(
     )
     projection = build_planner_memory_projection(
         compilation,
-        registry=_memory_policy_registry(),
+        registry=_memory_policy_registry(context),
         perspective_registry=DEFAULT_PERSPECTIVE_ALLOWLIST,
         selected_memory=tuple(
             _memory_reference(selected_by_id[memory_id])
@@ -6057,6 +6616,14 @@ def _reconciler_memory_summary(
     }
 
 
+def _append_memory_degradation_code(
+    context: PipelineContext,
+    reason_code: str,
+) -> None:
+    if reason_code not in context.memory_degradation_codes:
+        context.memory_degradation_codes.append(reason_code)
+
+
 def _memory_reporting_status(
     context: PipelineContext,
 ) -> dict[str, Any] | None:
@@ -6123,6 +6690,75 @@ def _memory_curator_audit_status(
     }
 
 
+def _memory_candidate_result_rows(
+    context: PipelineContext,
+) -> tuple[tuple[MemoryCandidate, dict[str, Any]], ...]:
+    """Bind Candidate bodies only to authoritative lifecycle result rows."""
+
+    raw_receipt = context.memory_persistence_receipt
+    if raw_receipt is None:
+        return ()
+    batch = _required(
+        context.memory_candidate_batch,
+        "Memory candidate batch for persistence receipt",
+    )
+    outbox = _required(
+        context.memory_outbox,
+        "Memory outbox for persistence receipt",
+    )
+    receipt = _memory_persistence_receipt_for_outbox(
+        raw_receipt,
+        batch=batch,
+        outbox=outbox,
+    )
+    candidates = {
+        candidate.candidate_id: candidate for candidate in batch.candidates
+    }
+    if set(candidates) != {
+        row["candidate_id"] for row in receipt["results"]
+    }:
+        raise ValueError("Memory receipt does not match its Candidate batch")
+    return tuple(
+        (candidates[row["candidate_id"]], row)
+        for row in receipt["results"]
+    )
+
+
+def _memory_pending_candidate_rows(
+    context: PipelineContext,
+) -> list[dict[str, Any]]:
+    """Report only lifecycle-confirmed ``pending_approval`` Candidates."""
+
+    pending: list[dict[str, Any]] = []
+    for candidate, result in _memory_candidate_result_rows(context):
+        if result["status"] != CandidateStatus.PENDING_APPROVAL.value:
+            continue
+        row = candidate.to_dict()
+        row["status"] = CandidateStatus.PENDING_APPROVAL.value
+        pending.append(row)
+    return pending
+
+
+def _memory_candidate_outcome_rows(
+    context: PipelineContext,
+) -> list[dict[str, Any]]:
+    """Return a bounded, content-free audit of every persisted outbox result."""
+
+    return [
+        {
+            "candidate_id": candidate.candidate_id,
+            "status": result["status"],
+            "dedupe": result["dedupe"],
+            "replayed": result["replayed"],
+            "persistence": (
+                "replayed" if result["replayed"] else "persisted"
+            ),
+            "validation_report_hash": result["validation_report_hash"],
+        }
+        for candidate, result in _memory_candidate_result_rows(context)
+    ]
+
+
 def _memory_outbox_audit_status(
     context: PipelineContext,
 ) -> dict[str, Any] | None:
@@ -6142,17 +6778,25 @@ def _memory_outbox_audit_status(
             "review_id": context.manifest.review_id,
             "candidate_ids": [],
         }
+    receipt = context.memory_persistence_receipt
+    if receipt is None:
+        status = "outbox_pending"
+    elif receipt["persisted_candidate_ids"] and receipt[
+        "replayed_candidate_ids"
+    ]:
+        status = "completed"
+    elif receipt["replayed_candidate_ids"]:
+        status = "replayed"
+    else:
+        status = "persisted"
     return {
-        "status": (
-            "persisted"
-            if context.memory_persistence_receipt is not None
-            else "outbox_pending"
-        ),
-        "pending": context.memory_persistence_receipt is None,
+        "status": status,
+        "pending": receipt is None,
         "review_id": outbox["review_id"],
         "candidate_ids": [
             item["candidate_id"] for item in outbox["entries"]
         ],
+        "candidate_outcomes": _memory_candidate_outcome_rows(context),
     }
 
 
@@ -6485,18 +7129,17 @@ def _memory_proposal_resume_artifacts(
             preserve.add("memory_outbox")
             if valid("memory_persistence_receipt"):
                 try:
-                    receipt = _memory_persistence_receipt_from_dict(
+                    receipt = _memory_persistence_receipt_for_outbox(
                         _read_session_json(
                             session_store.run_dir,
                             descriptors["memory_persistence_receipt"].path,
-                        )
+                        ),
+                        batch=batch,
+                        outbox=outbox,
                     )
                 except (OSError, ValueError, json.JSONDecodeError):
                     receipt = None
-                if receipt is not None and (
-                    receipt["outbox_digest"] == outbox["outbox_digest"]
-                    and receipt["batch_digest"] == batch.batch_digest
-                ):
+                if receipt is not None:
                     preserve.add("memory_persistence_receipt")
     return tuple(sorted(preserve))
 

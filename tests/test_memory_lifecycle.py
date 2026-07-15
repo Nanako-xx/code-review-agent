@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import threading
 from typing import Optional, Tuple
 
 import pytest
@@ -11,18 +14,24 @@ import review_agent.memory_lifecycle as memory_lifecycle_module
 from conftest import run_git
 from review_agent.memory_identity import repository_key
 from review_agent.memory_lifecycle import (
+    ApprovalResult,
+    CandidateLifecycleResult,
     CandidateDedupeKind,
+    ExpiryEvaluationStatus,
     MemoryLifecycle,
     MemoryLifecycleError,
     MemoryLifecycleErrorCode,
     RecordAuditStatus,
     TargetHeadApplicabilityEvaluator,
     build_canonical_source_bundle,
+    evaluate_expiry_conditions,
 )
 from review_agent.memory_models import (
     Applicability,
     CandidateStatus,
     DurableMemoryRecord,
+    ExpiryCondition,
+    ExpiryConditionKind,
     GitCommitSourceRef,
     MemoryCandidate,
     MemoryConfidence,
@@ -172,6 +181,7 @@ def _approve(
     provenance: TrustedCandidateProvenance,
     label: str,
     expected_generation: Optional[int] = None,
+    expiry_conditions: Tuple[ExpiryCondition, ...] = (),
 ):
     return lifecycle.approve_candidate(
         candidate.candidate_id,
@@ -181,6 +191,7 @@ def _approve(
         request_id=stable_request_id("lifecycle-approve", label),
         created_at=LATER,
         expected_generation=expected_generation,
+        expiry_conditions=expiry_conditions,
     )
 
 
@@ -188,6 +199,7 @@ def _detached_record(
     candidate: MemoryCandidate,
     *,
     status: RecordStatus = RecordStatus.ACTIVE,
+    expiry_conditions: Tuple[ExpiryCondition, ...] = (),
 ) -> DurableMemoryRecord:
     return DurableMemoryRecord(
         candidate_id=candidate.candidate_id,
@@ -206,6 +218,7 @@ def _detached_record(
         approval_event_id=stable_event_id("detached-record", candidate.candidate_id),
         status=status,
         created_at=LATER,
+        expiry_conditions=expiry_conditions,
     )
 
 
@@ -442,6 +455,113 @@ def test_exact_content_and_rejected_duplicates_are_deterministic(
     assert len(store.list_events(original.repository_key)) > event_count_before_approval
 
 
+def test_concurrent_same_fingerprint_submissions_have_one_pending_authority(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle, store = _lifecycle(git_repo, tmp_path)
+    sha = _head(git_repo)
+    first = _candidate(git_repo, sha)
+    second = replace(first, confidence=MemoryConfidence.MEDIUM)
+    assert first.candidate_id != second.candidate_id
+    assert first.content_fingerprint == second.content_fingerprint
+
+    # Rendezvous before either authority transaction starts. The transaction
+    # itself is intentionally serialized, so a barrier inside it would deadlock.
+    transaction_gate = threading.Barrier(2, timeout=5)
+    original_transaction = store.candidate_submission_transaction
+
+    @contextmanager
+    def synchronized_transaction():
+        transaction_gate.wait()
+        with original_transaction():
+            yield
+
+    monkeypatch.setattr(
+        store,
+        "candidate_submission_transaction",
+        synchronized_transaction,
+    )
+    candidates = {"first": first, "second": second}
+    results: dict[str, CandidateLifecycleResult] = {}
+    errors: list[Exception] = []
+
+    def submit(label: str) -> None:
+        candidate = candidates[label]
+        try:
+            results[label] = lifecycle.submit_candidate(
+                candidate,
+                runtime_provenance=_provenance(candidate, sha),
+                request_id=stable_request_id("concurrent-submit", label),
+            )
+        except Exception as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    submitters = [
+        threading.Thread(target=submit, args=(label,), name="submit-" + label)
+        for label in candidates
+    ]
+    for submitter in submitters:
+        submitter.start()
+    for submitter in submitters:
+        submitter.join(timeout=10)
+
+    assert all(not submitter.is_alive() for submitter in submitters)
+    assert errors == []
+    assert set(results) == set(candidates)
+    pending = [
+        result
+        for result in results.values()
+        if result.status is CandidateStatus.PENDING_APPROVAL
+    ]
+    rejected = [
+        result
+        for result in results.values()
+        if result.status is CandidateStatus.REJECTED
+    ]
+    assert len(pending) == len(rejected) == 1
+    winner, duplicate = pending[0], rejected[0]
+    assert winner.dedupe.kind is CandidateDedupeKind.UNIQUE
+    assert duplicate.dedupe.kind is CandidateDedupeKind.PENDING_DUPLICATE
+    assert duplicate.dedupe.related_candidate_id == winner.candidate_id
+
+    stored = {
+        candidate.candidate_id: candidate
+        for candidate in store.list_candidates(first.repository_key)
+    }
+    assert stored[winner.candidate_id].status is CandidateStatus.PENDING_APPROVAL
+    assert stored[duplicate.candidate_id].status is CandidateStatus.REJECTED
+    assert len(store.list_candidate_authority_receipts(winner.candidate_id)) == 1
+    assert len(store.list_candidate_authority_receipts(duplicate.candidate_id)) == 1
+
+    events = store.list_events(first.repository_key)
+    winner_events = [
+        event for event in events if event.subject_id == winner.candidate_id
+    ]
+    duplicate_events = [
+        event for event in events if event.subject_id == duplicate.candidate_id
+    ]
+    assert [event.action for event in winner_events] == [
+        "candidate_submitted",
+        "validate",
+        "request_approval",
+    ]
+    assert [event.action for event in duplicate_events] == [
+        "candidate_submitted",
+        "duplicate",
+    ]
+    assert [event.subject_id for event in events] == [
+        winner.candidate_id,
+        winner.candidate_id,
+        winner.candidate_id,
+        duplicate.candidate_id,
+        duplicate.candidate_id,
+    ]
+    assert store.verify_event_chain(first.repository_key) == len(events) == 5
+    assert store.validate_integrity().candidate_count == 2
+
+
 def test_approval_revalidates_and_atomically_materializes_pinned_bundle(
     git_repo: Path,
     tmp_path: Path,
@@ -506,6 +626,209 @@ def test_approval_revalidates_and_atomically_materializes_pinned_bundle(
     assert replay.record == approval.record
     assert replay.write_result.replayed
     assert store.count_records(candidate.repository_key) == 1
+
+
+def test_concurrent_approvals_converge_on_the_winning_final_record(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle, store = _lifecycle(git_repo, tmp_path)
+    sha = _head(git_repo)
+    candidate = _candidate(
+        git_repo,
+        sha,
+        statement="Concurrent approval has one durable authority result.",
+    )
+    provenance = _provenance(candidate, sha)
+    expiry = ExpiryCondition(
+        ExpiryConditionKind.AT_TIME,
+        "2027-01-01T00:00:00Z",
+    )
+    _submit(
+        lifecycle,
+        candidate,
+        provenance=provenance,
+        label="concurrent-approval-submit",
+    )
+
+    # Both callers finish validation and blob materialization before either
+    # enters the Store's serialized approval transaction.
+    approval_gate = threading.Barrier(2, timeout=5)
+    original_approve = store.approve_candidate_with_source_bundle
+
+    def synchronized_approve(*args, **kwargs):
+        approval_gate.wait()
+        return original_approve(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store,
+        "approve_candidate_with_source_bundle",
+        synchronized_approve,
+    )
+    request_ids = {
+        label: stable_request_id("concurrent-approval", label)
+        for label in ("first", "second")
+    }
+    results: dict[str, ApprovalResult] = {}
+    errors: list[Exception] = []
+
+    def approve(label: str) -> None:
+        try:
+            results[label] = lifecycle.approve_candidate(
+                candidate.candidate_id,
+                runtime_provenance=provenance,
+                actor="amy",
+                reason="Maintainer verified this durable project rule.",
+                request_id=request_ids[label],
+                created_at=LATER,
+                expiry_conditions=(expiry,),
+            )
+        except Exception as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    approvers = [
+        threading.Thread(target=approve, args=(label,), name="approve-" + label)
+        for label in request_ids
+    ]
+    for approver in approvers:
+        approver.start()
+    for approver in approvers:
+        approver.join(timeout=10)
+
+    assert all(not approver.is_alive() for approver in approvers)
+    assert errors == []
+    assert set(results) == set(request_ids)
+    applied = [
+        (label, result)
+        for label, result in results.items()
+        if result.write_result.applied
+    ]
+    converged = [
+        (label, result)
+        for label, result in results.items()
+        if result.converged
+    ]
+    assert len(applied) == len(converged) == 1
+    winner_label, winner = applied[0]
+    loser_label, loser = converged[0]
+    assert winner_label != loser_label
+    assert not loser.write_result.applied
+    assert not loser.write_result.replayed
+    assert loser.record == winner.record == store.get_record(winner.record.memory_id)
+    assert loser.bundle == winner.bundle
+    assert loser.bundle_payload == winner.bundle_payload
+    assert loser.write_result.operation == "transition_candidate"
+    assert loser.write_result.subject_id == candidate.candidate_id
+    assert loser.write_result.event_id is None
+    assert winner.write_result.event_id == winner.record.approval_event_id
+
+    with store.open_connection(read_only=True) as connection:
+        receipt_rows = connection.execute(
+            """
+            SELECT request_id, operation, subject_id, event_id, result_json
+            FROM outbox_receipts
+            WHERE request_id IN (?, ?)
+            ORDER BY request_id
+            """,
+            (request_ids[winner_label], request_ids[loser_label]),
+        ).fetchall()
+        receipt_count_before_replay = connection.execute(
+            "SELECT COUNT(*) FROM outbox_receipts"
+        ).fetchone()[0]
+    receipts = {row["request_id"]: row for row in receipt_rows}
+    assert set(receipts) == set(request_ids.values())
+    assert receipts[request_ids[winner_label]]["operation"] == (
+        "approve_candidate_with_source_bundle"
+    )
+    assert receipts[request_ids[winner_label]]["event_id"] == (
+        winner.record.approval_event_id
+    )
+    loser_receipt = receipts[request_ids[loser_label]]
+    assert loser_receipt["operation"] == "transition_candidate"
+    assert loser_receipt["subject_id"] == candidate.candidate_id
+    assert loser_receipt["event_id"] is None
+    assert json.loads(loser_receipt["result_json"])["applied"] is False
+
+    approval_events = [
+        event
+        for event in store.list_events(
+            candidate.repository_key,
+            subject_type="candidate",
+            subject_id=candidate.candidate_id,
+        )
+        if event.action == "approve"
+    ]
+    assert len(approval_events) == 1
+    assert approval_events[0].request_id == request_ids[winner_label]
+    assert approval_events[0].event_id == winner.record.approval_event_id
+    assert store.count_records(candidate.repository_key) == 1
+    assert store.get_candidate(candidate.candidate_id).status is CandidateStatus.APPROVED
+    assert store.verify_event_chain(candidate.repository_key) == 5
+    assert store.validate_integrity().record_count == 1
+
+    events_before_replay = store.list_events(candidate.repository_key)
+    generations_before_replay = store.get_generations(candidate.repository_key)
+    replay = lifecycle.approve_candidate(
+        candidate.candidate_id,
+        runtime_provenance=provenance,
+        actor="amy",
+        reason="Maintainer verified this durable project rule.",
+        request_id=request_ids[loser_label],
+        created_at=LATER,
+        expiry_conditions=(expiry,),
+    )
+
+    assert replay.converged
+    assert replay.record == loser.record
+    assert replay.bundle == loser.bundle
+    assert replay.bundle_payload == loser.bundle_payload
+    assert replay.write_result.operation == loser.write_result.operation
+    assert replay.write_result.subject_id == loser.write_result.subject_id
+    assert replay.write_result.event_id is None
+    assert not replay.write_result.applied
+    assert replay.write_result.replayed
+    assert replace(replay.write_result, replayed=False) == loser.write_result
+    assert store.list_events(candidate.repository_key) == events_before_replay
+    assert store.get_generations(candidate.repository_key) == generations_before_replay
+    assert store.count_records(candidate.repository_key) == 1
+    with store.open_connection(read_only=True) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM outbox_receipts"
+        ).fetchone()[0] == receipt_count_before_replay
+
+    with pytest.raises(MemoryStoreConflictError, match="request ID"):
+        lifecycle.approve_candidate(
+            candidate.candidate_id,
+            runtime_provenance=provenance,
+            actor="amy",
+            reason="A conflicting decision cannot reuse the loser request ID.",
+            request_id=request_ids[loser_label],
+            created_at=LATER,
+            expiry_conditions=(expiry,),
+        )
+    with pytest.raises(MemoryStoreConflictError, match="expiry conditions"):
+        lifecycle.approve_candidate(
+            candidate.candidate_id,
+            runtime_provenance=provenance,
+            actor="amy",
+            reason="Maintainer verified this durable project rule.",
+            request_id=request_ids[loser_label],
+            created_at=LATER,
+            expiry_conditions=(
+                ExpiryCondition(
+                    ExpiryConditionKind.AT_TIME,
+                    "2027-02-01T00:00:00Z",
+                ),
+            ),
+        )
+    assert store.list_events(candidate.repository_key) == events_before_replay
+    assert store.get_generations(candidate.repository_key) == generations_before_replay
+    assert store.count_records(candidate.repository_key) == 1
+    with store.open_connection(read_only=True) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM outbox_receipts"
+        ).fetchone()[0] == receipt_count_before_replay
 
 
 def test_human_reject_and_revoke_require_reason_and_are_request_idempotent(
@@ -651,6 +974,11 @@ def test_revalidate_creates_new_immutable_authority_and_supersedes_old(
         created_at="2026-07-14T08:02:00Z",
     )
     replacement_provenance = _provenance(replacement, new_sha)
+    replacement_expiry = ExpiryCondition(
+        ExpiryConditionKind.AT_TIME,
+        "2027-03-01T00:00:00Z",
+    )
+    revalidation_request = stable_request_id("revalidate", old_record.memory_id)
 
     result = lifecycle.revalidate_record(
         old_record.memory_id,
@@ -658,13 +986,15 @@ def test_revalidate_creates_new_immutable_authority_and_supersedes_old(
         runtime_provenance=replacement_provenance,
         actor="amy",
         reason="Maintainer approved refreshed evidence and wording.",
-        request_id=stable_request_id("revalidate", old_record.memory_id),
+        request_id=revalidation_request,
         created_at="2026-07-14T08:03:00Z",
+        expiry_conditions=(replacement_expiry,),
     )
 
     assert result.record.memory_id != old_record.memory_id
     assert result.record.candidate_id == replacement.candidate_id
     assert result.record.status is RecordStatus.ACTIVE
+    assert result.record.expiry_conditions == (replacement_expiry,)
     assert store.get_candidate(replacement.candidate_id).status is CandidateStatus.APPROVED
     assert store.get_record(old_record.memory_id).status is RecordStatus.SUPERSEDED
     assert store.get_record(result.record.memory_id).status is RecordStatus.ACTIVE
@@ -677,6 +1007,37 @@ def test_revalidate_creates_new_immutable_authority_and_supersedes_old(
     assert supersede_events[0].subject_id == old_record.memory_id
     assert supersede_events[0].actor_type == "human"
     assert supersede_events[0].actor_id == "amy"
+
+    generations = store.get_generations(original.repository_key)
+    replay = lifecycle.revalidate_record(
+        old_record.memory_id,
+        replacement,
+        runtime_provenance=replacement_provenance,
+        actor="amy",
+        reason="Maintainer approved refreshed evidence and wording.",
+        request_id=revalidation_request,
+        created_at="2026-07-14T08:03:00Z",
+        expiry_conditions=(replacement_expiry,),
+    )
+    assert replay.record == result.record
+    assert replay.write_result.replayed
+    assert store.get_generations(original.repository_key) == generations
+    with pytest.raises(MemoryStoreConflictError, match="expiry conditions"):
+        lifecycle.revalidate_record(
+            old_record.memory_id,
+            replacement,
+            runtime_provenance=replacement_provenance,
+            actor="amy",
+            reason="Maintainer approved refreshed evidence and wording.",
+            request_id=revalidation_request,
+            created_at="2026-07-14T08:03:00Z",
+            expiry_conditions=(
+                ExpiryCondition(
+                    ExpiryConditionKind.AT_TIME,
+                    "2027-04-01T00:00:00Z",
+                ),
+            ),
+        )
 
 
 @pytest.mark.parametrize("mutation", ["missing", "tampered"])
@@ -900,3 +1261,457 @@ def test_scope_change_inspection_failure_is_a_bounded_fail_closed_decision(
     assert decision.applicability is Applicability.SOURCE_MISSING
     assert decision.reason_code == "scope_change_unavailable"
     assert decision.requires_revalidation
+
+
+@pytest.mark.parametrize(
+    ("evaluated_at", "expected"),
+    (
+        (
+            datetime(2026, 7, 14, 7, 59, 59, tzinfo=timezone.utc),
+            ExpiryEvaluationStatus.NOT_DUE,
+        ),
+        (
+            datetime(2026, 7, 14, 16, 0, 0, tzinfo=timezone(timedelta(hours=8))),
+            ExpiryEvaluationStatus.DUE,
+        ),
+        (
+            datetime(2026, 7, 14, 8, 0, 1, tzinfo=timezone.utc),
+            ExpiryEvaluationStatus.DUE,
+        ),
+    ),
+)
+def test_time_expiry_before_boundary_and_after_are_timezone_aware(
+    git_repo: Path,
+    evaluated_at: datetime,
+    expected: ExpiryEvaluationStatus,
+) -> None:
+    condition = ExpiryCondition(
+        ExpiryConditionKind.AT_TIME,
+        "2026-07-14T08:00:00Z",
+    )
+
+    result = evaluate_expiry_conditions(
+        (condition,),
+        repository=git_repo,
+        target_head=_head(git_repo),
+        evaluated_at=evaluated_at,
+    )
+
+    assert result.status is expected
+    assert result.evaluated_at.endswith("Z")
+    if expected is ExpiryEvaluationStatus.DUE:
+        assert result.due_condition == condition
+        assert result.reason_code == "expiry_time_reached"
+
+    with pytest.raises(MemoryLifecycleError) as error:
+        evaluate_expiry_conditions(
+            (condition,),
+            repository=git_repo,
+            target_head=_head(git_repo),
+            evaluated_at=datetime(2026, 7, 14, 8, 0, 0),
+        )
+    assert error.value.code is MemoryLifecycleErrorCode.INVALID_INPUT
+
+
+def test_commit_expiry_lineage_missing_and_or_semantics(git_repo: Path) -> None:
+    main_branch = run_git(git_repo, "branch", "--show-current")
+    root = _head(git_repo)
+    run_git(git_repo, "commit", "--allow-empty", "-m", "expiry boundary")
+    boundary = _head(git_repo)
+    run_git(git_repo, "commit", "--allow-empty", "-m", "after expiry boundary")
+    descendant = _head(git_repo)
+    run_git(git_repo, "checkout", "-b", "expiry-diverged", root)
+    run_git(git_repo, "commit", "--allow-empty", "-m", "diverged expiry target")
+    diverged = _head(git_repo)
+    run_git(git_repo, "checkout", main_branch)
+
+    condition = ExpiryCondition(ExpiryConditionKind.AT_COMMIT, boundary)
+    evaluated_at = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+    expectations = {
+        root: ExpiryEvaluationStatus.NOT_DUE,
+        boundary: ExpiryEvaluationStatus.DUE,
+        descendant: ExpiryEvaluationStatus.DUE,
+        diverged: ExpiryEvaluationStatus.UNRESOLVED,
+        "f" * 40: ExpiryEvaluationStatus.UNRESOLVED,
+    }
+    for target, expected in expectations.items():
+        result = evaluate_expiry_conditions(
+            (condition,),
+            repository=git_repo,
+            target_head=target,
+            evaluated_at=evaluated_at,
+        )
+        assert result.status is expected
+        if expected is ExpiryEvaluationStatus.DUE:
+            assert result.reason_code == "expiry_commit_reached"
+
+    missing_commit = ExpiryCondition(ExpiryConditionKind.AT_COMMIT, "e" * 40)
+    time_due = ExpiryCondition(
+        ExpiryConditionKind.AT_TIME,
+        "2026-07-14T08:00:00Z",
+    )
+    due_wins = evaluate_expiry_conditions(
+        (time_due, missing_commit),
+        repository=git_repo,
+        target_head=descendant,
+        evaluated_at=evaluated_at,
+    )
+    assert due_wins.status is ExpiryEvaluationStatus.DUE
+    assert due_wins.due_condition == time_due
+    assert due_wins.unresolved_conditions == (missing_commit,)
+
+    future_time = ExpiryCondition(
+        ExpiryConditionKind.AT_TIME,
+        "2027-07-14T08:00:00Z",
+    )
+    unresolved_wins = evaluate_expiry_conditions(
+        (future_time, missing_commit),
+        repository=git_repo,
+        target_head=descendant,
+        evaluated_at=evaluated_at,
+    )
+    assert unresolved_wins.status is ExpiryEvaluationStatus.UNRESOLVED
+
+
+def test_approval_rejects_invalid_commit_boundaries_and_replay_changes(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    lifecycle, store = _lifecycle(git_repo, tmp_path)
+    main_branch = run_git(git_repo, "branch", "--show-current")
+    before_valid_from = _head(git_repo)
+    run_git(git_repo, "commit", "--allow-empty", "-m", "valid from")
+    valid_from = _head(git_repo)
+    run_git(git_repo, "checkout", "-b", "expiry-boundary-diverged", before_valid_from)
+    run_git(git_repo, "commit", "--allow-empty", "-m", "diverged boundary")
+    diverged = _head(git_repo)
+    run_git(git_repo, "checkout", main_branch)
+    run_git(git_repo, "commit", "--allow-empty", "-m", "valid expiry boundary")
+    valid_boundary = _head(git_repo)
+
+    invalid_boundaries = {
+        "before": before_valid_from,
+        "diverged": diverged,
+        "missing": "d" * 40,
+    }
+    for label, boundary in invalid_boundaries.items():
+        candidate = _candidate(
+            git_repo,
+            valid_from,
+            statement="Invalid %s expiry boundary must fail closed." % label,
+        )
+        provenance = _provenance(candidate, valid_boundary)
+        _submit(
+            lifecycle,
+            candidate,
+            provenance=provenance,
+            label="invalid-expiry-" + label,
+        )
+        with pytest.raises(MemoryLifecycleError) as error:
+            lifecycle.approve_candidate(
+                candidate.candidate_id,
+                runtime_provenance=provenance,
+                actor="amy",
+                reason="Maintainer supplied an invalid expiry boundary.",
+                request_id=stable_request_id("invalid-expiry", label),
+                created_at=LATER,
+                expiry_conditions=(
+                    ExpiryCondition(ExpiryConditionKind.AT_COMMIT, boundary),
+                ),
+            )
+        assert error.value.code is MemoryLifecycleErrorCode.INVALID_INPUT
+        assert store.get_candidate(candidate.candidate_id).status is (
+            CandidateStatus.PENDING_APPROVAL
+        )
+
+    candidate = _candidate(
+        git_repo,
+        valid_from,
+        statement="Valid expiry boundaries persist on immutable authority.",
+    )
+    provenance = _provenance(candidate, valid_boundary)
+    _submit(lifecycle, candidate, provenance=provenance, label="valid-expiry")
+    conditions = (
+        ExpiryCondition(ExpiryConditionKind.AT_TIME, "2026-01-01T00:00:00Z"),
+        ExpiryCondition(ExpiryConditionKind.AT_COMMIT, valid_boundary),
+    )
+    request_id = stable_request_id("valid-expiry", candidate.candidate_id)
+    approval = lifecycle.approve_candidate(
+        candidate.candidate_id,
+        runtime_provenance=provenance,
+        actor="amy",
+        reason="Maintainer approved canonical automatic expiry.",
+        request_id=request_id,
+        created_at=LATER,
+        expiry_conditions=conditions,
+    )
+    generation = store.get_generations(candidate.repository_key)
+    events = store.list_events(candidate.repository_key)
+    replay = lifecycle.approve_candidate(
+        candidate.candidate_id,
+        runtime_provenance=provenance,
+        actor="amy",
+        reason="Maintainer approved canonical automatic expiry.",
+        request_id=request_id,
+        created_at=LATER,
+        expiry_conditions=tuple(reversed(conditions)),
+    )
+
+    assert approval.record.expiry_conditions == tuple(reversed(conditions))
+    assert replay.record == approval.record
+    assert replay.write_result.replayed
+    assert store.get_generations(candidate.repository_key) == generation
+    assert store.list_events(candidate.repository_key) == events
+    with pytest.raises(MemoryStoreConflictError, match="expiry conditions"):
+        lifecycle.approve_candidate(
+            candidate.candidate_id,
+            runtime_provenance=provenance,
+            actor="amy",
+            reason="Maintainer approved canonical automatic expiry.",
+            request_id=request_id,
+            created_at=LATER,
+            expiry_conditions=(
+                ExpiryCondition(
+                    ExpiryConditionKind.AT_TIME,
+                    "2026-02-01T00:00:00Z",
+                ),
+                ExpiryCondition(ExpiryConditionKind.AT_COMMIT, valid_boundary),
+            ),
+        )
+
+
+def test_applicability_evaluates_expiry_after_status_gate_before_sources(
+    git_repo: Path,
+) -> None:
+    sha = _head(git_repo)
+    time_condition = ExpiryCondition(
+        ExpiryConditionKind.AT_TIME,
+        "2026-07-14T08:00:00Z",
+    )
+    active = _detached_record(
+        _candidate(git_repo, sha),
+        expiry_conditions=(time_condition,),
+    )
+    evaluator = TargetHeadApplicabilityEvaluator(git_repo, SourceValidator(git_repo))
+    evaluated_at = datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc)
+
+    due = evaluator.evaluate(
+        active,
+        target_head=sha,
+        evaluated_at="2026-07-14T08:00:00Z",
+    )
+    assert due.applicability is Applicability.EXPIRED
+    assert due.reason_code == "expiry_time_reached"
+    assert not due.requires_revalidation
+
+    persisted = evaluator.evaluate(
+        replace(active, status=RecordStatus.EXPIRED),
+        target_head="f" * 40,
+        evaluated_at=evaluated_at,
+    )
+    assert persisted.applicability is Applicability.EXPIRED
+    assert persisted.reason_code == "record_expired"
+
+    unresolved = evaluator.evaluate(
+        _detached_record(
+            _candidate(
+                git_repo,
+                sha,
+                statement="Unresolved expiry must fail closed before source checks.",
+            ),
+            expiry_conditions=(
+                ExpiryCondition(ExpiryConditionKind.AT_COMMIT, "e" * 40),
+            ),
+        ),
+        target_head=sha,
+        evaluated_at=evaluated_at,
+    )
+    assert unresolved.applicability is Applicability.SOURCE_MISSING
+    assert unresolved.reason_code == "expiry_condition_unresolved"
+    assert unresolved.requires_revalidation
+
+
+def test_runtime_expiry_sweep_events_generation_replay_and_unresolved(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    lifecycle, store = _lifecycle(git_repo, tmp_path)
+    main_branch = run_git(git_repo, "branch", "--show-current")
+    valid_from = _head(git_repo)
+    run_git(git_repo, "checkout", "-b", "expiry-unresolved", valid_from)
+    run_git(git_repo, "commit", "--allow-empty", "-m", "side expiry boundary")
+    unresolved_boundary = _head(git_repo)
+    run_git(git_repo, "checkout", main_branch)
+    run_git(git_repo, "commit", "--allow-empty", "-m", "runtime expiry target")
+    target = _head(git_repo)
+
+    configured = {
+        "time": ExpiryCondition(
+            ExpiryConditionKind.AT_TIME,
+            "2026-07-14T08:00:00Z",
+        ),
+        "commit": ExpiryCondition(ExpiryConditionKind.AT_COMMIT, valid_from),
+        "unresolved": ExpiryCondition(
+            ExpiryConditionKind.AT_COMMIT,
+            unresolved_boundary,
+        ),
+        "future": ExpiryCondition(
+            ExpiryConditionKind.AT_TIME,
+            "2027-07-14T08:00:00Z",
+        ),
+    }
+    records: dict[str, DurableMemoryRecord] = {}
+    for label, condition in configured.items():
+        candidate = _candidate(
+            git_repo,
+            valid_from,
+            statement="Runtime expiry sweep record %s." % label,
+        )
+        provenance = _provenance(candidate, target)
+        _submit(
+            lifecycle,
+            candidate,
+            provenance=provenance,
+            label="expiry-sweep-" + label,
+        )
+        records[label] = _approve(
+            lifecycle,
+            candidate,
+            provenance=provenance,
+            label="expiry-sweep-" + label,
+            expiry_conditions=(condition,),
+        ).record
+
+    evaluated_at = datetime(2026, 7, 14, 8, 5, tzinfo=timezone.utc)
+    generation_before = store.get_generations(
+        records["time"].repository_key
+    ).memory_generation
+    sweep = lifecycle.expire_due_records(
+        records["time"].repository_key,
+        target_head=target,
+        evaluated_at=evaluated_at,
+        max_records=10,
+    )
+
+    assert set(sweep.scanned_ids) == {
+        record.memory_id for record in records.values()
+    }
+    assert set(sweep.expired_ids) == {
+        records["time"].memory_id,
+        records["commit"].memory_id,
+    }
+    assert sweep.unresolved_ids == (records["unresolved"].memory_id,)
+    assert len(sweep.write_results) == 2
+    assert all(write.applied for write in sweep.write_results)
+    assert not sweep.truncated
+    assert store.get_generations(
+        records["time"].repository_key
+    ).memory_generation == generation_before + 2
+    assert store.get_record(records["future"].memory_id).status is RecordStatus.ACTIVE
+    assert store.get_record(records["unresolved"].memory_id).status is RecordStatus.ACTIVE
+
+    expiry_events = [
+        event
+        for event in store.list_events(records["time"].repository_key)
+        if event.action == "expire"
+    ]
+    assert len(expiry_events) == 2
+    assert {event.reason_code for event in expiry_events} == {
+        "expiry_time_reached",
+        "expiry_commit_reached",
+    }
+    for event in expiry_events:
+        assert event.actor_type == "runtime"
+        assert event.actor_id == "memory_expiry"
+        reason = json.loads(event.reason or "")
+        assert set(reason) == {
+            "condition_fingerprint",
+            "evaluated_at",
+            "target",
+        }
+        assert reason["evaluated_at"] == "2026-07-14T08:05:00Z"
+        assert reason["target"] == target
+        assert len(reason["condition_fingerprint"]) == 64
+        assert len(event.reason or "") < 512
+
+    events_before_replay = store.list_events(records["time"].repository_key)
+    generations_before_replay = store.get_generations(
+        records["time"].repository_key
+    )
+    replay = lifecycle.expire_record_if_due(
+        records["time"].memory_id,
+        target_head=target,
+        evaluated_at=evaluated_at,
+    )
+    assert replay.expired
+    assert replay.converged
+    assert replay.write_result is not None
+    assert replay.write_result.replayed
+    assert store.list_events(records["time"].repository_key) == events_before_replay
+    assert store.get_generations(
+        records["time"].repository_key
+    ) == generations_before_replay
+
+
+def test_expiry_cas_conflict_never_overwrites_concurrent_revocation(
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle, store = _lifecycle(git_repo, tmp_path)
+    sha = _head(git_repo)
+    candidate = _candidate(
+        git_repo,
+        sha,
+        statement="Concurrent revocation must win over runtime expiry.",
+    )
+    provenance = _provenance(candidate, sha)
+    _submit(lifecycle, candidate, provenance=provenance, label="expiry-race")
+    record = _approve(
+        lifecycle,
+        candidate,
+        provenance=provenance,
+        label="expiry-race",
+        expiry_conditions=(
+            ExpiryCondition(
+                ExpiryConditionKind.AT_TIME,
+                "2026-07-14T08:00:00Z",
+            ),
+        ),
+    ).record
+    original_transition = store.transition_record
+
+    def revoke_then_conflict(memory_id: str, **kwargs):
+        if kwargs.get("action") == "expire":
+            original_transition(
+                memory_id,
+                expected_status=RecordStatus.ACTIVE,
+                new_status=RecordStatus.REVOKED,
+                action="revoke",
+                actor_type="human",
+                actor_id="amy",
+                reason_code="revoked",
+                reason="Concurrent maintainer revocation won the CAS.",
+                request_id=stable_request_id("expiry-race", "revoke", memory_id),
+                created_at="2026-07-14T08:04:00Z",
+            )
+            raise MemoryStoreConflictError()
+        return original_transition(memory_id, **kwargs)
+
+    monkeypatch.setattr(store, "transition_record", revoke_then_conflict)
+    result = lifecycle.expire_record_if_due(
+        record.memory_id,
+        target_head=sha,
+        evaluated_at=datetime(2026, 7, 14, 8, 5, tzinfo=timezone.utc),
+    )
+
+    assert not result.expired
+    assert result.write_result is None
+    assert result.current_status is RecordStatus.REVOKED
+    assert store.get_record(record.memory_id).status is RecordStatus.REVOKED
+    record_events = store.list_events(
+        record.repository_key,
+        subject_type="record",
+        subject_id=record.memory_id,
+    )
+    assert [event.action for event in record_events] == ["revoke"]

@@ -13,6 +13,8 @@ from review_agent.memory_lifecycle import TargetHeadApplicabilityEvaluator
 from review_agent.memory_models import (
     Applicability,
     DurableMemoryRecord,
+    ExpiryCondition,
+    ExpiryConditionKind,
     GenerationMetadata,
     GitCommitSourceRef,
     MemoryConfidence,
@@ -104,6 +106,7 @@ def _record(
     policies: tuple[ValidityPolicy, ...] = (ValidityPolicy.MANUAL_UNTIL_REVOKED,),
     effect: PolicyEffect | None = None,
     status: RecordStatus = RecordStatus.ACTIVE,
+    expiry_conditions: tuple[ExpiryCondition, ...] = (),
 ) -> DurableMemoryRecord:
     revision = valid_from or _head(repo)
     candidate_id = stable_id("MC", "retrieval-test", label)
@@ -124,6 +127,7 @@ def _record(
         approval_event_id=stable_event_id("approve", candidate_id),
         status=status,
         created_at=NOW,
+        expiry_conditions=expiry_conditions,
     )
 
 
@@ -378,6 +382,78 @@ def test_semantic_ranker_sees_only_eligible_and_cannot_expand_it(git_repo: Path)
         )
 
 
+def test_frozen_time_expiry_precedes_semantic_ranking_and_budget(
+    git_repo: Path,
+) -> None:
+    due = _record(
+        git_repo,
+        "time-expired-hard-policy",
+        effect=PolicyEffect(PolicyEffectKind.REQUIRE_CHECK, "check.expired"),
+        expiry_conditions=(
+            ExpiryCondition(ExpiryConditionKind.AT_TIME, NOW),
+        ),
+    )
+    not_due = _record(
+        git_repo,
+        "time-not-due",
+        expiry_conditions=(
+            ExpiryCondition(
+                ExpiryConditionKind.AT_TIME,
+                "2026-07-15T00:00:01Z",
+            ),
+        ),
+    )
+    seen: list[tuple[str, ...]] = []
+
+    def ranker(records, _request):
+        seen.append(tuple(record.memory_id for record in records))
+        return {record.memory_id: 1 for record in records}
+
+    snapshot = _builder(
+        git_repo,
+        RetrievalLimits(max_snapshot_records=1),
+    ).build(
+        _selection(git_repo),
+        (due, not_due),
+        semantic_ranker=ranker,
+        created_at=NOW,
+    )
+
+    assert seen == [(not_due.memory_id,)]
+    assert [record.memory_id for record in snapshot.eligible_records] == [
+        not_due.memory_id
+    ]
+    due_decision = _decisions(snapshot)[due.memory_id]
+    assert due_decision.applicability is Applicability.EXPIRED
+    assert due_decision.reason_codes == ("expiry_time_reached",)
+    assert snapshot.created_at == NOW
+
+
+def test_commit_expiry_is_derived_at_the_frozen_target_head(git_repo: Path) -> None:
+    valid_from = _head(git_repo)
+    run_git(git_repo, "commit", "--allow-empty", "-m", "expiry boundary")
+    boundary = _head(git_repo)
+    record = _record(
+        git_repo,
+        "commit-expired",
+        valid_from=valid_from,
+        expiry_conditions=(
+            ExpiryCondition(ExpiryConditionKind.AT_COMMIT, boundary),
+        ),
+    )
+
+    snapshot = _builder(git_repo).build(
+        _selection(git_repo, head=boundary),
+        (record,),
+        created_at=NOW,
+    )
+
+    decision = _decisions(snapshot)[record.memory_id]
+    assert snapshot.eligible_records == ()
+    assert decision.applicability is Applicability.EXPIRED
+    assert decision.reason_codes == ("expiry_commit_reached",)
+
+
 def test_snapshot_copies_records_and_top_level_generations_deterministically(git_repo: Path) -> None:
     record = _record(git_repo, "immutable")
     selection = _selection(git_repo)
@@ -394,6 +470,24 @@ def test_snapshot_copies_records_and_top_level_generations_deterministically(git
     assert payload["knowledge_generation"] == 9
     assert "generations" not in payload
     assert MemorySnapshot.from_dict(payload) == first
+
+
+def test_legacy_v1_selection_input_remains_snapshot_read_compatible(
+    git_repo: Path,
+) -> None:
+    legacy = replace(
+        _selection(git_repo),
+        selection_policy_version="memory_selection_v1",
+    )
+
+    snapshot = _builder(git_repo).build(
+        legacy,
+        (_record(git_repo, "legacy-v1"),),
+        created_at=NOW,
+    )
+
+    assert snapshot.selection_policy_version == "memory_selection_v1"
+    assert MemorySnapshot.from_dict(snapshot.to_dict()) == snapshot
 
 
 def test_ordinary_budget_omits_but_hard_policy_count_and_bytes_block(git_repo: Path) -> None:

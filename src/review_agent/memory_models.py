@@ -21,13 +21,20 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Type, TypeVar
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Type, TypeVar, cast
 
 
 MODEL_SCHEMA_VERSION = 1
 CURRENT_MEMORY_STORE_SCHEMA_VERSION = 2
 SUPPORTED_MEMORY_STORE_SCHEMA_VERSIONS = frozenset({1, 2})
-MEMORY_SELECTION_POLICY_VERSION = "memory_selection_v1"
+LEGACY_MEMORY_SELECTION_POLICY_VERSION = "memory_selection_v1"
+MEMORY_SELECTION_POLICY_VERSION = "memory_selection_v2"
+SUPPORTED_MEMORY_SELECTION_POLICY_VERSIONS = frozenset(
+    {
+        LEGACY_MEMORY_SELECTION_POLICY_VERSION,
+        MEMORY_SELECTION_POLICY_VERSION,
+    }
+)
 FEEDBACK_AGGREGATION_POLICY_VERSION = "feedback_aggregation_v1"
 
 MAX_STATEMENT_LENGTH = 8_192
@@ -147,6 +154,11 @@ class ValidityPolicy(str, Enum):
     SYMBOL_SIGNATURE = "symbol_signature"
     SCOPE_CHANGE_TRIGGER = "scope_change_trigger"
     MANUAL_UNTIL_REVOKED = "manual_until_revoked"
+
+
+class ExpiryConditionKind(str, Enum):
+    AT_TIME = "at_time"
+    AT_COMMIT = "at_commit"
 
 
 class PolicyEffectKind(str, Enum):
@@ -420,6 +432,22 @@ def _utc_timestamp(value: Any, context: str) -> str:
     except ValueError as error:
         raise ValueError("%s must be a valid UTC timestamp" % context) from error
     return normalized
+
+
+def _canonical_utc_timestamp(value: Any, context: str) -> str:
+    """Validate the unique UTC ``Z`` representation used in identities."""
+
+    if not isinstance(value, str) or not _UTC_TIMESTAMP_PATTERN.fullmatch(value):
+        raise ValueError("%s must be a canonical RFC 3339 UTC timestamp ending in Z" % context)
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise ValueError("%s must be a valid UTC timestamp" % context) from error
+    timespec = "microseconds" if parsed.microsecond else "seconds"
+    canonical = parsed.isoformat(timespec=timespec).replace("+00:00", "Z")
+    if value != canonical:
+        raise ValueError("%s must use canonical UTC Z form" % context)
+    return value
 
 
 def _positive_int(value: Any, context: str, *, allow_zero: bool = False) -> int:
@@ -1187,10 +1215,12 @@ class CandidateAuthorityReceipt(_JsonModel):
                     "HUMAN authority receipt requires at least one "
                     "human_declarations item"
                 )
-        elif self.human_declarations:
-            raise ValueError(
-                "non-human authority receipt must not carry human_declarations"
-            )
+
+        # ``origin`` identifies who proposed the Candidate; declaration
+        # authority belongs to individual SourceRefs.  A local/model Curator
+        # may therefore propose a Candidate grounded in an explicit human
+        # declaration, and the receipt must be able to carry that independently
+        # validated declaration for later approval-time restoration.
 
         authorized_source_ref_json = {
             source_ref.to_json() for source_ref in self.authorized_source_refs
@@ -1459,6 +1489,93 @@ class PolicyEffect(_JsonModel):
             value=root["value"],
             schema_version=root["schema_version"],
         )
+
+
+@dataclass(frozen=True)
+class ExpiryCondition(_JsonModel):
+    """A closed, immutable approval-time expiry predicate."""
+
+    condition_kind: ExpiryConditionKind
+    value: str
+    schema_version: int = MODEL_SCHEMA_VERSION
+    condition_fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        _validate_schema(self.schema_version, "expiry_condition")
+        if not isinstance(self.condition_kind, ExpiryConditionKind):
+            raise ValueError("condition_kind must be an ExpiryConditionKind")
+        if self.condition_kind is ExpiryConditionKind.AT_TIME:
+            normalized = _canonical_utc_timestamp(
+                self.value,
+                "expiry_condition.value",
+            )
+        else:
+            normalized = _git_object_id(self.value, "expiry_condition.value")
+        object.__setattr__(self, "value", normalized)
+        object.__setattr__(
+            self,
+            "condition_fingerprint",
+            canonical_sha256(self._identity_dict()),
+        )
+
+    @property
+    def kind(self) -> ExpiryConditionKind:
+        return self.condition_kind
+
+    @property
+    def fingerprint(self) -> str:
+        return self.condition_fingerprint
+
+    @property
+    def expires_at(self) -> Optional[str]:
+        if self.condition_kind is ExpiryConditionKind.AT_TIME:
+            return self.value
+        return None
+
+    @property
+    def commit_sha(self) -> Optional[str]:
+        if self.condition_kind is ExpiryConditionKind.AT_COMMIT:
+            return self.value
+        return None
+
+    def _identity_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "type": self.condition_kind.value,
+            "value": self.value,
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "condition_fingerprint": self.condition_fingerprint,
+            **self._identity_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "ExpiryCondition":
+        root = _object(payload, "expiry_condition")
+        _exact_fields(
+            root,
+            {"schema_version", "condition_fingerprint", "type", "value"},
+            "expiry_condition",
+        )
+        _validate_schema(root["schema_version"], "expiry_condition")
+        condition = cls(
+            condition_kind=_enum_value(
+                ExpiryConditionKind,
+                root["type"],
+                "expiry_condition.type",
+            ),
+            value=root["value"],
+            schema_version=root["schema_version"],
+        )
+        if root["value"] != condition.value:
+            raise ValueError("expiry_condition.value must use canonical form")
+        if root["condition_fingerprint"] != condition.condition_fingerprint:
+            raise ValueError(
+                "expiry_condition.condition_fingerprint does not match canonical content"
+            )
+        return condition
 
 
 @dataclass(frozen=True)
@@ -1834,8 +1951,60 @@ class SourceBundleDescriptor(_JsonModel):
         return descriptor
 
 
+_DURABLE_MEMORY_RECORD_SCHEMA_V1 = 1
+_DURABLE_MEMORY_RECORD_SCHEMA_V2 = 2
+_AUTO_DURABLE_MEMORY_RECORD_SCHEMA = object()
+
+
+def _durable_memory_record_schema(value: Any) -> int:
+    if type(value) is not int or value not in {
+        _DURABLE_MEMORY_RECORD_SCHEMA_V1,
+        _DURABLE_MEMORY_RECORD_SCHEMA_V2,
+    }:
+        raise ValueError("durable_memory_record.schema_version must be 1 or 2")
+    return value
+
+
+def _canonical_expiry_conditions(
+    values: Any,
+    context: str,
+) -> Tuple[ExpiryCondition, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple)):
+        raise ValueError("%s must be a list or tuple of ExpiryCondition values" % context)
+    if len(values) > len(ExpiryConditionKind):
+        raise ValueError("%s must contain at most two conditions" % context)
+    by_kind: Dict[ExpiryConditionKind, ExpiryCondition] = {}
+    for condition in values:
+        if type(condition) is not ExpiryCondition:
+            raise ValueError("%s items must be ExpiryCondition values" % context)
+        if condition.condition_kind in by_kind:
+            raise ValueError(
+                "%s must contain at most one condition of each kind" % context
+            )
+        by_kind[condition.condition_kind] = condition
+    return tuple(by_kind[kind] for kind in sorted(by_kind, key=lambda item: item.value))
+
+
+def _expiry_conditions_from_payload(
+    value: Any,
+    context: str,
+) -> Tuple[ExpiryCondition, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError("%s must be a list or tuple" % context)
+    return _canonical_expiry_conditions(
+        tuple(ExpiryCondition.from_dict(item) for item in value),
+        context,
+    )
+
+
 @dataclass(frozen=True)
 class DurableMemoryRecord(_JsonModel):
+    """An immutable approved record with disjunctive approval-time expiry.
+
+    The model only preserves canonical predicates.  Runtime owns evaluation and
+    expires the record when any one of them matches.
+    """
+
     candidate_id: str
     repository_key: str
     kind: MemoryKind
@@ -1852,11 +2021,40 @@ class DurableMemoryRecord(_JsonModel):
     approval_event_id: str
     status: RecordStatus
     created_at: str
-    schema_version: int = MODEL_SCHEMA_VERSION
+    schema_version: int = field(
+        default=cast(int, _AUTO_DURABLE_MEMORY_RECORD_SCHEMA)
+    )
+    expiry_conditions: Tuple[ExpiryCondition, ...] = ()
     memory_id: str = field(init=False)
 
     def __post_init__(self) -> None:
-        _validate_schema(self.schema_version, "durable_memory_record")
+        raw_schema_version = self.schema_version
+        if raw_schema_version is _AUTO_DURABLE_MEMORY_RECORD_SCHEMA:
+            expiry_conditions = _canonical_expiry_conditions(
+                self.expiry_conditions,
+                "expiry_conditions",
+            )
+            schema_version = (
+                _DURABLE_MEMORY_RECORD_SCHEMA_V2
+                if expiry_conditions
+                else _DURABLE_MEMORY_RECORD_SCHEMA_V1
+            )
+        else:
+            schema_version = _durable_memory_record_schema(raw_schema_version)
+            expiry_conditions = _canonical_expiry_conditions(
+                self.expiry_conditions,
+                "expiry_conditions",
+            )
+        if schema_version == _DURABLE_MEMORY_RECORD_SCHEMA_V1 and expiry_conditions:
+            raise ValueError(
+                "durable_memory_record schema_version 1 must not carry expiry_conditions"
+            )
+        if schema_version == _DURABLE_MEMORY_RECORD_SCHEMA_V2 and not expiry_conditions:
+            raise ValueError(
+                "durable_memory_record schema_version 2 requires expiry_conditions"
+            )
+        object.__setattr__(self, "schema_version", schema_version)
+        object.__setattr__(self, "expiry_conditions", expiry_conditions)
         object.__setattr__(
             self,
             "candidate_id",
@@ -1913,7 +2111,7 @@ class DurableMemoryRecord(_JsonModel):
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "memory_id": self.memory_id,
             "candidate_id": self.candidate_id,
@@ -1933,33 +2131,54 @@ class DurableMemoryRecord(_JsonModel):
             "status": self.status.value,
             "created_at": self.created_at,
         }
+        if self.schema_version == _DURABLE_MEMORY_RECORD_SCHEMA_V2:
+            payload["expiry_conditions"] = [
+                item.to_dict() for item in self.expiry_conditions
+            ]
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Any) -> "DurableMemoryRecord":
         root = _object(payload, "durable_memory_record")
+        if "schema_version" not in root:
+            raise ValueError(
+                "durable_memory_record is missing required field(s): schema_version"
+            )
+        schema_version = _durable_memory_record_schema(root["schema_version"])
+        expected_fields = {
+            "schema_version",
+            "memory_id",
+            "candidate_id",
+            "repository_key",
+            "kind",
+            "statement",
+            "scope",
+            "source_refs",
+            "source_bundle_hash",
+            "valid_from_sha",
+            "validity_policies",
+            "confidence",
+            "sensitivity",
+            "policy_effect",
+            "approved_by",
+            "approval_event_id",
+            "status",
+            "created_at",
+        }
+        if schema_version == _DURABLE_MEMORY_RECORD_SCHEMA_V2:
+            expected_fields.add("expiry_conditions")
         _exact_fields(
             root,
-            {
-                "schema_version",
-                "memory_id",
-                "candidate_id",
-                "repository_key",
-                "kind",
-                "statement",
-                "scope",
-                "source_refs",
-                "source_bundle_hash",
-                "valid_from_sha",
-                "validity_policies",
-                "confidence",
-                "sensitivity",
-                "policy_effect",
-                "approved_by",
-                "approval_event_id",
-                "status",
-                "created_at",
-            },
+            expected_fields,
             "durable_memory_record",
+        )
+        expiry_conditions = (
+            ()
+            if schema_version == _DURABLE_MEMORY_RECORD_SCHEMA_V1
+            else _expiry_conditions_from_payload(
+                root["expiry_conditions"],
+                "durable_memory_record.expiry_conditions",
+            )
         )
         record = cls(
             candidate_id=root["candidate_id"],
@@ -2000,7 +2219,8 @@ class DurableMemoryRecord(_JsonModel):
                 "durable_memory_record.status",
             ),
             created_at=root["created_at"],
-            schema_version=root["schema_version"],
+            schema_version=schema_version,
+            expiry_conditions=expiry_conditions,
         )
         if root["memory_id"] != record.memory_id:
             raise ValueError("durable_memory_record.memory_id does not match candidate_id")
@@ -2401,10 +2621,12 @@ class MemorySelectionInput(_JsonModel):
         )
         if not isinstance(self.generations, GenerationMetadata):
             raise ValueError("generations must be GenerationMetadata")
-        if self.selection_policy_version != MEMORY_SELECTION_POLICY_VERSION:
+        if (
+            self.selection_policy_version
+            not in SUPPORTED_MEMORY_SELECTION_POLICY_VERSIONS
+        ):
             raise ValueError(
-                "selection_policy_version must be %s"
-                % MEMORY_SELECTION_POLICY_VERSION
+                "selection_policy_version must be a supported Memory selection policy"
             )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -3005,10 +3227,12 @@ class MemorySnapshot(_JsonModel):
         object.__setattr__(self, "head_sha", _git_object_id(self.head_sha, "head_sha"))
         if not isinstance(self.generations, GenerationMetadata):
             raise ValueError("generations must be GenerationMetadata")
-        if self.selection_policy_version != MEMORY_SELECTION_POLICY_VERSION:
+        if (
+            self.selection_policy_version
+            not in SUPPORTED_MEMORY_SELECTION_POLICY_VERSIONS
+        ):
             raise ValueError(
-                "selection_policy_version must be %s"
-                % MEMORY_SELECTION_POLICY_VERSION
+                "selection_policy_version must be a supported Memory selection policy"
             )
 
         if isinstance(self.eligible_records, (str, bytes)) or not isinstance(
@@ -3246,10 +3470,12 @@ class MemoryExecutionConfig(_JsonModel):
             raise ValueError("required must be a boolean")
         if self.mode is MemoryMode.OFF and self.required:
             raise ValueError("required=true cannot be combined with mode=off")
-        if self.selection_policy_version != MEMORY_SELECTION_POLICY_VERSION:
+        if (
+            self.selection_policy_version
+            not in SUPPORTED_MEMORY_SELECTION_POLICY_VERSIONS
+        ):
             raise ValueError(
-                "selection_policy_version must be %s"
-                % MEMORY_SELECTION_POLICY_VERSION
+                "selection_policy_version must be a supported Memory selection policy"
             )
         if self.feedback_policy_version != FEEDBACK_AGGREGATION_POLICY_VERSION:
             raise ValueError(

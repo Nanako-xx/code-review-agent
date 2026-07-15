@@ -253,7 +253,7 @@ def test_cli_review_writes_state_and_preflight_summary(
             "mode": "read-write",
             "root_path": cli_memory_root.as_posix(),
             "required": False,
-            "selection_policy_version": "memory_selection_v1",
+            "selection_policy_version": "memory_selection_v2",
             "feedback_policy_version": "feedback_aggregation_v1",
             "max_snapshot_records": 2000,
             "max_snapshot_bytes": 8388608,
