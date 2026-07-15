@@ -7,15 +7,36 @@ import pytest
 from review_agent.intent_inference import (
     INTENT_INFERENCE_SYSTEM_PROMPT,
     IntentInferenceParseError,
+    build_intent_memory_projection,
+    intent_claims_from_memory_projection,
     intent_inference_run_to_dict,
     parse_intent_inference_result,
     run_intent_inference,
+)
+from review_agent.intent import apply_user_decision, generate_material_questions
+from review_agent.memory_models import (
+    DurableMemoryRecord,
+    GitCommitSourceRef,
+    MemoryConfidence,
+    MemoryKind,
+    MemoryScope,
+    Producer,
+    ProducerType,
+    RecordStatus,
+    Sensitivity,
+    ValidityPolicy,
 )
 from review_agent.model_adapter import FakeToolCallingAdapter
 from review_agent.model_protocol import (
     ModelResponseKind,
     ModelToolCall,
     ModelTurnResponse,
+)
+from review_agent.models import (
+    IntentDecision,
+    IntentDecisionAction,
+    IntentOrigin,
+    IntentSource,
 )
 from review_agent.observations import ObservationStore
 from review_agent.tool_gateway import ToolGateway
@@ -326,6 +347,100 @@ def test_intent_inference_provider_invalid_returns_failed(git_repo, tmp_path):
     assert run.result.uncertainties == ["provider unavailable"]
 
 
+def test_approved_memory_projects_only_sourced_inferred_intent_and_can_be_confirmed() -> None:
+    records = [
+        _memory_record(1, MemoryKind.ARCHITECTURE_BOUNDARY, "Keep adapters behind the gateway."),
+        _memory_record(2, MemoryKind.BUSINESS_INVARIANT, "Duplicate delivery remains idempotent."),
+        _memory_record(3, MemoryKind.COMPATIBILITY_REQUIREMENT, "Keep the v1 response shape."),
+        _memory_record(4, MemoryKind.REVIEW_RULE, "Run every possible command."),
+    ]
+
+    projection = build_intent_memory_projection(records)
+    claims = intent_claims_from_memory_projection(projection)
+
+    assert len(claims) == 3
+    assert all(claim.source is IntentSource.INFERRED for claim in claims)
+    assert all(claim.origin is IntentOrigin.PROJECT_MEMORY for claim in claims)
+    assert all(
+        any(ref.startswith("memory:MEM-") for ref in claim.source_refs)
+        for claim in claims
+    )
+    assert "Run every possible command." not in {claim.value for claim in claims}
+
+    questions = generate_material_questions(claims)
+    business_question = next(
+        question
+        for question in questions
+        if "Duplicate delivery remains idempotent." in question.proposed_values
+    )
+    confirmed, _ = apply_user_decision(
+        claims,
+        questions,
+        IntentDecision(
+            question_id=business_question.question_id,
+            action=IntentDecisionAction.CONFIRMED,
+        ),
+    )
+    confirmed_claim = next(
+        claim
+        for claim in confirmed
+        if claim.value == "Duplicate delivery remains idempotent."
+    )
+    assert confirmed_claim.source is IntentSource.EXPLICIT
+    assert confirmed_claim.origin is IntentOrigin.USER_CONFIRMATION
+
+
+def test_model_may_only_restate_an_authorized_memory_projection_as_inferred(
+    git_repo,
+    tmp_path,
+) -> None:
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    gateway = ToolGateway(
+        git_repo,
+        head,
+        head,
+        ObservationStore(tmp_path / "intent-memory"),
+    )
+    projection = build_intent_memory_projection(
+        [
+            _memory_record(
+                10,
+                MemoryKind.BUSINESS_INVARIANT,
+                "The add operation preserves integer addition.",
+            )
+        ]
+    )
+    memory_ref = f"memory:{projection.claims[0].memory.memory_id}"
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=_result_json(
+                    origin="project_memory",
+                    source_refs=[memory_ref],
+                    evidence_refs=[],
+                ),
+            )
+        ]
+    )
+
+    run = _run(
+        adapter,
+        gateway,
+        base=head,
+        head=head,
+        memory_projection=projection,
+    )
+
+    assert run.result.candidates[0].origin == "project_memory"
+    assert run.result.candidates[0].source == "inferred"
+    context = json.loads(adapter.requests[0].messages[0]["content"])
+    assert context["approved_project_memory"]["claims"][0]["memory"]["memory_id"] == (
+        projection.claims[0].memory.memory_id
+    )
+    assert "eligible_records" not in context["approved_project_memory"]
+
+
 def _run(
     adapter,
     gateway,
@@ -335,6 +450,7 @@ def _run(
     initial_observation_summaries=None,
     max_turns=4,
     max_tool_calls=8,
+    memory_projection=None,
 ):
     return run_intent_inference(
         adapter=adapter,
@@ -349,6 +465,7 @@ def _run(
         trace_id="intent-test-trace",
         max_turns=max_turns,
         max_tool_calls=max_tool_calls,
+        memory_projection=memory_projection,
     )
 
 
@@ -375,4 +492,30 @@ def _result_json(
             "uncertainties": [],
             "summary": "Intent candidate extracted.",
         }
+    )
+
+
+def _memory_record(index: int, kind: MemoryKind, statement: str) -> DurableMemoryRecord:
+    return DurableMemoryRecord(
+        candidate_id="MC-" + format(index, "064x"),
+        repository_key="4" * 64,
+        kind=kind,
+        statement=statement,
+        scope=MemoryScope(paths=("app.py",)),
+        source_refs=(
+            GitCommitSourceRef(
+                commit_sha="a" * 40,
+                metadata_hash="1" * 64,
+            ),
+        ),
+        source_bundle_hash="2" * 64,
+        valid_from_sha="a" * 40,
+        validity_policies=(ValidityPolicy.MANUAL_UNTIL_REVOKED,),
+        confidence=MemoryConfidence.HIGH,
+        sensitivity=Sensitivity.NORMAL,
+        policy_effect=None,
+        approved_by="amy",
+        approval_event_id="EVT-" + format(index + 1_000, "064x"),
+        status=RecordStatus.ACTIVE,
+        created_at="2026-07-14T12:00:00Z",
     )

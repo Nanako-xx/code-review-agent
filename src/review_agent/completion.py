@@ -5,7 +5,14 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from review_agent.evidence import EvidenceReconciliation
-from review_agent.models import IntentPacket, IntentStatus, QualityGateResult, ReviewerResultStatus
+from review_agent.models import (
+    CompletionMemoryProjection,
+    IntentPacket,
+    IntentStatus,
+    MemoryDiagnostic,
+    QualityGateResult,
+    ReviewerResultStatus,
+)
 from review_agent.orchestrator import ReviewerExecution
 from review_agent.quality import QualityGatePlan
 
@@ -17,6 +24,35 @@ class CompletionResult:
     blockers: list[str]
     uncertainties: list[str]
     missing_perspectives: list[str]
+    memory_diagnostics: tuple[MemoryDiagnostic, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.status not in {
+            "completed",
+            "completed_with_uncertainties",
+            "blocked",
+            "budget_exhausted",
+        }:
+            raise ValueError("completion status is unsupported")
+        if self.recommendation not in {"approve", "needs_work", "manual_review"}:
+            raise ValueError("completion recommendation is unsupported")
+        for name in (
+            "blockers",
+            "uncertainties",
+            "missing_perspectives",
+        ):
+            values = getattr(self, name)
+            if not isinstance(values, list) or any(
+                not isinstance(item, str) or not item.strip() for item in values
+            ):
+                raise ValueError(f"completion {name} must be a list of non-empty strings")
+            object.__setattr__(self, name, list(values))
+        diagnostics = tuple(self.memory_diagnostics)
+        if any(not isinstance(item, MemoryDiagnostic) for item in diagnostics):
+            raise ValueError(
+                "completion memory_diagnostics must contain MemoryDiagnostic values"
+            )
+        object.__setattr__(self, "memory_diagnostics", diagnostics)
 
 
 def check_completion(
@@ -30,6 +66,7 @@ def check_completion(
     require_final_risk: bool = False,
     final_risk_level: str | None = None,
     semantic_reconciliation: Mapping[str, Any] | None = None,
+    memory_projection: CompletionMemoryProjection | None = None,
 ) -> CompletionResult:
     """Determine the authoritative review outcome.
 
@@ -41,6 +78,23 @@ def check_completion(
     blockers: list[str] = []
     uncertainties: list[str] = []
     missing_perspectives: list[str] = []
+    if memory_projection is not None and not isinstance(
+        memory_projection,
+        CompletionMemoryProjection,
+    ):
+        raise ValueError(
+            "memory_projection must be a CompletionMemoryProjection or None"
+        )
+    memory_diagnostics = (
+        () if memory_projection is None else memory_projection.diagnostics
+    )
+    if memory_projection is not None:
+        for diagnostic in memory_projection.diagnostics:
+            message = f"memory {diagnostic.code.value}: {diagnostic.message}"
+            if diagnostic.blocking:
+                blockers.append(message)
+            else:
+                uncertainties.append(message)
     initial_executions = [
         execution for execution in executions if _is_initial_execution(execution)
     ]
@@ -99,6 +153,63 @@ def check_completion(
                 else:
                     uncertainties.append(message)
 
+    if memory_projection is not None:
+        for requirement in memory_projection.required_contracts:
+            assigned = [
+                execution
+                for execution in initial_executions
+                if requirement.requirement_id
+                in execution.assignment.assigned_contract
+            ]
+            if not assigned:
+                blockers.append(
+                    "Memory-required contract was not assigned: "
+                    + requirement.requirement_id
+                )
+                continue
+            incomplete = [
+                execution
+                for execution in assigned
+                if execution.result.status is not ReviewerResultStatus.COMPLETED
+                or contract_coverage.get(
+                    (execution.reviewer_index, requirement.requirement_id)
+                )
+                != "complete"
+            ]
+            if incomplete:
+                blockers.append(
+                    "Memory-required contract coverage incomplete: "
+                    + requirement.requirement_id
+                    + " ("
+                    + ", ".join(
+                        f"{execution.assignment.role}#{execution.reviewer_index}"
+                        for execution in incomplete
+                    )
+                    + ")"
+                )
+        for requirement in memory_projection.required_checks:
+            matching = [
+                result
+                for result in quality_results
+                if result.name == requirement.requirement_id
+            ]
+            if not matching:
+                blockers.append(
+                    "Memory-required check result missing: "
+                    + requirement.requirement_id
+                )
+            elif len(matching) != 1:
+                blockers.append(
+                    "Memory-required check result duplicated: "
+                    + requirement.requirement_id
+                )
+            elif matching[0].status != "passed":
+                blockers.append(
+                    "Memory-required check did not pass: "
+                    + requirement.requirement_id
+                    + f" ({matching[0].status})"
+                )
+
     if reconciliation.rejected_findings:
         uncertainties.append("unsupported findings rejected")
 
@@ -125,6 +236,7 @@ def check_completion(
             blockers=blockers,
             uncertainties=uncertainties,
             missing_perspectives=missing_perspectives,
+            memory_diagnostics=memory_diagnostics,
         )
 
     if budget_exhausted:
@@ -134,6 +246,7 @@ def check_completion(
             blockers=[],
             uncertainties=uncertainties,
             missing_perspectives=missing_perspectives,
+            memory_diagnostics=memory_diagnostics,
         )
 
     recommendation = _recommendation(reconciliation, uncertainties, missing_perspectives)
@@ -144,11 +257,23 @@ def check_completion(
         blockers=[],
         uncertainties=uncertainties,
         missing_perspectives=missing_perspectives,
+        memory_diagnostics=memory_diagnostics,
     )
 
 
 def completion_to_dict(result: CompletionResult) -> dict[str, Any]:
-    return asdict(result)
+    payload = {
+        "status": result.status,
+        "recommendation": result.recommendation,
+        "blockers": list(result.blockers),
+        "uncertainties": list(result.uncertainties),
+        "missing_perspectives": list(result.missing_perspectives),
+    }
+    if result.memory_diagnostics:
+        payload["memory_diagnostics"] = [
+            item.to_dict() for item in result.memory_diagnostics
+        ]
+    return payload
 
 
 def _is_core_reviewer(assignment: object) -> bool:

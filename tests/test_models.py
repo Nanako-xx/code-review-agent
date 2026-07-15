@@ -2,9 +2,23 @@ import pytest
 
 from review_agent.models import (
     Assignment,
+    CompiledMemoryRequirement,
+    CompiledRiskFloor,
+    CompletionMemoryProjection,
     ContractItemStatus,
+    FinalRiskMemoryProjection,
     InitialContext,
+    IntentField,
+    IntentMemoryClaim,
+    IntentMemoryProjection,
+    MemoryDiagnostic,
+    MemoryDiagnosticCode,
+    MemoryReference,
+    MemoryRiskSignal,
+    PlannerMemoryProjection,
+    PlannerPerspectiveHint,
     IntentPacket,
+    IntentOrigin,
     IntentSource,
     IntentStatus,
     QualityGateResult,
@@ -13,7 +27,9 @@ from review_agent.models import (
     ReviewerRuntimeMetadata,
     ReviewerTerminationReason,
     RiskAssessment,
+    RiskMemoryProjection,
     RiskLevel,
+    VerificationTemplateHint,
 )
 
 
@@ -257,3 +273,152 @@ def test_reviewer_runtime_metadata_has_legacy_unknown_defaults():
 def test_contract_status_values_are_stable():
     assert ContractItemStatus.COVERED.value == "covered"
     assert ContractItemStatus.NOT_APPLICABLE.value == "not_applicable"
+
+
+def test_memory_stage_projections_are_typed_minimal_and_auditable() -> None:
+    memory_id = "MEM-" + "1" * 64
+    reference = MemoryReference(
+        memory_id=memory_id,
+        kind="business_invariant",
+        source_refs=("memory-source:" + "2" * 64,),
+    )
+    risk_memory_id = "MEM-" + "5" * 64
+    risk_reference = MemoryReference(
+        memory_id=risk_memory_id,
+        kind="incident_lesson",
+        source_refs=("memory-source:" + "6" * 64,),
+    )
+    diagnostic = MemoryDiagnostic(
+        code=MemoryDiagnosticCode.STALE,
+        message="approved memory requires revalidation",
+        memory_ids=(memory_id,),
+    )
+    claim = IntentMemoryClaim(
+        field=IntentField.ACCEPTANCE_CRITERIA,
+        value="Duplicate delivery remains idempotent.",
+        memory=reference,
+    )
+    signal = MemoryRiskSignal(
+        signal_ref=f"memory:{risk_memory_id}",
+        summary="Prior incidents affected duplicate delivery.",
+        memory=risk_reference,
+    )
+    floor = CompiledRiskFloor(
+        minimum_level=RiskLevel.HIGH,
+        memory_ids=(risk_memory_id,),
+    )
+    contract = CompiledMemoryRequirement(
+        requirement_id="behavioral_correctness",
+        memory_ids=(memory_id,),
+    )
+    check = CompiledMemoryRequirement(
+        requirement_id="idempotency_check",
+        memory_ids=(memory_id,),
+    )
+    template = VerificationTemplateHint(
+        command_template_id="pytest_idempotency",
+        memory_ids=(memory_id,),
+    )
+    perspective = PlannerPerspectiveHint(
+        perspective_id="domain-invariants",
+        source_feedback_ids=("FB-" + "3" * 64,),
+    )
+
+    intent_projection = IntentMemoryProjection(
+        claims=(claim,), diagnostics=(diagnostic,)
+    )
+    risk_projection = RiskMemoryProjection(
+        signals=(signal,), risk_floor=floor, diagnostics=(diagnostic,)
+    )
+    planner_projection = PlannerMemoryProjection(
+        required_contracts=(contract,),
+        required_checks=(check,),
+        verification_hints=(template,),
+        perspective_hints=(perspective,),
+        selected_memory=(reference,),
+        diagnostics=(diagnostic,),
+    )
+    completion_projection = CompletionMemoryProjection(
+        required_contracts=(contract,),
+        required_checks=(check,),
+        diagnostics=(diagnostic,),
+    )
+    final_projection = FinalRiskMemoryProjection(
+        applied_memory=(risk_reference,),
+        risk_signals=(signal,),
+        risk_floor=floor,
+        diagnostics=(diagnostic,),
+        residual_risk=("Revalidation remains pending.",),
+    )
+
+    assert IntentOrigin.PROJECT_MEMORY.value == "project_memory"
+    assert intent_projection.claims[0].memory.memory_id == memory_id
+    assert risk_projection.risk_floor is floor
+    assert planner_projection.verification_hints[0].command_template_id == (
+        "pytest_idempotency"
+    )
+    assert completion_projection.required_checks == (check,)
+    assert final_projection.residual_risk == ("Revalidation remains pending.",)
+    assert "statement" not in planner_projection.to_dict()
+    assert "command" not in planner_projection.to_dict()["verification_hints"][0]
+
+
+def test_initial_context_persists_only_selected_memory_refs_and_expanded_hints() -> None:
+    context = InitialContext(
+        selected_memory_refs=["MEM-" + "4" * 64],
+        verification_template_hints=["pytest_idempotency"],
+    )
+
+    assert context.selected_memory_refs == ["MEM-" + "4" * 64]
+    assert context.verification_template_hints == ["pytest_idempotency"]
+    assert not hasattr(context, "memory_snapshot")
+
+
+def test_model_projections_remove_local_only_records_and_all_provenance_paths() -> None:
+    memory_id = "MEM-" + "a" * 64
+    reference = MemoryReference(
+        memory_id=memory_id,
+        kind="review_rule",
+        source_refs=("memory-source:" + "b" * 64,),
+        local_only=True,
+    )
+    diagnostic = MemoryDiagnostic(
+        code=MemoryDiagnosticCode.STALE,
+        message="local record requires revalidation",
+        memory_ids=(memory_id,),
+    )
+    planner = PlannerMemoryProjection(
+        required_contracts=(
+            CompiledMemoryRequirement("behavioral_correctness", (memory_id,)),
+        ),
+        selected_memory=(reference,),
+        diagnostics=(diagnostic,),
+    )
+
+    model_payload = planner.to_dict(for_model=True)
+    encoded = str(model_payload)
+
+    assert model_payload["required_contracts"] == [
+        {"requirement_id": "behavioral_correctness"}
+    ]
+    assert model_payload["diagnostics"] == []
+    assert memory_id not in encoded
+    assert "local_only" not in encoded
+    assert "selected_memory" not in model_payload
+
+
+def test_risk_floor_provenance_is_not_required_to_be_an_informational_signal() -> None:
+    memory_id = "MEM-" + "c" * 64
+    source = MemoryReference(
+        memory_id=memory_id,
+        kind="review_rule",
+        source_refs=("memory-source:" + "d" * 64,),
+    )
+    projection = RiskMemoryProjection(
+        risk_floor=CompiledRiskFloor(RiskLevel.HIGH, (memory_id,)),
+        policy_sources=(source,),
+    )
+
+    assert projection.signals == ()
+    assert projection.policy_sources == (source,)
+    assert projection.risk_floor.memory_ids == (memory_id,)

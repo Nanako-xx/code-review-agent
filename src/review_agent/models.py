@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -36,6 +37,7 @@ class IntentOrigin(str, Enum):
     USER_CONFIRMATION = "user_confirmation"
     USER_CORRECTION = "user_correction"
     CHANGED_FILES = "changed_files"
+    PROJECT_MEMORY = "project_memory"
 
 
 class IntentConfidence(str, Enum):
@@ -101,6 +103,73 @@ def _validate_text_list(values: object, name: str) -> None:
         if value in seen:
             raise ValueError(f"{name} must not contain duplicate values")
         seen.add(value)
+
+
+_STABLE_MEMORY_ID = re.compile(r"^MEM-[0-9a-f]{64}$")
+_STABLE_FEEDBACK_ID = re.compile(r"^FB-[0-9a-f]{64}$")
+_POLICY_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:+#/@-]{0,511}$")
+MAX_STAGE_HARD_POLICY_ITEMS = 64
+MAX_STAGE_HARD_POLICY_BYTES = 32_768
+_MEMORY_KINDS = frozenset(
+    {
+        "architecture_boundary",
+        "business_invariant",
+        "review_rule",
+        "compatibility_requirement",
+        "verification_command",
+        "incident_lesson",
+        "high_risk_module",
+    }
+)
+
+
+def _validate_stable_identifier(
+    value: object,
+    pattern: re.Pattern[str],
+    name: str,
+) -> str:
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
+        raise ValueError(f"{name} must be a canonical stable ID")
+    return value
+
+
+def _validate_policy_identifier(value: object, name: str) -> str:
+    if not isinstance(value, str) or _POLICY_IDENTIFIER.fullmatch(value) is None:
+        raise ValueError(f"{name} must be a bounded policy identifier")
+    return value
+
+
+def _canonical_text_tuple(
+    values: object,
+    name: str,
+    *,
+    allow_empty: bool = True,
+) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple)):
+        raise ValueError(f"{name} must be a list or tuple")
+    normalized: set[str] = set()
+    for value in values:
+        _validate_non_empty_text(value, f"{name} item")
+        normalized.add(value)
+    if not allow_empty and not normalized:
+        raise ValueError(f"{name} must not be empty")
+    return tuple(sorted(normalized))
+
+
+def _canonical_memory_ids(values: object, name: str) -> tuple[str, ...]:
+    normalized = _canonical_text_tuple(values, name, allow_empty=False)
+    return tuple(
+        _validate_stable_identifier(value, _STABLE_MEMORY_ID, f"{name} item")
+        for value in normalized
+    )
+
+
+def _canonical_feedback_ids(values: object, name: str) -> tuple[str, ...]:
+    normalized = _canonical_text_tuple(values, name, allow_empty=False)
+    return tuple(
+        _validate_stable_identifier(value, _STABLE_FEEDBACK_ID, f"{name} item")
+        for value in normalized
+    )
 
 
 @dataclass(frozen=True)
@@ -272,6 +341,812 @@ class RiskLevel(str, Enum):
     CRITICAL = "critical"
 
 
+class MemoryDiagnosticCode(str, Enum):
+    UNAVAILABLE = "memory_unavailable"
+    STALE = "stale"
+    HARD_POLICY_OVERFLOW = "hard_policy_overflow"
+    POLICY_REJECTED = "policy_rejected"
+
+
+@dataclass(frozen=True)
+class MemoryDiagnostic:
+    """Visible, content-free degradation emitted at a stage boundary."""
+
+    code: MemoryDiagnosticCode
+    message: str
+    memory_ids: tuple[str, ...] = ()
+    blocking: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.code, MemoryDiagnosticCode):
+            raise ValueError("memory diagnostic code must be a MemoryDiagnosticCode")
+        _validate_non_empty_text(self.message, "memory diagnostic message")
+        if type(self.blocking) is not bool:
+            raise ValueError("memory diagnostic blocking must be a boolean")
+        ids = (
+            _canonical_memory_ids(self.memory_ids, "memory diagnostic memory_ids")
+            if self.memory_ids
+            else ()
+        )
+        mandatory_blocking = self.code in {
+            MemoryDiagnosticCode.HARD_POLICY_OVERFLOW,
+            MemoryDiagnosticCode.POLICY_REJECTED,
+        }
+        object.__setattr__(self, "memory_ids", ids)
+        if mandatory_blocking:
+            object.__setattr__(self, "blocking", True)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "code": self.code.value,
+            "message": self.message,
+            "memory_ids": list(self.memory_ids),
+            "blocking": self.blocking,
+        }
+
+    def to_model_dict(
+        self,
+        *,
+        excluded_memory_ids: tuple[str, ...] = (),
+    ) -> dict[str, object] | None:
+        """Return a diagnostic that cannot disclose an excluded Memory source."""
+
+        excluded = frozenset(excluded_memory_ids)
+        if any(memory_id in self.message for memory_id in excluded):
+            return None
+        visible_ids = tuple(
+            memory_id for memory_id in self.memory_ids if memory_id not in excluded
+        )
+        if self.memory_ids and not visible_ids:
+            return None
+        return {
+            "code": self.code.value,
+            "message": self.message,
+            "memory_ids": list(visible_ids),
+            "blocking": self.blocking,
+        }
+
+
+def hard_policy_overflow_diagnostic(
+    stage: str,
+    policy_items: object,
+    memory_ids: object,
+    *,
+    max_items: int = MAX_STAGE_HARD_POLICY_ITEMS,
+    max_bytes: int = MAX_STAGE_HARD_POLICY_BYTES,
+) -> MemoryDiagnostic | None:
+    """Independently bound one stage's authoritative policy projection.
+
+    The caller keeps the complete typed policy.  An overflow therefore becomes a
+    blocking diagnostic instead of an implicit truncation or authority loss.
+    """
+
+    _validate_policy_identifier(stage, "hard policy stage")
+    if type(max_items) is not int or max_items < 0:
+        raise ValueError("max_items must be a non-negative integer")
+    if type(max_bytes) is not int or max_bytes < 1:
+        raise ValueError("max_bytes must be a positive integer")
+    if isinstance(policy_items, (str, bytes)) or not isinstance(
+        policy_items, (list, tuple)
+    ):
+        raise ValueError("policy_items must be a list or tuple")
+    items = tuple(policy_items)
+    ids = (
+        _canonical_memory_ids(memory_ids, "hard policy memory_ids")
+        if memory_ids
+        else ()
+    )
+    normalized_items: list[object] = []
+    for item in items:
+        try:
+            encoded = json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("policy_items must be canonically JSON serializable") from error
+        normalized_items.append(json.loads(encoded))
+    payload_bytes = len(
+        json.dumps(
+            {
+                "stage": stage,
+                "policy_items": normalized_items,
+                "memory_ids": list(ids),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+    required_items = max(len(items), len(ids))
+    over_count = required_items > max_items
+    over_bytes = payload_bytes > max_bytes
+    if not over_count and not over_bytes:
+        return None
+    exceeded = (
+        "records and bytes"
+        if over_count and over_bytes
+        else "records"
+        if over_count
+        else "bytes"
+    )
+    return MemoryDiagnostic(
+        code=MemoryDiagnosticCode.HARD_POLICY_OVERFLOW,
+        message=f"{stage} hard policy exceeds the stage projection {exceeded} budget",
+        memory_ids=ids,
+    )
+
+
+@dataclass(frozen=True)
+class MemoryReference:
+    """The maximum common Memory identity exposed to authoritative stages."""
+
+    memory_id: str
+    kind: str
+    source_refs: tuple[str, ...]
+    local_only: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "memory_id",
+            _validate_stable_identifier(
+                self.memory_id,
+                _STABLE_MEMORY_ID,
+                "memory reference memory_id",
+            ),
+        )
+        if self.kind not in _MEMORY_KINDS:
+            raise ValueError("memory reference kind is unsupported")
+        object.__setattr__(
+            self,
+            "source_refs",
+            _canonical_text_tuple(
+                self.source_refs,
+                "memory reference source_refs",
+                allow_empty=False,
+            ),
+        )
+        if type(self.local_only) is not bool:
+            raise ValueError("memory reference local_only must be a boolean")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "memory_id": self.memory_id,
+            "kind": self.kind,
+            "authority": "human_approved_project_memory",
+            "source_refs": list(self.source_refs),
+            "local_only": self.local_only,
+        }
+
+    def to_model_dict(self) -> dict[str, object]:
+        if self.local_only:
+            raise ValueError("local-only Memory cannot enter a model payload")
+        return {
+            "memory_id": self.memory_id,
+            "kind": self.kind,
+            "authority": "human_approved_project_memory",
+            "source_refs": list(self.source_refs),
+        }
+
+
+@dataclass(frozen=True)
+class IntentMemoryClaim:
+    field: IntentField
+    value: str
+    memory: MemoryReference
+    confidence: IntentConfidence = IntentConfidence.HIGH
+    conclusion_impact: ConclusionImpact = ConclusionImpact.MATERIAL
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.field, IntentField):
+            raise ValueError("intent memory claim field must be an IntentField")
+        _validate_non_empty_text(self.value, "intent memory claim value")
+        if not isinstance(self.memory, MemoryReference):
+            raise ValueError("intent memory claim memory must be a MemoryReference")
+        if self.memory.kind not in {
+            "architecture_boundary",
+            "business_invariant",
+            "compatibility_requirement",
+        }:
+            raise ValueError("intent memory claim uses a stage-disallowed memory kind")
+        if not isinstance(self.confidence, IntentConfidence):
+            raise ValueError("intent memory claim confidence must be IntentConfidence")
+        if not isinstance(self.conclusion_impact, ConclusionImpact):
+            raise ValueError(
+                "intent memory claim conclusion_impact must be ConclusionImpact"
+            )
+
+    def to_dict(self, *, for_model: bool = False) -> dict[str, object]:
+        return {
+            "field": self.field.value,
+            "value": self.value,
+            "source": IntentSource.INFERRED.value,
+            "origin": IntentOrigin.PROJECT_MEMORY.value,
+            "confidence": self.confidence.value,
+            "conclusion_impact": self.conclusion_impact.value,
+            "memory": (
+                self.memory.to_model_dict()
+                if for_model
+                else self.memory.to_dict()
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class IntentMemoryProjection:
+    claims: tuple[IntentMemoryClaim, ...] = ()
+    diagnostics: tuple[MemoryDiagnostic, ...] = ()
+
+    def __post_init__(self) -> None:
+        claims = tuple(self.claims)
+        diagnostics = tuple(self.diagnostics)
+        if any(not isinstance(item, IntentMemoryClaim) for item in claims):
+            raise ValueError("intent memory claims must contain IntentMemoryClaim values")
+        if any(not isinstance(item, MemoryDiagnostic) for item in diagnostics):
+            raise ValueError("intent memory diagnostics must contain MemoryDiagnostic values")
+        ids = [item.memory.memory_id for item in claims]
+        if len(ids) != len(set(ids)):
+            raise ValueError("intent memory claims must not repeat a memory_id")
+        object.__setattr__(
+            self,
+            "claims",
+            tuple(sorted(claims, key=lambda item: item.memory.memory_id)),
+        )
+        object.__setattr__(
+            self,
+            "diagnostics",
+            tuple(sorted(diagnostics, key=lambda item: (item.code.value, item.message))),
+        )
+
+    def to_dict(self, *, for_model: bool = False) -> dict[str, object]:
+        claims = (
+            tuple(item for item in self.claims if not item.memory.local_only)
+            if for_model
+            else self.claims
+        )
+        return {
+            "schema_version": "intent_memory_projection_v1",
+            "claims": [item.to_dict(for_model=for_model) for item in claims],
+            "diagnostics": [
+                rendered
+                for item in self.diagnostics
+                if (
+                    rendered := (
+                        item.to_model_dict(
+                            excluded_memory_ids=tuple(
+                                claim.memory.memory_id
+                                for claim in self.claims
+                                if claim.memory.local_only
+                            )
+                        )
+                        if for_model
+                        else item.to_dict()
+                    )
+                )
+                is not None
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class MemoryRiskSignal:
+    signal_ref: str
+    summary: str
+    memory: MemoryReference
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.memory, MemoryReference):
+            raise ValueError("memory risk signal memory must be a MemoryReference")
+        if self.memory.kind not in {"incident_lesson", "high_risk_module"}:
+            raise ValueError("memory risk signal uses a stage-disallowed memory kind")
+        expected_ref = f"memory:{self.memory.memory_id}"
+        if self.signal_ref != expected_ref:
+            raise ValueError("memory risk signal_ref must bind its memory_id")
+        _validate_non_empty_text(self.summary, "memory risk signal summary")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "signal_ref": self.signal_ref,
+            "summary": self.summary,
+            "memory": self.memory.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class CompiledRiskFloor:
+    minimum_level: RiskLevel
+    memory_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.minimum_level, RiskLevel):
+            raise ValueError("compiled risk floor minimum_level must be a RiskLevel")
+        object.__setattr__(
+            self,
+            "memory_ids",
+            _canonical_memory_ids(self.memory_ids, "compiled risk floor memory_ids"),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "minimum_level": self.minimum_level.value,
+            "memory_ids": list(self.memory_ids),
+        }
+
+
+@dataclass(frozen=True)
+class RiskMemoryProjection:
+    signals: tuple[MemoryRiskSignal, ...] = ()
+    risk_floor: CompiledRiskFloor | None = None
+    policy_sources: tuple[MemoryReference, ...] = ()
+    diagnostics: tuple[MemoryDiagnostic, ...] = ()
+
+    def __post_init__(self) -> None:
+        signals = tuple(self.signals)
+        policy_sources = tuple(self.policy_sources)
+        diagnostics = tuple(self.diagnostics)
+        if any(not isinstance(item, MemoryRiskSignal) for item in signals):
+            raise ValueError("risk memory signals must contain MemoryRiskSignal values")
+        if self.risk_floor is not None and not isinstance(
+            self.risk_floor, CompiledRiskFloor
+        ):
+            raise ValueError("risk_floor must be a CompiledRiskFloor or None")
+        if any(not isinstance(item, MemoryDiagnostic) for item in diagnostics):
+            raise ValueError("risk memory diagnostics must contain MemoryDiagnostic values")
+        if any(not isinstance(item, MemoryReference) for item in policy_sources):
+            raise ValueError("risk policy_sources must contain MemoryReference values")
+        refs = [item.signal_ref for item in signals]
+        if len(refs) != len(set(refs)):
+            raise ValueError("risk memory signals must not repeat signal_ref")
+        source_ids = [item.memory_id for item in policy_sources]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("risk policy_sources must not repeat a memory_id")
+        policy_sources = tuple(
+            sorted(policy_sources, key=lambda item: item.memory_id)
+        )
+        if self.risk_floor is not None:
+            signal_sources = {
+                item.memory.memory_id: item.memory for item in signals
+            }
+            policy_by_id = {item.memory_id: item for item in policy_sources}
+            for memory_id in self.risk_floor.memory_ids:
+                if memory_id not in policy_by_id and memory_id in signal_sources:
+                    policy_by_id[memory_id] = signal_sources[memory_id]
+            policy_sources = tuple(
+                policy_by_id[memory_id] for memory_id in sorted(policy_by_id)
+            )
+        object.__setattr__(
+            self,
+            "signals",
+            tuple(sorted(signals, key=lambda item: item.signal_ref)),
+        )
+        object.__setattr__(self, "policy_sources", policy_sources)
+        object.__setattr__(
+            self,
+            "diagnostics",
+            tuple(sorted(diagnostics, key=lambda item: (item.code.value, item.message))),
+        )
+
+    @property
+    def local_only_memory_ids(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    item.memory.memory_id
+                    for item in self.signals
+                    if item.memory.local_only
+                }
+                | {
+                    item.memory_id
+                    for item in self.policy_sources
+                    if item.local_only
+                }
+            )
+        )
+
+    @property
+    def memory_ids(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {item.memory.memory_id for item in self.signals}
+                | {item.memory_id for item in self.policy_sources}
+                | (
+                    set(self.risk_floor.memory_ids)
+                    if self.risk_floor is not None
+                    else set()
+                )
+            )
+        )
+
+    def to_dict(self, *, for_model: bool = False) -> dict[str, object]:
+        if for_model:
+            # Informational statements and the authoritative local floor are kept
+            # out of the same model channel. Runtime applies the floor locally.
+            return {
+                "schema_version": "risk_memory_projection_v1",
+                "diagnostics": [
+                    rendered
+                    for item in self.diagnostics
+                    if (
+                        rendered := item.to_model_dict(
+                            excluded_memory_ids=self.local_only_memory_ids
+                        )
+                    )
+                    is not None
+                ],
+            }
+        return {
+            "schema_version": "risk_memory_projection_v1",
+            "signals": [item.to_dict() for item in self.signals],
+            "risk_floor": None if self.risk_floor is None else self.risk_floor.to_dict(),
+            "policy_sources": [item.to_dict() for item in self.policy_sources],
+            "diagnostics": [item.to_dict() for item in self.diagnostics],
+        }
+
+
+@dataclass(frozen=True)
+class CompiledMemoryRequirement:
+    requirement_id: str
+    memory_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "requirement_id",
+            _validate_policy_identifier(self.requirement_id, "requirement_id"),
+        )
+        object.__setattr__(
+            self,
+            "memory_ids",
+            _canonical_memory_ids(self.memory_ids, "requirement memory_ids"),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "requirement_id": self.requirement_id,
+            "memory_ids": list(self.memory_ids),
+        }
+
+
+@dataclass(frozen=True)
+class VerificationTemplateHint:
+    command_template_id: str
+    memory_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "command_template_id",
+            _validate_policy_identifier(
+                self.command_template_id,
+                "command_template_id",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "memory_ids",
+            _canonical_memory_ids(self.memory_ids, "verification hint memory_ids"),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        # Deliberately no command, executable, environment, or callable field.
+        return {
+            "command_template_id": self.command_template_id,
+            "memory_ids": list(self.memory_ids),
+        }
+
+
+@dataclass(frozen=True)
+class PlannerPerspectiveHint:
+    perspective_id: str
+    source_feedback_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "perspective_id",
+            _validate_policy_identifier(self.perspective_id, "perspective_id"),
+        )
+        object.__setattr__(
+            self,
+            "source_feedback_ids",
+            _canonical_feedback_ids(
+                self.source_feedback_ids,
+                "perspective hint source_feedback_ids",
+            ),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "perspective_id": self.perspective_id,
+            "source_feedback_ids": list(self.source_feedback_ids),
+        }
+
+
+def _canonical_typed_tuple(
+    values: object,
+    expected_type: type,
+    name: str,
+    key,
+) -> tuple:
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple)):
+        raise ValueError(f"{name} must be a list or tuple")
+    items = tuple(values)
+    if any(not isinstance(item, expected_type) for item in items):
+        raise ValueError(f"{name} contains an unsupported value")
+    keys = [key(item) for item in items]
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"{name} must not repeat its typed identity")
+    return tuple(sorted(items, key=key))
+
+
+@dataclass(frozen=True)
+class PlannerMemoryProjection:
+    required_contracts: tuple[CompiledMemoryRequirement, ...] = ()
+    required_checks: tuple[CompiledMemoryRequirement, ...] = ()
+    verification_hints: tuple[VerificationTemplateHint, ...] = ()
+    perspective_hints: tuple[PlannerPerspectiveHint, ...] = ()
+    selected_memory: tuple[MemoryReference, ...] = ()
+    diagnostics: tuple[MemoryDiagnostic, ...] = ()
+    feedback_summary_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "required_contracts",
+            _canonical_typed_tuple(
+                self.required_contracts,
+                CompiledMemoryRequirement,
+                "required_contracts",
+                lambda item: item.requirement_id,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "required_checks",
+            _canonical_typed_tuple(
+                self.required_checks,
+                CompiledMemoryRequirement,
+                "required_checks",
+                lambda item: item.requirement_id,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "verification_hints",
+            _canonical_typed_tuple(
+                self.verification_hints,
+                VerificationTemplateHint,
+                "verification_hints",
+                lambda item: item.command_template_id,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "perspective_hints",
+            _canonical_typed_tuple(
+                self.perspective_hints,
+                PlannerPerspectiveHint,
+                "perspective_hints",
+                lambda item: item.perspective_id,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "selected_memory",
+            _canonical_typed_tuple(
+                self.selected_memory,
+                MemoryReference,
+                "selected_memory",
+                lambda item: item.memory_id,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "diagnostics",
+            _canonical_typed_tuple(
+                self.diagnostics,
+                MemoryDiagnostic,
+                "memory diagnostics",
+                lambda item: (item.code.value, item.message, item.memory_ids),
+            ),
+        )
+        if self.feedback_summary_hash is not None:
+            if (
+                not isinstance(self.feedback_summary_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", self.feedback_summary_hash) is None
+            ):
+                raise ValueError("feedback_summary_hash must be a SHA-256 digest or None")
+        selected_ids = {item.memory_id for item in self.selected_memory}
+        policy_ids = {
+            memory_id
+            for item in (
+                *self.required_contracts,
+                *self.required_checks,
+                *self.verification_hints,
+            )
+            for memory_id in item.memory_ids
+        }
+        if not policy_ids.issubset(selected_ids):
+            raise ValueError(
+                "planner policy provenance must be present in selected_memory"
+            )
+
+    @property
+    def local_only_memory_ids(self) -> tuple[str, ...]:
+        return tuple(
+            item.memory_id for item in self.selected_memory if item.local_only
+        )
+
+    def to_dict(self, *, for_model: bool = False) -> dict[str, object]:
+        if for_model:
+            return {
+                "schema_version": "planner_memory_projection_v1",
+                "required_contracts": [
+                    {"requirement_id": item.requirement_id}
+                    for item in self.required_contracts
+                ],
+                "required_checks": [
+                    {"requirement_id": item.requirement_id}
+                    for item in self.required_checks
+                ],
+                "verification_hints": [
+                    {"command_template_id": item.command_template_id}
+                    for item in self.verification_hints
+                ],
+                "perspective_hints": [
+                    {"perspective_id": item.perspective_id}
+                    for item in self.perspective_hints
+                ],
+                "diagnostics": [
+                    rendered
+                    for item in self.diagnostics
+                    if (
+                        rendered := item.to_model_dict(
+                            excluded_memory_ids=self.local_only_memory_ids
+                        )
+                    )
+                    is not None
+                ],
+                "feedback_summary_hash": self.feedback_summary_hash,
+            }
+        return {
+            "schema_version": "planner_memory_projection_v1",
+            "required_contracts": [item.to_dict() for item in self.required_contracts],
+            "required_checks": [item.to_dict() for item in self.required_checks],
+            "verification_hints": [item.to_dict() for item in self.verification_hints],
+            "perspective_hints": [item.to_dict() for item in self.perspective_hints],
+            "selected_memory": [item.to_dict() for item in self.selected_memory],
+            "diagnostics": [item.to_dict() for item in self.diagnostics],
+            "feedback_summary_hash": self.feedback_summary_hash,
+        }
+
+
+@dataclass(frozen=True)
+class CompletionMemoryProjection:
+    required_contracts: tuple[CompiledMemoryRequirement, ...] = ()
+    required_checks: tuple[CompiledMemoryRequirement, ...] = ()
+    diagnostics: tuple[MemoryDiagnostic, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "required_contracts",
+            _canonical_typed_tuple(
+                self.required_contracts,
+                CompiledMemoryRequirement,
+                "completion required_contracts",
+                lambda item: item.requirement_id,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "required_checks",
+            _canonical_typed_tuple(
+                self.required_checks,
+                CompiledMemoryRequirement,
+                "completion required_checks",
+                lambda item: item.requirement_id,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "diagnostics",
+            _canonical_typed_tuple(
+                self.diagnostics,
+                MemoryDiagnostic,
+                "completion diagnostics",
+                lambda item: (item.code.value, item.message, item.memory_ids),
+            ),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": "completion_memory_projection_v1",
+            "required_contracts": [item.to_dict() for item in self.required_contracts],
+            "required_checks": [item.to_dict() for item in self.required_checks],
+            "diagnostics": [item.to_dict() for item in self.diagnostics],
+        }
+
+
+@dataclass(frozen=True)
+class FinalRiskMemoryProjection:
+    applied_memory: tuple[MemoryReference, ...] = ()
+    risk_signals: tuple[MemoryRiskSignal, ...] = ()
+    risk_floor: CompiledRiskFloor | None = None
+    diagnostics: tuple[MemoryDiagnostic, ...] = ()
+    residual_risk: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "applied_memory",
+            _canonical_typed_tuple(
+                self.applied_memory,
+                MemoryReference,
+                "applied_memory",
+                lambda item: item.memory_id,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "risk_signals",
+            _canonical_typed_tuple(
+                self.risk_signals,
+                MemoryRiskSignal,
+                "final risk signals",
+                lambda item: item.signal_ref,
+            ),
+        )
+        if self.risk_floor is not None and not isinstance(
+            self.risk_floor, CompiledRiskFloor
+        ):
+            raise ValueError("final risk_floor must be a CompiledRiskFloor or None")
+        object.__setattr__(
+            self,
+            "diagnostics",
+            _canonical_typed_tuple(
+                self.diagnostics,
+                MemoryDiagnostic,
+                "final risk diagnostics",
+                lambda item: (item.code.value, item.message, item.memory_ids),
+            ),
+        )
+        object.__setattr__(
+            self,
+            "residual_risk",
+            _canonical_text_tuple(self.residual_risk, "residual_risk"),
+        )
+        applied_ids = {item.memory_id for item in self.applied_memory}
+        if any(item.memory.memory_id not in applied_ids for item in self.risk_signals):
+            raise ValueError("final risk signals must reference applied memory")
+        # ``risk_floor.memory_ids`` is itself the authoritative provenance. A
+        # separately projected reference is desirable but cannot be required:
+        # doing so would reintroduce kind/sensitivity filtering at this boundary.
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": "final_risk_memory_projection_v1",
+            "applied_memory": [item.to_dict() for item in self.applied_memory],
+            "risk_signals": [item.to_dict() for item in self.risk_signals],
+            "risk_floor": None if self.risk_floor is None else self.risk_floor.to_dict(),
+            "diagnostics": [item.to_dict() for item in self.diagnostics],
+            "residual_risk": list(self.residual_risk),
+        }
+
+
+# Stage-first and Memory-first spellings are both intentionally stable for callers.
+MemoryIntentProjection = IntentMemoryProjection
+MemoryRiskProjection = RiskMemoryProjection
+MemoryPlannerProjection = PlannerMemoryProjection
+MemoryCompletionProjection = CompletionMemoryProjection
+MemoryFinalRiskProjection = FinalRiskMemoryProjection
+
+
 class ContractItemStatus(str, Enum):
     COVERED = "covered"
     PARTIAL = "partial"
@@ -422,6 +1297,16 @@ class RiskAssessmentPacket:
     diff_excerpt: list[str]
     changed_symbols: list[dict[str, object]] = field(default_factory=list)
     signal_catalog: dict[str, str] = field(default_factory=dict)
+    memory_projection: RiskMemoryProjection | None = None
+
+    def __post_init__(self) -> None:
+        if self.memory_projection is not None and not isinstance(
+            self.memory_projection,
+            RiskMemoryProjection,
+        ):
+            raise ValueError(
+                "memory_projection must be a RiskMemoryProjection or None"
+            )
 
 
 @dataclass(frozen=True)
@@ -442,6 +1327,32 @@ class InitialContext:
     quality_gate_summary: dict[str, str] = field(default_factory=dict)
     observation_refs: list[str] = field(default_factory=list)
     signal_refs: list[str] = field(default_factory=list)
+    selected_memory_refs: list[str] = field(default_factory=list)
+    verification_template_hints: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        _validate_text_list(self.selected_memory_refs, "selected_memory_refs")
+        _validate_text_list(
+            self.verification_template_hints,
+            "verification_template_hints",
+        )
+        for memory_id in self.selected_memory_refs:
+            _validate_stable_identifier(
+                memory_id,
+                _STABLE_MEMORY_ID,
+                "selected_memory_refs item",
+            )
+        for template_id in self.verification_template_hints:
+            _validate_policy_identifier(
+                template_id,
+                "verification_template_hints item",
+            )
+        object.__setattr__(self, "selected_memory_refs", list(self.selected_memory_refs))
+        object.__setattr__(
+            self,
+            "verification_template_hints",
+            list(self.verification_template_hints),
+        )
 
 
 @dataclass(frozen=True)

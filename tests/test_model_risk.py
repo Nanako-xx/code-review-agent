@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 
 import pytest
@@ -13,15 +14,20 @@ from review_agent.model_risk import (
     build_local_risk_run,
     compile_risk_proposal,
     parse_risk_proposal,
+    risk_packet_to_model_input,
     risk_input_digest,
     risk_invocation_id,
     risk_model_run_to_dict,
     run_model_risk_assessment,
 )
 from review_agent.models import (
+    CompiledRiskFloor,
     IntentStatus,
+    MemoryReference,
+    MemoryRiskSignal,
     RiskAssessment,
     RiskAssessmentPacket,
+    RiskMemoryProjection,
     RiskLevel,
 )
 
@@ -383,3 +389,93 @@ def test_input_digest_and_invocation_id_are_stable_and_scope_review_identity():
         "review-2",
         first_digest,
     )
+
+
+def test_model_risk_compiler_consumes_typed_memory_floor_not_memory_statement() -> None:
+    memory_id = "MEM-" + "5" * 64
+    reference = MemoryReference(
+        memory_id=memory_id,
+        kind="high_risk_module",
+        source_refs=("memory-source:" + "6" * 64,),
+    )
+    projection = RiskMemoryProjection(
+        signals=(
+            MemoryRiskSignal(
+                signal_ref=f"memory:{memory_id}",
+                summary="Prior incidents make this module sensitive.",
+                memory=reference,
+            ),
+        ),
+        risk_floor=CompiledRiskFloor(
+            minimum_level=RiskLevel.HIGH,
+            memory_ids=(memory_id,),
+        ),
+    )
+    proposal = RiskProposal(
+        level=RiskLevel.LOW,
+        dimensions=_dimensions(),
+        reasons=["model considers the change local"],
+        signal_refs=[f"memory:{memory_id}"],
+        uncertainties=["model uncertainty"],
+        suggested_focus=["model focus"],
+    )
+
+    compiled = compile_risk_proposal(
+        _local(RiskLevel.LOW),
+        proposal,
+        memory_projection=projection,
+    )
+    model_input = risk_packet_to_model_input(
+        replace(_packet(), memory_projection=projection)
+    )
+
+    assert compiled.local_floor is RiskLevel.HIGH
+    assert compiled.final_level is RiskLevel.HIGH
+    assert compiled.floor_applied is True
+    assert "memory" not in model_input
+    encoded = json.dumps(model_input)
+    assert memory_id not in encoded
+    assert "Prior incidents make this module sensitive" not in encoded
+    assert "risk_floor" not in encoded
+    assert "eligible_records" not in encoded
+    assert "policy_effect" not in encoded
+
+
+def test_informational_memory_is_not_a_model_authority_channel() -> None:
+    memory_id = "MEM-" + "7" * 64
+    statement = "A prior incident should not silently become a risk floor."
+    reference = MemoryReference(
+        memory_id=memory_id,
+        kind="incident_lesson",
+        source_refs=("memory-source:" + "8" * 64,),
+        local_only=True,
+    )
+    projection = RiskMemoryProjection(
+        signals=(
+            MemoryRiskSignal(
+                signal_ref=f"memory:{memory_id}",
+                summary=statement,
+                memory=reference,
+            ),
+        ),
+    )
+    packet = replace(
+        _packet(),
+        signal_catalog={
+            **_packet().signal_catalog,
+            f"memory:{memory_id}": statement,
+        },
+        memory_projection=projection,
+    )
+
+    compiled = compile_risk_proposal(
+        _local(RiskLevel.LOW),
+        None,
+        memory_projection=projection,
+    )
+    encoded = json.dumps(risk_packet_to_model_input(packet))
+
+    assert compiled.final_level is RiskLevel.LOW
+    assert memory_id not in encoded
+    assert statement not in encoded
+    assert "local_only" not in encoded

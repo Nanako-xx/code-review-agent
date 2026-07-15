@@ -4,9 +4,13 @@ from review_agent.completion import check_completion, completion_to_dict
 from review_agent.evidence import ContractCoverage, EvidenceReconciliation
 from review_agent.model_protocol import ModelResponse
 from review_agent.models import (
+    CompiledMemoryRequirement,
+    CompletionMemoryProjection,
     IntentPacket,
     IntentSource,
     IntentStatus,
+    MemoryDiagnostic,
+    MemoryDiagnosticCode,
     QualityGateResult,
     ReviewerResult,
     ReviewerResultStatus,
@@ -512,3 +516,171 @@ def test_supplemental_execution_cannot_supply_initial_core_presence():
 
     assert result.status == "blocked"
     assert "Core Reviewer did not run" in result.blockers
+
+
+def test_completion_enforces_compiled_memory_contract_and_check_without_statements() -> None:
+    memory_id = "MEM-" + "b" * 64
+    projection = CompletionMemoryProjection(
+        required_contracts=(
+            CompiledMemoryRequirement(
+                requirement_id="regression_safety",
+                memory_ids=(memory_id,),
+            ),
+        ),
+        required_checks=(
+            CompiledMemoryRequirement(
+                requirement_id="schema_check",
+                memory_ids=(memory_id,),
+            ),
+        ),
+    )
+    kwargs = {
+        "intent": intent(),
+        "executions": [
+            execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED)
+        ],
+        "reconciliation": reconciliation_with_coverage(
+            coverage(0, "Core Reviewer")
+        ),
+        "memory_projection": projection,
+    }
+
+    passed = check_completion(
+        quality_results=[
+            QualityGateResult(
+                name="schema_check",
+                status="passed",
+                command=["python", "-m", "schema_check"],
+                summary="schema valid",
+            )
+        ],
+        **kwargs,
+    )
+    missing = check_completion(quality_results=[], **kwargs)
+
+    assert passed.status == "completed"
+    assert missing.status == "blocked"
+    assert "Memory-required check result missing: schema_check" in missing.blockers
+    assert "statement" not in completion_to_dict(passed)
+
+
+def test_memory_required_contract_is_distributed_but_all_assigned_copies_must_complete() -> None:
+    memory_id = "MEM-" + "e" * 64
+    projection = CompletionMemoryProjection(
+        required_contracts=(
+            CompiledMemoryRequirement("api_compatibility", (memory_id,)),
+        ),
+    )
+    core = execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED)
+    core = replace(
+        core,
+        assignment=replace(
+            core.assignment,
+            assigned_contract=["regression_safety", "api_compatibility"],
+        ),
+    )
+    specialist = execution(
+        1,
+        "Compatibility Reviewer",
+        ReviewerResultStatus.COMPLETED,
+    )
+    specialist = replace(
+        specialist,
+        assignment=replace(
+            specialist.assignment,
+            assigned_contract=["regression_safety"],
+        ),
+    )
+    rows = [
+        coverage(0, "Core Reviewer"),
+        coverage(0, "Core Reviewer", "api_compatibility"),
+        coverage(1, "Compatibility Reviewer"),
+    ]
+
+    distributed = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[core, specialist],
+        reconciliation=reconciliation_with_coverage(*rows),
+        memory_projection=projection,
+    )
+    duplicated_assignment = replace(
+        specialist,
+        assignment=replace(
+            specialist.assignment,
+            assigned_contract=["regression_safety", "api_compatibility"],
+        ),
+    )
+    incomplete = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[core, duplicated_assignment],
+        reconciliation=reconciliation_with_coverage(*rows),
+        memory_projection=projection,
+    )
+
+    assert distributed.status == "completed"
+    assert incomplete.status == "blocked"
+    assert any(
+        "Memory-required contract coverage incomplete: api_compatibility" in item
+        for item in incomplete.blockers
+    )
+
+
+def test_memory_unavailable_stale_and_hard_overflow_are_visible_and_fail_closed() -> None:
+    base = {
+        "intent": intent(),
+        "quality_results": [],
+        "executions": [
+            execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED)
+        ],
+        "reconciliation": reconciliation_with_coverage(
+            coverage(0, "Core Reviewer")
+        ),
+    }
+    unavailable = MemoryDiagnostic(
+        code=MemoryDiagnosticCode.UNAVAILABLE,
+        message="Memory Store could not be opened",
+    )
+    stale = MemoryDiagnostic(
+        code=MemoryDiagnosticCode.STALE,
+        message="one approved record requires revalidation",
+        memory_ids=("MEM-" + "c" * 64,),
+    )
+    hard_overflow = MemoryDiagnostic(
+        code=MemoryDiagnosticCode.HARD_POLICY_OVERFLOW,
+        message="typed hard policy exceeded the projection budget",
+        memory_ids=("MEM-" + "d" * 64,),
+    )
+
+    degraded = check_completion(
+        **base,
+        memory_projection=CompletionMemoryProjection(
+            diagnostics=(unavailable, stale),
+        ),
+    )
+    blocked = check_completion(
+        **base,
+        memory_projection=CompletionMemoryProjection(
+            diagnostics=(hard_overflow,),
+        ),
+    )
+
+    assert degraded.status == "completed_with_uncertainties"
+    assert degraded.recommendation == "manual_review"
+    assert any("memory_unavailable" in item for item in degraded.uncertainties)
+    assert any("stale" in item for item in degraded.uncertainties)
+    assert blocked.status == "blocked"
+    assert any("hard_policy_overflow" in item for item in blocked.blockers)
+    assert "memory_diagnostics" in completion_to_dict(blocked)
+
+
+def test_legacy_completion_payload_has_no_memory_fields() -> None:
+    result = check_completion(
+        intent=intent(),
+        quality_results=[],
+        executions=[execution(0, "Core Reviewer", ReviewerResultStatus.COMPLETED)],
+        reconciliation=reconciliation_with_coverage(coverage(0, "Core Reviewer")),
+    )
+
+    assert "memory_diagnostics" not in completion_to_dict(result)
