@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from review_agent.brief import ReviewBrief, build_review_brief
+from review_agent.brief import (
+    ReviewBrief,
+    build_memory_audit_projection,
+    build_review_brief,
+)
 from review_agent.models import IntentPacket, QualityGateResult, ReviewerResult, RiskAssessment
 
 
 def render_review_brief_markdown(brief: ReviewBrief) -> str:
+    memory_audit = build_memory_audit_projection(brief.memory_audit)
     return "\n".join(
         [
             "# Review Brief",
@@ -39,6 +44,16 @@ def render_review_brief_markdown(brief: ReviewBrief) -> str:
             "",
             _change_map_section(brief),
             "",
+            *(
+                [
+                    "## Memory Audit",
+                    "",
+                    _memory_audit_section(memory_audit),
+                    "",
+                ]
+                if memory_audit
+                else []
+            ),
             "## Verified Findings",
             "",
             _verified_findings_section(brief),
@@ -104,6 +119,17 @@ def render_markdown_report(
     quality_results: list[QualityGateResult] | None = None,
     planning_summary: dict[str, object] | None = None,
     semantic_reconciliation_summary: dict[str, object] | None = None,
+    memory_audit_summary: dict[str, object] | None = None,
+    memory_audit_payload: dict[str, object] | None = None,
+    memory_snapshot: Any | None = None,
+    compiled_memory_policy: Any | None = None,
+    cache_provenance: Any | None = None,
+    feedback_summary: Any | None = None,
+    pending_memory_candidates: Any | None = None,
+    memory_status: Any | None = None,
+    memory_warnings: Any | None = None,
+    curator_status: Any | None = None,
+    outbox_status: Any | None = None,
 ) -> str:
     brief = build_review_brief(
         review_id=review_id,
@@ -121,6 +147,20 @@ def render_markdown_report(
         completion_summary=completion_summary,
         planning_summary=planning_summary,
         semantic_reconciliation_payload=semantic_reconciliation_summary,
+        memory_audit_payload=(
+            memory_audit_summary
+            if memory_audit_summary is not None
+            else memory_audit_payload
+        ),
+        memory_snapshot=memory_snapshot,
+        compiled_memory_policy=compiled_memory_policy,
+        cache_provenance=cache_provenance,
+        feedback_summary=feedback_summary,
+        pending_memory_candidates=pending_memory_candidates,
+        memory_status=memory_status,
+        memory_warnings=memory_warnings,
+        curator_status=curator_status,
+        outbox_status=outbox_status,
     )
     return render_review_brief_markdown(brief)
 
@@ -358,6 +398,230 @@ def _change_map_section(brief: ReviewBrief) -> str:
     if reviewer_summary:
         lines.extend(["", "Reviewer summary:", _dict_lines(dict(reviewer_summary))])
     return "\n".join(lines)
+
+
+def _memory_audit_section(audit: dict[str, Any]) -> str:
+    lines: list[str] = []
+    snapshot = audit.get("snapshot", {})
+    if isinstance(snapshot, dict) and snapshot:
+        lines.extend(["Snapshot:", _dict_lines(snapshot), ""])
+
+    lines.extend(["### Applied Memory", _applied_memory_section(audit.get("applied_memory", [])), ""])
+    lines.extend(
+        [
+            "### Memory Records Not Applied",
+            _not_applied_memory_section(audit.get("not_applied_memory", [])),
+            "",
+        ]
+    )
+    lines.extend(
+        [
+            "### Runtime-Compiled Policy",
+            _compiled_policy_section(audit.get("compiled_policy", {})),
+            "",
+            "### Repository Knowledge Cache Provenance",
+            _cache_provenance_section(audit.get("cache_provenance", [])),
+            "",
+            "### Memory Validity Warnings",
+            _warnings_section(audit.get("warnings", [])),
+            "",
+            "### Feedback Calibration Summary",
+            _feedback_section(audit.get("feedback_summary", {})),
+            "",
+            "### Pending Memory Candidates",
+            _pending_candidates_section(audit.get("pending_candidates", [])),
+            "",
+            "### Memory Runtime Status",
+            _status_section(audit.get("status", {})),
+        ]
+    )
+    return "\n".join(lines).rstrip()
+
+
+def _applied_memory_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No applied Memory records"
+    lines: list[str] = []
+    for row in rows:
+        lines.append(
+            f"- `{row.get('memory_id', 'unknown')}` "
+            f"[{row.get('kind', 'unknown')}] "
+            f"authority={row.get('authority', 'unknown')}"
+        )
+        if row.get("statement"):
+            lines.append(f"  - Statement: {row['statement']}")
+        lines.append(f"  - Scope: {_inline_value(row.get('scope', {}))}")
+        source_refs = row.get("source_refs", [])
+        if source_refs:
+            lines.append(f"  - Source refs: {_inline_value(source_refs)}")
+        lines.append(f"  - Validity: {_inline_value(row.get('validity', {}))}")
+        if row.get("policy_effect"):
+            lines.append(f"  - Policy effect: {_inline_value(row['policy_effect'])}")
+    return "\n".join(lines)
+
+
+def _not_applied_memory_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No inactive, partial, or unselected Memory records"
+    lines: list[str] = []
+    for row in rows:
+        lines.append(
+            f"- `{row.get('memory_id', 'unknown')}` "
+            f"[{row.get('kind', 'unknown')}] "
+            f"reason={row.get('reason_code', 'record_not_applied')}"
+        )
+        lines.append(
+            "  - Authority: not_applied"
+            + (
+                f" (claimed={row['claimed_authority']})"
+                if row.get("claimed_authority")
+                else ""
+            )
+        )
+        lines.append(
+            "  - State: "
+            f"status={row.get('status', 'missing')}; "
+            f"applicability={row.get('applicability', 'missing')}"
+        )
+        lines.append(f"  - Scope: {_inline_value(row.get('scope', {}))}")
+    return "\n".join(lines)
+
+
+def _compiled_policy_section(value: object) -> str:
+    if not isinstance(value, dict) or not value:
+        return "- No Runtime-compiled policy effects"
+    lines = []
+    for key in ("policy_version", "initial_risk_floor", "effective_risk_floor", "blocked"):
+        if key in value:
+            lines.append(f"- {key}: {_inline_value(value[key])}")
+    actions = value.get("actions", [])
+    if actions:
+        lines.append("- Actions:")
+        lines.extend(f"  - {_inline_value(item)}" for item in actions)
+    diagnostics = value.get("diagnostics", [])
+    if diagnostics:
+        lines.append("- Diagnostics:")
+        lines.extend(f"  - {_inline_value(item)}" for item in diagnostics)
+    provenance = value.get("provenance", [])
+    if provenance:
+        lines.append("- Provenance:")
+        lines.extend(f"  - {_inline_value(item)}" for item in provenance)
+    return "\n".join(lines) or "- No Runtime-compiled policy effects"
+
+
+def _cache_provenance_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No Repository Knowledge cache provenance recorded"
+    lines: list[str] = []
+    for row in rows:
+        entry = row.get("entry_id", "unknown")
+        status = row.get("status", "unknown")
+        details = []
+        for key in (
+            "revision_binding",
+            "capability",
+            "blob_hash",
+            "persistent",
+            "session_pinned",
+            "corruption_reason",
+        ):
+            if key in row:
+                details.append(f"{key}={row[key]}")
+        analyzer = row.get("analyzer")
+        if analyzer:
+            details.append(f"analyzer={_inline_value(analyzer)}")
+        suffix = "; " + "; ".join(details) if details else ""
+        lines.append(f"- `{entry}`: {status}{suffix}")
+        fallback = row.get("fallback")
+        if fallback:
+            lines.append(f"  - Fallback: {_inline_value(fallback)}")
+    return "\n".join(lines)
+
+
+def _warnings_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No stale, lineage, or revalidation warnings"
+    lines: list[str] = []
+    for row in rows:
+        lines.append(
+            f"- [{row.get('category', 'memory')}] "
+            f"memory={row.get('memory_id', 'n/a')}; "
+            f"applicability={row.get('applicability', row.get('code', 'unknown'))}"
+        )
+        if row.get("reason_codes"):
+            lines.append(f"  - Reason codes: {_inline_value(row['reason_codes'])}")
+        if row.get("message"):
+            lines.append(f"  - Message: {row['message']}")
+        if row.get("requires_revalidation") is not None:
+            lines.append(f"  - Requires revalidation: {row['requires_revalidation']}")
+    return "\n".join(lines)
+
+
+def _feedback_section(value: object) -> str:
+    if not isinstance(value, dict) or not value:
+        return "- No Feedback calibration summary recorded"
+    return "\n".join(f"- {key}: {_inline_value(item)}" for key, item in value.items())
+
+
+def _pending_candidates_section(value: object) -> str:
+    rows = _mapping_rows(value)
+    if not rows:
+        return "- No pending Memory Candidates"
+    lines: list[str] = []
+    for row in rows:
+        lines.append(
+            f"- `{row.get('candidate_id', 'unknown')}` "
+            f"[{row.get('kind', 'unknown')}; status={row.get('status', 'pending_approval')}; "
+            f"active={row.get('active', False)}]"
+        )
+        if row.get("statement"):
+            lines.append(f"  - Statement: {row['statement']}")
+        lines.append(f"  - Scope: {_inline_value(row.get('scope', {}))}")
+        if row.get("approval_hint"):
+            lines.append(f"  - Approval: {row['approval_hint']}")
+    return "\n".join(lines)
+
+
+def _status_section(value: object) -> str:
+    if not isinstance(value, dict) or not value:
+        return "- No Memory runtime status recorded"
+    lines: list[str] = []
+    for key, item in value.items():
+        if key in {"outbox", "curator", "degradation_reasons"}:
+            continue
+        lines.append(f"- {key}: {_inline_value(item)}")
+    outbox = value.get("outbox")
+    if isinstance(outbox, dict):
+        lines.append(f"- outbox: {_inline_value(outbox)}")
+    if value.get("degradation_reasons"):
+        lines.append(
+            f"- degradation_reasons: {_inline_value(value['degradation_reasons'])}"
+        )
+    curator = value.get("curator")
+    if isinstance(curator, dict):
+        lines.append(f"- curator status: {curator.get('status', 'unknown')}")
+        if curator.get("mode"):
+            lines.append(f"  - curator mode: {curator['mode']}")
+        if curator.get("outcome"):
+            lines.append(f"  - curator outcome: {curator['outcome']}")
+        if curator.get("attempt_count") is not None:
+            lines.append(f"  - curator attempt_count: {curator['attempt_count']}")
+        if curator.get("candidate_ids") is not None:
+            lines.append(
+                f"  - curator candidate_ids: {_inline_value(curator['candidate_ids'])}"
+            )
+        if curator.get("review_conclusion_impact"):
+            lines.append(
+                "  - curator review_conclusion_impact: "
+                f"{curator['review_conclusion_impact']}"
+            )
+        if curator.get("warning_codes"):
+            lines.append(f"  - curator warnings: {_inline_value(curator['warning_codes'])}")
+    return "\n".join(lines) or "- No Memory runtime status recorded"
 
 
 def _verified_findings_section(brief: ReviewBrief) -> str:

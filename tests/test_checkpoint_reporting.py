@@ -5,6 +5,7 @@ import json
 import pytest
 
 import review_agent.checkpoint as checkpoint_module
+from review_agent.brief import build_memory_audit_projection
 from review_agent.checkpoint import CheckpointStore
 from review_agent.models import IntentStatus, ReviewerResult, ReviewerResultStatus, RiskAssessment, RiskLevel
 from review_agent.reporting import render_markdown_report
@@ -327,3 +328,140 @@ def test_markdown_report_includes_reconciliation_and_completion_sections():
     assert "## Rejected Hypotheses" in report
     assert "## Non-Binding Recommendation" in report
     assert "Needs work before merge." in report
+
+
+def test_markdown_report_accepts_structured_memory_audit_summary() -> None:
+    memory_id = "MEM-" + "a" * 64
+    report = render_markdown_report(
+        review_id="review-memory-report",
+        base_revision="base",
+        head_revision="head",
+        risk_assessment=RiskAssessment(
+            level=RiskLevel.MEDIUM,
+            dimensions={},
+            reasons=[],
+            signal_refs=[],
+            uncertainties=[],
+            suggested_focus=[],
+        ),
+        changed_files=["auth.py"],
+        memory_audit_summary={
+            "applied_memory": [
+                {
+                    "memory_id": memory_id,
+                    "kind": "business_invariant",
+                    "statement": "Authentication remains mandatory.",
+                    "scope": {"paths": ["auth.py"]},
+                    "authority": "human_approved_context",
+                    "source_refs": [
+                        {"type": "git_commit", "commit_sha": "b" * 40}
+                    ],
+                    "validity": {
+                        "applicability": "selected",
+                        "valid_from_sha": "a" * 40,
+                        "policies": ["manual_until_revoked"],
+                    },
+                }
+            ],
+            "status": {
+                "mode": "read",
+                "available": True,
+                "curator": {"status": "disabled", "mode": "disabled"},
+            },
+        },
+    )
+
+    assert "## Memory Audit" in report
+    assert memory_id in report
+    assert "human_approved_context" in report
+    assert "curator status: disabled" in report
+    assert "### Memory Records Not Applied" in report
+    assert "reason=record_status_missing" in report
+
+
+def test_memory_json_and_markdown_keep_pending_cache_and_curator_semantics() -> None:
+    candidate_id = "MC-" + "a" * 64
+    entry_id = "RKE-" + "b" * 64
+    memory = {
+        "cache_provenance": [
+            {
+                "status": "rebuild",
+                "entry_id": entry_id,
+                "corruption_reason": "hash_mismatch",
+            }
+        ],
+        "pending_candidates": [
+            {
+                "candidate_id": candidate_id,
+                "kind": "business_invariant",
+                "statement": "Authentication remains mandatory.",
+                "scope": {
+                    "paths": ["auth/**"],
+                    "symbols": ["Auth.check"],
+                    "contracts": ["behavioral-correctness"],
+                    "languages": ["python"],
+                },
+                "status": "pending_approval",
+            }
+        ],
+        "status": {
+            "mode": "read-write",
+            "available": True,
+            "curator": {
+                "mode": "model",
+                "status": "proposed",
+                "outcome": "proposed",
+                "attempt_count": 2,
+                "candidate_ids": [candidate_id],
+                "review_conclusion_impact": "none",
+            },
+        },
+    }
+    audit = build_memory_audit_projection(memory)
+    report = render_markdown_report(
+        review_id="review-memory-parity",
+        base_revision="base",
+        head_revision="head",
+        risk_assessment=RiskAssessment(
+            level=RiskLevel.MEDIUM,
+            dimensions={},
+            reasons=[],
+            signal_refs=[],
+            uncertainties=[],
+            suggested_focus=[],
+        ),
+        changed_files=["auth/check.py"],
+        memory_audit_summary=memory,
+    )
+
+    assert audit["pending_candidates"][0]["scope"] == {
+        "paths": ["auth/**"],
+        "symbols": ["Auth.check"],
+        "contracts": ["behavioral-correctness"],
+        "languages": ["python"],
+    }
+    assert audit["cache_provenance"][0]["corruption_reason"] == "hash_mismatch"
+    assert audit["status"]["curator"] == {
+        "mode": "model",
+        "outcome": "proposed",
+        "status": "proposed",
+        "attempt_count": 2,
+        "review_conclusion_impact": "none",
+        "candidate_ids": [candidate_id],
+    }
+    for expected in (
+        "Scope: paths=['auth/**']",
+        "symbols=['Auth.check']",
+        "corruption_reason=hash_mismatch",
+        "curator outcome: proposed",
+        "curator attempt_count: 2",
+        f"curator candidate_ids: {candidate_id}",
+        "curator review_conclusion_impact: none",
+    ):
+        assert expected in report
+
+
+def test_pipeline_import_smoke_has_no_reporting_cycle() -> None:
+    from review_agent.pipeline import ReviewPipeline
+
+    assert ReviewPipeline.__name__ == "ReviewPipeline"
