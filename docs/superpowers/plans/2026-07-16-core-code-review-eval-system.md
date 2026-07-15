@@ -1,6 +1,6 @@
 # Core Code Review Eval System 实施计划
 
-**状态：** 执行中（Task 1 v1 协议已冻结）
+**状态：** 执行中（Task 1 已完成，Task 2 待开始）
 
 **设计来源：** `docs/superpowers/specs/2026-07-16-core-code-review-eval-system-design.md`
 
@@ -158,44 +158,47 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 - 新建 `src/review_agent_eval/__init__.py`
 - 新建 `src/review_agent_eval/models.py`
+- 新建 `tests/eval/__init__.py`
 - 新建 `tests/eval/test_models.py`
 - 新建 `tests/eval/test_schema_hydration.py`
 
 **RED 测试：**
 
-- [ ] `EvalInput v1` 只严格 round-trip repository 和 review request，不包含 clarification policy/answers；EvalCase 单独严格 round-trip 带 `max_rounds`/typed answers 的私有 clarification script。
-- [ ] `EvalSubmission v1` 对 completed/failed/blocked/invalid_output 都可构造；每个终态的 intent/review/failure 必填与 null 组合明确，零 Finding 合法。
-- [ ] 每个终态 Trial 恰有一个 Submission；pending/running/incomplete 是可恢复非终态；blocked clarification 必须保留可评分 Intent transcript，invalid_output 不伪造部分 Outcome。
-- [ ] Intent claim 只接受四个 dimension 与 `explicit|inferred` source；`inferred` 不被 hydration 自动改成 explicit。
-- [ ] clarification transcript 保留连续 turn index、material claim、匹配 answer、action、response 和 resolved values；答案耗尽/未匹配不被 Harness 猜测补齐。
-- [ ] clarification action/null 组合、matched answer 引用、confirm/correct/reject/skip/defer 的 response/resolved-values 约束严格 round-trip。
-- [ ] Finding、typed Evidence、location、uncertainty、usage 与 cost 的 null/缺失语义不同，缺字段不被空字符串伪装。
-- [ ] Intent/Review uncertainties 是 bounded non-empty string lists；Usage 的 elapsed/cost 为 finite non-negative number，token/tool fields 为 non-negative int，token total 与 cost currency 组合受跨字段验证。
-- [ ] `EvalCase v1` 严格区分 input 与 truth；intent truth 可 `scorable=false`；review completeness 只接受三种设计值。
-- [ ] expected/forbidden Intent、expected/known-invalid Finding 使用不同 typed leaf；truth ID 唯一，location/evidence anchor 可多条，known-invalid 不与 expected Finding 使用同一 ID。
-- [ ] closed-world 支持 `verify|forbid` novel Finding policy；expert-augmented/human-observed 拒绝 `forbid`。
-- [ ] 所有 ID、集合排序、canonical JSON 和完整 SHA-256 digest 稳定；语义重复 Finding、重复 evidence ref 和 clarification 时序不会被 set 去重擦除。
-- [ ] 超长 claim、excerpt、Case、Finding 数量和 Evidence 数量 fail closed，防止 benchmark 或 Agent 输出无界占用内存。
-- [ ] 未知 schema/version/enum、递归重复 JSON key、NaN/Infinity/`1e999`、bool 冒充 int 全部拒绝。
-- [ ] dangling Evidence ref 结构上可 hydration 并留给 Evidence Checker 判 missing；非法 Evidence 对象本身仍拒绝。
-- [ ] duplicate Finding/Evidence object ID 是 schema error；重复或 dangling ref 保留；有界但未授权 revision/path/line/hash 内容进入 missing/invalid grader，不把问题 Finding 整体抹掉。
+- [x] `EvalInput v1` 只严格 round-trip repository 和 review request，不包含 clarification policy/answers；EvalCase 单独严格 round-trip 带 `max_rounds`/typed answers 的私有 clarification script。
+- [x] `EvalSubmission v1` 对 completed/failed/blocked/invalid_output 都可构造；每个终态的 intent/review/failure 必填与 null 组合明确，零 Finding 合法。
+- [x] 每个终态 Trial 恰有一个 Submission；pending/running/incomplete 是可恢复非终态；blocked clarification 必须保留可评分 Intent transcript，invalid_output 不伪造部分 Outcome。
+- [x] Intent claim 只接受四个 dimension 与 `explicit|inferred` source；`inferred` 不被 hydration 自动改成 explicit。
+- [x] clarification transcript 保留连续 turn index、material claim、匹配 answer、action、response 和 resolved values；答案耗尽/未匹配不被 Harness 猜测补齐。
+- [x] clarification action/null 组合、matched answer 引用、confirm/correct/reject/skip/defer 的 response/resolved-values 约束严格 round-trip。
+- [x] Finding、typed Evidence、location、uncertainty、usage 与 cost 的 null/缺失语义不同，缺字段不被空字符串伪装。
+- [x] Intent/Review uncertainties 是 bounded non-empty string lists；Usage 的 elapsed/cost 为 finite non-negative number，token/tool fields 为 non-negative int，token total 与 cost currency 组合受跨字段验证。
+- [x] `EvalCase v1` 严格区分 input 与 truth；intent truth 可 `scorable=false`；review completeness 只接受三种设计值。
+- [x] expected/forbidden Intent、expected/known-invalid Finding 使用不同 typed leaf；truth ID 唯一，location/evidence anchor 可多条，known-invalid 不与 expected Finding 使用同一 ID。
+- [x] closed-world 支持 `verify|forbid` novel Finding policy；expert-augmented/human-observed 拒绝 `forbid`。
+- [x] 所有 ID、集合排序、canonical JSON 和完整 SHA-256 digest 稳定；语义重复 Finding、重复 evidence ref 和 clarification 时序不会被 set 去重擦除。
+- [x] 超长 claim、excerpt、Case、Finding 数量和 Evidence 数量 fail closed，防止 benchmark 或 Agent 输出无界占用内存。
+- [x] 未知 schema/version/enum、递归重复 JSON key、NaN/Infinity/`1e999`、bool 冒充 int 全部拒绝。
+- [x] dangling Evidence ref 结构上可 hydration 并留给 Evidence Checker 判 missing；非法 Evidence 对象本身仍拒绝。
+- [x] duplicate Finding/Evidence object ID 是 schema error；重复或 dangling ref 保留；有界但未授权 revision/path/line/hash 内容进入 missing/invalid grader，不把问题 Finding 整体抹掉。
 
 **实现：**
 
-- [ ] 定义 frozen domain models 与 enums：trial/submission status、failure code、clarification action、intent dimension/result、truth completeness、novel policy、issue judgement、Evidence integrity/support、Judge status。
-- [ ] 实现唯一 canonical `to_dict/from_dict`、JSON duplicate-key rejection、长度/数量上限和 digest helper。
-- [ ] 模型只保存 JSON-ready 基础值，不保存 `Path`、subprocess、Provider response、产品 Session 或 Runtime 类型。
-- [ ] 为输入、提交、Case、truth Finding、Evidence、clarification answer 定义稳定 ID 规则。
-- [ ] 实现 typed `SubmissionFailure`、`SubmissionClarificationExchange`、`ForbiddenIntentClaim`、`KnownInvalidFinding` 和 annotation rationale；completed 与非 completed 终态做跨字段验证。
-- [ ] 集中定义已确认设计中的 v1 字节/字符/数量上限；先检查原始 collection 数量，再 canonicalize。
-- [ ] 把设计中的 YAML 作为说明格式；实现与 artifact 使用 canonical UTF-8 JSON，避免新增核心 YAML 依赖。
-- [ ] 定义 `repository_file/repository_diff/command_output/external_record` Evidence 的 exact keys；hydration 保留有界但未授权的 revision/path 给 Checker，Checker 才按 kind 验证精确 base/head/range 与 source attestation。
+- [x] 定义 frozen domain models 与 enums：trial/submission status、failure code、clarification action、intent dimension/result、truth completeness、novel policy、issue judgement、Evidence integrity/support、Judge status。
+- [x] 实现唯一 canonical `to_dict/from_dict`、JSON duplicate-key rejection、长度/数量上限和 digest helper。
+- [x] 模型只保存 JSON-ready 基础值，不保存 `Path`、subprocess、Provider response、产品 Session 或 Runtime 类型。
+- [x] 为输入、提交、Case、truth Finding、Evidence、clarification answer 定义稳定 ID 规则。
+- [x] 实现 typed `SubmissionFailure`、`SubmissionClarificationExchange`、`ForbiddenIntentClaim`、`KnownInvalidFinding` 和 annotation rationale；completed 与非 completed 终态做跨字段验证。
+- [x] 集中定义已确认设计中的 v1 字节/字符/数量上限；先检查原始 collection 数量，再 canonicalize。
+- [x] 把设计中的 YAML 作为说明格式；实现与 artifact 使用 canonical UTF-8 JSON，避免新增核心 YAML 依赖。
+- [x] 定义 `repository_file/repository_diff/command_output/external_record` Evidence 的 exact keys；hydration 保留有界但未授权的 revision/path 给 Checker，Checker 才按 kind 验证精确 base/head/range 与 source attestation。
 
 **验证：**
 
 ```powershell
 & 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_models.py tests/eval/test_schema_hydration.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t1'
 ```
+
+**完成记录（2026-07-16）：** Task 1 定向测试与产品模型、hydration、架构边界合并回归共 210 项通过。
 
 **提交边界：** `feat(eval): add canonical input submission and case protocols`
 
