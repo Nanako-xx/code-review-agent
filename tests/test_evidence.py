@@ -1,6 +1,7 @@
 import pytest
 
 from review_agent.evidence import (
+    CanonicalFinding,
     build_reconciliation_prepass,
     reconcile_evidence,
     reconciliation_to_dict,
@@ -90,6 +91,19 @@ def test_reconcile_evidence_keeps_and_deduplicates_supported_findings():
     assert payload["canonical_findings"][0]["claim"] == "Auth bypass"
     assert payload["canonical_findings"][0]["reviewer_indices"] == [0, 1]
     assert payload["canonical_findings"][0]["roles"] == ["Core Reviewer", "Adversarial Reviewer"]
+
+
+def test_canonical_finding_id_uses_the_feedback_protocol_shape():
+    with pytest.raises(ValueError, match="32 or 64 lowercase hex"):
+        CanonicalFinding(
+            claim="Invalid identity",
+            severity="high",
+            confidence="high",
+            evidence_refs=["O-auth"],
+            reviewer_indices=[0],
+            roles=["core"],
+            finding_id="F-1",
+        )
 
 
 def test_prepass_keeps_stable_candidates_before_exact_deduplication():

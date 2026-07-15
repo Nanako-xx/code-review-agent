@@ -30,6 +30,7 @@ class BriefFinding:
     line: int | None = None
     impact: str = ""
     verification_performed: list[str] = field(default_factory=list)
+    finding_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,9 @@ def build_review_brief(
 
 def review_brief_to_dict(brief: ReviewBrief) -> dict[str, Any]:
     payload = _json_ready(asdict(brief))
+    for finding in payload["verified_findings"]:
+        if finding.get("finding_id") is None:
+            finding.pop("finding_id", None)
     if not brief.semantic_reconciliation:
         payload.pop("semantic_reconciliation", None)
     return payload
@@ -202,6 +206,11 @@ def _verified_findings(reconciliation: dict[str, Any]) -> list[BriefFinding]:
                 verification_performed=[
                     str(item) for item in row.get("verification_performed", [])
                 ],
+                finding_id=(
+                    str(row["finding_id"])
+                    if row.get("finding_id") is not None
+                    else None
+                ),
             )
         )
     return findings

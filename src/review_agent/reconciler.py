@@ -17,6 +17,7 @@ from review_agent.evidence import (
     FindingCandidate,
     ReconciliationPrepass,
     RejectedFinding,
+    canonical_finding_to_dict,
 )
 from review_agent.model_adapter import ModelAdapter
 from review_agent.model_protocol import (
@@ -446,7 +447,9 @@ class SemanticReconciliation:
         return {
             "schema_version": self.schema_version,
             "status": self.status,
-            "canonical_findings": [asdict(item) for item in self.canonical_findings],
+            "canonical_findings": [
+                canonical_finding_to_dict(item) for item in self.canonical_findings
+            ],
             "rejected_findings": [asdict(item) for item in self.rejected_findings],
             "conflicts_resolved": [asdict(item) for item in self.conflicts_resolved],
             "remaining_disagreements": [
@@ -1136,6 +1139,7 @@ def compile_semantic_proposals(
             canonical.append(
                 _canonical_from_candidates(
                     members,
+                    finding_id=group.representative_id,
                     claim=group.canonical_claim,
                     confidence=group.proposed_confidence,
                     supporting_refs=group.supporting_refs,
@@ -1157,6 +1161,7 @@ def compile_semantic_proposals(
                 canonical.append(
                     _canonical_from_candidates(
                         [candidate],
+                        finding_id=candidate.finding_id,
                         claim=candidate.claim,
                         confidence=candidate.confidence,
                         supporting_refs=tuple(candidate.evidence_refs),
@@ -1287,6 +1292,7 @@ def deterministic_semantic_reconciliation(
     canonical = [
         _canonical_from_candidates(
             members,
+            finding_id=min(member.finding_id for member in members),
             claim=members[0].claim,
             confidence=_highest_confidence(members),
             supporting_refs=tuple(
@@ -1657,6 +1663,7 @@ def _supplemental_request(
 def _canonical_from_candidates(
     members: Sequence[FindingCandidate],
     *,
+    finding_id: str,
     claim: str,
     confidence: str,
     supporting_refs: Sequence[str],
@@ -1703,6 +1710,7 @@ def _canonical_from_candidates(
                 for item in member.verification_performed
             }
         ),
+        finding_id=finding_id,
     )
 
 
@@ -1902,8 +1910,15 @@ def _semantic_conflict_from_dict(value: Any, context: str) -> SemanticConflict:
 
 def _canonical_finding_from_dict(value: Any, context: str) -> CanonicalFinding:
     item = _object(value, context)
+    finding_id = (
+        _string(item, "finding_id", context)
+        if "finding_id" in item
+        else None
+    )
+    legacy_shape = dict(item)
+    legacy_shape.pop("finding_id", None)
     _exact(
-        item,
+        legacy_shape,
         {
             "claim",
             "severity",
@@ -1963,6 +1978,7 @@ def _canonical_finding_from_dict(value: Any, context: str) -> CanonicalFinding:
                 allow_empty=True,
             )
         ),
+        finding_id=finding_id,
     )
 
 

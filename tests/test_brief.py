@@ -38,6 +38,7 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
     reconciliation_payload = {
         "canonical_findings": [
             {
+                "finding_id": "F-" + "a" * 32,
                 "claim": "Bad token path is not covered",
                 "severity": "high",
                 "confidence": "medium",
@@ -156,6 +157,7 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
         == ["auth.py"]
     )
     assert payload["verified_findings"][0]["claim"] == "Bad token path is not covered"
+    assert payload["verified_findings"][0]["finding_id"] == "F-" + "a" * 32
     assert payload["rejected_hypotheses"][0]["claim"] == "Session storage changed"
     assert payload["reviewer_disagreements"] == ["core and adversarial disagree on token expiry"]
     assert payload["review_contract_coverage"][0]["contract"] == "Behavioral Correctness"
@@ -172,6 +174,7 @@ def test_review_brief_to_dict_contains_spec_sections_and_recommendation() -> Non
     assert "  - Observation: O-QG" in markdown
     assert "## Risk And Portfolio Orchestration" in markdown
     assert "local_floor=high" in markdown
+    assert "`F-" + "a" * 32 + "`" in markdown
 
 
 def test_render_review_brief_markdown_uses_spec_section_order() -> None:

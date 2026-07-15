@@ -365,7 +365,11 @@ def _verified_findings_section(brief: ReviewBrief) -> str:
         return "- No verified findings recorded"
     lines = []
     for finding in brief.verified_findings:
-        line = f"- [{finding.severity}/{finding.confidence}] {finding.claim}"
+        finding_id = f" `{finding.finding_id}`" if finding.finding_id else ""
+        line = (
+            f"- [{finding.severity}/{finding.confidence}]{finding_id} "
+            f"{finding.claim}"
+        )
         if finding.path:
             location = finding.path
             if finding.line is not None:

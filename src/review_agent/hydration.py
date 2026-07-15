@@ -1594,7 +1594,7 @@ def _canonical_finding(value: Any, context: str) -> CanonicalFinding:
     _required_with_optional(
         item,
         {"claim", "severity", "confidence", "evidence_refs", "reviewer_indices", "roles", "suggested_action"},
-        {"path", "line", "impact", "verification_performed"},
+        {"path", "line", "impact", "verification_performed", "finding_id"},
         context,
     )
     line = item.get("line")
@@ -1619,6 +1619,11 @@ def _canonical_finding(value: Any, context: str) -> CanonicalFinding:
             _string_list(item, "verification_performed", context)
             if "verification_performed" in item
             else []
+        ),
+        finding_id=(
+            _string(item, "finding_id", context)
+            if "finding_id" in item
+            else None
         ),
     )
 
@@ -1667,7 +1672,7 @@ def _brief_finding(value: Any, context: str) -> BriefFinding:
     _required_with_optional(
         item,
         {"claim", "severity", "confidence", "evidence_refs", "reviewer_indices", "roles", "suggested_action"},
-        {"path", "line", "impact", "verification_performed"},
+        {"path", "line", "impact", "verification_performed", "finding_id"},
         context,
     )
     line = item.get("line")
@@ -1692,6 +1697,11 @@ def _brief_finding(value: Any, context: str) -> BriefFinding:
             _string_list(item, "verification_performed", context)
             if "verification_performed" in item
             else []
+        ),
+        finding_id=(
+            _string(item, "finding_id", context)
+            if "finding_id" in item
+            else None
         ),
     )
 
