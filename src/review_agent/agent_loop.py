@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
-from review_agent.context import build_reviewer_envelope
+from review_agent.context import (
+    ReviewerMemoryContext,
+    build_reviewer_envelope,
+    current_reviewer_memory_context,
+)
+from review_agent.memory_retrieval import HardPolicyBudgetExceeded
 from review_agent.model_adapter import ModelAdapter
 from review_agent.model_protocol import (
     ModelResponse,
@@ -95,6 +100,15 @@ def run_reviewer_agent_loop(
     model: str = "configured-reviewer-model",
 ) -> AgentLoopRun:
     runtime = RuntimeTracker.start()
+    memory_context = current_reviewer_memory_context()
+    if memory_context is None:
+        gateway_snapshot = getattr(gateway, "memory_snapshot", None)
+        gateway_service = getattr(gateway, "memory_query_service", None)
+        if gateway_snapshot is not None and gateway_service is not None:
+            memory_context = ReviewerMemoryContext(
+                snapshot=gateway_snapshot,
+                query_service=gateway_service,
+            )
     envelope = build_reviewer_envelope(
         assignment=assignment,
         intent=intent,
@@ -103,7 +117,14 @@ def run_reviewer_agent_loop(
         trace_id=trace_id,
         model=model,
         max_output_tokens=assignment.max_output_tokens,
+        memory_context=memory_context,
     )
+    if memory_context is not None and gateway.memory_query_service is not None:
+        context_metadata = envelope.parameters.get("context", {})
+        gateway.bind_memory_context_ledger(
+            limit_bytes=int(context_metadata["memory_ledger_limit_bytes"]),
+            initial_bytes=int(context_metadata["memory_ledger_initial_bytes"]),
+        )
     tools = [_tool_spec_from_envelope_tool(tool) for tool in envelope.tools]
     runtime_messages = list(envelope.messages)
     turns: list[AgentLoopTurn] = []
@@ -305,8 +326,40 @@ def run_reviewer_agent_loop(
                     ReviewerTerminationReason.TOOL_BUDGET_EXHAUSTED,
                 )
 
-            turn_tool_results = [_execute_tool_call(gateway, call) for call in turn_tool_calls]
-            tool_call_count += len(turn_tool_calls)
+            turn_tool_results: list[ModelToolResult] = []
+            attempted_in_turn = 0
+            try:
+                for call in turn_tool_calls:
+                    attempted_in_turn += 1
+                    turn_tool_results.append(_execute_tool_call(gateway, call))
+            except HardPolicyBudgetExceeded as error:
+                tool_call_count += attempted_in_turn
+                runtime.tool_calls = tool_call_count
+                error_message = f"blocking hard-policy budget failure: {error}"
+                turns.append(
+                    AgentLoopTurn(
+                        turn_index=turn_index,
+                        response_kind=response.kind.value,
+                        tool_calls=turn_tool_calls,
+                        tool_results=turn_tool_results,
+                        error=error_message,
+                        provider_attempts=provider_attempts,
+                    )
+                )
+                result = _blocked_result(
+                    error_message,
+                    _authorized_observation_ids(gateway, observations),
+                )
+                return _run_from_parts(
+                    envelope,
+                    response,
+                    result,
+                    trace_id,
+                    turns,
+                    runtime,
+                    ReviewerTerminationReason.REVIEWER_BLOCKED,
+                )
+            tool_call_count += attempted_in_turn
             runtime.tool_calls = tool_call_count
             tool_results.extend(turn_tool_results)
             turns.append(
@@ -487,6 +540,8 @@ def _tool_spec_from_envelope_tool(tool: dict[str, object]) -> ModelToolSpec:
 def _execute_tool_call(gateway: ToolGateway, call: ModelToolCall) -> ModelToolResult:
     try:
         result = gateway.execute(call.tool_name, call.arguments)
+    except HardPolicyBudgetExceeded:
+        raise
     except Exception as error:  # Tool execution is a Reviewer isolation boundary.
         return ModelToolResult(
             call_id=call.call_id,
@@ -500,6 +555,23 @@ def _execute_tool_call(gateway: ToolGateway, call: ModelToolCall) -> ModelToolRe
         tool_name=call.tool_name,
         content=result.context_view,
         observation_ids=result.observation_ids,
+    )
+
+
+def _blocked_result(
+    reason: str,
+    observation_refs: set[str],
+) -> ReviewerResult:
+    retained = sorted(observation_refs)
+    retained_summary = ", ".join(retained) if retained else "none"
+    return ReviewerResult(
+        uncertainties=[reason],
+        observation_refs=retained,
+        investigation_summary=(
+            f"Reviewer execution was blocked because {reason}. "
+            f"Authorized observations retained: {retained_summary}."
+        ),
+        status=ReviewerResultStatus.BLOCKED,
     )
 
 

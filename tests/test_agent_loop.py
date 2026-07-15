@@ -4,6 +4,8 @@ from dataclasses import replace
 from review_agent.agent_loop import agent_loop_run_to_dict, run_reviewer_agent_loop
 from review_agent.model_adapter import FakeToolCallingAdapter
 from review_agent.model_protocol import ModelResponseKind, ModelToolCall, ModelTurnResponse
+from review_agent.memory_models import MemoryScope
+from review_agent.memory_retrieval import SnapshotMemoryQueryService
 from review_agent.models import (
     IntentPacket,
     IntentSource,
@@ -14,6 +16,7 @@ from review_agent.observations import ObservationStore
 from review_agent.tool_gateway import ToolGateway
 from tests.conftest import run_git
 from tests.test_orchestrator import make_assignment
+from tests.test_context import _memory_snapshot
 
 
 def make_intent():
@@ -105,6 +108,254 @@ def test_agent_loop_executes_tool_call_and_returns_final_result(git_repo):
     assert run.trace.turns[0].tool_results[0].observation_ids
     assert adapter.requests[1].tool_results[0].content
     assert list(observation_store.summaries_by_id())
+
+
+def test_agent_loop_executes_snapshot_memory_tool_turn(git_repo):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    snapshot = _memory_snapshot(head=base)
+    assignment = replace(
+        make_assignment("Core Reviewer"),
+        assignment_id="assignment-memory",
+        initial_context=replace(
+            make_assignment("Core Reviewer").initial_context,
+            changed_files=["app.py"],
+        ),
+    )
+    observation_store = ObservationStore(
+        git_repo / ".review-agent" / "runs" / "review-memory-tool"
+    )
+    service = SnapshotMemoryQueryService(
+        snapshot,
+        assignment_id="assignment-memory",
+        assignment_scope=MemoryScope(
+            paths=("app.py",),
+            contracts=("regression_safety",),
+        ),
+    )
+    gateway = ToolGateway(
+        git_repo,
+        base,
+        base,
+        observation_store,
+        allowed_tools=("query_project_memory",),
+        memory_query_service=service,
+    )
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.TOOL_CALLS,
+                tool_calls=[
+                    ModelToolCall(
+                        "memory-call",
+                        "query_project_memory",
+                        {
+                            "assignment_id": "assignment-memory",
+                            "path": "app.py",
+                            "query": "approved rule",
+                        },
+                    )
+                ],
+            ),
+            final_response,
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=assignment,
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-memory-tool-reviewer-0",
+    )
+
+    assert run.trace.turns[0].tool_calls[0].tool_name == "query_project_memory"
+    assert run.trace.turns[0].tool_results[0].observation_ids
+    assert gateway.memory_snapshot.snapshot_id in adapter.requests[1].tool_results[0].content
+    assert run.result.observation_refs == list(observation_store.summaries_by_id())
+    metadata = run.envelope.parameters["context"]
+    query_bytes = len(
+        adapter.requests[1].tool_results[0].content.encode("utf-8")
+    )
+    assert gateway.memory_context_used_bytes == (
+        metadata["memory_ledger_initial_bytes"] + query_bytes
+    )
+    assert gateway.memory_context_used_bytes <= metadata["memory_ledger_limit_bytes"]
+
+
+def test_agent_loop_hard_policy_budget_failure_blocks_without_model_recovery(
+    git_repo,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    snapshot = _memory_snapshot(head=head, hard_policy=True)
+    base_assignment = make_assignment("Core Reviewer")
+    assignment = replace(
+        base_assignment,
+        assignment_id="assignment-memory",
+        initial_context=replace(
+            base_assignment.initial_context,
+            changed_files=["app.py"],
+        ),
+    )
+    service = SnapshotMemoryQueryService(
+        snapshot,
+        assignment_id="assignment-memory",
+        assignment_scope=MemoryScope(
+            paths=("app.py",),
+            contracts=("regression_safety",),
+        ),
+    )
+    store = ObservationStore(
+        git_repo / ".review-agent" / "runs" / "review-memory-hard-block"
+    )
+    gateway = ToolGateway(
+        git_repo,
+        head,
+        "HEAD",
+        store,
+        max_context_chars=200,
+        allowed_tools=("query_project_memory",),
+        memory_query_service=service,
+    )
+
+    def must_not_recover(_request):
+        raise AssertionError("model must not receive a recoverable tool error")
+
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.TOOL_CALLS,
+                tool_calls=[
+                    ModelToolCall(
+                        "memory-hard-call",
+                        "query_project_memory",
+                        {
+                            "assignment_id": "assignment-memory",
+                            "path": "app.py",
+                        },
+                    )
+                ],
+            ),
+            must_not_recover,
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=assignment,
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-memory-hard-block-reviewer-0",
+    )
+
+    assert len(adapter.requests) == 1
+    assert run.result.status.value == "blocked"
+    assert run.runtime.termination_reason is ReviewerTerminationReason.REVIEWER_BLOCKED
+    assert "hard-policy" in run.trace.turns[0].error
+    assert run.trace.turns[0].tool_results == []
+    assert store.list_observations() == []
+
+
+def test_agent_loop_memory_queries_share_one_cumulative_ten_percent_ledger(
+    git_repo,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    snapshot = _memory_snapshot(head=head)
+    base_assignment = make_assignment("Core Reviewer")
+    assignment = replace(
+        base_assignment,
+        assignment_id="assignment-memory",
+        initial_context=replace(
+            base_assignment.initial_context,
+            changed_files=["app.py"],
+        ),
+        max_turns=12,
+        max_tool_calls=12,
+    )
+    service = SnapshotMemoryQueryService(
+        snapshot,
+        assignment_id="assignment-memory",
+        assignment_scope=MemoryScope(
+            paths=("app.py",),
+            contracts=("regression_safety",),
+        ),
+    )
+    gateway = ToolGateway(
+        git_repo,
+        head,
+        "HEAD",
+        ObservationStore(
+            git_repo / ".review-agent" / "runs" / "review-memory-ledger"
+        ),
+        allowed_tools=("query_project_memory",),
+        memory_query_service=service,
+    )
+
+    def continue_until_ledger_error(request):
+        if request.tool_results[-1].is_error:
+            return final_response_after_tool_error(request)
+        next_index = len(request.tool_results) + 1
+        return ModelTurnResponse(
+            kind=ModelResponseKind.TOOL_CALLS,
+            tool_calls=[
+                ModelToolCall(
+                    f"memory-ledger-{next_index}",
+                    "query_project_memory",
+                    {
+                        "assignment_id": "assignment-memory",
+                        "path": "app.py",
+                    },
+                )
+            ],
+        )
+
+    first_call = ModelTurnResponse(
+        kind=ModelResponseKind.TOOL_CALLS,
+        tool_calls=[
+            ModelToolCall(
+                "memory-ledger-1",
+                "query_project_memory",
+                {
+                    "assignment_id": "assignment-memory",
+                    "path": "app.py",
+                },
+            )
+        ],
+    )
+    adapter = FakeToolCallingAdapter(
+        script=[first_call, *([continue_until_ledger_error] * 11)]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=assignment,
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-memory-ledger-reviewer-0",
+    )
+
+    all_results = [
+        result
+        for turn in run.trace.turns
+        for result in turn.tool_results
+    ]
+    successful = [result for result in all_results if not result.is_error]
+    errors = [result for result in all_results if result.is_error]
+    assert len(successful) >= 2
+    assert errors
+    assert "remaining Context budget" in errors[-1].content
+    metadata = run.envelope.parameters["context"]
+    assert gateway.memory_context_used_bytes == (
+        metadata["memory_ledger_initial_bytes"]
+        + sum(len(result.content.encode("utf-8")) for result in successful)
+    )
+    assert gateway.memory_context_used_bytes <= metadata["memory_ledger_limit_bytes"]
+    assert run.result.status.value == "partial"
 
 
 def test_agent_loop_returns_partial_when_tool_budget_is_exhausted(git_repo):
