@@ -67,6 +67,7 @@ from .models import (
     _strict_json_loads,
     canonical_json_bytes,
     stable_id,
+    submission_status_for_failure,
 )
 
 
@@ -100,27 +101,6 @@ _TERMINAL_STATUSES = frozenset(
         TrialStatus.INVALID_OUTPUT,
     }
 )
-_FAILED_CODES = frozenset(
-    {
-        FailureCode.TIMEOUT,
-        FailureCode.NON_ZERO_EXIT,
-        FailureCode.PROCESS_KILLED,
-        FailureCode.ADAPTER_ERROR,
-        FailureCode.UNKNOWN,
-    }
-)
-_BLOCKED_CODES = frozenset(
-    {FailureCode.CLARIFICATION_REQUIRED, FailureCode.AGENT_BLOCKED}
-)
-_INVALID_CODES = frozenset(
-    {
-        FailureCode.INVALID_JSON,
-        FailureCode.SCHEMA_MISMATCH,
-        FailureCode.OUTPUT_OVERFLOW,
-    }
-)
-
-
 class ArtifactError(RuntimeError):
     """Base class for artifact persistence failures."""
 
@@ -557,17 +537,19 @@ def _validate_failure(status: Optional[TrialStatus], code: Optional[FailureCode]
     elif status is TrialStatus.COMPLETED:
         if code is not None:
             raise SchemaError("completed receipt requires failure_code=null")
-    elif status is TrialStatus.FAILED:
-        if code not in _FAILED_CODES:
-            raise SchemaError("failed receipt has an invalid failure_code")
-    elif status is TrialStatus.BLOCKED:
-        if code not in _BLOCKED_CODES:
-            raise SchemaError("blocked receipt has an invalid failure_code")
-    elif status is TrialStatus.INVALID_OUTPUT:
-        if code not in _INVALID_CODES:
-            raise SchemaError("invalid_output receipt has an invalid failure_code")
-    else:
+    elif status not in _TERMINAL_STATUSES:
         raise SchemaError("terminal receipt has a nonterminal Trial status")
+    elif code is None:
+        raise SchemaError("terminal failure receipt requires failure_code")
+    else:
+        try:
+            expected = TrialStatus(submission_status_for_failure(code).value)
+        except (TypeError, ValueError) as exc:
+            raise SchemaError("terminal receipt has an invalid failure_code") from exc
+        if status is not expected:
+            raise SchemaError(
+                "%s receipt has an invalid failure_code" % status.value
+            )
 
 
 def derive_receipt_id(
@@ -3030,7 +3012,13 @@ class ArtifactStore:
         failure_code: FailureCode = FailureCode.PROCESS_KILLED,
         message: str = "Interrupted Trial was abandoned during recovery.",
     ) -> TrialState:
-        if failure_code not in _FAILED_CODES:
+        try:
+            failure_status = submission_status_for_failure(failure_code)
+        except (TypeError, ValueError) as exc:
+            raise SchemaError(
+                "abandonment requires a stable failed failure code"
+            ) from exc
+        if failure_status is not SubmissionStatus.FAILED:
             raise SchemaError("abandonment requires a stable failed failure code")
         validate_safe_text(message, "abandonment failure message")
         config = self.load_run_config(run_id)

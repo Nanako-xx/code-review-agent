@@ -11,6 +11,7 @@ import review_agent_eval.config as config_module
 from review_agent_eval.cases import RunCaseSnapshot, SuiteCase, SuiteManifest
 from review_agent_eval.config import (
     AgentConfigSnapshot,
+    ClarificationMatcherSnapshot,
     EvalRunConfig,
     EvaluatorExecutionConfig,
     EvaluatorRunConfig,
@@ -153,6 +154,23 @@ def evaluator_config(
     )
 
 
+def matcher_config(
+    *,
+    matcher_version: str = "matcher-v1",
+    threshold: float | None = None,
+) -> ClarificationMatcherSnapshot:
+    return ClarificationMatcherSnapshot(
+        matcher_id="canonical-material-claim",
+        matcher_version=matcher_version,
+        implementation_digest="d" * 64,
+        model_artifact_digest=None,
+        rubric_digest="e" * 64,
+        normalization_version="unicode-whitespace-casefold-v1",
+        threshold=threshold,
+        parameters={"unicode_version": "14.0.0"},
+    )
+
+
 def suite_config(snapshot: RunCaseSnapshot) -> SuiteRunConfig:
     return SuiteRunConfig.from_case_snapshot(snapshot)
 
@@ -174,6 +192,7 @@ def run_config(
     *,
     run_instance_key: str = "instance-20260716-001",
     agent: Optional[AgentConfigSnapshot] = None,
+    matcher: Optional[ClarificationMatcherSnapshot] = None,
     evaluator: Optional[EvaluatorRunConfig] = None,
     suite: Optional[SuiteRunConfig] = None,
     resource_budgets: Optional[ResourceBudgets] = None,
@@ -182,6 +201,7 @@ def run_config(
     return EvalRunConfig.create(
         run_instance_key=run_instance_key,
         agent=agent or agent_config(),
+        clarification_matcher=matcher or matcher_config(),
         evaluator=evaluator or evaluator_config(),
         suite=suite or suite_config(snapshot),
         trial_count=trial_count,
@@ -230,6 +250,10 @@ def test_final_run_config_records_complete_reproduction_identity_and_round_trips
     assert dict(config.agent.parameters)["temperature"] == 0
     assert config.agent.prompt_config_digest == "b" * 64
     assert config.agent_config_digest == canonical_sha256(config.agent)
+    assert config.clarification_matcher.matcher_id == "canonical-material-claim"
+    assert config.clarification_matcher_config_digest == canonical_sha256(
+        config.clarification_matcher
+    )
     assert config.evaluator_config_digest == canonical_sha256(config.evaluator)
     assert config.evaluator.judge_version == "judge-v1"
     assert config.evaluator.rubric_version == "rubric-v7"
@@ -282,6 +306,10 @@ def test_run_id_excludes_evaluator_but_includes_snapshot_binding(
         case_snapshot,
         agent=agent_config(model="agent-model-v2"),
     )
+    changed_matcher = run_config(
+        case_snapshot,
+        matcher=matcher_config(matcher_version="matcher-v2"),
+    )
     changed_agent_budgets_payload = budgets(parallel=2).to_dict()
     changed_agent_budgets_payload["agent_timeout_seconds"] = 901
     changed_agent_budgets = run_config(
@@ -310,6 +338,7 @@ def test_run_id_excludes_evaluator_but_includes_snapshot_binding(
     assert original.run_id != changed_snapshot.run_id
     assert original.run_id != next_instance.run_id
     assert original.run_id != changed_agent.run_id
+    assert original.run_id != changed_matcher.run_id
     assert original.run_id != changed_agent_budgets.run_id
     assert original.run_id == changed_evaluator_budgets.run_id
     assert EvaluatorExecutionConfig.from_resource_budgets(
@@ -319,6 +348,49 @@ def test_run_id_excludes_evaluator_but_includes_snapshot_binding(
         changed_evaluator_budgets.resource_budgets,
     ).digest()
     assert re.fullmatch(r"run-[0-9a-f]{64}", original.run_id)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("matcher_version", "matcher-v2"),
+        ("implementation_digest", "1" * 64),
+        ("model_artifact_digest", "2" * 64),
+        ("rubric_digest", "3" * 64),
+        ("normalization_version", "normalization-v2"),
+        ("threshold", 0.75),
+        ("parameters", {"unicode_version": "15.0.0"}),
+    ],
+)
+def test_run_id_binds_every_matcher_reproduction_dimension(
+    case_snapshot: RunCaseSnapshot,
+    field: str,
+    value: object,
+) -> None:
+    original = run_config(case_snapshot)
+    changed_snapshot = matcher_config().to_dict()
+    changed_snapshot[field] = value
+    changed = run_config(
+        case_snapshot,
+        matcher=ClarificationMatcherSnapshot.from_dict(changed_snapshot),
+    )
+
+    assert original.run_id != changed.run_id
+
+
+@pytest.mark.parametrize("threshold", [-0.1, 1.1, True, float("nan")])
+def test_matcher_snapshot_rejects_invalid_thresholds(threshold: object) -> None:
+    with pytest.raises(SchemaError, match="threshold"):
+        ClarificationMatcherSnapshot(
+            matcher_id="semantic-material-claim",
+            matcher_version="1",
+            implementation_digest="1" * 64,
+            model_artifact_digest="2" * 64,
+            rubric_digest="3" * 64,
+            normalization_version="normalization-v1",
+            threshold=threshold,
+            parameters={},
+        )
 
 
 def test_trial_and_case_path_ids_are_stable_and_never_embed_opaque_task_id() -> None:
@@ -452,6 +524,11 @@ def test_strict_hydration_rejects_unknown_duplicate_and_digest_mismatch(
         EvalRunConfig.from_dict(payload)
 
     payload = config.to_dict()
+    payload["clarification_matcher_config_digest"] = "0" * 64
+    with pytest.raises(SchemaError, match="clarification_matcher_config_digest"):
+        EvalRunConfig.from_dict(payload)
+
+    payload = config.to_dict()
     payload["run_id"] = "run-" + "0" * 64
     with pytest.raises(SchemaError, match="run_id"):
         EvalRunConfig.from_dict(payload)
@@ -534,6 +611,7 @@ def test_resource_and_trial_budgets_fail_closed(
         EvalRunConfig.create(
             run_instance_key="instance",
             agent=agent_config(),
+            clarification_matcher=matcher_config(),
             evaluator=evaluator_config(),
             suite=suite_config(case_snapshot),
             trial_count=1,

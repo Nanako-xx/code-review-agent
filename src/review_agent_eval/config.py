@@ -374,6 +374,122 @@ def _version(value: Any, context: str) -> str:
 
 
 @dataclass(frozen=True)
+class ClarificationMatcherSnapshot(_JsonModel):
+    """Reproducible matcher implementation/config bound into Agent-side Run identity."""
+
+    matcher_id: str
+    matcher_version: str
+    implementation_digest: str
+    model_artifact_digest: Optional[str]
+    rubric_digest: str
+    normalization_version: str
+    threshold: Any
+    parameters: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        _identifier(self.matcher_id, "clarification_matcher.matcher_id")
+        _version(self.matcher_version, "clarification_matcher.matcher_version")
+        _digest(
+            self.implementation_digest,
+            "clarification_matcher.implementation_digest",
+        )
+        if self.model_artifact_digest is not None:
+            _digest(
+                self.model_artifact_digest,
+                "clarification_matcher.model_artifact_digest",
+            )
+        _digest(self.rubric_digest, "clarification_matcher.rubric_digest")
+        _version(
+            self.normalization_version,
+            "clarification_matcher.normalization_version",
+        )
+        if self.threshold is not None:
+            threshold = _number(
+                self.threshold,
+                "clarification_matcher.threshold",
+            )
+            if threshold > 1:
+                raise SchemaError(
+                    "clarification_matcher.threshold must be at most one"
+                )
+        object.__setattr__(
+            self,
+            "parameters",
+            _json_object(
+                self.parameters,
+                "clarification_matcher.parameters",
+            ),
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "ClarificationMatcherSnapshot":
+        payload = _object(value, "clarification_matcher")
+        _exact_fields(
+            payload,
+            (
+                "matcher_id",
+                "matcher_version",
+                "implementation_digest",
+                "model_artifact_digest",
+                "rubric_digest",
+                "normalization_version",
+                "threshold",
+                "parameters",
+            ),
+            "clarification_matcher",
+        )
+        model_artifact_digest = payload["model_artifact_digest"]
+        if model_artifact_digest is not None:
+            model_artifact_digest = _digest(
+                model_artifact_digest,
+                "clarification_matcher.model_artifact_digest",
+            )
+        threshold = payload["threshold"]
+        if threshold is not None:
+            threshold = _number(threshold, "clarification_matcher.threshold")
+        return cls(
+            matcher_id=_identifier(
+                payload["matcher_id"],
+                "clarification_matcher.matcher_id",
+            ),
+            matcher_version=_version(
+                payload["matcher_version"],
+                "clarification_matcher.matcher_version",
+            ),
+            implementation_digest=_digest(
+                payload["implementation_digest"],
+                "clarification_matcher.implementation_digest",
+            ),
+            model_artifact_digest=model_artifact_digest,
+            rubric_digest=_digest(
+                payload["rubric_digest"],
+                "clarification_matcher.rubric_digest",
+            ),
+            normalization_version=_version(
+                payload["normalization_version"],
+                "clarification_matcher.normalization_version",
+            ),
+            threshold=threshold,
+            parameters=_object(
+                payload["parameters"],
+                "clarification_matcher.parameters",
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "matcher_id": self.matcher_id,
+            "matcher_version": self.matcher_version,
+            "implementation_digest": self.implementation_digest,
+            "model_artifact_digest": self.model_artifact_digest,
+            "rubric_digest": self.rubric_digest,
+            "normalization_version": self.normalization_version,
+            "threshold": self.threshold,
+            "parameters": _thaw_json(self.parameters),
+        }
+
+
+@dataclass(frozen=True)
 class AgentConfigSnapshot(_JsonModel):
     agent_id: str
     agent_name: str
@@ -916,6 +1032,8 @@ class EvalRunConfig(_JsonModel):
     run_instance_key: str
     agent: AgentConfigSnapshot
     agent_config_digest: str
+    clarification_matcher: ClarificationMatcherSnapshot
+    clarification_matcher_config_digest: str
     evaluator: EvaluatorRunConfig
     evaluator_config_digest: str
     suite: SuiteRunConfig
@@ -931,6 +1049,13 @@ class EvalRunConfig(_JsonModel):
         if not isinstance(self.agent, AgentConfigSnapshot):
             raise SchemaError(
                 "run_config.agent must be a persisted AgentConfigSnapshot"
+            )
+        if not isinstance(
+            self.clarification_matcher,
+            ClarificationMatcherSnapshot,
+        ):
+            raise SchemaError(
+                "run_config.clarification_matcher must be a ClarificationMatcherSnapshot"
             )
         if not isinstance(self.evaluator, EvaluatorRunConfig):
             raise SchemaError("run_config.evaluator must be an EvaluatorRunConfig")
@@ -957,14 +1082,22 @@ class EvalRunConfig(_JsonModel):
                 "max_parallel_trials may not exceed the number of planned Trials"
             )
         expected_agent_digest = self.agent.digest()
+        expected_matcher_digest = self.clarification_matcher.digest()
         expected_evaluator_digest = self.evaluator.digest()
         if self.agent_config_digest != expected_agent_digest:
             raise SchemaError("agent_config_digest does not match agent config")
+        if self.clarification_matcher_config_digest != expected_matcher_digest:
+            raise SchemaError(
+                "clarification_matcher_config_digest does not match matcher config"
+            )
         if self.evaluator_config_digest != expected_evaluator_digest:
             raise SchemaError("evaluator_config_digest does not match evaluator config")
         expected_run_id = self.derive_run_id(
             run_instance_key=self.run_instance_key,
             agent_config_digest=self.agent_config_digest,
+            clarification_matcher_config_digest=(
+                self.clarification_matcher_config_digest
+            ),
             suite=self.suite,
             trial_count=self.trial_count,
             resource_budgets=self.resource_budgets,
@@ -979,6 +1112,7 @@ class EvalRunConfig(_JsonModel):
         *,
         run_instance_key: str,
         agent_config_digest: str,
+        clarification_matcher_config_digest: str,
         suite: SuiteRunConfig,
         trial_count: int,
         resource_budgets: ResourceBudgets,
@@ -989,6 +1123,9 @@ class EvalRunConfig(_JsonModel):
             "schema_version": EVAL_RUN_CONFIG_SCHEMA_VERSION,
             "run_instance_key": run_instance_key,
             "agent_config_digest": agent_config_digest,
+            "clarification_matcher_config_digest": (
+                clarification_matcher_config_digest
+            ),
             "agent_resource_budgets": {
                 "agent_timeout_seconds": resource_budgets.agent_timeout_seconds,
                 "max_agent_output_bytes": resource_budgets.max_agent_output_bytes,
@@ -1007,6 +1144,7 @@ class EvalRunConfig(_JsonModel):
         *,
         run_instance_key: str,
         agent_config_digest: str,
+        clarification_matcher_config_digest: str,
         suite: SuiteRunConfig,
         trial_count: int,
         resource_budgets: ResourceBudgets,
@@ -1016,6 +1154,9 @@ class EvalRunConfig(_JsonModel):
             cls._identity_payload(
                 run_instance_key=run_instance_key,
                 agent_config_digest=agent_config_digest,
+                clarification_matcher_config_digest=(
+                    clarification_matcher_config_digest
+                ),
                 suite=suite,
                 trial_count=trial_count,
                 resource_budgets=resource_budgets,
@@ -1028,6 +1169,7 @@ class EvalRunConfig(_JsonModel):
         *,
         run_instance_key: str,
         agent: AgentConfigSnapshot,
+        clarification_matcher: ClarificationMatcherSnapshot,
         evaluator: EvaluatorRunConfig,
         suite: SuiteRunConfig,
         trial_count: int,
@@ -1037,6 +1179,10 @@ class EvalRunConfig(_JsonModel):
         validate_safe_text(run_instance_key, "run_instance_key")
         if not isinstance(agent, AgentConfigSnapshot):
             raise SchemaError("agent must be a persisted AgentConfigSnapshot")
+        if not isinstance(clarification_matcher, ClarificationMatcherSnapshot):
+            raise SchemaError(
+                "clarification_matcher must be a ClarificationMatcherSnapshot"
+            )
         if not isinstance(evaluator, EvaluatorRunConfig):
             raise SchemaError("evaluator must be an EvaluatorRunConfig")
         if not isinstance(suite, SuiteRunConfig):
@@ -1044,10 +1190,12 @@ class EvalRunConfig(_JsonModel):
         if not isinstance(resource_budgets, ResourceBudgets):
             raise SchemaError("resource_budgets must be a ResourceBudgets")
         agent_digest = agent.digest()
+        matcher_digest = clarification_matcher.digest()
         evaluator_digest = evaluator.digest()
         run_id = cls.derive_run_id(
             run_instance_key=run_instance_key,
             agent_config_digest=agent_digest,
+            clarification_matcher_config_digest=matcher_digest,
             suite=suite,
             trial_count=trial_count,
             resource_budgets=resource_budgets,
@@ -1058,6 +1206,8 @@ class EvalRunConfig(_JsonModel):
             run_instance_key=run_instance_key,
             agent=agent,
             agent_config_digest=agent_digest,
+            clarification_matcher=clarification_matcher,
+            clarification_matcher_config_digest=matcher_digest,
             evaluator=evaluator,
             evaluator_config_digest=evaluator_digest,
             suite=suite,
@@ -1076,6 +1226,8 @@ class EvalRunConfig(_JsonModel):
                 "run_instance_key",
                 "agent",
                 "agent_config_digest",
+                "clarification_matcher",
+                "clarification_matcher_config_digest",
                 "evaluator",
                 "evaluator_config_digest",
                 "suite",
@@ -1095,6 +1247,13 @@ class EvalRunConfig(_JsonModel):
             agent=AgentConfigSnapshot.from_dict(payload["agent"]),
             agent_config_digest=_digest(
                 payload["agent_config_digest"], "run_config.agent_config_digest"
+            ),
+            clarification_matcher=ClarificationMatcherSnapshot.from_dict(
+                payload["clarification_matcher"]
+            ),
+            clarification_matcher_config_digest=_digest(
+                payload["clarification_matcher_config_digest"],
+                "run_config.clarification_matcher_config_digest",
             ),
             evaluator=EvaluatorRunConfig.from_dict(payload["evaluator"]),
             evaluator_config_digest=_digest(
@@ -1132,6 +1291,10 @@ class EvalRunConfig(_JsonModel):
             "run_instance_key": self.run_instance_key,
             "agent": self.agent.to_dict(),
             "agent_config_digest": self.agent_config_digest,
+            "clarification_matcher": self.clarification_matcher.to_dict(),
+            "clarification_matcher_config_digest": (
+                self.clarification_matcher_config_digest
+            ),
             "evaluator": self.evaluator.to_dict(),
             "evaluator_config_digest": self.evaluator_config_digest,
             "suite": self.suite.to_dict(),
@@ -1216,6 +1379,7 @@ __all__ = [
     "MAX_SUITE_CASES",
     "MAX_TRIAL_COUNT",
     "MAX_PLANNED_TRIALS",
+    "ClarificationMatcherSnapshot",
     "AgentConfigSnapshot",
     "EvaluatorRunConfig",
     "SuiteCase",

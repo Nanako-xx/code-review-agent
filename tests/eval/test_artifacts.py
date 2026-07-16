@@ -47,7 +47,7 @@ from review_agent_eval.models import (
     canonical_json_bytes,
 )
 
-from .test_config import agent_config, budgets, evaluator_config
+from .test_config import agent_config, budgets, evaluator_config, matcher_config
 
 
 TASK_ID = "../../private/case:with/slashes"
@@ -148,6 +148,7 @@ def make_config(
     return EvalRunConfig.create(
         run_instance_key=instance,
         agent=agent_config(),
+        clarification_matcher=matcher_config(),
         evaluator=evaluator or evaluator_config(),
         suite=SuiteRunConfig.from_case_snapshot(snapshot),
         trial_count=1,

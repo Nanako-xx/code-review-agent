@@ -1,6 +1,6 @@
 # Core Code Review Eval System 实施计划
 
-**状态：** 执行中（Task 1–4 已完成，下一步 Task 5）
+**状态：** 执行中（Task 1–5 已完成，下一步 Task 6）
 
 **设计来源：** `docs/superpowers/specs/2026-07-16-core-code-review-eval-system-design.md`
 
@@ -17,9 +17,12 @@
 ## 1. 全局不变量
 
 - Eval Harness 只通过 `EvalInput + bounded ClarificationChannel -> AgentUnderTestAdapter -> EvalSubmission` 观察被测 Agent；除当前产品 Adapter 的输出转换外，Evaluator 不依赖 Agent 的 Runtime、Session、Memory、Reviewer 数量、Context 组装或工具调用顺序。完整 Clarification Script 只在 Harness 侧，不能进入 Agent-facing EvalInput。
+- Adapter 是 Harness 内受信任的集成代码；Python `ClarificationChannel` 是最小权限 API，不是同进程安全沙箱。被测 Agent 与不受信任 Adapter 必须位于 Runner 管理的进程/HTTP/IPC 边界后，只能收到当前一轮答案，不能依靠 `__dir__` 或私有属性伪装物理隔离。
+- Clarification matcher 必须用正式 `ClarificationMatcherSnapshot` 显式配置，并以独立 digest 进入 Run identity、再投影到只能由 verified binding 工厂构造的 `AgentRunConfig`；`ClarificationSession` 拒绝 duck-typed binding。canonical matcher 要求带 claim ID 的问题完整解析全部 ID；部分/全部失配不能被 proposed values 掩盖，只有原本无 claim ID 时的显式 canonical proposed values 可用。否则稳定报 incompatibility，任意自由文本必须使用 versioned semantic matcher，不允许静默退回精确字符串匹配。每次候选判断保留 Harness-private immutable match receipt。
 - Prompt、模型、Provider、Risk 策略、Reviewer 策略和 Memory 配置只记录为不透明 Run Configuration，用于复现和分组，不形成独立产品得分。
 - Ground truth 和完整 Clarification Script 与 Agent workspace 必须物理隔离；Case 路径、环境变量、文件名、提交信息和临时目录都不得泄漏答案。
 - 每个 Trial 都从独立、干净、固定 base/head 的工作区开始；一个 Trial 创建的文件、Git 状态和产品持久状态不得影响另一个 Trial。
+- Adapter compatibility 在 Trial plan 创建前完成；不支持的输入能力作为 Run/Suite incompatibility 单独报告，不得进入 Agent failure rate。过滤 Case 时必须生成新的 Suite snapshot 与 Run ID。
 - `prepare`、`run-agent` 与 `evaluate` 必须解耦。更换 Judge、修复 matcher 或调整 rubric 时可以重评已有 Submission，不重新调用 Agent。
 - 每个 Trial 无论成功、失败、超时、阻塞还是输出不可解析，都必须生成一个终态 `EvalSubmission`；没有 Finding 是合法的零 Finding 输出，不得静默跳过 Case。
 - Ground-truth Finding 必须原子化标注；不要求唯一标准 Evidence。可选 `evidence_anchors` 只描述必须证明的事实，不要求 Agent 引用相同位置。
@@ -345,34 +348,38 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 - 新建 `tests/eval/test_agent_adapter.py`
 - 新建 `tests/eval/test_current_agent_adapter.py`
 - 新建 `tests/eval/test_clarification_script.py`
+- 修改 `src/review_agent_eval/config.py`、`models.py`、`artifacts.py`
+- 修改 `tests/eval/test_config.py`、`tests/eval/test_artifacts.py`
 
 **RED 测试：**
 
-- [ ] Adapter 接口只接收 EvalInput、workspace、AgentRunConfig 和能力受限的 `ClarificationChannel`，只返回 EvalSubmission/trace descriptor，不接收 EvalCase truth。
-- [ ] `ClarificationChannel` 允许提交一个实际问题并取得至多一个匹配回答，但不能读取 policy、完整答案表或剩余答案。
-- [ ] generic subprocess Adapter 使用参数数组而非 shell string，环境变量 allowlist、cwd、timeout、stdout/stderr 大小和终止语义受控。
-- [ ] clarification answers 按 material claim/action 消费；多问、少问、问题次序变化、错误 field 和答案耗尽都形成可评分 transcript，而不是 Harness 猜答案。
-- [ ] 当前 Agent Adapter 只从最终 `review_brief.json`、受校验 Observation artifacts 和公开终态提取 Intent/Findings/Evidence/Uncertainties。
-- [ ] explicit/inferred provenance、clarification history 和 unresolved question 被无损映射；Adapter 不自行把 inferred 改成 explicit。
-- [ ] Brief Finding 的 path/line/severity/evidence refs 稳定映射；缺失字段保留 null，不从 claim 文本猜行号。
-- [ ] Observation ID、raw artifact hash、revision binding 与 Finding refs 交叉校验；未引用或越权 Observation 不被补成 Agent Evidence。
-- [ ] `base@sha`、`head@sha` 和精确 diff-range 规范化为 Eval Evidence binding；无法重放的产品证据保留为可诊断的 invalid/missing，不由 Adapter伪造新的文件引用。
-- [ ] completed、awaiting clarification、failed、invalid artifact 和零 Finding 都产生合法 Submission。
-- [ ] Adapter 不读取 Memory Store、Session 内部计划或 Reviewer trace 为 Agent 增加它未输出的 Finding；只可为 Agent 已引用的 command artifact 生成可审计 attestation，或把已引用搜索/符号结果规范化为其实际 file/diff source。
+- [x] Adapter 接口只接收 EvalInput、workspace、AgentRunConfig 和能力受限的 `ClarificationChannel`，只返回 EvalSubmission/trace descriptor，不接收 EvalCase truth。
+- [x] `ClarificationChannel` 允许提交一个实际问题并取得至多一个匹配回答，但不能读取 policy、完整答案表或剩余答案。
+- [x] generic subprocess Adapter 使用参数数组而非 shell string，环境变量 allowlist、cwd、timeout、stdout/stderr 大小和终止语义受控。
+- [x] clarification answers 按 material claim/action 消费；多问、少问、问题次序变化、错误 field 和答案耗尽都形成可评分 transcript，而不是 Harness 猜答案。
+- [x] 当前 Agent Adapter 只从最终 `review_brief.json`、受校验 Observation artifacts 和公开终态提取 Intent/Findings/Evidence/Uncertainties。
+- [x] explicit/inferred provenance、clarification history 和 unresolved question 被无损映射；Adapter 不自行把 inferred 改成 explicit。
+- [x] Brief Finding 的 path/line/severity/evidence refs 稳定映射；缺失字段保留 null，不从 claim 文本猜行号。
+- [x] Observation ID、raw artifact hash、revision binding 与 Finding refs 交叉校验；未引用或越权 Observation 不被补成 Agent Evidence。
+- [x] `base@sha`、`head@sha` 和精确 diff-range 规范化为 Eval Evidence binding；无法重放的产品证据保留为可诊断的 invalid/missing，不由 Adapter伪造新的文件引用。
+- [x] completed、awaiting clarification、failed、invalid artifact 和零 Finding 都产生合法 Submission。
+- [x] Adapter 不读取 Memory Store、Session 内部计划或 Reviewer trace 为 Agent 增加它未输出的 Finding；只可为 Agent 已引用的 command artifact 生成可审计 attestation，或把已引用搜索/符号结果规范化为其实际 file/diff source。
 
 **实现：**
 
-- [ ] 定义 `AgentUnderTestAdapter` Protocol、`AgentRunConfig` 和稳定 error taxonomy。
-- [ ] generic subprocess Adapter 支持任意外部 Agent 的 JSON 输入/输出约定，具体命令模板由 Run Config 固定。
-- [ ] 当前产品 Adapter 黑盒调用正式 `review-agent review` 入口；每个 Trial 使用隔离 run/memory root，并仅把 `ClarificationChannel` 当前返回的单个回答写入 stdin。
-- [ ] 解析当前产品最终 artifact，生成 canonical EvalSubmission；保留 `trace_ref` 指向有界 Trial trace。
-- [ ] usage 只填写产品真实提供的数据；未知 token/cost 为 null，不估算或捏造。
+- [x] 定义 `AgentUnderTestAdapter` Protocol、`AgentRunConfig` 和稳定 error taxonomy。
+- [x] generic subprocess Adapter 支持任意外部 Agent 的 JSON 输入/输出约定，具体命令模板由 Run Config 固定。
+- [x] 当前产品 Adapter 黑盒调用正式 `review-agent review` 入口；每个 Trial 使用隔离 run/memory root，并仅把 `ClarificationChannel` 当前返回的单个回答写入 stdin。
+- [x] 解析当前产品最终 artifact，生成 canonical EvalSubmission；保留 `trace_ref` 指向有界 Trial trace。
+- [x] usage 只填写产品真实提供的数据；未知 token/cost 为 null，不估算或捏造。
 
 **验证：**
 
 ```powershell
 & 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_agent_adapter.py tests/eval/test_current_agent_adapter.py tests/eval/test_clarification_script.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t5'
 ```
+
+**完成记录（2026-07-16）：** Task 5 定向测试 91 项通过；完整 Eval 回归 430 项通过、3 项按平台/能力跳过（共 433 项）；产品 models/hydration/architecture boundary 回归 63 项通过。已落地 run-bound `ClarificationMatcherSnapshot`、sealed `AgentRunConfig`、Harness-private match receipt、strict ordered clarification transcript、generic/current black-box Adapter、preflight/dynamic incompatibility、canonical Submission/trace binding，以及 Observation/Evidence 的 revision/hash/authority 转换。未经 Harness immutable attestation 的 command output（含 truncated output）不会生成 Evidence；existing-CI 与无法 canonicalize 的 material claim 抛稳定 incompatibility，不计为产品 `adapter_error`。独立子 Agent 最终复核 PASS；Task 6 将负责在 Trial plan 前强制 capability gating，并持久化 match receipt/可选 Runner attestation。
 
 **提交边界：** `feat(eval): adapt black box agents into canonical submissions`
 
@@ -399,12 +406,16 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 - [ ] 并行 Case/Trial 的 workspace、run artifact、端口、环境和产品状态相互隔离。
 - [ ] 中断和 cancellation 终止完整子进程树，并保留可读诊断。
 - [ ] Runner 不读取 truth、不计算 metric、不调用 Judge。
+- [ ] Adapter capability preflight 在任何 Trial plan/workspace 创建前运行；strict 模式以稳定 incompatibility reason 拒绝整个 Run，filter 模式必须先生成新的 Suite Snapshot/Run ID 与 capability coverage，不产生伪 `adapter_error` Submission。
+- [ ] Harness-private clarification match receipts 按 Trial 持久化并由 terminal receipt 绑定；Agent trace/Submission 不得包含完整候选答案表。
+- [ ] command-output 只有在 Harness 自己观察或执行命令并生成完整 immutable attestation 时才可进入 Evidence；attestation 绑定 Trial、revision、argv、exit code、stream、完整 bytes/hash/size，任何 truncated 或 self-reported product output 都保持 missing。
 
 **实现：**
 
 - [ ] 实现单 Trial 与有界 worker pool 调度、timeout/cancellation、terminal Submission factory。
 - [ ] 每个 Trial 固定 config digest、Case digest、workspace binding 和 Adapter version。
 - [ ] 将原始输出保存为有界 trace；报告只暴露脱敏摘要。
+- [ ] 持久化 capability preflight 结果、clarification match receipts 和可选 Runner command attestations；全部 create-only、hash-bound、受 execution artifact budget 约束。
 - [ ] 为后续重复 Trial 预留确定性 trial index/seed，但不把 seed 传给不支持它的 Agent 冒充可控随机性。
 
 **验证：**

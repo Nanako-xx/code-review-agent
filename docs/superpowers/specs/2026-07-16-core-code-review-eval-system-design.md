@@ -96,6 +96,13 @@ Eval System 不需要知道 Agent 内部：
 
 ```python
 class AgentUnderTestAdapter:
+    def compatibility(
+        self,
+        eval_input: EvalInput,
+        config: AgentRunConfig,
+    ) -> AdapterCompatibility:
+        ...
+
     def run(
         self,
         eval_input: EvalInput,
@@ -106,7 +113,11 @@ class AgentUnderTestAdapter:
         ...
 ```
 
-`ClarificationChannel` 只暴露“提交一个实际问题并取得至多一个匹配回答”的方法，不暴露 Case policy、答案列表或剩余答案。Harness 持有并消费 Clarification Script；Adapter 和 Agent 永远拿不到完整脚本。
+`ClarificationChannel` 只暴露“提交一个实际问题并取得至多一个匹配回答”的方法，不把 Case policy、答案列表或剩余答案作为 Adapter authority。Harness 持有并消费 Clarification Script；Adapter 只取得受限 channel，Agent 只取得当前一次回答。
+
+Adapter 是 Harness 内受信任的集成代码，Python facade 是最小权限 API，不冒充同进程安全沙箱。被测 Agent、第三方 CLI 和其他不受信任代码必须位于进程/HTTP/IPC 边界之后，不能取得 channel object；Adapter 只能把本轮单个回答转发给它。若某个“Adapter”本身是不受信任代码，也必须把它放到 Runner 管理的独立进程，不能依靠私有属性或 `__dir__` 隐藏答案。
+
+`compatibility()` 在创建 Trial 之前完成输入能力检查。Adapter 不支持 Case 所需输入能力时，Harness 以稳定 incompatibility reason 拒绝 Run 或生成显式过滤后的新 Suite/Run identity；不得创建 Trial 后再把它计为 `adapter_error`。即使调用方错误地绕过 preflight，Adapter 也必须抛出稳定 `AgentAdapterIncompatibleError`，不能伪造产品失败 Submission。
 
 Adapter 可以：
 
@@ -550,6 +561,9 @@ Clarification Script 是 Case/Harness 私有交互数据，不属于 Agent-facin
 - `max_rounds` 是 1 到 16 的正整数；answer ID 唯一；
 - `correct` 必须提供非空 `corrected_values`；其他 action 的 `corrected_values` 必须为空；
 - 问题按 `dimension + material_claim` 做语义匹配，不按精确句子匹配；
+- matcher 没有静默的“精确文本假装语义”fallback：只要产品问题带 claim ID，就必须完整解析全部 ID 后才能选择 versioned canonical matcher，部分/全部失配不得被 proposed values 掩盖；仅在问题本来就没有 claim ID 时，产品显式给出的 canonical proposed values 才可作为 canonical claim。其余路径必须抛出稳定 incompatibility；接收任意自由文本 material claim 的 Run 必须配置真正的 semantic matcher；
+- matcher 使用 `EvalRunConfig.clarification_matcher` 中的正式 `ClarificationMatcherSnapshot`，其 digest 独立进入 Run identity；Snapshot 严格绑定 matcher ID/version、implementation digest、可选 model artifact digest、rubric digest、normalization version、threshold 和 bounded parameters；`AgentRunConfig` 只能通过 verified binding 工厂构造，`ClarificationSession` 只接受该具体类型并经 matcher factory 构造 matcher，不接受 duck-typed snapshot/digest 对，修改任一维度必须产生新的 Run identity；
+- 每次 material-claim 匹配生成 Harness-private immutable receipt，保存 request/matcher digest、逐候选布尔判断、action eligibility 以及 matched/unmatched/ambiguous/round-limit 结果；Agent-facing transcript 只保存实际问答，不泄漏候选答案表；
 - 是否应该澄清只由 `intent_truth.clarification_policy` 表达，不在 Script 中保存第二份可冲突 policy；
 - Runner 每次只向 `ClarificationChannel` 返回当前问题匹配到的一个回答，不暴露 truth policy、答案列表、剩余答案或 ground truth；
 - 没有匹配答案、答案耗尽或超过最大轮数时保留未解决 transcript，不由 Harness 猜测答案。
@@ -1343,11 +1357,12 @@ Run Config 记录：
 - 模型和 Provider；
 - Prompt/config digest；
 - 模型参数；
+- Clarification Matcher Snapshot 及其独立 config digest；Snapshot exact keys 为 `matcher_id/matcher_version/implementation_digest/model_artifact_digest/rubric_digest/normalization_version/threshold/parameters`，只有 model artifact digest 和 threshold 可为 null；
 - Suite manifest digest、Case Snapshot ID/digest、Case bindings 与版本；
 - Trial 数量；
 - Grader/Judge/rubric 版本。
 
-Run ID 只绑定 Agent-side execution identity：run instance key、Agent config、影响 Agent 执行的 timeout/output/trace/artifact/parallel resource budgets、Case Snapshot/Suite binding 和 Trial 数量；不绑定 Evaluator/Judge 及只影响重评的 evaluator timeout，因此同一 Submission 可以重评。每次重评把 Judge/model/rubric 配置、evaluator timeout 与 execution artifact file/total budgets 冻结为严格 `eval_evaluator_execution_config_v1`；其完整 digest 与显式 revision 派生独立 `evaluation-id`。Evaluator receipt 同时保存 execution digest、revision 与 ID，并在 hydration 时重新验证三者关系。相同 Judge/revision 但 timeout 或执行预算不同，也必须得到不同命名空间，不能覆盖或伪装成同一次评测。
+Run ID 只绑定 Agent-side execution identity：run instance key、Agent config、Clarification Matcher config digest、影响 Agent 执行的 timeout/output/trace/artifact/parallel resource budgets、Case Snapshot/Suite binding 和 Trial 数量；不绑定 Evaluator/Judge 及只影响重评的 evaluator timeout，因此同一 Submission 可以重评。每次重评把 Judge/model/rubric 配置、evaluator timeout 与 execution artifact file/total budgets 冻结为严格 `eval_evaluator_execution_config_v1`；其完整 digest 与显式 revision 派生独立 `evaluation-id`。Evaluator receipt 同时保存 execution digest、revision 与 ID，并在 hydration 时重新验证三者关系。相同 Judge/revision 但 timeout 或执行预算不同，也必须得到不同命名空间，不能覆盖或伪装成同一次评测。
 
 所有 JSON artifact 使用 canonical UTF-8、单文件/累计读取预算、内容 hash 和 create-if-absent 发布。`run_config.json`、`case_snapshot.json`、Run/Trial manifest、receipts 与必须始终落盘的 canonical terminal Submission 属于 control plane，分别受协议上限约束，不受 execution artifact budget 意外截断；v1 Run Config 上限为 32 MiB，Artifact Store 默认单文件/累计读取上限为 256/512 MiB，正好能够持久化协议允许的 Snapshot。Agent 原始 stdout/stderr、trace 与 evaluator 产物另受 `max_execution_artifact_file_bytes` / `max_execution_artifact_total_bytes` 约束，字段名不得再伪装成覆盖所有 control-plane artifact 的全局上限。
 

@@ -1769,25 +1769,31 @@ class SubmissionFailure(_JsonModel):
         }
 
 
-_FAILED_CODES = frozenset(
-    {
-        FailureCode.TIMEOUT,
-        FailureCode.NON_ZERO_EXIT,
-        FailureCode.PROCESS_KILLED,
-        FailureCode.ADAPTER_ERROR,
-        FailureCode.UNKNOWN,
-    }
-)
-_BLOCKED_CODES = frozenset(
-    {FailureCode.CLARIFICATION_REQUIRED, FailureCode.AGENT_BLOCKED}
-)
-_INVALID_OUTPUT_CODES = frozenset(
-    {
-        FailureCode.INVALID_JSON,
-        FailureCode.SCHEMA_MISMATCH,
-        FailureCode.OUTPUT_OVERFLOW,
-    }
-)
+_FAILURE_STATUS_BY_CODE = {
+    FailureCode.TIMEOUT: SubmissionStatus.FAILED,
+    FailureCode.NON_ZERO_EXIT: SubmissionStatus.FAILED,
+    FailureCode.PROCESS_KILLED: SubmissionStatus.FAILED,
+    FailureCode.ADAPTER_ERROR: SubmissionStatus.FAILED,
+    FailureCode.UNKNOWN: SubmissionStatus.FAILED,
+    FailureCode.CLARIFICATION_REQUIRED: SubmissionStatus.BLOCKED,
+    FailureCode.AGENT_BLOCKED: SubmissionStatus.BLOCKED,
+    FailureCode.INVALID_JSON: SubmissionStatus.INVALID_OUTPUT,
+    FailureCode.SCHEMA_MISMATCH: SubmissionStatus.INVALID_OUTPUT,
+    FailureCode.OUTPUT_OVERFLOW: SubmissionStatus.INVALID_OUTPUT,
+}
+
+
+def submission_status_for_failure(code: FailureCode) -> SubmissionStatus:
+    """Return the one canonical terminal Submission status for ``code``."""
+
+    if not isinstance(code, FailureCode):
+        raise TypeError("failure code must be FailureCode")
+    try:
+        return _FAILURE_STATUS_BY_CODE[code]
+    except KeyError as exc:
+        raise ValueError(
+            "failure code has no canonical terminal Submission status"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -1837,10 +1843,14 @@ class EvalSubmission(_JsonModel):
                     "completed submission requires intent/review and failure=null"
                 )
         elif self.status is SubmissionStatus.FAILED:
-            if self.failure is None or self.failure.code not in _FAILED_CODES:
+            if self.failure is None or submission_status_for_failure(
+                self.failure.code
+            ) is not SubmissionStatus.FAILED:
                 raise _error("failed submission has an invalid or missing failure code")
         elif self.status is SubmissionStatus.BLOCKED:
-            if self.failure is None or self.failure.code not in _BLOCKED_CODES:
+            if self.failure is None or submission_status_for_failure(
+                self.failure.code
+            ) is not SubmissionStatus.BLOCKED:
                 raise _error("blocked submission has an invalid or missing failure code")
             if self.failure.code is FailureCode.CLARIFICATION_REQUIRED:
                 unresolved = (
@@ -1855,7 +1865,9 @@ class EvalSubmission(_JsonModel):
                         "clarification_required needs Intent with an unresolved exchange"
                     )
         elif self.status is SubmissionStatus.INVALID_OUTPUT:
-            if self.failure is None or self.failure.code not in _INVALID_OUTPUT_CODES:
+            if self.failure is None or submission_status_for_failure(
+                self.failure.code
+            ) is not SubmissionStatus.INVALID_OUTPUT:
                 raise _error(
                     "invalid_output submission has an invalid or missing failure code"
                 )
@@ -2993,6 +3005,7 @@ __all__ = [
     "TraceRef",
     "SubmissionFailure",
     "EvalSubmission",
+    "submission_status_for_failure",
     "CaseSource",
     "ClarificationAnswer",
     "ClarificationScript",
