@@ -1,6 +1,6 @@
 # Core Code Review Eval System 实施计划
 
-**状态：** 执行中（Task 1–3 已完成，下一步 Task 4）
+**状态：** 执行中（Task 1–4 已完成，下一步 Task 5）
 
 **设计来源：** `docs/superpowers/specs/2026-07-16-core-code-review-eval-system-design.md`
 
@@ -297,22 +297,22 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 **RED 测试：**
 
-- [ ] local fixture、local Git cache 和显式 remote source 都解析到精确 full base/head SHA；不存在、非 commit 或相同错误 binding 失败。
-- [ ] fixture source tree 使用固定作者/时间/排序创建可复现 commits，并校验 base/head tree digest。
-- [ ] 每个 Trial 获得独立 writable checkout；base object 可读、HEAD 固定，另一个 Trial 的未跟踪文件和产品目录不可见。
-- [ ] dirty source repository 不污染 Trial；submodule、LFS、symlink 和 nested repository 使用显式 policy，不隐式访问网络。
-- [ ] truth 文件、suite manifest、held-out 标注和 evaluator config 永不复制到 Agent workspace。
-- [ ] cleanup 失败形成诊断但不篡改 Trial 成绩；保留 workspace 的 debug policy 明确且默认有界。
-- [ ] remote prepare 校验 URL 脱敏、commit allowlist、content hash 和 license；trial phase 断网也可运行。
-- [ ] Windows path/case/reparse point 与 Unix symlink 路径均不能逃逸 eval root。
+- [x] local fixture、local Git cache 和显式 remote source 都解析到精确 full base/head SHA；不存在、非 commit 或相同错误 binding 失败。
+- [x] fixture source tree 使用固定作者/时间/排序创建可复现 commits，并校验 base/head tree digest。
+- [x] 每个 Trial 获得独立 writable checkout；base object 可读、HEAD 固定，另一个 Trial 的未跟踪文件和产品目录不可见。
+- [x] dirty source repository 不污染 Trial；submodule、LFS、symlink 和 nested repository 使用显式 policy，不隐式访问网络。
+- [x] truth 文件、suite manifest、held-out 标注和 evaluator config 永不复制到 Agent workspace。
+- [x] cleanup 失败形成诊断但不篡改 Trial 成绩；保留 workspace 的 debug policy 明确且默认有界。
+- [x] remote prepare 校验 URL 脱敏、commit allowlist、content hash 和 license；trial phase 断网也可运行。
+- [x] Windows path/case/reparse point 与 Unix symlink 路径均不能逃逸 eval root。
 
 **实现：**
 
-- [ ] 实现 `PreparedRepository`、`TrialWorkspace` 和 `RepositoryPreparer` context manager。
-- [ ] 外部 source 只在 `prepare` 阶段进入 `.eval-data/` 内容寻址 cache；Trial 只读取固定对象。
-- [ ] Core fixture builder 从提交的 base/head trees 创建确定性 Git 仓库，再产生正常 `EvalInput` full SHA。
-- [ ] workspace manifest 记录 source digest、base/head SHA、Git version 和隔离策略，不记录凭证。
-- [ ] 显式清理与保留策略都先校验 resolved absolute path 位于 eval workspace root。
+- [x] 实现 `PreparedRepository`、`TrialWorkspace` 和 `RepositoryPreparer` context manager。
+- [x] 外部 source 只在 `prepare` 阶段进入 `.eval-data/` 内容寻址 cache；Trial 只读取固定对象。
+- [x] Core fixture builder 从提交的 base/head trees 创建确定性 Git 仓库，再产生正常 `EvalInput` full SHA。
+- [x] workspace manifest 记录 source digest、base/head SHA、Git version 和隔离策略，不记录凭证。
+- [x] 显式清理与保留策略都先校验 resolved absolute path 位于 eval workspace root。
 
 **验证：**
 
@@ -321,6 +321,8 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 ```
 
 **提交边界：** `feat(eval): isolate reproducible repository trials`
+
+**完成记录（2026-07-16）：** Task 4 定向回归 55 项通过、3 项按平台能力跳过；Task 1–4 全部 Eval 回归 328 项通过、3 项跳过，产品模型/hydration/架构边界回归 63 项通过。唯一 canonical `Repository` 贯穿 acquisition、runtime、Workspace 与 immutable request index；纯内容 `PreparedRepositoryManifest` 与 Git 版本/二进制 provenance 分层，物理压缩字节不再污染内容身份。Fixture/local Git 先经 POSIX descriptor-relative 或 Windows held-handle 安全快照，再进入有界 quarantine、逻辑 Git object closure 和手工 Trial materialization；cache 使用原子 no-replace 发布、独立 loose objects，禁止 remotes、alternates、hardlinks、hooks、filters、LFS、submodule、symlink 与非便携路径。`.eval-data` 使用全局 byte/node quota、跨进程持久 capacity reservation、request/content/data-store locks，并在恢复时回收 stale reservation、orphan staging 与未被 index 引用的 cache；Git 子进程继承 operation lease，父进程崩溃后其存活期间 staging 和 reservation 仍不可被回收或复用。Remote 默认关闭；显式 binding 复用 canonical `Repository` 与 `SuiteSource`，要求 licensed provenance、HTTPS、无凭证/redirect、global-unicast DNS、`http.curloptResolve` capability gate 和固定解析。Windows 控制树使用 protected exact DACL，仅允许当前身份、SYSTEM 与 Administrators；控制根 owner/权限、进程树、输出、解压、保留与删除均 fail closed。Task 4 明确不冒充已提供 Trial OS 身份或 egress 隔离，该边界由后续 Adapter/Runner sandbox 落实。
 
 ---
 
