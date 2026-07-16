@@ -1,0 +1,3471 @@
+"""Create-only, resumable artifacts for canonical code-review evaluations.
+
+``run_manifest.json`` and every ``trial_manifest.json`` are immutable plans.
+Execution state is derived only from create-only receipts.  In particular, a
+Submission is committed by one terminal agent receipt written *after* all
+artifacts it binds; nonterminal/incomplete Trials therefore have no committed
+Submission.  Evaluator artifacts live under versioned ``evaluations``
+namespaces and never mutate the agent Submission.
+"""
+
+from __future__ import annotations
+
+import errno
+import hashlib
+import os
+import re
+import stat
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any, ClassVar, Dict, Iterable, Iterator, List, Optional, Tuple
+
+from .cases import MAX_RUN_CASE_SNAPSHOT_BYTES, RunCaseSnapshot
+from .config import (
+    MAX_EVAL_RUN_CONFIG_BYTES,
+    EvalRunConfig,
+    EvaluatorExecutionConfig,
+    SuiteRunConfig,
+    derive_case_path_id,
+    derive_evaluation_id,
+    derive_trial_id,
+    derive_trial_seed,
+    validate_case_path_id,
+    validate_evaluation_id,
+    validate_evaluation_id_shape,
+    validate_path_segment,
+    validate_run_id,
+    validate_safe_json,
+    validate_safe_text,
+    validate_trial_id,
+    validate_trial_id_shape,
+)
+from .models import (
+    EVAL_SUBMISSION_SCHEMA_VERSION,
+    MAX_COUNTER,
+    MAX_EVAL_INPUT_BYTES,
+    MAX_EVAL_SUBMISSION_BYTES,
+    EvalInput,
+    EvalSubmission,
+    FailureCode,
+    SchemaError,
+    SubmissionFailure,
+    SubmissionStatus,
+    SubmissionUsage,
+    TrialStatus,
+    _JsonModel,
+    _array,
+    _check_model_size,
+    _digest,
+    _enum_value,
+    _exact_fields,
+    _identifier,
+    _integer,
+    _object,
+    _strict_json_loads,
+    canonical_json_bytes,
+    stable_id,
+    submission_status_for_failure,
+)
+
+
+EVAL_RUN_MANIFEST_SCHEMA_VERSION = "eval_run_manifest_v1"
+EVAL_TRIAL_MANIFEST_SCHEMA_VERSION = "eval_trial_manifest_v1"
+EVAL_STAGE_RECEIPT_SCHEMA_VERSION = "eval_stage_receipt_v1"
+
+MAX_RUN_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_TRIAL_MANIFEST_BYTES = 1024 * 1024
+MAX_STAGE_RECEIPT_BYTES = 2 * 1024 * 1024
+MAX_MANIFEST_TRIALS = 100_000
+MAX_RECEIPT_ARTIFACTS = 128
+MAX_ARTIFACT_PATH_CHARS = 2_048
+MAX_TRIAL_ATTEMPTS = 10_000
+DEFAULT_MAX_FILE_BYTES = MAX_RUN_CASE_SNAPSHOT_BYTES
+DEFAULT_MAX_TOTAL_READ_BYTES = 512 * 1024 * 1024
+DIRECTORY_FSYNC_SUPPORTED = os.name != "nt"
+
+
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_ATTEMPT_RE = re.compile(r"^attempt-[0-9]{4,5}$")
+_TEMP_FILE_RE = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
+_INTERNAL_DIRECTORIES = frozenset(
+    {".locks", "cases", "trials", "receipts", "evaluations"}
+)
+_TERMINAL_STATUSES = frozenset(
+    {
+        TrialStatus.COMPLETED,
+        TrialStatus.FAILED,
+        TrialStatus.BLOCKED,
+        TrialStatus.INVALID_OUTPUT,
+    }
+)
+class ArtifactError(RuntimeError):
+    """Base class for artifact persistence failures."""
+
+
+class ArtifactConflictError(ArtifactError):
+    """A create-only artifact or writer claim already exists."""
+
+
+class ArtifactIntegrityError(ArtifactError):
+    """Stored bytes fail canonical, size, hash, or identity validation."""
+
+
+class ArtifactSecurityError(ArtifactIntegrityError):
+    """A path contains a symlink, reparse point, or special node."""
+
+
+class ArtifactStateError(ArtifactError):
+    """The requested receipt would violate the Trial state machine."""
+
+
+class RunStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    INCOMPLETE = "incomplete"
+    COMPLETED = "completed"
+
+
+class StageName(str, Enum):
+    START = "start"
+    PREPARE = "prepare"
+    INCOMPLETE = "incomplete"
+    AGENT = "agent"
+    EVALUATOR = "evaluator"
+
+
+def _require_enum(enum_type: Any, value: Any, context: str) -> Any:
+    if not isinstance(value, enum_type):
+        raise SchemaError("%s must be a %s" % (context, enum_type.__name__))
+    return value
+
+
+def _relative_artifact_path(value: Any, context: str = "artifact path") -> str:
+    if type(value) is not str or not value or len(value) > MAX_ARTIFACT_PATH_CHARS:
+        raise SchemaError("%s must be a bounded non-empty relative path" % context)
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeEncodeError as exc:
+        raise SchemaError("%s must contain valid Unicode" % context) from exc
+    if value.startswith("/") or "\\" in value or "//" in value:
+        raise SchemaError("%s must be normalized POSIX relative form" % context)
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise SchemaError("%s may not traverse directories" % context)
+    for part in parts:
+        validate_path_segment(part, context)
+    return value
+
+
+@dataclass(frozen=True)
+class ArtifactRef(_JsonModel):
+    relative_path: str
+    sha256: str
+    size_bytes: int
+
+    def __post_init__(self) -> None:
+        _relative_artifact_path(self.relative_path)
+        _digest(self.sha256, "artifact.sha256")
+        _integer(
+            self.size_bytes,
+            "artifact.size_bytes",
+            minimum=0,
+            maximum=MAX_COUNTER,
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "ArtifactRef":
+        payload = _object(value, "artifact")
+        _exact_fields(payload, ("relative_path", "sha256", "size_bytes"), "artifact")
+        return cls(
+            relative_path=_relative_artifact_path(payload["relative_path"]),
+            sha256=_digest(payload["sha256"], "artifact.sha256"),
+            size_bytes=_integer(
+                payload["size_bytes"],
+                "artifact.size_bytes",
+                minimum=0,
+                maximum=MAX_COUNTER,
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "relative_path": self.relative_path,
+            "sha256": self.sha256,
+            "size_bytes": self.size_bytes,
+        }
+
+
+@dataclass(frozen=True)
+class TrialManifest(_JsonModel):
+    """Immutable Trial plan; it deliberately contains no execution status."""
+
+    SCHEMA_VERSION: ClassVar[str] = EVAL_TRIAL_MANIFEST_SCHEMA_VERSION
+
+    schema_version: str
+    run_id: str
+    task_id: str
+    case_path_id: str
+    canonical_case_digest: str
+    eval_input_digest: str
+    trial_id: str
+    trial_index: int
+    seed: int
+    agent_config_digest: str
+    initial_evaluator_execution_digest: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != self.SCHEMA_VERSION:
+            raise SchemaError("TrialManifest has an unknown schema_version")
+        validate_run_id(self.run_id)
+        _identifier(self.task_id, "trial_manifest.task_id")
+        validate_case_path_id(self.case_path_id)
+        if self.case_path_id != derive_case_path_id(self.task_id):
+            raise SchemaError("case_path_id does not match opaque task_id")
+        _digest(
+            self.canonical_case_digest,
+            "trial_manifest.canonical_case_digest",
+        )
+        _digest(self.eval_input_digest, "trial_manifest.eval_input_digest")
+        validate_trial_id(self.trial_id, self.run_id, self.task_id, self.trial_index)
+        _integer(
+            self.trial_index,
+            "trial_manifest.trial_index",
+            minimum=1,
+            maximum=MAX_COUNTER,
+        )
+        if self.seed != derive_trial_seed(self.run_id, self.task_id, self.trial_index):
+            raise SchemaError("Trial seed does not match its canonical identity")
+        _digest(self.agent_config_digest, "trial_manifest.agent_config_digest")
+        _digest(
+            self.initial_evaluator_execution_digest,
+            "trial_manifest.initial_evaluator_execution_digest",
+        )
+        validate_safe_json(self.to_dict(), "trial_manifest")
+        _check_model_size(self, MAX_TRIAL_MANIFEST_BYTES, "TrialManifest")
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "TrialManifest":
+        payload = _object(value, "TrialManifest")
+        _exact_fields(
+            payload,
+            (
+                "schema_version",
+                "run_id",
+                "task_id",
+                "case_path_id",
+                "canonical_case_digest",
+                "eval_input_digest",
+                "trial_id",
+                "trial_index",
+                "seed",
+                "agent_config_digest",
+                "initial_evaluator_execution_digest",
+            ),
+            "TrialManifest",
+        )
+        if payload["schema_version"] != cls.SCHEMA_VERSION:
+            raise SchemaError("TrialManifest has an unknown schema_version")
+        return cls(
+            schema_version=payload["schema_version"],
+            run_id=validate_run_id(payload["run_id"]),
+            task_id=_identifier(payload["task_id"], "trial_manifest.task_id"),
+            case_path_id=validate_case_path_id(payload["case_path_id"]),
+            canonical_case_digest=_digest(
+                payload["canonical_case_digest"],
+                "trial_manifest.canonical_case_digest",
+            ),
+            eval_input_digest=_digest(
+                payload["eval_input_digest"], "trial_manifest.eval_input_digest"
+            ),
+            trial_id=validate_trial_id_shape(payload["trial_id"]),
+            trial_index=_integer(
+                payload["trial_index"],
+                "trial_manifest.trial_index",
+                minimum=1,
+                maximum=MAX_COUNTER,
+            ),
+            seed=_integer(
+                payload["seed"],
+                "trial_manifest.seed",
+                minimum=0,
+                maximum=(1 << 63) - 1,
+            ),
+            agent_config_digest=_digest(
+                payload["agent_config_digest"],
+                "trial_manifest.agent_config_digest",
+            ),
+            initial_evaluator_execution_digest=_digest(
+                payload["initial_evaluator_execution_digest"],
+                "trial_manifest.initial_evaluator_execution_digest",
+            ),
+        )
+
+    @classmethod
+    def from_json(cls, data: Any) -> "TrialManifest":
+        return cls.from_dict(
+            _strict_json_loads(data, MAX_TRIAL_MANIFEST_BYTES, "TrialManifest JSON")
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "case_path_id": self.case_path_id,
+            "canonical_case_digest": self.canonical_case_digest,
+            "eval_input_digest": self.eval_input_digest,
+            "trial_id": self.trial_id,
+            "trial_index": self.trial_index,
+            "seed": self.seed,
+            "agent_config_digest": self.agent_config_digest,
+            "initial_evaluator_execution_digest": self.initial_evaluator_execution_digest,
+        }
+
+
+@dataclass(frozen=True)
+class RunTrialPlan(_JsonModel):
+    task_id: str
+    case_path_id: str
+    canonical_case_digest: str
+    eval_input_digest: str
+    trial_id: str
+    trial_index: int
+    manifest: ArtifactRef
+
+    def __post_init__(self) -> None:
+        _identifier(self.task_id, "run trial.task_id")
+        validate_case_path_id(self.case_path_id)
+        if self.case_path_id != derive_case_path_id(self.task_id):
+            raise SchemaError("run trial.case_path_id does not match task_id")
+        _digest(
+            self.canonical_case_digest,
+            "run trial.canonical_case_digest",
+        )
+        _digest(self.eval_input_digest, "run trial.eval_input_digest")
+        validate_trial_id_shape(self.trial_id)
+        _integer(
+            self.trial_index,
+            "run trial.trial_index",
+            minimum=1,
+            maximum=MAX_COUNTER,
+        )
+        if not isinstance(self.manifest, ArtifactRef):
+            raise SchemaError("run trial.manifest must be an ArtifactRef")
+        expected = "cases/%s/trials/%s/trial_manifest.json" % (
+            self.case_path_id,
+            self.trial_id,
+        )
+        if self.manifest.relative_path != expected:
+            raise SchemaError("run trial.manifest references the wrong immutable plan")
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "RunTrialPlan":
+        payload = _object(value, "run trial")
+        _exact_fields(
+            payload,
+            (
+                "task_id",
+                "case_path_id",
+                "canonical_case_digest",
+                "eval_input_digest",
+                "trial_id",
+                "trial_index",
+                "manifest",
+            ),
+            "run trial",
+        )
+        return cls(
+            task_id=_identifier(payload["task_id"], "run trial.task_id"),
+            case_path_id=validate_case_path_id(payload["case_path_id"]),
+            canonical_case_digest=_digest(
+                payload["canonical_case_digest"],
+                "run trial.canonical_case_digest",
+            ),
+            eval_input_digest=_digest(
+                payload["eval_input_digest"], "run trial.eval_input_digest"
+            ),
+            trial_id=validate_trial_id_shape(payload["trial_id"]),
+            trial_index=_integer(
+                payload["trial_index"],
+                "run trial.trial_index",
+                minimum=1,
+                maximum=MAX_COUNTER,
+            ),
+            manifest=ArtifactRef.from_dict(payload["manifest"]),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "case_path_id": self.case_path_id,
+            "canonical_case_digest": self.canonical_case_digest,
+            "eval_input_digest": self.eval_input_digest,
+            "trial_id": self.trial_id,
+            "trial_index": self.trial_index,
+            "manifest": self.manifest.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class RunManifest(_JsonModel):
+    """Immutable run plan; state is derived from Trial receipts."""
+
+    SCHEMA_VERSION: ClassVar[str] = EVAL_RUN_MANIFEST_SCHEMA_VERSION
+
+    schema_version: str
+    run_id: str
+    run_config: ArtifactRef
+    case_snapshot: ArtifactRef
+    agent_config_digest: str
+    initial_evaluator_execution_digest: str
+    trials: Tuple[RunTrialPlan, ...]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != self.SCHEMA_VERSION:
+            raise SchemaError("RunManifest has an unknown schema_version")
+        validate_run_id(self.run_id)
+        if not isinstance(self.run_config, ArtifactRef):
+            raise SchemaError("run_manifest.run_config must be an ArtifactRef")
+        if self.run_config.relative_path != "run_config.json":
+            raise SchemaError("run_manifest.run_config must reference run_config.json")
+        if not isinstance(self.case_snapshot, ArtifactRef):
+            raise SchemaError(
+                "run_manifest.case_snapshot must be an ArtifactRef"
+            )
+        if self.case_snapshot.relative_path != "case_snapshot.json":
+            raise SchemaError(
+                "run_manifest.case_snapshot must reference case_snapshot.json"
+            )
+        _digest(self.agent_config_digest, "run_manifest.agent_config_digest")
+        _digest(
+            self.initial_evaluator_execution_digest,
+            "run_manifest.initial_evaluator_execution_digest",
+        )
+        if type(self.trials) not in (list, tuple):
+            raise SchemaError("run_manifest.trials must be a list or tuple")
+        if not self.trials or len(self.trials) > MAX_MANIFEST_TRIALS:
+            raise SchemaError(
+                "run_manifest.trials must contain between 1 and %d entries"
+                % MAX_MANIFEST_TRIALS
+            )
+        trials = tuple(self.trials)
+        if any(not isinstance(item, RunTrialPlan) for item in trials):
+            raise SchemaError("run_manifest.trials must contain RunTrialPlan values")
+        for item in trials:
+            validate_trial_id(
+                item.trial_id,
+                self.run_id,
+                item.task_id,
+                item.trial_index,
+            )
+        identities = [(item.task_id, item.trial_index) for item in trials]
+        if len(identities) != len(set(identities)):
+            raise SchemaError("run_manifest.trials contains duplicate plans")
+        if len({item.trial_id for item in trials}) != len(trials):
+            raise SchemaError("run_manifest.trials contains duplicate trial_id values")
+        if len({item.manifest.relative_path for item in trials}) != len(trials):
+            raise SchemaError("run_manifest.trials contains duplicate manifest paths")
+        object.__setattr__(
+            self,
+            "trials",
+            tuple(sorted(trials, key=lambda item: (item.task_id, item.trial_index))),
+        )
+        validate_safe_json(self.to_dict(), "run_manifest")
+        _check_model_size(self, MAX_RUN_MANIFEST_BYTES, "RunManifest")
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "RunManifest":
+        payload = _object(value, "RunManifest")
+        _exact_fields(
+            payload,
+            (
+                "schema_version",
+                "run_id",
+                "run_config",
+                "case_snapshot",
+                "agent_config_digest",
+                "initial_evaluator_execution_digest",
+                "trials",
+            ),
+            "RunManifest",
+        )
+        if payload["schema_version"] != cls.SCHEMA_VERSION:
+            raise SchemaError("RunManifest has an unknown schema_version")
+        trials = _array(payload["trials"], "run_manifest.trials", MAX_MANIFEST_TRIALS)
+        if not trials:
+            raise SchemaError("run_manifest.trials must not be empty")
+        return cls(
+            schema_version=payload["schema_version"],
+            run_id=validate_run_id(payload["run_id"]),
+            run_config=ArtifactRef.from_dict(payload["run_config"]),
+            case_snapshot=ArtifactRef.from_dict(payload["case_snapshot"]),
+            agent_config_digest=_digest(
+                payload["agent_config_digest"], "run_manifest.agent_config_digest"
+            ),
+            initial_evaluator_execution_digest=_digest(
+                payload["initial_evaluator_execution_digest"],
+                "run_manifest.initial_evaluator_execution_digest",
+            ),
+            trials=tuple(RunTrialPlan.from_dict(item) for item in trials),
+        )
+
+    @classmethod
+    def from_json(cls, data: Any) -> "RunManifest":
+        return cls.from_dict(
+            _strict_json_loads(data, MAX_RUN_MANIFEST_BYTES, "RunManifest JSON")
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "run_config": self.run_config.to_dict(),
+            "case_snapshot": self.case_snapshot.to_dict(),
+            "agent_config_digest": self.agent_config_digest,
+            "initial_evaluator_execution_digest": self.initial_evaluator_execution_digest,
+            "trials": [item.to_dict() for item in self.trials],
+        }
+
+
+def _validate_failure(status: Optional[TrialStatus], code: Optional[FailureCode]) -> None:
+    if status is None:
+        if code is not None:
+            raise SchemaError("nonterminal receipt requires failure_code=null")
+    elif status is TrialStatus.COMPLETED:
+        if code is not None:
+            raise SchemaError("completed receipt requires failure_code=null")
+    elif status not in _TERMINAL_STATUSES:
+        raise SchemaError("terminal receipt has a nonterminal Trial status")
+    elif code is None:
+        raise SchemaError("terminal failure receipt requires failure_code")
+    else:
+        try:
+            expected = TrialStatus(submission_status_for_failure(code).value)
+        except (TypeError, ValueError) as exc:
+            raise SchemaError("terminal receipt has an invalid failure_code") from exc
+        if status is not expected:
+            raise SchemaError(
+                "%s receipt has an invalid failure_code" % status.value
+            )
+
+
+def derive_receipt_id(
+    run_id: str,
+    task_id: str,
+    trial_id: str,
+    stage: StageName,
+    config_digest: str,
+    *,
+    attempt: Optional[int],
+    evaluation_id: Optional[str],
+    evaluation_revision: Optional[str],
+) -> str:
+    validate_run_id(run_id)
+    _identifier(task_id, "receipt.task_id")
+    validate_trial_id_shape(trial_id)
+    _require_enum(StageName, stage, "receipt.stage")
+    _digest(config_digest, "receipt.config_digest")
+    if attempt is not None:
+        _integer(attempt, "receipt.attempt", minimum=1, maximum=MAX_TRIAL_ATTEMPTS)
+    if evaluation_id is not None:
+        validate_evaluation_id_shape(evaluation_id)
+    if evaluation_revision is not None:
+        validate_path_segment(
+            evaluation_revision, "receipt.evaluation_revision"
+        )
+    return stable_id(
+        "receipt",
+        run_id,
+        task_id,
+        trial_id,
+        stage.value,
+        config_digest,
+        attempt,
+        evaluation_id,
+        evaluation_revision,
+    )
+
+
+@dataclass(frozen=True)
+class StageReceipt(_JsonModel):
+    SCHEMA_VERSION: ClassVar[str] = EVAL_STAGE_RECEIPT_SCHEMA_VERSION
+
+    schema_version: str
+    receipt_id: str
+    run_id: str
+    task_id: str
+    trial_id: str
+    stage: StageName
+    config_digest: str
+    attempt: Optional[int]
+    evaluation_id: Optional[str]
+    evaluation_revision: Optional[str]
+    artifacts: Tuple[ArtifactRef, ...]
+    terminal_status: Optional[TrialStatus]
+    failure_code: Optional[FailureCode]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != self.SCHEMA_VERSION:
+            raise SchemaError("StageReceipt has an unknown schema_version")
+        validate_run_id(self.run_id)
+        _identifier(self.task_id, "receipt.task_id")
+        validate_trial_id_shape(self.trial_id)
+        _require_enum(StageName, self.stage, "receipt.stage")
+        _digest(self.config_digest, "receipt.config_digest")
+        if self.attempt is not None:
+            _integer(
+                self.attempt,
+                "receipt.attempt",
+                minimum=1,
+                maximum=MAX_TRIAL_ATTEMPTS,
+            )
+        if self.evaluation_id is not None:
+            validate_evaluation_id_shape(self.evaluation_id)
+        if self.evaluation_revision is not None:
+            validate_path_segment(
+                self.evaluation_revision, "receipt.evaluation_revision"
+            )
+        expected = derive_receipt_id(
+            self.run_id,
+            self.task_id,
+            self.trial_id,
+            self.stage,
+            self.config_digest,
+            attempt=self.attempt,
+            evaluation_id=self.evaluation_id,
+            evaluation_revision=self.evaluation_revision,
+        )
+        if self.receipt_id != expected:
+            raise SchemaError("receipt_id does not match its canonical identity")
+        if type(self.artifacts) not in (list, tuple):
+            raise SchemaError("receipt.artifacts must be a list or tuple")
+        if len(self.artifacts) > MAX_RECEIPT_ARTIFACTS:
+            raise SchemaError("receipt.artifacts exceeds its item limit")
+        artifacts = tuple(self.artifacts)
+        if any(not isinstance(item, ArtifactRef) for item in artifacts):
+            raise SchemaError("receipt.artifacts must contain ArtifactRef values")
+        paths = [item.relative_path for item in artifacts]
+        if len(paths) != len(set(paths)):
+            raise SchemaError("receipt.artifacts contains duplicate paths")
+        if self.terminal_status is not None:
+            _require_enum(TrialStatus, self.terminal_status, "receipt.terminal_status")
+        if self.failure_code is not None:
+            _require_enum(FailureCode, self.failure_code, "receipt.failure_code")
+        _validate_failure(self.terminal_status, self.failure_code)
+
+        if self.stage in {StageName.START, StageName.INCOMPLETE}:
+            if (
+                self.attempt is None
+                or self.evaluation_id is not None
+                or self.evaluation_revision is not None
+                or artifacts
+                or self.terminal_status is not None
+            ):
+                raise SchemaError("lifecycle receipt has an invalid field combination")
+        elif self.stage is StageName.PREPARE:
+            if (
+                self.attempt is not None
+                or self.evaluation_id is not None
+                or self.evaluation_revision is not None
+                or self.terminal_status is not None
+                or len(artifacts) != 1
+                or not artifacts[0].relative_path.endswith("/input.json")
+            ):
+                raise SchemaError("prepare receipt must bind exactly input.json")
+        elif self.stage is StageName.AGENT:
+            submission_count = sum(
+                item.relative_path.endswith("/submission.json")
+                for item in artifacts
+            )
+            if (
+                self.attempt is None
+                or self.evaluation_id is not None
+                or self.evaluation_revision is not None
+                or self.terminal_status not in _TERMINAL_STATUSES
+                or submission_count != 1
+            ):
+                raise SchemaError("agent receipt must uniquely commit a terminal Submission")
+        elif self.stage is StageName.EVALUATOR:
+            if (
+                self.attempt is not None
+                or self.evaluation_id is None
+                or self.evaluation_revision is None
+                or self.terminal_status is not None
+                or not artifacts
+            ):
+                raise SchemaError("evaluator receipt has an invalid field combination")
+            validate_evaluation_id(
+                self.evaluation_id,
+                self.run_id,
+                self.config_digest,
+                self.evaluation_revision,
+            )
+        object.__setattr__(
+            self, "artifacts", tuple(sorted(artifacts, key=lambda item: item.relative_path))
+        )
+        validate_safe_json(self.to_dict(), "stage_receipt")
+        _check_model_size(self, MAX_STAGE_RECEIPT_BYTES, "StageReceipt")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        stage: StageName,
+        config_digest: str,
+        artifacts: Iterable[ArtifactRef] = (),
+        attempt: Optional[int] = None,
+        evaluation_id: Optional[str] = None,
+        evaluation_revision: Optional[str] = None,
+        terminal_status: Optional[TrialStatus] = None,
+        failure_code: Optional[FailureCode] = None,
+    ) -> "StageReceipt":
+        return cls(
+            schema_version=cls.SCHEMA_VERSION,
+            receipt_id=derive_receipt_id(
+                run_id,
+                task_id,
+                trial_id,
+                stage,
+                config_digest,
+                attempt=attempt,
+                evaluation_id=evaluation_id,
+                evaluation_revision=evaluation_revision,
+            ),
+            run_id=run_id,
+            task_id=task_id,
+            trial_id=trial_id,
+            stage=stage,
+            config_digest=config_digest,
+            attempt=attempt,
+            evaluation_id=evaluation_id,
+            evaluation_revision=evaluation_revision,
+            artifacts=tuple(artifacts),
+            terminal_status=terminal_status,
+            failure_code=failure_code,
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "StageReceipt":
+        payload = _object(value, "StageReceipt")
+        _exact_fields(
+            payload,
+            (
+                "schema_version",
+                "receipt_id",
+                "run_id",
+                "task_id",
+                "trial_id",
+                "stage",
+                "config_digest",
+                "attempt",
+                "evaluation_id",
+                "evaluation_revision",
+                "artifacts",
+                "terminal_status",
+                "failure_code",
+            ),
+            "StageReceipt",
+        )
+        if payload["schema_version"] != cls.SCHEMA_VERSION:
+            raise SchemaError("StageReceipt has an unknown schema_version")
+        artifacts = _array(
+            payload["artifacts"], "receipt.artifacts", MAX_RECEIPT_ARTIFACTS
+        )
+        return cls(
+            schema_version=payload["schema_version"],
+            receipt_id=validate_path_segment(
+                payload["receipt_id"], "receipt.receipt_id"
+            ),
+            run_id=validate_run_id(payload["run_id"]),
+            task_id=_identifier(payload["task_id"], "receipt.task_id"),
+            trial_id=validate_trial_id_shape(payload["trial_id"]),
+            stage=_enum_value(StageName, payload["stage"], "receipt.stage"),
+            config_digest=_digest(payload["config_digest"], "receipt.config_digest"),
+            attempt=(
+                None
+                if payload["attempt"] is None
+                else _integer(
+                    payload["attempt"],
+                    "receipt.attempt",
+                    minimum=1,
+                    maximum=MAX_TRIAL_ATTEMPTS,
+                )
+            ),
+            evaluation_id=(
+                None
+                if payload["evaluation_id"] is None
+                else validate_evaluation_id_shape(payload["evaluation_id"])
+            ),
+            evaluation_revision=(
+                None
+                if payload["evaluation_revision"] is None
+                else validate_path_segment(
+                    payload["evaluation_revision"],
+                    "receipt.evaluation_revision",
+                )
+            ),
+            artifacts=tuple(ArtifactRef.from_dict(item) for item in artifacts),
+            terminal_status=(
+                None
+                if payload["terminal_status"] is None
+                else _enum_value(
+                    TrialStatus,
+                    payload["terminal_status"],
+                    "receipt.terminal_status",
+                )
+            ),
+            failure_code=(
+                None
+                if payload["failure_code"] is None
+                else _enum_value(
+                    FailureCode, payload["failure_code"], "receipt.failure_code"
+                )
+            ),
+        )
+
+    @classmethod
+    def from_json(cls, data: Any) -> "StageReceipt":
+        return cls.from_dict(
+            _strict_json_loads(data, MAX_STAGE_RECEIPT_BYTES, "StageReceipt JSON")
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "receipt_id": self.receipt_id,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "trial_id": self.trial_id,
+            "stage": self.stage.value,
+            "config_digest": self.config_digest,
+            "attempt": self.attempt,
+            "evaluation_id": self.evaluation_id,
+            "evaluation_revision": self.evaluation_revision,
+            "artifacts": [item.to_dict() for item in self.artifacts],
+            "terminal_status": (
+                None if self.terminal_status is None else self.terminal_status.value
+            ),
+            "failure_code": None if self.failure_code is None else self.failure_code.value,
+        }
+
+
+@dataclass(frozen=True)
+class TrialState:
+    trial_id: str
+    status: TrialStatus
+    active_attempt: Optional[int]
+    next_attempt: int
+    completed_stages: Tuple[StageName, ...]
+    terminal_receipt: Optional[StageReceipt]
+
+
+@dataclass(frozen=True)
+class RunState:
+    run_id: str
+    status: RunStatus
+    trials: Tuple[TrialState, ...]
+
+
+@dataclass(frozen=True)
+class ResumePlan:
+    trial_id: str
+    status: TrialStatus
+    completed_stages: Tuple[StageName, ...]
+    missing_stages: Tuple[StageName, ...]
+    terminal: bool
+
+
+@dataclass(frozen=True)
+class _VerifiedRunBundle:
+    manifest: RunManifest
+    config: EvalRunConfig
+    case_snapshot: RunCaseSnapshot
+
+
+@dataclass
+class _ReadBudget:
+    maximum: int
+    consumed: int = 0
+
+    def ensure(self, amount: int) -> None:
+        if amount < 0 or self.consumed + amount > self.maximum:
+            raise ArtifactIntegrityError("artifact reads exceed the cumulative byte limit")
+
+    def add(self, amount: int) -> None:
+        self.ensure(amount)
+        self.consumed += amount
+
+
+def _is_reparse(info: os.stat_result) -> bool:
+    return bool(getattr(info, "st_file_attributes", 0) & _REPARSE_POINT)
+
+
+def _unsafe_node(info: os.stat_result) -> bool:
+    return stat.S_ISLNK(info.st_mode) or _is_reparse(info)
+
+
+def _file_identity(info: os.stat_result) -> Optional[Tuple[int, int]]:
+    inode = getattr(info, "st_ino", 0)
+    if not inode:
+        return None
+    return (getattr(info, "st_dev", 0), inode)
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare usable filesystem identities; missing inode data is unknown."""
+
+    left_identity = _file_identity(left)
+    right_identity = _file_identity(right)
+    return (
+        left_identity is not None
+        and right_identity is not None
+        and left_identity == right_identity
+    )
+
+
+def _normalized_filesystem_path(value: os.PathLike[str] | str) -> str:
+    path = os.path.abspath(os.fspath(value))
+    if os.name == "nt":
+        if path.startswith("\\\\?\\UNC\\"):
+            path = "\\\\" + path[8:]
+        elif path.startswith("\\\\?\\"):
+            path = path[4:]
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _path_is_within(root: Path, target: Path) -> bool:
+    root_text = _normalized_filesystem_path(root)
+    target_text = _normalized_filesystem_path(target)
+    try:
+        common = os.path.commonpath((root_text, target_text))
+    except ValueError:
+        return False
+    return os.path.normcase(common) == root_text
+
+
+def _windows_descriptor_path(descriptor: int) -> Optional[Path]:
+    """Return the kernel-resolved path for an opened Windows descriptor."""
+
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_final_path = kernel32.GetFinalPathNameByHandleW
+        get_final_path.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        )
+        get_final_path.restype = wintypes.DWORD
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
+        required = get_final_path(handle, None, 0, 0)
+        if not required:
+            raise OSError(
+                ctypes.get_last_error(), "GetFinalPathNameByHandleW failed"
+            )
+        buffer = ctypes.create_unicode_buffer(required + 1)
+        written = get_final_path(handle, buffer, len(buffer), 0)
+        if not written or written >= len(buffer):
+            raise OSError(
+                ctypes.get_last_error(), "GetFinalPathNameByHandleW failed"
+            )
+        value = buffer.value
+    except (ImportError, OSError, ValueError) as exc:
+        raise ArtifactSecurityError(
+            "could not verify the opened Windows artifact identity"
+        ) from exc
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value)
+
+
+def _windows_descriptor_identity(descriptor: int) -> Optional[Tuple[int, int]]:
+    """Return the stable Windows volume/file ID for an open descriptor."""
+
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class ByHandleFileInformation(ctypes.Structure):
+            _fields_ = (
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_information = kernel32.GetFileInformationByHandle
+        get_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(ByHandleFileInformation),
+        )
+        get_information.restype = wintypes.BOOL
+        information = ByHandleFileInformation()
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
+        if not get_information(handle, ctypes.byref(information)):
+            raise OSError(
+                ctypes.get_last_error(), "GetFileInformationByHandle failed"
+            )
+        file_index = (
+            int(information.nFileIndexHigh) << 32
+        ) | int(information.nFileIndexLow)
+        if file_index == 0:
+            raise OSError("Windows file identity is unavailable")
+        return (int(information.dwVolumeSerialNumber), file_index)
+    except (ImportError, OSError, ValueError) as exc:
+        raise ArtifactSecurityError(
+            "could not verify the opened Windows artifact file ID"
+        ) from exc
+
+
+def _descriptor_identity(
+    descriptor: int, metadata: os.stat_result
+) -> Optional[Tuple[int, int]]:
+    identity = _file_identity(metadata)
+    if identity is not None:
+        return identity
+    return _windows_descriptor_identity(descriptor)
+
+
+def _windows_open_directory_handle(path: Path) -> int:
+    if os.name != "nt":
+        raise ArtifactSecurityError("Windows directory handles are unavailable")
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(path),
+            0x0080,  # FILE_READ_ATTRIBUTES
+            0x00000001 | 0x00000002,  # share read/write, deliberately not delete
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        handle_value = (
+            int(handle)
+            if isinstance(handle, int)
+            else int(getattr(handle, "value", 0) or 0)
+        )
+        if not handle_value or handle_value == invalid:
+            raise OSError(ctypes.get_last_error(), "CreateFileW directory failed")
+        return handle_value
+    except (ImportError, OSError, TypeError, ValueError) as exc:
+        raise ArtifactSecurityError(
+            "could not acquire a non-replaceable Windows directory handle"
+        ) from exc
+
+
+def _windows_close_handle(handle: int) -> None:
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    close_handle(wintypes.HANDLE(handle))
+
+
+def _windows_raw_handle_path(handle: int) -> Path:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_final_path = kernel32.GetFinalPathNameByHandleW
+        get_final_path.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        )
+        get_final_path.restype = wintypes.DWORD
+        raw_handle = wintypes.HANDLE(handle)
+        required = get_final_path(raw_handle, None, 0, 0)
+        if not required:
+            raise OSError(ctypes.get_last_error(), "GetFinalPathNameByHandleW failed")
+        buffer = ctypes.create_unicode_buffer(required + 1)
+        written = get_final_path(raw_handle, buffer, len(buffer), 0)
+        if not written or written >= len(buffer):
+            raise OSError(ctypes.get_last_error(), "GetFinalPathNameByHandleW failed")
+        value = buffer.value
+    except (ImportError, OSError, ValueError) as exc:
+        raise ArtifactSecurityError(
+            "could not verify a Windows directory handle path"
+        ) from exc
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value)
+
+
+def _windows_raw_handle_attributes(handle: int) -> int:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class ByHandleFileInformation(ctypes.Structure):
+            _fields_ = (
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_information = kernel32.GetFileInformationByHandle
+        get_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(ByHandleFileInformation),
+        )
+        get_information.restype = wintypes.BOOL
+        information = ByHandleFileInformation()
+        if not get_information(
+            wintypes.HANDLE(handle), ctypes.byref(information)
+        ):
+            raise OSError(
+                ctypes.get_last_error(), "GetFileInformationByHandle failed"
+            )
+        return int(information.dwFileAttributes)
+    except (ImportError, OSError, ValueError) as exc:
+        raise ArtifactSecurityError(
+            "could not verify Windows directory handle attributes"
+        ) from exc
+
+
+def _absolute_storage_path(value: os.PathLike[str] | str) -> Path:
+    """Return an absolute path, using Win32 extended-length form on Windows."""
+
+    raw = os.fspath(value)
+    if os.name != "nt":
+        return Path(os.path.abspath(raw))
+    if raw.startswith("\\\\?\\"):
+        return Path(raw)
+    absolute = os.path.abspath(raw)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
+class ArtifactStore:
+    """Fail-closed store rooted at an explicit ``.eval-runs`` directory.
+
+    File contents are flushed before create-only publication on every platform.
+    Parent-directory metadata is additionally fsynced where the Python runtime
+    exposes POSIX directory descriptors.  Windows therefore provides atomic
+    no-overwrite publication and file flush, but this class does not claim the
+    stronger POSIX parent-directory durability guarantee there.
+    """
+
+    def __init__(
+        self,
+        runs_root: os.PathLike[str] | str,
+        *,
+        max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+        max_total_read_bytes: int = DEFAULT_MAX_TOTAL_READ_BYTES,
+        create_root: bool = True,
+    ) -> None:
+        if type(max_file_bytes) is not int or max_file_bytes <= 0:
+            raise ValueError("max_file_bytes must be a positive integer")
+        if type(max_total_read_bytes) is not int or max_total_read_bytes <= 0:
+            raise ValueError("max_total_read_bytes must be a positive integer")
+        if max_file_bytes > max_total_read_bytes:
+            raise ValueError("max_file_bytes may not exceed max_total_read_bytes")
+        if type(create_root) is not bool:
+            raise ValueError("create_root must be a bool")
+        root = _absolute_storage_path(runs_root)
+        if root.name != ".eval-runs":
+            raise ValueError("ArtifactStore root must be an explicit .eval-runs directory")
+        self.root = root
+        self.max_file_bytes = max_file_bytes
+        self.max_total_read_bytes = max_total_read_bytes
+        if create_root:
+            self._prepare_root()
+        else:
+            self._require_existing_root()
+        root_metadata = os.lstat(self.root)
+        self._root_identity = _file_identity(root_metadata)
+        if os.name != "nt" and self._root_identity is None:
+            raise ArtifactSecurityError(
+                "artifact root filesystem identity is unavailable"
+            )
+
+    @property
+    def directory_fsync_supported(self) -> bool:
+        return DIRECTORY_FSYNC_SUPPORTED
+
+    def _prepare_root(self) -> None:
+        current = self.root.parent
+        while True:
+            try:
+                ancestor = os.lstat(current)
+            except OSError as exc:
+                raise ArtifactSecurityError("artifact root ancestor is unavailable") from exc
+            if _unsafe_node(ancestor) or not stat.S_ISDIR(ancestor.st_mode):
+                raise ArtifactSecurityError(
+                    "artifact root ancestor is a link, reparse point, or non-directory"
+                )
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+        created = False
+        try:
+            os.mkdir(self.root, 0o700)
+            created = True
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise ArtifactSecurityError("could not create artifact root") from exc
+        self._assert_directory(self.root)
+        if created and DIRECTORY_FSYNC_SUPPORTED:
+            self._fsync_directory(self.root.parent)
+
+    def _require_existing_root(self) -> None:
+        try:
+            metadata = os.lstat(self.root)
+        except FileNotFoundError as exc:
+            raise ArtifactIntegrityError(
+                "read-only artifact root does not exist"
+            ) from exc
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "read-only artifact root is unavailable"
+            ) from exc
+        if _unsafe_node(metadata) or not stat.S_ISDIR(metadata.st_mode):
+            raise ArtifactSecurityError(
+                "read-only artifact root is a link, reparse point, or non-directory"
+            )
+
+    @staticmethod
+    def _validate_internal_component(value: str) -> None:
+        if value in _INTERNAL_DIRECTORIES or _ATTEMPT_RE.fullmatch(value):
+            return
+        validate_path_segment(value, "artifact directory")
+
+    def _within_root(self, path: Path) -> Path:
+        absolute = _absolute_storage_path(path)
+        try:
+            common = os.path.commonpath((os.fspath(self.root), os.fspath(absolute)))
+        except ValueError as exc:
+            raise ArtifactSecurityError("artifact path crosses filesystem roots") from exc
+        if os.path.normcase(common) != os.path.normcase(os.fspath(self.root)):
+            raise ArtifactSecurityError("artifact path escapes .eval-runs")
+        return absolute
+
+    def _assert_directory(self, path: Path) -> None:
+        try:
+            info = os.lstat(path)
+        except OSError as exc:
+            raise ArtifactSecurityError("required artifact directory is unavailable") from exc
+        if _unsafe_node(info) or not stat.S_ISDIR(info.st_mode):
+            raise ArtifactSecurityError(
+                "artifact path contains a symlink, reparse point, or non-directory"
+            )
+
+    def _ensure_directory(self, path: Path) -> None:
+        path = self._within_root(path)
+        if os.name == "nt":
+            handles: List[int] = []
+            current = self.root
+            try:
+                root_handle = _windows_open_directory_handle(current)
+                handles.append(root_handle)
+                self._validate_windows_directory_handle(root_handle, current)
+                for part in path.relative_to(self.root).parts:
+                    self._validate_internal_component(part)
+                    target = current / part
+                    try:
+                        os.mkdir(target, 0o700)
+                    except FileExistsError:
+                        pass
+                    except OSError as exc:
+                        raise ArtifactSecurityError(
+                            "could not create artifact directory"
+                        ) from exc
+                    handle = _windows_open_directory_handle(target)
+                    handles.append(handle)
+                    self._validate_windows_directory_handle(handle, target)
+                    current = target
+            finally:
+                for handle in reversed(handles):
+                    _windows_close_handle(handle)
+            return
+
+        if os.open not in getattr(os, "supports_dir_fd", set()):
+            raise ArtifactSecurityError(
+                "descriptor-relative directory creation is unavailable"
+            )
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(self.root, directory_flags)
+        try:
+            if _file_identity(os.fstat(descriptor)) != self._root_identity:
+                raise ArtifactSecurityError(
+                    "artifact root identity changed after initialization"
+                )
+            for part in path.relative_to(self.root).parts:
+                self._validate_internal_component(part)
+                created = False
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise ArtifactSecurityError(
+                        "could not create artifact directory"
+                    ) from exc
+                if created:
+                    os.fsync(descriptor)
+                next_descriptor = os.open(
+                    part, directory_flags, dir_fd=descriptor
+                )
+                metadata = os.fstat(next_descriptor)
+                if _unsafe_node(metadata) or not stat.S_ISDIR(metadata.st_mode):
+                    os.close(next_descriptor)
+                    raise ArtifactSecurityError(
+                        "artifact path contains an unsafe directory component"
+                    )
+                os.close(descriptor)
+                descriptor = next_descriptor
+        finally:
+            os.close(descriptor)
+
+    def _validate_windows_directory_handle(
+        self, handle: int, expected_path: Path
+    ) -> None:
+        actual = _windows_raw_handle_path(handle)
+        attributes = _windows_raw_handle_attributes(handle)
+        if (
+            _normalized_filesystem_path(actual)
+            != _normalized_filesystem_path(expected_path)
+            or not _path_is_within(self.root, actual)
+        ):
+            raise ArtifactSecurityError(
+                "Windows artifact directory resolved to an unexpected path"
+            )
+        if attributes & _REPARSE_POINT or not attributes & 0x10:
+            raise ArtifactSecurityError(
+                "Windows artifact directory is a reparse point or non-directory"
+            )
+
+    def _open_posix_directory_descriptor(self, path: Path) -> int:
+        if os.name == "nt" or os.open not in getattr(os, "supports_dir_fd", set()):
+            raise ArtifactSecurityError(
+                "descriptor-relative directory access is unavailable"
+            )
+        path = self._within_root(path)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(self.root, flags)
+        try:
+            if _file_identity(os.fstat(descriptor)) != self._root_identity:
+                raise ArtifactSecurityError(
+                    "artifact root identity changed after initialization"
+                )
+            for component in path.relative_to(self.root).parts:
+                next_descriptor = os.open(
+                    component, flags, dir_fd=descriptor
+                )
+                metadata = os.fstat(next_descriptor)
+                if _unsafe_node(metadata) or not stat.S_ISDIR(metadata.st_mode):
+                    os.close(next_descriptor)
+                    raise ArtifactSecurityError(
+                        "artifact path contains an unsafe directory component"
+                    )
+                os.close(descriptor)
+                descriptor = next_descriptor
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @contextmanager
+    def _guard_parent_directory(self, path: Path) -> Iterator[Optional[int]]:
+        path = self._within_root(path)
+        parent = path.parent
+        self._ensure_directory(parent)
+        if os.name != "nt":
+            descriptor = self._open_posix_directory_descriptor(parent)
+            try:
+                yield descriptor
+            finally:
+                os.close(descriptor)
+            return
+
+        handles: List[int] = []
+        current = self.root
+        try:
+            root_handle = _windows_open_directory_handle(current)
+            handles.append(root_handle)
+            self._validate_windows_directory_handle(root_handle, current)
+            for component in parent.relative_to(self.root).parts:
+                current = current / component
+                handle = _windows_open_directory_handle(current)
+                handles.append(handle)
+                self._validate_windows_directory_handle(handle, current)
+            yield None
+        finally:
+            for handle in reversed(handles):
+                _windows_close_handle(handle)
+
+    def _assert_parent_chain(self, path: Path) -> None:
+        path = self._within_root(path)
+        current = self.root
+        self._assert_directory(current)
+        for part in path.parent.relative_to(self.root).parts:
+            current = current / part
+            self._assert_directory(current)
+
+    def _exists_regular(self, path: Path) -> bool:
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ArtifactSecurityError("artifact path could not be inspected") from exc
+        self._assert_parent_chain(path)
+        if _unsafe_node(info) or not stat.S_ISREG(info.st_mode):
+            raise ArtifactSecurityError(
+                "artifact is a symlink, reparse point, or special file"
+            )
+        return True
+
+    def _run_dir(self, run_id: str) -> Path:
+        validate_run_id(run_id)
+        return self.root / run_id
+
+    def _trial_dir(self, plan: TrialManifest) -> Path:
+        return (
+            self._run_dir(plan.run_id)
+            / "cases"
+            / plan.case_path_id
+            / "trials"
+            / plan.trial_id
+        )
+
+    def _target(self, run_id: str, relative_path: str) -> Path:
+        relative = _relative_artifact_path(relative_path)
+        return self._within_root(self._run_dir(run_id) / Path(*relative.split("/")))
+
+    def _run_relative(self, run_id: str, path: Path) -> str:
+        return _relative_artifact_path(
+            self._within_root(path).relative_to(self._run_dir(run_id)).as_posix()
+        )
+
+    @staticmethod
+    def _write_all(descriptor: int, data: bytes) -> None:
+        offset = 0
+        while offset < len(data):
+            written = os.write(descriptor, data[offset:])
+            if written <= 0:
+                raise OSError("short artifact write")
+            offset += written
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> bool:
+        """Flush parent metadata when supported and report that capability."""
+
+        if not DIRECTORY_FSYNC_SUPPORTED:
+            return False
+        descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return True
+
+    def _write_bytes_exclusive(self, path: Path, data: bytes) -> None:
+        """Atomically publish bytes with create-if-absent semantics."""
+
+        if len(data) > self.max_file_bytes:
+            raise ArtifactIntegrityError("artifact exceeds the single-file byte limit")
+        path = self._within_root(path)
+        temp = path.parent / (".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
+        temp_name = temp.name
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: Optional[int] = None
+        parent_descriptor: Optional[int] = None
+        with self._guard_parent_directory(path) as guarded_parent:
+            parent_descriptor = guarded_parent
+            try:
+                if parent_descriptor is None:
+                    descriptor = os.open(temp, flags, 0o600)
+                else:
+                    descriptor = os.open(
+                        temp_name,
+                        flags,
+                        0o600,
+                        dir_fd=parent_descriptor,
+                    )
+                self._write_all(descriptor, data)
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = None
+                try:
+                    if parent_descriptor is None:
+                        # The guarded Windows parent chain cannot be renamed or
+                        # replaced while this no-overwrite rename is in flight.
+                        os.rename(temp, path)
+                    else:
+                        os.link(
+                            temp_name,
+                            path.name,
+                            src_dir_fd=parent_descriptor,
+                            dst_dir_fd=parent_descriptor,
+                            follow_symlinks=False,
+                        )
+                        os.unlink(temp_name, dir_fd=parent_descriptor)
+                except FileExistsError as exc:
+                    raise ArtifactConflictError(
+                        "create-only artifact already exists"
+                    ) from exc
+                except PermissionError as exc:
+                    if os.path.lexists(path):
+                        raise ArtifactConflictError(
+                            "artifact conflicts with an existing writer or completed file"
+                        ) from exc
+                    raise ArtifactSecurityError(
+                        "artifact publication was denied"
+                    ) from exc
+                if parent_descriptor is None:
+                    # Do not claim directory fsync on Windows; the capability is
+                    # explicitly exposed as false.
+                    self._fsync_directory(path.parent)
+                else:
+                    os.fsync(parent_descriptor)
+            except ArtifactError:
+                raise
+            except OSError as exc:
+                if exc.errno in (errno.EEXIST, errno.EACCES) and os.path.lexists(path):
+                    raise ArtifactConflictError(
+                        "create-only artifact already exists"
+                    ) from exc
+                raise ArtifactError("atomic create-if-absent write failed") from exc
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                try:
+                    if parent_descriptor is None:
+                        os.unlink(temp)
+                    else:
+                        os.unlink(temp_name, dir_fd=parent_descriptor)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+
+    @contextmanager
+    def _lock(self, path: Path) -> Iterator[None]:
+        path = self._within_root(path)
+        with self._guard_parent_directory(path) as parent_descriptor:
+            try:
+                if parent_descriptor is None:
+                    existing = os.lstat(path)
+                else:
+                    existing = os.stat(
+                        path.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+            except FileNotFoundError:
+                existing = None
+            except OSError as exc:
+                raise ArtifactSecurityError("could not inspect writer lock") from exc
+            if existing is not None and (
+                _unsafe_node(existing) or not stat.S_ISREG(existing.st_mode)
+            ):
+                raise ArtifactSecurityError(
+                    "writer lock is a symlink, reparse point, or special file"
+                )
+            flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                if parent_descriptor is None:
+                    descriptor = os.open(path, flags, 0o600)
+                else:
+                    descriptor = os.open(
+                        path.name,
+                        flags,
+                        0o600,
+                        dir_fd=parent_descriptor,
+                    )
+            except OSError as exc:
+                raise ArtifactSecurityError("could not open writer lock") from exc
+            locked = False
+            try:
+                info = os.fstat(descriptor)
+                if _unsafe_node(info) or not stat.S_ISREG(info.st_mode):
+                    raise ArtifactSecurityError("writer lock is not a regular file")
+                opened_path = _windows_descriptor_path(descriptor)
+                if opened_path is not None and (
+                    not _path_is_within(self.root, opened_path)
+                    or _normalized_filesystem_path(opened_path)
+                    != _normalized_filesystem_path(path)
+                ):
+                    raise ArtifactSecurityError(
+                        "writer lock resolved to an unexpected path"
+                    )
+                if info.st_size == 0:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    os.write(descriptor, b"\0")
+                    os.fsync(descriptor)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                except (OSError, BlockingIOError) as exc:
+                    raise ArtifactConflictError(
+                        "another writer owns this namespace"
+                    ) from exc
+                yield
+            finally:
+                if locked:
+                    try:
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        if os.name == "nt":
+                            import msvcrt
+
+                            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+
+                            fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                os.close(descriptor)
+
+    def _open_read_descriptor(self, path: Path) -> int:
+        """Open a file without trusting a previously inspected parent chain."""
+
+        path = self._within_root(path)
+        relative = path.relative_to(self.root)
+        components = relative.parts
+        if not components:
+            raise ArtifactSecurityError("artifact path must name a file")
+        binary = getattr(os, "O_BINARY", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        if os.name != "nt" and os.open in getattr(os, "supports_dir_fd", set()):
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | nofollow
+                | cloexec
+            )
+            directory_descriptor = os.open(self.root, directory_flags)
+            try:
+                if (
+                    _file_identity(os.fstat(directory_descriptor))
+                    != self._root_identity
+                ):
+                    raise ArtifactSecurityError(
+                        "artifact root identity changed after initialization"
+                    )
+                for component in components[:-1]:
+                    next_descriptor = os.open(
+                        component,
+                        directory_flags,
+                        dir_fd=directory_descriptor,
+                    )
+                    os.close(directory_descriptor)
+                    directory_descriptor = next_descriptor
+                    metadata = os.fstat(directory_descriptor)
+                    if _unsafe_node(metadata) or not stat.S_ISDIR(metadata.st_mode):
+                        raise ArtifactSecurityError(
+                            "artifact path contains an unsafe directory component"
+                        )
+                return os.open(
+                    components[-1],
+                    os.O_RDONLY | binary | nofollow | cloexec,
+                    dir_fd=directory_descriptor,
+                )
+            finally:
+                os.close(directory_descriptor)
+        return os.open(path, os.O_RDONLY | binary | nofollow | cloexec)
+
+    def _read_bytes(
+        self,
+        path: Path,
+        *,
+        expected_sha256: Optional[str],
+        expected_size: Optional[int],
+        budget: _ReadBudget,
+        maximum_bytes: Optional[int] = None,
+    ) -> bytes:
+        effective_maximum = min(
+            self.max_file_bytes,
+            self.max_file_bytes if maximum_bytes is None else maximum_bytes,
+        )
+        path = self._within_root(path)
+        self._assert_parent_chain(path)
+        try:
+            before = os.lstat(path)
+        except OSError as exc:
+            raise ArtifactIntegrityError("required artifact is missing") from exc
+        if _unsafe_node(before) or not stat.S_ISREG(before.st_mode):
+            raise ArtifactSecurityError(
+                "artifact is a symlink, reparse point, or special file"
+            )
+        if before.st_size > effective_maximum:
+            raise ArtifactIntegrityError("artifact exceeds the single-file byte limit")
+        if expected_size is not None and before.st_size != expected_size:
+            raise ArtifactIntegrityError("artifact size does not match its descriptor")
+        budget.ensure(before.st_size)
+        try:
+            descriptor = self._open_read_descriptor(path)
+        except OSError as exc:
+            raise ArtifactSecurityError("artifact could not be safely opened") from exc
+        chunks: List[bytes] = []
+        total = 0
+        path_revalidated_by_handle = False
+        try:
+            opened = os.fstat(descriptor)
+            if _unsafe_node(opened) or not stat.S_ISREG(opened.st_mode):
+                raise ArtifactSecurityError("artifact changed during safe open")
+            before_identity = _file_identity(before)
+            opened_identity = _descriptor_identity(descriptor, opened)
+            if (
+                before_identity is not None
+                and opened_identity is not None
+                and before_identity != opened_identity
+            ):
+                raise ArtifactSecurityError("artifact changed during safe open")
+            opened_path = _windows_descriptor_path(descriptor)
+            if opened_path is not None:
+                if not _path_is_within(self.root, opened_path):
+                    raise ArtifactSecurityError(
+                        "opened artifact resolved outside .eval-runs"
+                    )
+                if _normalized_filesystem_path(opened_path) != _normalized_filesystem_path(
+                    path
+                ):
+                    raise ArtifactSecurityError(
+                        "opened artifact resolved to an unexpected path"
+                    )
+            elif before_identity is None or opened_identity is None:
+                raise ArtifactSecurityError(
+                    "artifact filesystem identity could not be verified"
+                )
+            if before.st_size != opened.st_size:
+                raise ArtifactSecurityError("artifact changed during safe open")
+            if opened.st_size > effective_maximum:
+                raise ArtifactIntegrityError(
+                    "artifact exceeds the single-file byte limit"
+                )
+            if expected_size is not None and opened.st_size != expected_size:
+                raise ArtifactIntegrityError(
+                    "artifact size does not match its descriptor"
+                )
+            budget.ensure(opened.st_size)
+            while True:
+                chunk = os.read(
+                    descriptor,
+                    min(1024 * 1024, max(1, effective_maximum + 1 - total)),
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > effective_maximum:
+                    raise ArtifactIntegrityError(
+                        "artifact exceeds the single-file byte limit"
+                    )
+                budget.ensure(total)
+            after = os.fstat(descriptor)
+            after_identity = _descriptor_identity(descriptor, after)
+            if (
+                opened_identity is not None
+                and after_identity is not None
+                and opened_identity != after_identity
+            ):
+                raise ArtifactIntegrityError("artifact changed while being read")
+            if opened_identity is None or after_identity is None:
+                if opened_path is None:
+                    raise ArtifactSecurityError(
+                        "artifact filesystem identity became unverifiable"
+                    )
+            if (
+                after.st_size != total
+                or opened.st_size != after.st_size
+                or getattr(opened, "st_mtime_ns", None)
+                != getattr(after, "st_mtime_ns", None)
+            ):
+                raise ArtifactIntegrityError("artifact changed while being read")
+            if opened_path is not None:
+                recheck_descriptor: Optional[int] = None
+                try:
+                    recheck_descriptor = self._open_read_descriptor(path)
+                    recheck = os.fstat(recheck_descriptor)
+                    if _unsafe_node(recheck) or not stat.S_ISREG(recheck.st_mode):
+                        raise ArtifactSecurityError(
+                            "artifact path changed while it was open"
+                        )
+                    recheck_path = _windows_descriptor_path(recheck_descriptor)
+                    if (
+                        recheck_path is None
+                        or _normalized_filesystem_path(recheck_path)
+                        != _normalized_filesystem_path(path)
+                    ):
+                        raise ArtifactSecurityError(
+                            "artifact path resolved to an unexpected file during revalidation"
+                        )
+                    recheck_identity = _descriptor_identity(
+                        recheck_descriptor, recheck
+                    )
+                    if (
+                        opened_identity is None
+                        or recheck_identity is None
+                        or opened_identity != recheck_identity
+                    ):
+                        raise ArtifactSecurityError(
+                            "artifact path changed while it was open"
+                        )
+                    path_revalidated_by_handle = True
+                finally:
+                    if recheck_descriptor is not None:
+                        os.close(recheck_descriptor)
+        finally:
+            os.close(descriptor)
+        self._assert_parent_chain(path)
+        try:
+            path_after = os.lstat(path)
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "artifact path changed while it was open"
+            ) from exc
+        if _unsafe_node(path_after) or not stat.S_ISREG(path_after.st_mode):
+            raise ArtifactSecurityError(
+                "artifact path changed into a link, reparse point, or special file"
+            )
+        if (
+            _file_identity(opened) is not None
+            and _file_identity(path_after) is not None
+            and not _same_file(opened, path_after)
+        ):
+            raise ArtifactSecurityError("artifact path changed while it was open")
+        if (
+            _file_identity(opened) is None
+            or _file_identity(path_after) is None
+        ) and not path_revalidated_by_handle:
+            raise ArtifactSecurityError(
+                "artifact path identity could not be revalidated"
+            )
+        data = b"".join(chunks)
+        budget.add(len(data))
+        if expected_size is not None and len(data) != expected_size:
+            raise ArtifactIntegrityError("artifact size does not match its descriptor")
+        if expected_sha256 is not None and hashlib.sha256(data).hexdigest() != expected_sha256:
+            raise ArtifactIntegrityError("artifact content hash mismatch")
+        return data
+
+    def _read_json(
+        self,
+        path: Path,
+        *,
+        expected: Optional[ArtifactRef] = None,
+        budget: Optional[_ReadBudget] = None,
+        maximum: Optional[int] = None,
+    ) -> Any:
+        active_budget = budget or _ReadBudget(self.max_total_read_bytes)
+        data = self._read_bytes(
+            path,
+            expected_sha256=None if expected is None else expected.sha256,
+            expected_size=None if expected is None else expected.size_bytes,
+            budget=active_budget,
+            maximum_bytes=maximum,
+        )
+        value = _strict_json_loads(
+            data,
+            min(self.max_file_bytes, maximum or self.max_file_bytes),
+            "artifact JSON",
+        )
+        if canonical_json_bytes(value) != data:
+            raise ArtifactIntegrityError("JSON artifact is not canonical UTF-8 JSON")
+        validate_safe_json(value, "artifact")
+        return value
+
+    def _artifact_ref(self, run_id: str, path: Path, data: bytes) -> ArtifactRef:
+        return ArtifactRef(
+            relative_path=self._run_relative(run_id, path),
+            sha256=hashlib.sha256(data).hexdigest(),
+            size_bytes=len(data),
+        )
+
+    def _write_json(
+        self,
+        run_id: str,
+        relative_path: str,
+        value: Any,
+        *,
+        maximum: Optional[int] = None,
+    ) -> ArtifactRef:
+        validate_safe_json(value, "artifact")
+        data = canonical_json_bytes(value)
+        if len(data) > min(self.max_file_bytes, maximum or self.max_file_bytes):
+            raise ArtifactIntegrityError("JSON artifact exceeds its byte limit")
+        path = self._target(run_id, relative_path)
+        self._write_bytes_exclusive(path, data)
+        return self._artifact_ref(run_id, path, data)
+
+    def _write_text(
+        self, run_id: str, relative_path: str, value: str, *, maximum: int
+    ) -> ArtifactRef:
+        text = validate_safe_text(value, "report")
+        if "\r" in text:
+            raise SchemaError("report must use canonical LF line endings")
+        data = text.encode("utf-8", "strict")
+        if len(data) > min(maximum, self.max_file_bytes):
+            raise ArtifactIntegrityError("report exceeds its byte limit")
+        path = self._target(run_id, relative_path)
+        self._write_bytes_exclusive(path, data)
+        return self._artifact_ref(run_id, path, data)
+
+    def _adopt_json(
+        self,
+        run_id: str,
+        relative_path: str,
+        *,
+        budget: _ReadBudget,
+        maximum: int,
+    ) -> Tuple[Any, ArtifactRef]:
+        path = self._target(run_id, relative_path)
+        data = self._read_bytes(
+            path,
+            expected_sha256=None,
+            expected_size=None,
+            budget=budget,
+            maximum_bytes=maximum,
+        )
+        value = _strict_json_loads(
+            data, min(maximum, self.max_file_bytes), "orphan artifact JSON"
+        )
+        if canonical_json_bytes(value) != data:
+            raise ArtifactIntegrityError("orphan JSON artifact is not canonical")
+        validate_safe_json(value, "artifact")
+        return value, self._artifact_ref(run_id, path, data)
+
+    def read_json_artifact(self, run_id: str, artifact: ArtifactRef) -> Any:
+        if not isinstance(artifact, ArtifactRef):
+            raise TypeError("artifact must be an ArtifactRef")
+        return self._read_json(
+            self._target(run_id, artifact.relative_path), expected=artifact
+        )
+
+    def read_json_artifacts(
+        self, run_id: str, artifacts: Iterable[ArtifactRef]
+    ) -> Tuple[Any, ...]:
+        budget = _ReadBudget(self.max_total_read_bytes)
+        values: List[Any] = []
+        for artifact in artifacts:
+            if not isinstance(artifact, ArtifactRef):
+                raise TypeError("artifacts must contain ArtifactRef values")
+            values.append(
+                self._read_json(
+                    self._target(run_id, artifact.relative_path),
+                    expected=artifact,
+                    budget=budget,
+                )
+            )
+        return tuple(values)
+
+    @staticmethod
+    def _validate_snapshot_binding(
+        config: EvalRunConfig, case_snapshot: RunCaseSnapshot
+    ) -> None:
+        if not isinstance(config, EvalRunConfig):
+            raise TypeError("config must be an EvalRunConfig")
+        if not isinstance(case_snapshot, RunCaseSnapshot):
+            raise TypeError("case_snapshot must be a RunCaseSnapshot")
+        expected_suite = SuiteRunConfig.from_case_snapshot(case_snapshot)
+        if config.suite != expected_suite:
+            raise SchemaError(
+                "Run Config suite does not match the verified RunCaseSnapshot"
+            )
+
+    def create_run(
+        self, config: EvalRunConfig, case_snapshot: RunCaseSnapshot
+    ) -> RunManifest:
+        """Materialize the complete immutable Run/Trial plan, manifest last."""
+
+        self._validate_snapshot_binding(config, case_snapshot)
+        run_dir = self._run_dir(config.run_id)
+        self._assert_directory(self.root)
+        with self._guard_parent_directory(run_dir) as parent_descriptor:
+            try:
+                if parent_descriptor is None:
+                    os.mkdir(run_dir, 0o700)
+                else:
+                    os.mkdir(
+                        run_dir.name,
+                        0o700,
+                        dir_fd=parent_descriptor,
+                    )
+                    os.fsync(parent_descriptor)
+            except FileExistsError as exc:
+                raise ArtifactConflictError(
+                    "run instance already exists; use a new run_instance_key"
+                ) from exc
+            except OSError as exc:
+                raise ArtifactSecurityError("could not create run directory") from exc
+        self._assert_directory(run_dir)
+        for fixed in (".locks", "cases", "evaluations", "receipts"):
+            self._ensure_directory(run_dir / fixed)
+        config_ref = self._write_json(
+            config.run_id,
+            "run_config.json",
+            config,
+            maximum=MAX_EVAL_RUN_CONFIG_BYTES,
+        )
+        snapshot_ref = self._write_json(
+            config.run_id,
+            "case_snapshot.json",
+            case_snapshot,
+            maximum=MAX_RUN_CASE_SNAPSHOT_BYTES,
+        )
+        initial_evaluator_execution_digest = (
+            EvaluatorExecutionConfig.from_resource_budgets(
+                config.evaluator, config.resource_budgets
+            ).digest()
+        )
+        plans: List[RunTrialPlan] = []
+        for case in config.suite.cases:
+            case_path_id = derive_case_path_id(case.task_id)
+            for trial_index in range(1, config.trial_count + 1):
+                trial_id = derive_trial_id(config.run_id, case.task_id, trial_index)
+                relative_base = "cases/%s/trials/%s" % (case_path_id, trial_id)
+                for suffix in (".locks", "receipts", "evaluations"):
+                    self._ensure_directory(
+                        self._target(config.run_id, relative_base) / suffix
+                    )
+                trial_manifest = TrialManifest(
+                    schema_version=TrialManifest.SCHEMA_VERSION,
+                    run_id=config.run_id,
+                    task_id=case.task_id,
+                    case_path_id=case_path_id,
+                    canonical_case_digest=case.canonical_case_digest,
+                    eval_input_digest=case.eval_input_digest,
+                    trial_id=trial_id,
+                    trial_index=trial_index,
+                    seed=derive_trial_seed(config.run_id, case.task_id, trial_index),
+                    agent_config_digest=config.agent_config_digest,
+                    initial_evaluator_execution_digest=(
+                        initial_evaluator_execution_digest
+                    ),
+                )
+                manifest_ref = self._write_json(
+                    config.run_id,
+                    "%s/trial_manifest.json" % relative_base,
+                    trial_manifest,
+                    maximum=MAX_TRIAL_MANIFEST_BYTES,
+                )
+                plans.append(
+                    RunTrialPlan(
+                        task_id=case.task_id,
+                        case_path_id=case_path_id,
+                        canonical_case_digest=case.canonical_case_digest,
+                        eval_input_digest=case.eval_input_digest,
+                        trial_id=trial_id,
+                        trial_index=trial_index,
+                        manifest=manifest_ref,
+                    )
+                )
+        manifest = RunManifest(
+            schema_version=RunManifest.SCHEMA_VERSION,
+            run_id=config.run_id,
+            run_config=config_ref,
+            case_snapshot=snapshot_ref,
+            agent_config_digest=config.agent_config_digest,
+            initial_evaluator_execution_digest=(
+                initial_evaluator_execution_digest
+            ),
+            trials=tuple(plans),
+        )
+        # This is the Run-plan commit marker and is always published last.
+        self._write_json(
+            config.run_id,
+            "run_manifest.json",
+            manifest,
+            maximum=MAX_RUN_MANIFEST_BYTES,
+        )
+        return manifest
+
+    def _read_run_manifest(
+        self, run_id: str, *, budget: _ReadBudget
+    ) -> RunManifest:
+        validate_run_id(run_id)
+        payload = self._read_json(
+            self._run_dir(run_id) / "run_manifest.json",
+            budget=budget,
+            maximum=MAX_RUN_MANIFEST_BYTES,
+        )
+        manifest = RunManifest.from_dict(payload)
+        if manifest.run_id != run_id:
+            raise ArtifactIntegrityError("RunManifest identity does not match its path")
+        return manifest
+
+    def _read_run_config(
+        self,
+        run_id: str,
+        manifest: RunManifest,
+        *,
+        budget: _ReadBudget,
+    ) -> EvalRunConfig:
+        payload = self._read_json(
+            self._run_dir(run_id) / "run_config.json",
+            expected=manifest.run_config,
+            budget=budget,
+            maximum=MAX_EVAL_RUN_CONFIG_BYTES,
+        )
+        config = EvalRunConfig.from_dict(payload)
+        if config.run_id != run_id:
+            raise ArtifactIntegrityError("Run Config identity does not match its path")
+        if (
+            config.agent_config_digest != manifest.agent_config_digest
+            or EvaluatorExecutionConfig.from_resource_budgets(
+                config.evaluator, config.resource_budgets
+            ).digest()
+            != manifest.initial_evaluator_execution_digest
+        ):
+            raise ArtifactIntegrityError("Run Config digests do not match RunManifest")
+        return config
+
+    def _read_case_snapshot(
+        self,
+        run_id: str,
+        manifest: RunManifest,
+        *,
+        budget: _ReadBudget,
+    ) -> RunCaseSnapshot:
+        payload = self._read_json(
+            self._run_dir(run_id) / "case_snapshot.json",
+            expected=manifest.case_snapshot,
+            budget=budget,
+            maximum=MAX_RUN_CASE_SNAPSHOT_BYTES,
+        )
+        return RunCaseSnapshot.from_dict(payload)
+
+    def _load_verified_run_bundle(
+        self, run_id: str, *, budget: Optional[_ReadBudget] = None
+    ) -> _VerifiedRunBundle:
+        active_budget = budget or _ReadBudget(self.max_total_read_bytes)
+        manifest = self._read_run_manifest(run_id, budget=active_budget)
+        config = self._read_run_config(
+            run_id, manifest, budget=active_budget
+        )
+        case_snapshot = self._read_case_snapshot(
+            run_id, manifest, budget=active_budget
+        )
+        try:
+            self._validate_snapshot_binding(config, case_snapshot)
+        except (SchemaError, TypeError) as exc:
+            raise ArtifactIntegrityError(
+                "Run Config and Case Snapshot bindings do not match"
+            ) from exc
+        expected_count = len(config.suite.cases) * config.trial_count
+        if len(manifest.trials) != expected_count:
+            raise ArtifactIntegrityError("RunManifest does not contain the complete Trial plan")
+        actual = {
+            (item.task_id, item.trial_index): item for item in manifest.trials
+        }
+        for case in config.suite.cases:
+            for trial_index in range(1, config.trial_count + 1):
+                item = actual.get((case.task_id, trial_index))
+                if item is None or (
+                    item.case_path_id != derive_case_path_id(case.task_id)
+                    or item.canonical_case_digest
+                    != case.canonical_case_digest
+                    or item.eval_input_digest != case.eval_input_digest
+                    or item.trial_id
+                    != derive_trial_id(run_id, case.task_id, trial_index)
+                ):
+                    raise ArtifactIntegrityError(
+                        "RunManifest Trial plan differs from Run Config"
+                    )
+        return _VerifiedRunBundle(
+            manifest=manifest,
+            config=config,
+            case_snapshot=case_snapshot,
+        )
+
+    def load_run_manifest(self, run_id: str) -> RunManifest:
+        """Load a Run manifest only after validating its Config and Snapshot."""
+
+        return self._load_verified_run_bundle(run_id).manifest
+
+    def load_run_config(self, run_id: str) -> EvalRunConfig:
+        return self._load_verified_run_bundle(run_id).config
+
+    def load_case_snapshot(self, run_id: str) -> RunCaseSnapshot:
+        """Load the immutable truth-free Case selection bound by a Run."""
+
+        return self._load_verified_run_bundle(run_id).case_snapshot
+
+    @staticmethod
+    def _find_plan(
+        manifest: RunManifest, task_id: str, trial_id: str
+    ) -> RunTrialPlan:
+        for plan in manifest.trials:
+            if plan.task_id == task_id and plan.trial_id == trial_id:
+                return plan
+        raise ArtifactStateError("Trial is not present in immutable RunManifest")
+
+    def _load_trial_manifest(
+        self,
+        bundle: _VerifiedRunBundle,
+        task_id: str,
+        trial_id: str,
+        *,
+        budget: _ReadBudget,
+    ) -> TrialManifest:
+        run_id = bundle.config.run_id
+        plan = self._find_plan(bundle.manifest, task_id, trial_id)
+        payload = self._read_json(
+            self._target(run_id, plan.manifest.relative_path),
+            expected=plan.manifest,
+            budget=budget,
+            maximum=MAX_TRIAL_MANIFEST_BYTES,
+        )
+        trial = TrialManifest.from_dict(payload)
+        if (
+            trial.run_id != run_id
+            or trial.task_id != task_id
+            or trial.trial_id != trial_id
+            or trial.case_path_id != plan.case_path_id
+            or trial.canonical_case_digest != plan.canonical_case_digest
+            or trial.eval_input_digest != plan.eval_input_digest
+            or trial.trial_index != plan.trial_index
+            or trial.agent_config_digest
+            != bundle.config.agent_config_digest
+            or trial.initial_evaluator_execution_digest
+            != EvaluatorExecutionConfig.from_resource_budgets(
+                bundle.config.evaluator,
+                bundle.config.resource_budgets,
+            ).digest()
+        ):
+            raise ArtifactIntegrityError("TrialManifest does not match RunManifest plan")
+        return trial
+
+    def load_trial_manifest(
+        self, run_id: str, task_id: str, trial_id: str
+    ) -> TrialManifest:
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        return self._load_trial_manifest(
+            bundle, task_id, trial_id, budget=budget
+        )
+
+    def create_trial(
+        self, run_id: str, task_id: str, trial_index: int
+    ) -> TrialManifest:
+        """Return a pre-created immutable Trial plan; never append to a manifest."""
+
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        bundle.config.suite.case(task_id)
+        if trial_index > bundle.config.trial_count:
+            raise SchemaError("trial_index exceeds run_config.trial_count")
+        trial_id = derive_trial_id(run_id, task_id, trial_index)
+        return self._load_trial_manifest(
+            bundle, task_id, trial_id, budget=budget
+        )
+
+    def _receipt_path(
+        self, plan: TrialManifest, stage: StageName, attempt: Optional[int] = None
+    ) -> str:
+        base = "cases/%s/trials/%s/receipts" % (
+            plan.case_path_id,
+            plan.trial_id,
+        )
+        if stage is StageName.PREPARE:
+            return "%s/prepare.json" % base
+        if stage is StageName.AGENT:
+            return "%s/terminal.json" % base
+        if stage in {StageName.START, StageName.INCOMPLETE} and attempt is not None:
+            return "%s/attempt-%04d/%s.json" % (base, attempt, stage.value)
+        raise ArtifactStateError("receipt path requires a legal stage/attempt")
+
+    def _load_receipt(
+        self,
+        run_id: str,
+        relative_path: str,
+        *,
+        budget: _ReadBudget,
+        expected: Optional[ArtifactRef] = None,
+    ) -> StageReceipt:
+        payload = self._read_json(
+            self._target(run_id, relative_path),
+            expected=expected,
+            budget=budget,
+            maximum=MAX_STAGE_RECEIPT_BYTES,
+        )
+        return StageReceipt.from_dict(payload)
+
+    @staticmethod
+    def _validate_receipt_binding(
+        receipt: StageReceipt,
+        plan: TrialManifest,
+        *,
+        config_digest: str,
+    ) -> None:
+        if (
+            receipt.run_id != plan.run_id
+            or receipt.task_id != plan.task_id
+            or receipt.trial_id != plan.trial_id
+            or receipt.config_digest != config_digest
+        ):
+            raise ArtifactIntegrityError("receipt identity/config binding mismatch")
+        prefix = "cases/%s/trials/%s/" % (plan.case_path_id, plan.trial_id)
+        for artifact in receipt.artifacts:
+            if not artifact.relative_path.startswith(prefix):
+                raise ArtifactIntegrityError("receipt artifact escapes its Trial namespace")
+        if receipt.stage is StageName.PREPARE:
+            if receipt.artifacts[0].relative_path != prefix + "input.json":
+                raise ArtifactIntegrityError("prepare receipt binds the wrong input path")
+        elif receipt.stage is StageName.AGENT:
+            submission_paths = [
+                item.relative_path
+                for item in receipt.artifacts
+                if item.relative_path.endswith("/submission.json")
+            ]
+            if submission_paths != [prefix + "submission.json"]:
+                raise ArtifactIntegrityError(
+                    "terminal receipt binds the wrong Submission path"
+                )
+        elif receipt.stage is StageName.EVALUATOR:
+            evaluation_prefix = prefix + "evaluations/%s/" % receipt.evaluation_id
+            if any(
+                not item.relative_path.startswith(evaluation_prefix)
+                for item in receipt.artifacts
+            ):
+                raise ArtifactIntegrityError(
+                    "evaluator receipt escapes its evaluation namespace"
+                )
+
+    def _verify_receipt(
+        self,
+        run_id: str,
+        receipt: StageReceipt,
+        *,
+        budget: _ReadBudget,
+        maximum_bytes: Optional[int] = None,
+    ) -> None:
+        for artifact in receipt.artifacts:
+            self._read_bytes(
+                self._target(run_id, artifact.relative_path),
+                expected_sha256=artifact.sha256,
+                expected_size=artifact.size_bytes,
+                budget=budget,
+                maximum_bytes=maximum_bytes,
+            )
+
+    def _load_terminal_submission(
+        self,
+        bundle: _VerifiedRunBundle,
+        plan: TrialManifest,
+        receipt: StageReceipt,
+        *,
+        budget: _ReadBudget,
+    ) -> EvalSubmission:
+        expected_path = "cases/%s/trials/%s/submission.json" % (
+            plan.case_path_id,
+            plan.trial_id,
+        )
+        submission_refs = [
+            artifact
+            for artifact in receipt.artifacts
+            if artifact.relative_path == expected_path
+        ]
+        if len(submission_refs) != 1:
+            raise ArtifactIntegrityError(
+                "terminal receipt must uniquely bind one Submission"
+            )
+        submission_ref = submission_refs[0]
+        for artifact in receipt.artifacts:
+            if artifact is submission_ref:
+                continue
+            self._read_bytes(
+                self._target(plan.run_id, artifact.relative_path),
+                expected_sha256=artifact.sha256,
+                expected_size=artifact.size_bytes,
+                budget=budget,
+                maximum_bytes=(
+                    bundle.config.resource_budgets.max_execution_artifact_file_bytes
+                ),
+            )
+        payload = self._read_json(
+            self._target(plan.run_id, submission_ref.relative_path),
+            expected=submission_ref,
+            budget=budget,
+            maximum=MAX_EVAL_SUBMISSION_BYTES,
+        )
+        submission = EvalSubmission.from_dict(payload)
+        if receipt.terminal_status is None:
+            raise ArtifactIntegrityError("terminal receipt lacks terminal status")
+        expected_failure = (
+            None if submission.failure is None else submission.failure.code
+        )
+        if (
+            submission.task_id != plan.task_id
+            or submission.trial_id != plan.trial_id
+            or submission.agent_id != bundle.config.agent.agent_id
+            or submission.status.value != receipt.terminal_status.value
+            or expected_failure is not receipt.failure_code
+        ):
+            raise ArtifactIntegrityError(
+                "Submission does not match its terminal receipt or verified Run"
+            )
+        return submission
+
+    def _attempt_indices(self, plan: TrialManifest) -> Tuple[int, ...]:
+        receipts = self._trial_dir(plan) / "receipts"
+        self._assert_directory(receipts)
+        indices: List[int] = []
+        try:
+            entries = list(os.scandir(receipts))
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "could not inspect Trial attempt receipts"
+            ) from exc
+        for entry in entries:
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "could not inspect Trial attempt receipts"
+                ) from exc
+            if _unsafe_node(metadata):
+                raise ArtifactSecurityError(
+                    "Trial receipts contain a link or reparse point"
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                if _ATTEMPT_RE.fullmatch(entry.name) is None:
+                    raise ArtifactIntegrityError(
+                        "Trial receipts contain an unknown directory"
+                    )
+                index = int(entry.name.split("-", 1)[1])
+                if index < 1 or index > MAX_TRIAL_ATTEMPTS:
+                    raise ArtifactIntegrityError(
+                        "Trial receipt attempt index is out of range"
+                    )
+                indices.append(index)
+            elif not stat.S_ISREG(metadata.st_mode):
+                raise ArtifactSecurityError(
+                    "Trial receipts contain a special file"
+                )
+            elif (
+                entry.name not in {"prepare.json", "terminal.json"}
+                and _TEMP_FILE_RE.fullmatch(entry.name) is None
+            ):
+                raise ArtifactIntegrityError(
+                    "Trial receipts contain an unknown file"
+                )
+        ordered = tuple(sorted(indices))
+        if ordered and ordered != tuple(range(1, ordered[-1] + 1)):
+            raise ArtifactIntegrityError(
+                "Trial attempt receipt directories are not contiguous"
+            )
+        return ordered
+
+    def _load_trial_state(
+        self,
+        bundle: _VerifiedRunBundle,
+        plan: TrialManifest,
+        *,
+        budget: _ReadBudget,
+    ) -> Tuple[TrialState, Optional[EvalSubmission]]:
+        terminal: Optional[StageReceipt] = None
+        terminal_path = self._receipt_path(plan, StageName.AGENT)
+        if self._exists_regular(self._target(plan.run_id, terminal_path)):
+            terminal = self._load_receipt(
+                plan.run_id, terminal_path, budget=budget
+            )
+            self._validate_receipt_binding(
+                terminal, plan, config_digest=plan.agent_config_digest
+            )
+            if terminal.stage is not StageName.AGENT:
+                raise ArtifactIntegrityError("terminal receipt has the wrong stage")
+
+        completed: List[StageName] = []
+        prepare_path = self._receipt_path(plan, StageName.PREPARE)
+        if self._exists_regular(self._target(plan.run_id, prepare_path)):
+            prepare = self._load_receipt(plan.run_id, prepare_path, budget=budget)
+            self._validate_receipt_binding(
+                prepare, plan, config_digest=plan.agent_config_digest
+            )
+            if prepare.stage is not StageName.PREPARE:
+                raise ArtifactIntegrityError("prepare receipt has the wrong stage")
+            self._verify_receipt(
+                plan.run_id,
+                prepare,
+                budget=budget,
+                maximum_bytes=MAX_EVAL_INPUT_BYTES,
+            )
+            completed.append(StageName.PREPARE)
+
+        attempt_indices = self._attempt_indices(plan)
+        latest_attempt: Optional[int] = None
+        latest_incomplete = False
+        for attempt in attempt_indices:
+            start_path = self._receipt_path(plan, StageName.START, attempt)
+            incomplete_path = self._receipt_path(plan, StageName.INCOMPLETE, attempt)
+            has_start = self._exists_regular(self._target(plan.run_id, start_path))
+            has_incomplete = self._exists_regular(
+                self._target(plan.run_id, incomplete_path)
+            )
+            if not has_start:
+                if has_incomplete:
+                    raise ArtifactIntegrityError(
+                        "incomplete receipt exists without matching start receipt"
+                    )
+                raise ArtifactIntegrityError(
+                    "Trial attempt directory has no start receipt"
+                )
+            start = self._load_receipt(plan.run_id, start_path, budget=budget)
+            self._validate_receipt_binding(
+                start, plan, config_digest=plan.agent_config_digest
+            )
+            if start.stage is not StageName.START or start.attempt != attempt:
+                raise ArtifactIntegrityError("start receipt has invalid attempt binding")
+            latest_attempt = attempt
+            latest_incomplete = has_incomplete
+            if has_incomplete:
+                incomplete = self._load_receipt(
+                    plan.run_id, incomplete_path, budget=budget
+                )
+                self._validate_receipt_binding(
+                    incomplete, plan, config_digest=plan.agent_config_digest
+                )
+                if (
+                    incomplete.stage is not StageName.INCOMPLETE
+                    or incomplete.attempt != attempt
+                ):
+                    raise ArtifactIntegrityError(
+                        "incomplete receipt has invalid attempt binding"
+                    )
+            elif attempt < attempt_indices[-1]:
+                next_start = self._receipt_path(plan, StageName.START, attempt + 1)
+                if self._exists_regular(self._target(plan.run_id, next_start)):
+                    raise ArtifactIntegrityError(
+                        "new attempt starts before prior attempt is incomplete"
+                    )
+
+        terminal_submission: Optional[EvalSubmission] = None
+        if terminal is not None:
+            if terminal.attempt is None or latest_attempt is None:
+                raise ArtifactIntegrityError("terminal receipt has no started attempt")
+            if terminal.attempt != latest_attempt:
+                raise ArtifactIntegrityError("terminal receipt binds the wrong attempt")
+            status = terminal.terminal_status
+            if status is None:
+                raise ArtifactIntegrityError("terminal receipt lacks terminal status")
+            if (
+                status is TrialStatus.COMPLETED
+                and StageName.PREPARE not in completed
+            ):
+                raise ArtifactIntegrityError(
+                    "completed terminal receipt lacks committed prepare stage"
+                )
+            terminal_submission = self._load_terminal_submission(
+                bundle, plan, terminal, budget=budget
+            )
+            completed.append(StageName.AGENT)
+        elif latest_attempt is None:
+            if StageName.PREPARE in completed:
+                raise ArtifactIntegrityError(
+                    "prepare receipt exists without a started Trial attempt"
+                )
+            status = TrialStatus.PENDING
+        elif latest_incomplete:
+            status = TrialStatus.INCOMPLETE
+        else:
+            status = TrialStatus.RUNNING
+        return (
+            TrialState(
+                trial_id=plan.trial_id,
+                status=status,
+                active_attempt=latest_attempt,
+                next_attempt=1 if latest_attempt is None else latest_attempt + 1,
+                completed_stages=tuple(completed),
+                terminal_receipt=terminal,
+            ),
+            terminal_submission,
+        )
+
+    def load_trial_state(
+        self, run_id: str, task_id: str, trial_id: str
+    ) -> TrialState:
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        plan = self._load_trial_manifest(
+            bundle, task_id, trial_id, budget=budget
+        )
+        state, _submission = self._load_trial_state(
+            bundle, plan, budget=budget
+        )
+        return state
+
+    def load_run_state(self, run_id: str) -> RunState:
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        states: List[TrialState] = []
+        for entry in bundle.manifest.trials:
+            plan = self._load_trial_manifest(
+                bundle, entry.task_id, entry.trial_id, budget=budget
+            )
+            state, _submission = self._load_trial_state(
+                bundle, plan, budget=budget
+            )
+            states.append(state)
+        if all(state.status in _TERMINAL_STATUSES for state in states):
+            status = RunStatus.COMPLETED
+        elif any(state.status is TrialStatus.RUNNING for state in states):
+            status = RunStatus.RUNNING
+        elif any(state.status is TrialStatus.INCOMPLETE for state in states):
+            status = RunStatus.INCOMPLETE
+        else:
+            status = RunStatus.PENDING
+        return RunState(run_id=run_id, status=status, trials=tuple(states))
+
+    def _trial_lock_path(self, plan: TrialManifest) -> Path:
+        return self._trial_dir(plan) / ".locks" / "trial.lock"
+
+    def start_trial(self, run_id: str, task_id: str, trial_id: str) -> TrialState:
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        plan = self._load_trial_manifest(
+            bundle, task_id, trial_id, budget=budget
+        )
+        with self._lock(self._trial_lock_path(plan)):
+            state, _submission = self._load_trial_state(
+                bundle,
+                plan,
+                budget=_ReadBudget(self.max_total_read_bytes),
+            )
+            if state.status not in {TrialStatus.PENDING, TrialStatus.INCOMPLETE}:
+                raise ArtifactConflictError("Trial cannot start from its current state")
+            if state.next_attempt > MAX_TRIAL_ATTEMPTS:
+                raise ArtifactStateError("Trial attempt limit has been reached")
+            receipt = StageReceipt.create(
+                run_id=run_id,
+                task_id=task_id,
+                trial_id=trial_id,
+                stage=StageName.START,
+                config_digest=plan.agent_config_digest,
+                attempt=state.next_attempt,
+            )
+            self._write_json(
+                run_id,
+                self._receipt_path(plan, StageName.START, state.next_attempt),
+                receipt,
+                maximum=MAX_STAGE_RECEIPT_BYTES,
+            )
+        return self.load_trial_state(run_id, task_id, trial_id)
+
+    def mark_trial_incomplete(
+        self,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        *,
+        attempt: int,
+    ) -> TrialState:
+        _integer(attempt, "attempt", minimum=1, maximum=MAX_TRIAL_ATTEMPTS)
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        plan = self._load_trial_manifest(
+            bundle, task_id, trial_id, budget=budget
+        )
+        with self._lock(self._trial_lock_path(plan)):
+            state, _submission = self._load_trial_state(
+                bundle,
+                plan,
+                budget=_ReadBudget(self.max_total_read_bytes),
+            )
+            if (
+                state.status is not TrialStatus.RUNNING
+                or state.active_attempt != attempt
+            ):
+                raise ArtifactStateError("only an active running Trial can become incomplete")
+            receipt = StageReceipt.create(
+                run_id=run_id,
+                task_id=task_id,
+                trial_id=trial_id,
+                stage=StageName.INCOMPLETE,
+                config_digest=plan.agent_config_digest,
+                attempt=attempt,
+            )
+            self._write_json(
+                run_id,
+                self._receipt_path(
+                    plan, StageName.INCOMPLETE, attempt
+                ),
+                receipt,
+                maximum=MAX_STAGE_RECEIPT_BYTES,
+            )
+        return self.load_trial_state(run_id, task_id, trial_id)
+
+    def write_prepare_stage(
+        self,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        eval_input: EvalInput,
+        *,
+        attempt: int,
+    ) -> StageReceipt:
+        if not isinstance(eval_input, EvalInput):
+            raise TypeError("eval_input must be an EvalInput")
+        _integer(attempt, "attempt", minimum=1, maximum=MAX_TRIAL_ATTEMPTS)
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        plan = self._load_trial_manifest(
+            bundle, task_id, trial_id, budget=budget
+        )
+        with self._lock(self._trial_lock_path(plan)):
+            state, _submission = self._load_trial_state(
+                bundle,
+                plan,
+                budget=_ReadBudget(self.max_total_read_bytes),
+            )
+            if (
+                state.status is not TrialStatus.RUNNING
+                or state.active_attempt != attempt
+            ):
+                raise ArtifactStateError("prepare stage requires a running Trial")
+            if StageName.PREPARE in state.completed_stages:
+                raise ArtifactConflictError("prepare stage is already committed")
+            if eval_input.task_id != task_id:
+                raise SchemaError("EvalInput task_id does not match Trial plan")
+            if eval_input.digest() != plan.eval_input_digest:
+                raise SchemaError("EvalInput digest does not match immutable Trial plan")
+            base = "cases/%s/trials/%s" % (plan.case_path_id, trial_id)
+            input_ref = self._write_json(
+                run_id,
+                "%s/input.json" % base,
+                eval_input,
+                maximum=MAX_EVAL_INPUT_BYTES,
+            )
+            receipt = StageReceipt.create(
+                run_id=run_id,
+                task_id=task_id,
+                trial_id=trial_id,
+                stage=StageName.PREPARE,
+                config_digest=plan.agent_config_digest,
+                artifacts=(input_ref,),
+            )
+            # Receipt is the stage commit marker and is published last.
+            self._write_json(
+                run_id,
+                self._receipt_path(plan, StageName.PREPARE),
+                receipt,
+                maximum=MAX_STAGE_RECEIPT_BYTES,
+            )
+        return receipt
+
+    @staticmethod
+    def _submission_status(submission: EvalSubmission) -> TrialStatus:
+        return TrialStatus(submission.status.value)
+
+    @staticmethod
+    def _evaluation_artifact_limit(
+        evaluator_execution: EvaluatorExecutionConfig,
+    ) -> int:
+        return evaluator_execution.max_execution_artifact_file_bytes
+
+    def _execution_artifact_total_bytes(self, run_id: str) -> int:
+        """Count execution-plane bytes without following links or reparse points."""
+
+        run_dir = self._run_dir(run_id)
+        self._assert_directory(run_dir)
+        total = 0
+        pending = [run_dir]
+        while pending:
+            directory = pending.pop()
+            self._assert_directory(directory)
+            try:
+                entries = list(os.scandir(directory))
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "could not inspect execution artifact usage"
+                ) from exc
+            for entry in entries:
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise ArtifactSecurityError(
+                        "could not inspect execution artifact usage"
+                    ) from exc
+                if _unsafe_node(metadata):
+                    raise ArtifactSecurityError(
+                        "execution artifact tree contains a link or reparse point"
+                    )
+                entry_path = Path(entry.path)
+                relative_parts = entry_path.relative_to(run_dir).parts
+                if stat.S_ISDIR(metadata.st_mode):
+                    if entry.name != ".locks":
+                        pending.append(entry_path)
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ArtifactSecurityError(
+                        "execution artifact tree contains a special file"
+                    )
+                if (
+                    "evaluations" in relative_parts
+                    and entry.name != "receipt.json"
+                ):
+                    total += metadata.st_size
+        return total
+
+    def _planned_artifact_ref(
+        self, run_id: str, relative_path: str, data: bytes
+    ) -> ArtifactRef:
+        return self._artifact_ref(
+            run_id, self._target(run_id, relative_path), data
+        )
+
+    def finalize_submission(
+        self,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        submission: EvalSubmission,
+        *,
+        attempt: int,
+    ) -> TrialState:
+        return self._finalize_submission(
+            run_id,
+            task_id,
+            trial_id,
+            submission,
+            attempt=attempt,
+            allow_incomplete=False,
+        )
+
+    def _finalize_submission(
+        self,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        submission: EvalSubmission,
+        *,
+        attempt: int,
+        allow_incomplete: bool,
+    ) -> TrialState:
+        if not isinstance(submission, EvalSubmission):
+            raise TypeError("submission must be an EvalSubmission")
+        _integer(attempt, "attempt", minimum=1, maximum=MAX_TRIAL_ATTEMPTS)
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        plan = self._load_trial_manifest(
+            bundle, task_id, trial_id, budget=budget
+        )
+        validate_safe_json(submission, "submission")
+        with self._lock(self._trial_lock_path(plan)):
+            state, _existing_submission = self._load_trial_state(
+                bundle,
+                plan,
+                budget=_ReadBudget(self.max_total_read_bytes),
+            )
+            allowed_statuses = {TrialStatus.RUNNING}
+            if allow_incomplete:
+                allowed_statuses.add(TrialStatus.INCOMPLETE)
+            if state.status not in allowed_statuses:
+                raise ArtifactConflictError("Trial cannot be finalized from this state")
+            if state.active_attempt != attempt:
+                raise ArtifactConflictError(
+                    "stale Trial attempt cannot commit a terminal Submission"
+                )
+            if (
+                submission.task_id != task_id
+                or submission.trial_id != trial_id
+                or submission.agent_id != bundle.config.agent.agent_id
+            ):
+                raise SchemaError("Submission identity does not match Run/Trial")
+            terminal_status = self._submission_status(submission)
+            if (
+                terminal_status is TrialStatus.COMPLETED
+                and StageName.PREPARE not in state.completed_stages
+            ):
+                raise ArtifactStateError(
+                    "completed Submission requires committed prepare stage"
+                )
+            base = "cases/%s/trials/%s" % (plan.case_path_id, trial_id)
+            submission_ref = self._write_json(
+                run_id,
+                "%s/submission.json" % base,
+                submission,
+                maximum=MAX_EVAL_SUBMISSION_BYTES,
+            )
+            artifacts: List[ArtifactRef] = [submission_ref]
+            if submission.trace_ref is not None:
+                artifacts.append(
+                    self._write_json(
+                        run_id,
+                        "%s/trace_ref.json" % base,
+                        submission.trace_ref,
+                    )
+                )
+            receipt = StageReceipt.create(
+                run_id=run_id,
+                task_id=task_id,
+                trial_id=trial_id,
+                stage=StageName.AGENT,
+                config_digest=plan.agent_config_digest,
+                artifacts=artifacts,
+                attempt=attempt,
+                terminal_status=terminal_status,
+                failure_code=(
+                    None if submission.failure is None else submission.failure.code
+                ),
+            )
+            # Unique terminal receipt is always the final create-only write.
+            self._write_json(
+                run_id,
+                self._receipt_path(plan, StageName.AGENT),
+                receipt,
+                maximum=MAX_STAGE_RECEIPT_BYTES,
+            )
+        return self.load_trial_state(run_id, task_id, trial_id)
+
+    def abandon_trial(
+        self,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        *,
+        failure_code: FailureCode = FailureCode.PROCESS_KILLED,
+        message: str = "Interrupted Trial was abandoned during recovery.",
+    ) -> TrialState:
+        try:
+            failure_status = submission_status_for_failure(failure_code)
+        except (TypeError, ValueError) as exc:
+            raise SchemaError(
+                "abandonment requires a stable failed failure code"
+            ) from exc
+        if failure_status is not SubmissionStatus.FAILED:
+            raise SchemaError("abandonment requires a stable failed failure code")
+        validate_safe_text(message, "abandonment failure message")
+        config = self.load_run_config(run_id)
+        state = self.load_trial_state(run_id, task_id, trial_id)
+        if state.active_attempt is None:
+            raise ArtifactStateError(
+                "abandonment requires a started Trial attempt"
+            )
+        submission = EvalSubmission(
+            schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
+            task_id=task_id,
+            agent_id=config.agent.agent_id,
+            trial_id=trial_id,
+            status=SubmissionStatus.FAILED,
+            intent=None,
+            review=None,
+            evidence=(),
+            usage=SubmissionUsage(
+                elapsed_seconds=None,
+                input_tokens=None,
+                output_tokens=None,
+                total_tokens=None,
+                tool_calls=None,
+                cost_amount=None,
+                cost_currency=None,
+            ),
+            trace_ref=None,
+            failure=SubmissionFailure(
+                code=failure_code,
+                message=message,
+                retryable=False,
+            ),
+        )
+        return self._finalize_submission(
+            run_id,
+            task_id,
+            trial_id,
+            submission,
+            attempt=state.active_attempt,
+            allow_incomplete=True,
+        )
+
+    def load_existing_submission(
+        self, run_id: str, task_id: str, trial_id: str
+    ) -> EvalSubmission:
+        """Read only a terminal-receipt-bound Submission; perform no repair."""
+
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        plan = self._load_trial_manifest(
+            bundle, task_id, trial_id, budget=budget
+        )
+        state, submission = self._load_trial_state(
+            bundle, plan, budget=budget
+        )
+        if (
+            state.terminal_receipt is None
+            or state.status not in _TERMINAL_STATUSES
+            or submission is None
+        ):
+            raise ArtifactStateError("nonterminal Trial has no committed Submission")
+        return submission
+
+    def recover_trial(
+        self, run_id: str, task_id: str, trial_id: str
+    ) -> ResumePlan:
+        """Commit only valid orphan artifacts/receipts and mark interrupted attempts."""
+
+        initial_budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(
+            run_id, budget=initial_budget
+        )
+        plan = self._load_trial_manifest(
+            bundle, task_id, trial_id, budget=initial_budget
+        )
+        with self._lock(self._trial_lock_path(plan)):
+            budget = _ReadBudget(self.max_total_read_bytes)
+            state, _submission = self._load_trial_state(
+                bundle, plan, budget=budget
+            )
+            if state.terminal_receipt is not None:
+                return ResumePlan(
+                    trial_id=trial_id,
+                    status=state.status,
+                    completed_stages=state.completed_stages,
+                    missing_stages=(),
+                    terminal=True,
+                )
+            if state.status is TrialStatus.RUNNING and state.active_attempt is not None:
+                incomplete = StageReceipt.create(
+                    run_id=run_id,
+                    task_id=task_id,
+                    trial_id=trial_id,
+                    stage=StageName.INCOMPLETE,
+                    config_digest=plan.agent_config_digest,
+                    attempt=state.active_attempt,
+                )
+                self._write_json(
+                    run_id,
+                    self._receipt_path(
+                        plan, StageName.INCOMPLETE, state.active_attempt
+                    ),
+                    incomplete,
+                    maximum=MAX_STAGE_RECEIPT_BYTES,
+                )
+                state, _submission = self._load_trial_state(
+                    bundle,
+                    plan,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                )
+
+            base = "cases/%s/trials/%s" % (plan.case_path_id, trial_id)
+            prepare_path = self._receipt_path(plan, StageName.PREPARE)
+            input_path = "%s/input.json" % base
+            prepare_committed = StageName.PREPARE in state.completed_stages
+            if (
+                not prepare_committed
+                and self._exists_regular(self._target(run_id, input_path))
+            ):
+                if state.active_attempt is None:
+                    raise ArtifactIntegrityError(
+                        "orphan EvalInput has no started Trial attempt"
+                    )
+                payload, input_ref = self._adopt_json(
+                    run_id,
+                    input_path,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                    maximum=MAX_EVAL_INPUT_BYTES,
+                )
+                eval_input = EvalInput.from_dict(payload)
+                if eval_input.task_id != task_id:
+                    raise ArtifactIntegrityError("orphan EvalInput has wrong task_id")
+                if eval_input.digest() != plan.eval_input_digest:
+                    raise ArtifactIntegrityError(
+                        "orphan EvalInput digest does not match Trial plan"
+                    )
+                prepare = StageReceipt.create(
+                    run_id=run_id,
+                    task_id=task_id,
+                    trial_id=trial_id,
+                    stage=StageName.PREPARE,
+                    config_digest=plan.agent_config_digest,
+                    artifacts=(input_ref,),
+                )
+                self._write_json(
+                    run_id,
+                    prepare_path,
+                    prepare,
+                    maximum=MAX_STAGE_RECEIPT_BYTES,
+                )
+                prepare_committed = True
+
+            terminal_path = self._receipt_path(plan, StageName.AGENT)
+            submission_path = "%s/submission.json" % base
+            if (
+                not self._exists_regular(self._target(run_id, terminal_path))
+                and self._exists_regular(self._target(run_id, submission_path))
+            ):
+                if state.active_attempt is None:
+                    raise ArtifactIntegrityError(
+                        "orphan Submission has no started Trial attempt"
+                    )
+                payload, submission_ref = self._adopt_json(
+                    run_id,
+                    submission_path,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                    maximum=MAX_EVAL_SUBMISSION_BYTES,
+                )
+                submission = EvalSubmission.from_dict(payload)
+                if (
+                    submission.task_id != task_id
+                    or submission.trial_id != trial_id
+                    or submission.agent_id != bundle.config.agent.agent_id
+                ):
+                    raise ArtifactIntegrityError("orphan Submission has wrong identity")
+                if (
+                    self._submission_status(submission) is TrialStatus.COMPLETED
+                    and not prepare_committed
+                ):
+                    raise ArtifactIntegrityError(
+                        "orphan completed Submission lacks committed prepare stage"
+                    )
+                terminal = StageReceipt.create(
+                    run_id=run_id,
+                    task_id=task_id,
+                    trial_id=trial_id,
+                    stage=StageName.AGENT,
+                    config_digest=plan.agent_config_digest,
+                    artifacts=(submission_ref,),
+                    attempt=state.active_attempt,
+                    terminal_status=self._submission_status(submission),
+                    failure_code=(
+                        None if submission.failure is None else submission.failure.code
+                    ),
+                )
+                # Recovery never rewrites Submission; it only writes the missing
+                # unique terminal commit marker, and does so last.
+                self._write_json(
+                    run_id,
+                    terminal_path,
+                    terminal,
+                    maximum=MAX_STAGE_RECEIPT_BYTES,
+                )
+        state = self.load_trial_state(run_id, task_id, trial_id)
+        missing = () if state.status in _TERMINAL_STATUSES else tuple(
+            stage
+            for stage in (StageName.PREPARE, StageName.AGENT)
+            if stage not in state.completed_stages
+        )
+        return ResumePlan(
+            trial_id=trial_id,
+            status=state.status,
+            completed_stages=state.completed_stages,
+            missing_stages=missing,
+            terminal=state.status in _TERMINAL_STATUSES,
+        )
+
+    def write_evaluation(
+        self,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        *,
+        evaluator_execution: EvaluatorExecutionConfig,
+        revision: str,
+        intent_matches: Any,
+        review_matches: Any,
+        judge_input: Any,
+        judge_output: Any,
+        score: Any,
+        report: Optional[str] = None,
+    ) -> StageReceipt:
+        """Create a versioned evaluator namespace without touching Submission."""
+
+        if not isinstance(evaluator_execution, EvaluatorExecutionConfig):
+            raise TypeError(
+                "evaluator_execution must be an EvaluatorExecutionConfig"
+            )
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        plan = self._load_trial_manifest(
+            bundle, task_id, trial_id, budget=budget
+        )
+        state, submission = self._load_trial_state(
+            bundle, plan, budget=budget
+        )
+        if (
+            state.status not in _TERMINAL_STATUSES
+            or submission is None
+        ):
+            raise ArtifactStateError(
+                "evaluation requires a committed terminal Submission"
+            )
+        evaluator_execution_digest = evaluator_execution.digest()
+        evaluation_limit = self._evaluation_artifact_limit(
+            evaluator_execution
+        )
+        evaluation_id = derive_evaluation_id(
+            run_id, evaluator_execution_digest, revision
+        )
+        base = "cases/%s/trials/%s/evaluations/%s" % (
+            plan.case_path_id,
+            trial_id,
+            evaluation_id,
+        )
+        receipt_path = "%s/receipt.json" % base
+        values = (
+            ("evaluator_execution_config.json", evaluator_execution),
+            ("intent_matches.json", intent_matches),
+            ("review_matches.json", review_matches),
+            ("judge_input.json", judge_input),
+            ("judge_output.json", judge_output),
+            ("score.json", score),
+        )
+        planned_json: List[Tuple[str, Any, bytes, ArtifactRef]] = []
+        artifacts: List[ArtifactRef] = []
+        for filename, value in values:
+            relative_path = "%s/%s" % (base, filename)
+            validate_safe_json(value, "evaluation artifact")
+            data = canonical_json_bytes(value)
+            if len(data) > min(self.max_file_bytes, evaluation_limit):
+                raise ArtifactIntegrityError(
+                    "evaluation artifact exceeds its execution byte limit"
+                )
+            artifact = self._planned_artifact_ref(
+                run_id, relative_path, data
+            )
+            planned_json.append((relative_path, value, data, artifact))
+            artifacts.append(artifact)
+
+        planned_report: Optional[Tuple[str, str, bytes, ArtifactRef]] = None
+        if report is not None:
+            report_text = validate_safe_text(report, "report")
+            if "\r" in report_text:
+                raise SchemaError("report must use canonical LF line endings")
+            report_path = "%s/report.md" % base
+            report_data = report_text.encode("utf-8", "strict")
+            if len(report_data) > min(self.max_file_bytes, evaluation_limit):
+                raise ArtifactIntegrityError(
+                    "evaluation report exceeds its execution byte limit"
+                )
+            report_ref = self._planned_artifact_ref(
+                run_id, report_path, report_data
+            )
+            planned_report = (
+                report_path,
+                report_text,
+                report_data,
+                report_ref,
+            )
+            artifacts.append(report_ref)
+
+        receipt = StageReceipt.create(
+            run_id=run_id,
+            task_id=task_id,
+            trial_id=trial_id,
+            stage=StageName.EVALUATOR,
+            config_digest=evaluator_execution_digest,
+            evaluation_id=evaluation_id,
+            evaluation_revision=revision,
+            artifacts=artifacts,
+        )
+        budget_lock = self._run_dir(run_id) / ".locks" / "execution-budget.lock"
+        evaluation_lock = self._target(run_id, base) / ".locks" / "evaluation.lock"
+        with self._lock(budget_lock):
+            with self._lock(evaluation_lock):
+                if self._exists_regular(self._target(run_id, receipt_path)):
+                    raise ArtifactConflictError(
+                        "evaluation version is already committed"
+                    )
+                missing_json: List[Tuple[str, Any, bytes, ArtifactRef]] = []
+                missing_bytes = 0
+                for item in planned_json:
+                    relative_path, _value, data, artifact = item
+                    target = self._target(run_id, relative_path)
+                    if self._exists_regular(target):
+                        self._read_bytes(
+                            target,
+                            expected_sha256=artifact.sha256,
+                            expected_size=artifact.size_bytes,
+                            budget=_ReadBudget(self.max_total_read_bytes),
+                        )
+                    else:
+                        missing_json.append(item)
+                        missing_bytes += len(data)
+
+                report_missing = False
+                if planned_report is not None:
+                    report_path, _report_text, report_data, report_ref = planned_report
+                    target = self._target(run_id, report_path)
+                    if self._exists_regular(target):
+                        self._read_bytes(
+                            target,
+                            expected_sha256=report_ref.sha256,
+                            expected_size=report_ref.size_bytes,
+                            budget=_ReadBudget(self.max_total_read_bytes),
+                        )
+                    else:
+                        report_missing = True
+                        missing_bytes += len(report_data)
+
+                current_bytes = self._execution_artifact_total_bytes(run_id)
+                maximum_total = (
+                    evaluator_execution.max_execution_artifact_total_bytes
+                )
+                if current_bytes + missing_bytes > maximum_total:
+                    raise ArtifactIntegrityError(
+                        "execution artifacts exceed the configured cumulative byte limit"
+                    )
+
+                for relative_path, value, _data, expected_ref in missing_json:
+                    written = self._write_json(
+                        run_id,
+                        relative_path,
+                        value,
+                        maximum=evaluation_limit,
+                    )
+                    if written != expected_ref:
+                        raise ArtifactIntegrityError(
+                            "evaluation artifact publication changed its planned identity"
+                        )
+                if report_missing and planned_report is not None:
+                    report_path, report_text, _report_data, expected_ref = planned_report
+                    written = self._write_text(
+                        run_id,
+                        report_path,
+                        report_text,
+                        maximum=evaluation_limit,
+                    )
+                    if written != expected_ref:
+                        raise ArtifactIntegrityError(
+                            "evaluation report publication changed its planned identity"
+                        )
+                # Evaluator receipt is the version commit marker and is last.
+                self._write_json(
+                    run_id,
+                    receipt_path,
+                    receipt,
+                    maximum=MAX_STAGE_RECEIPT_BYTES,
+                )
+        return receipt
+
+def load_existing_submission(
+    runs_root: os.PathLike[str] | str,
+    run_id: str,
+    task_id: str,
+    trial_id: str,
+    *,
+    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    max_total_read_bytes: int = DEFAULT_MAX_TOTAL_READ_BYTES,
+) -> EvalSubmission:
+    """Read-only convenience loader for evaluator-only processes."""
+
+    return ArtifactStore(
+        runs_root,
+        max_file_bytes=max_file_bytes,
+        max_total_read_bytes=max_total_read_bytes,
+        create_root=False,
+    ).load_existing_submission(run_id, task_id, trial_id)
+
+
+__all__ = [
+    "EVAL_RUN_MANIFEST_SCHEMA_VERSION",
+    "EVAL_TRIAL_MANIFEST_SCHEMA_VERSION",
+    "EVAL_STAGE_RECEIPT_SCHEMA_VERSION",
+    "MAX_RUN_MANIFEST_BYTES",
+    "MAX_TRIAL_MANIFEST_BYTES",
+    "MAX_STAGE_RECEIPT_BYTES",
+    "DEFAULT_MAX_FILE_BYTES",
+    "DEFAULT_MAX_TOTAL_READ_BYTES",
+    "DIRECTORY_FSYNC_SUPPORTED",
+    "ArtifactError",
+    "ArtifactConflictError",
+    "ArtifactIntegrityError",
+    "ArtifactSecurityError",
+    "ArtifactStateError",
+    "RunStatus",
+    "StageName",
+    "ArtifactRef",
+    "TrialManifest",
+    "RunTrialPlan",
+    "RunManifest",
+    "StageReceipt",
+    "TrialState",
+    "RunState",
+    "ResumePlan",
+    "derive_receipt_id",
+    "ArtifactStore",
+    "load_existing_submission",
+]
