@@ -104,6 +104,9 @@ MAX_CACHE_BYTES = 1024 * 1024 * 1024
 MAX_PATH_DEPTH = 64
 MAX_PATH_BYTES = 1024
 MAX_PATH_COMPONENT_BYTES = 255
+# A small Git tree DAG can expand into an enormous logical tree.  Count logical
+# entries, not only unique objects/files, before materialization or replay.
+MAX_LOGICAL_TREE_ENTRIES = MAX_MATERIALIZED_FILES * 2 + MAX_PATH_DEPTH
 MAX_GIT_METADATA_OBJECT_BYTES = 8 * 1024 * 1024
 MAX_TRIAL_ATTEMPT = 10_000
 DEFAULT_GIT_TIMEOUT_SECONDS = 180.0
@@ -242,6 +245,7 @@ def _budget_policy(
         "max_blob_bytes": MAX_GIT_BLOB_BYTES,
         "max_materialized_files": MAX_MATERIALIZED_FILES,
         "max_materialized_bytes": MAX_MATERIALIZED_BYTES,
+        "max_logical_tree_entries": MAX_LOGICAL_TREE_ENTRIES,
         "max_cache_bytes": MAX_CACHE_BYTES,
         "actual_objects": object_count,
         "actual_blobs": blob_count,
@@ -269,6 +273,7 @@ def _validate_budget_policy(value: Any) -> Dict[str, Any]:
         "max_blob_bytes",
         "max_materialized_files",
         "max_materialized_bytes",
+        "max_logical_tree_entries",
         "max_cache_bytes",
         "actual_objects",
         "actual_blobs",
@@ -283,6 +288,7 @@ def _validate_budget_policy(value: Any) -> Dict[str, Any]:
         "max_blob_bytes": MAX_GIT_BLOB_BYTES,
         "max_materialized_files": MAX_MATERIALIZED_FILES,
         "max_materialized_bytes": MAX_MATERIALIZED_BYTES,
+        "max_logical_tree_entries": MAX_LOGICAL_TREE_ENTRIES,
         "max_cache_bytes": MAX_CACHE_BYTES,
     }
     for key, expected in fixed.items():
@@ -3001,11 +3007,17 @@ def _closure_from_objects(
     head_tree, _ = commit_data(head_revision)
     materialized: List[Tuple[str, int, bytes, str]] = []
     materialized_bytes = 0
+    materialized_entries = 0
     materialized_folded: Set[str] = set()
 
     def enumerate_tree(oid: str, prefix: Tuple[str, ...]) -> None:
-        nonlocal materialized_bytes
+        nonlocal materialized_bytes, materialized_entries
         for entry in tree_data(oid):
+            materialized_entries += 1
+            if materialized_entries > MAX_LOGICAL_TREE_ENTRIES:
+                raise RepositoryLimitError(
+                    "head tree exceeds logical entry expansion budget"
+                )
             parts = (*prefix, entry.name)
             path_bytes = _validate_repo_path(parts, "head tree")
             path = path_bytes.decode("utf-8", "strict")
@@ -4468,6 +4480,215 @@ class PreparedRepository:
         return stable_id("repository-cache", self.manifest.prepared_repository_id)
 
 
+def canonical_repository_path(value: Any) -> str:
+    """Return one path under the exact policy used by prepared Git trees.
+
+    The validator is public so evaluator components cannot silently develop a
+    second notion of a canonical repository path.  It performs no correction:
+    callers receive the original string or a policy/limit exception.
+    """
+
+    if type(value) is not str or not value:
+        raise RepositoryPolicyError(
+            "repository path must be a non-empty string"
+        )
+    encoded = _validate_repo_path(value.split("/"), "repository path")
+    if encoded.decode("utf-8", "strict") != value:
+        raise RepositoryPolicyError(
+            "repository path must be canonical UTF-8 POSIX form"
+        )
+    return value
+
+
+def _replay_byte_limit(value: Any, context: str, maximum: int) -> int:
+    if type(value) is not int or value < 1 or value > maximum:
+        raise RepositoryLimitError(
+            "%s must be an integer from 1 through %d" % (context, maximum)
+        )
+    return value
+
+
+def _tree_file_index(
+    closure: _RepositoryClosure, tree_oid: str
+) -> Mapping[str, str]:
+    files: Dict[str, str] = {}
+    logical_entries = 0
+
+    def visit(oid: str, prefix: Tuple[str, ...]) -> None:
+        nonlocal logical_entries
+        tree = closure.objects.get(oid)
+        if tree is None:
+            raise RepositoryIntegrityError(
+                "repository replay tree references a missing object"
+            )
+        for entry in _parse_tree(tree, closure.object_format):
+            logical_entries += 1
+            if logical_entries > MAX_LOGICAL_TREE_ENTRIES:
+                raise RepositoryLimitError(
+                    "repository replay tree exceeds logical entry expansion budget"
+                )
+            parts = (*prefix, entry.name)
+            path_bytes = _validate_repo_path(parts, "repository replay tree")
+            path = path_bytes.decode("utf-8", "strict")
+            if entry.object_type == "tree":
+                visit(entry.oid, parts)
+                continue
+            if path in files:
+                raise RepositoryIntegrityError(
+                    "repository replay tree contains a duplicate path"
+                )
+            files[path] = entry.oid
+
+    visit(tree_oid, ())
+    return MappingProxyType(dict(sorted(files.items())))
+
+
+@dataclass(frozen=True)
+class PreparedRepositoryReplay:
+    """Read-only replay of the exact base/head objects in a prepared cache.
+
+    Instances are issued only by :meth:`RepositoryPreparer.open_replay` after
+    the cache index, manifest, complete object closure, and Git executable have
+    been revalidated.  File reads come from that immutable in-memory closure;
+    diffs use the same bounded, isolated Git process boundary used during
+    preparation and never inspect a Trial workspace.
+    """
+
+    prepared_repository_id: str
+    repository_descriptor_digest: str
+    base_revision: str
+    head_revision: str
+    _git_dir: Path = field(repr=False, compare=False)
+    _runner: _GitRunner = field(repr=False, compare=False)
+    _open_check: Callable[[], None] = field(repr=False, compare=False)
+    _verify_cache: Callable[[], None] = field(repr=False, compare=False)
+    _objects: Mapping[str, _GitObject] = field(repr=False, compare=False)
+    _files_by_revision: Mapping[str, Mapping[str, str]] = field(
+        repr=False, compare=False
+    )
+
+    @classmethod
+    def _from_verified(
+        cls,
+        prepared: PreparedRepository,
+        closure: _RepositoryClosure,
+        runner: _GitRunner,
+        open_check: Callable[[], None],
+        verify_cache: Callable[[], None],
+    ) -> "PreparedRepositoryReplay":
+        if (
+            closure.base_revision != prepared.manifest.base_revision
+            or closure.head_revision != prepared.manifest.head_revision
+            or closure.source_digest != prepared.manifest.source_digest
+        ):
+            raise RepositoryIntegrityError(
+                "repository replay closure does not match PreparedRepository"
+            )
+        base_files = _tree_file_index(closure, closure.base_tree)
+        head_files = _tree_file_index(closure, closure.head_tree)
+        files_by_revision: Mapping[str, Mapping[str, str]] = MappingProxyType(
+            {
+                closure.base_revision: base_files,
+                closure.head_revision: head_files,
+            }
+        )
+        return cls(
+            prepared_repository_id=prepared.manifest.prepared_repository_id,
+            repository_descriptor_digest=prepared.repository.digest(),
+            base_revision=closure.base_revision,
+            head_revision=closure.head_revision,
+            _git_dir=prepared.cache_path,
+            _runner=runner,
+            _open_check=open_check,
+            _verify_cache=verify_cache,
+            _objects=MappingProxyType(dict(closure.objects)),
+            _files_by_revision=files_by_revision,
+        )
+
+    def _files(self, revision: Any) -> Mapping[str, str]:
+        self._open_check()
+        if type(revision) is not str or revision not in self._files_by_revision:
+            raise RepositoryIntegrityError(
+                "repository replay revision must be the exact base or head"
+            )
+        return self._files_by_revision[revision]
+
+    def paths(self, revision: str) -> Tuple[str, ...]:
+        """Return a stable case-sensitive path catalog for one exact revision."""
+
+        return tuple(self._files(revision))
+
+    def contains_path(self, revision: str, path: str) -> bool:
+        canonical = canonical_repository_path(path)
+        return canonical in self._files(revision)
+
+    def read_file(
+        self,
+        revision: str,
+        path: str,
+        *,
+        max_bytes: int = MAX_GIT_BLOB_BYTES,
+    ) -> Optional[bytes]:
+        """Read a regular blob from an exact revision, or ``None`` if absent."""
+
+        limit = _replay_byte_limit(
+            max_bytes, "repository replay file byte limit", MAX_GIT_BLOB_BYTES
+        )
+        canonical = canonical_repository_path(path)
+        oid = self._files(revision).get(canonical)
+        if oid is None:
+            return None
+        obj = self._objects.get(oid)
+        if obj is None or obj.object_type != "blob":
+            raise RepositoryIntegrityError(
+                "repository replay path does not resolve to a verified blob"
+            )
+        if len(obj.raw) > limit:
+            raise RepositoryLimitError(
+                "repository replay file exceeds its requested byte limit"
+            )
+        return obj.raw
+
+    def diff(
+        self,
+        path: str,
+        *,
+        max_bytes: int = MAX_GIT_STDOUT_BYTES,
+    ) -> bytes:
+        """Replay the canonical full ``base..head`` diff for one path."""
+
+        limit = _replay_byte_limit(
+            max_bytes, "repository replay diff byte limit", MAX_GIT_STDOUT_BYTES
+        )
+        self._open_check()
+        canonical = canonical_repository_path(path)
+        self._verify_cache()
+        try:
+            try:
+                result = self._runner.run(
+                    [
+                        "--literal-pathspecs",
+                        "--git-dir",
+                        str(self._git_dir),
+                        "diff",
+                        "--no-color",
+                        "--no-ext-diff",
+                        "--unified=3",
+                        "%s..%s" % (self.base_revision, self.head_revision),
+                        "--",
+                        canonical,
+                    ],
+                    stdout_limit=limit,
+                )
+            except _GitCommandFailure as exc:
+                raise RepositoryIntegrityError(
+                    "canonical repository diff replay failed"
+                ) from exc
+        finally:
+            self._verify_cache()
+        return result.stdout
+
+
 @dataclass(frozen=True)
 class RepositoryAcquisitionBinding(_JsonModel):
     """Harness-only HTTPS attestation; it is never exposed to a Trial."""
@@ -5602,14 +5823,14 @@ class RepositoryPreparer:
         self._runner.require_curlopt_resolve()
         return binding
 
-    def _load_cached_from_index(
+    def _load_cached_bundle_from_index(
         self,
         index: Mapping[str, Any],
         *,
         expected_request_id: str,
         repository: Repository,
         acquisition_binding_digest: Optional[str],
-    ) -> PreparedRepository:
+    ) -> Tuple[PreparedRepository, _RepositoryClosure]:
         repository_descriptor_digest = repository.digest()
         if (
             index["request_id"] != expected_request_id
@@ -5667,14 +5888,33 @@ class RepositoryPreparer:
             raise RepositoryLimitError(
                 "prepared repository cache exceeds its physical byte budget"
             )
-        return PreparedRepository(
-            manifest=manifest,
-            cache_path=repository_path,
+        return (
+            PreparedRepository(
+                manifest=manifest,
+                cache_path=repository_path,
+                repository=repository,
+                acquisition_binding_digest=acquisition_binding_digest,
+                git_version=self._runner.version,
+                git_executable_sha256=self._runner.executable_sha256,
+            ),
+            closure,
+        )
+
+    def _load_cached_from_index(
+        self,
+        index: Mapping[str, Any],
+        *,
+        expected_request_id: str,
+        repository: Repository,
+        acquisition_binding_digest: Optional[str],
+    ) -> PreparedRepository:
+        prepared, _closure = self._load_cached_bundle_from_index(
+            index,
+            expected_request_id=expected_request_id,
             repository=repository,
             acquisition_binding_digest=acquisition_binding_digest,
-            git_version=self._runner.version,
-            git_executable_sha256=self._runner.executable_sha256,
         )
+        return prepared
 
     def _acquire_closure(
         self,
@@ -5881,6 +6121,80 @@ class RepositoryPreparer:
         )
         return prepared, index
 
+    def _verified_prepared_bundle(
+        self, prepared: PreparedRepository
+    ) -> Tuple[PreparedRepository, _RepositoryClosure]:
+        self._require_open()
+        if not isinstance(prepared, PreparedRepository):
+            raise TypeError("prepared must be a PreparedRepository")
+        expected_entry = self.cache_root / prepared.cache_id
+        expected_cache_path = expected_entry / "repository.git"
+        if _normalized_path(prepared.cache_path) != _normalized_path(
+            expected_cache_path
+        ):
+            raise RepositorySecurityError(
+                "PreparedRepository handle is outside its canonical cache entry"
+            )
+        _validate_direct_child(
+            self.cache_root, expected_entry, "prepared repository cache handle"
+        )
+        _assert_secure_directory(expected_entry, "prepared repository cache entry")
+        persisted_manifest = PreparedRepositoryManifest.from_json(
+            _read_regular_file(
+                expected_entry / "manifest.json",
+                maximum=MAX_REPOSITORY_MANIFEST_BYTES,
+                context="prepared repository handle manifest",
+            )
+        )
+        if persisted_manifest != prepared.manifest:
+            raise RepositoryIntegrityError(
+                "PreparedRepository handle does not match its persisted manifest"
+            )
+        request_id = _request_id(
+            prepared.repository.digest(),
+            prepared.acquisition_binding_digest,
+            prepared.git_version,
+            prepared.git_executable_sha256,
+        )
+        index_path = self.index_root / (request_id + ".json")
+        if not os.path.lexists(index_path):
+            raise RepositoryIntegrityError(
+                "PreparedRepository has no verified request-index binding"
+            )
+        verified_handle, closure = self._load_cached_bundle_from_index(
+            _load_cache_index(index_path),
+            expected_request_id=request_id,
+            repository=prepared.repository,
+            acquisition_binding_digest=prepared.acquisition_binding_digest,
+        )
+        if verified_handle != prepared:
+            raise RepositoryIntegrityError(
+                "PreparedRepository runtime provenance is not verified"
+            )
+        return verified_handle, closure
+
+    def open_replay(
+        self, prepared: PreparedRepository
+    ) -> PreparedRepositoryReplay:
+        """Open a verified, read-only base/head Evidence replay handle."""
+
+        verified, closure = self._verified_prepared_bundle(prepared)
+
+        def verify_cache() -> None:
+            current, _current_closure = self._verified_prepared_bundle(verified)
+            if current != verified:
+                raise RepositoryIntegrityError(
+                    "prepared repository replay binding changed"
+                )
+
+        return PreparedRepositoryReplay._from_verified(
+            verified,
+            closure,
+            self._runner,
+            self._require_open,
+            verify_cache,
+        )
+
     def prepare(self, descriptor: Repository) -> PreparedRepository:
         self._require_open()
         self._assert_data_root_budget()
@@ -5982,53 +6296,8 @@ class RepositoryPreparer:
         eval_input: EvalInput,
         attempt: int,
     ) -> TrialWorkspace:
-        self._require_open()
-        if not isinstance(prepared, PreparedRepository):
-            raise TypeError("prepared must be a PreparedRepository")
-        expected_entry = self.cache_root / prepared.cache_id
-        expected_cache_path = expected_entry / "repository.git"
-        if _normalized_path(prepared.cache_path) != _normalized_path(
-            expected_cache_path
-        ):
-            raise RepositorySecurityError(
-                "PreparedRepository handle is outside its canonical cache entry"
-            )
-        _validate_direct_child(
-            self.cache_root, expected_entry, "prepared repository cache handle"
-        )
-        _assert_secure_directory(expected_entry, "prepared repository cache entry")
-        persisted_manifest = PreparedRepositoryManifest.from_json(
-            _read_regular_file(
-                expected_entry / "manifest.json",
-                maximum=MAX_REPOSITORY_MANIFEST_BYTES,
-                context="prepared repository handle manifest",
-            )
-        )
-        if persisted_manifest != prepared.manifest:
-            raise RepositoryIntegrityError(
-                "PreparedRepository handle does not match its persisted manifest"
-            )
-        request_id = _request_id(
-            prepared.repository.digest(),
-            prepared.acquisition_binding_digest,
-            prepared.git_version,
-            prepared.git_executable_sha256,
-        )
-        index_path = self.index_root / (request_id + ".json")
-        if not os.path.lexists(index_path):
-            raise RepositoryIntegrityError(
-                "PreparedRepository has no verified request-index binding"
-            )
-        verified_handle = self._load_cached_from_index(
-            _load_cache_index(index_path),
-            expected_request_id=request_id,
-            repository=prepared.repository,
-            acquisition_binding_digest=prepared.acquisition_binding_digest,
-        )
-        if verified_handle != prepared:
-            raise RepositoryIntegrityError(
-                "PreparedRepository runtime provenance is not verified"
-            )
+        verified_handle, closure = self._verified_prepared_bundle(prepared)
+        prepared = verified_handle
         manifest = WorkspaceManifest.create(
             prepared,
             trial_manifest=trial_manifest,
@@ -6042,14 +6311,6 @@ class RepositoryPreparer:
         if workspace_id in self._active_leases or os.path.lexists(target):
             raise RepositoryPreparationError("Trial workspace already exists")
 
-        closure, _cache_bytes = _read_loose_repository(
-            prepared.cache_path,
-            object_format=prepared.manifest.object_format,
-            base_revision=prepared.manifest.base_revision,
-            head_revision=prepared.manifest.head_revision,
-        )
-        if closure.source_digest != prepared.manifest.source_digest:
-            raise RepositoryIntegrityError("prepared repository changed before Trial")
         staging = self.active_root / ("staging-" + uuid.uuid4().hex)
         _validate_direct_child(self.active_root, staging, "Trial staging workspace")
         _mkdir_exclusive(staging)
@@ -6324,6 +6585,7 @@ __all__ = [
     "FixtureRepositoryBuilder",
     "PreparedRepository",
     "PreparedRepositoryManifest",
+    "PreparedRepositoryReplay",
     "RepositoryAcquisitionBinding",
     "RepositoryIntegrityError",
     "RepositoryLimitError",
@@ -6335,4 +6597,5 @@ __all__ = [
     "WorkspaceDiagnostic",
     "WorkspaceManifest",
     "WorkspaceRetentionPolicy",
+    "canonical_repository_path",
 ]

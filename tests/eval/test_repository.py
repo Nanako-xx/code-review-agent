@@ -125,6 +125,41 @@ def _init_bare_repository_with_tree_names(
     return base, head
 
 
+def _expanding_tree_objects(
+    *, fanout: int = 47, levels: int = 3
+) -> tuple[str, str, dict[str, object]]:
+    """Build a tiny tree-object DAG with a large logical expansion."""
+
+    objects: dict[str, object] = {}
+
+    def add(object_type: str, raw: bytes) -> str:
+        oid = repository_module._object_hash("sha1", object_type, raw)
+        objects[oid] = repository_module._GitObject(oid, object_type, raw)
+        return oid
+
+    empty_tree = add("tree", b"")
+    child = empty_tree
+    for _level in range(levels):
+        raw = b"".join(
+            b"40000 d%03d\0" % index + bytes.fromhex(child)
+            for index in range(fanout)
+        )
+        child = add("tree", raw)
+    return empty_tree, child, objects
+
+
+def _commit_object(
+    objects: dict[str, object], tree: str, *, parent: str | None = None
+) -> str:
+    headers = ["tree %s" % tree]
+    if parent is not None:
+        headers.append("parent %s" % parent)
+    raw = (("\n".join(headers)) + "\n\nfixture\n").encode("ascii")
+    oid = repository_module._object_hash("sha1", "commit", raw)
+    objects[oid] = repository_module._GitObject(oid, "commit", raw)
+    return oid
+
+
 def _local_descriptor(path: str, base: str, head: str) -> Repository:
     return Repository(
         source=RepositorySource.GIT,
@@ -273,6 +308,35 @@ def test_fixture_builder_creates_reproducible_commits_and_tree_digests(
     assert _git(first.repository_path, "rev-parse", f"{first.base_revision}^{{tree}}") == first.base_tree
     assert _git(first.repository_path, "rev-parse", f"{first.head_revision}^{{tree}}") == first.head_tree
     assert _git(first.repository_path, "rev-parse", f"{first.head_revision}^") == first.base_revision
+
+
+def test_head_tree_dag_expansion_is_bounded_by_logical_entries() -> None:
+    empty_tree, expanding_tree, objects = _expanding_tree_objects()
+    base = _commit_object(objects, empty_tree)
+    head = _commit_object(objects, expanding_tree, parent=base)
+
+    with pytest.raises(RepositoryLimitError, match="logical entry"):
+        repository_module._closure_from_objects(
+            objects,
+            object_format="sha1",
+            base_revision=base,
+            head_revision=head,
+        )
+
+
+def test_base_tree_dag_expansion_is_bounded_before_replay_allocation() -> None:
+    empty_tree, expanding_tree, objects = _expanding_tree_objects()
+    base = _commit_object(objects, expanding_tree)
+    head = _commit_object(objects, empty_tree, parent=base)
+    closure = repository_module._closure_from_objects(
+        objects,
+        object_format="sha1",
+        base_revision=base,
+        head_revision=head,
+    )
+
+    with pytest.raises(RepositoryLimitError, match="logical entry"):
+        repository_module._tree_file_index(closure, closure.base_tree)
 
 
 def test_fixture_builder_rejects_links_special_nodes_and_vcs_metadata(
@@ -1151,6 +1215,10 @@ def test_prepared_repository_budget_policy_is_immutable(tmp_path: Path) -> None:
             manifest.budget_policy["actual_objects"] = 0  # type: ignore[index]
 
         assert dict(manifest.budget_policy) == original_budget
+        assert (
+            manifest.budget_policy["max_logical_tree_entries"]
+            == repository_module.MAX_LOGICAL_TREE_ENTRIES
+        )
         assert "actual_cache_bytes" not in manifest.budget_policy
         detached = manifest.to_dict()["budget_policy"]
         detached["actual_objects"] = 0
