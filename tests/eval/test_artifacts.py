@@ -143,6 +143,7 @@ def make_config(
     evaluator=None,
     case_snapshot: RunCaseSnapshot | None = None,
     resource_budgets: ResourceBudgets | None = None,
+    trial_count: int = 1,
 ):
     snapshot = case_snapshot or make_case_snapshot()
     return EvalRunConfig.create(
@@ -151,7 +152,7 @@ def make_config(
         clarification_matcher=matcher_config(),
         evaluator=evaluator or evaluator_config(),
         suite=SuiteRunConfig.from_case_snapshot(snapshot),
-        trial_count=1,
+        trial_count=trial_count,
         resource_budgets=resource_budgets or budgets(parallel=1),
     )
 
@@ -256,6 +257,34 @@ def make_store(tmp_path: Path):
     return store, config, manifest, plan, trial
 
 
+def required_runner_artifacts(submission: EvalSubmission):
+    """Minimal control-plane artifacts required by a terminal Agent receipt."""
+
+    return {
+        "clarification_match_receipts.json": {"receipts": []},
+        "terminal_summary.json": {"status": submission.status.value},
+    }
+
+
+def write_required_runner_artifacts(
+    store: ArtifactStore,
+    config,
+    plan,
+    submission: EvalSubmission,
+    *,
+    attempt: int,
+):
+    base = "cases/%s/trials/%s/runner/attempt-%04d" % (
+        plan.case_path_id,
+        plan.trial_id,
+        attempt,
+    )
+    refs = []
+    for name, value in required_runner_artifacts(submission).items():
+        refs.append(store._write_json(config.run_id, "%s/%s" % (base, name), value))
+    return tuple(refs)
+
+
 def complete_trial(store, config, plan):
     running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
     assert running.active_attempt is not None
@@ -273,6 +302,7 @@ def complete_trial(store, config, plan):
         plan.trial_id,
         submission,
         attempt=running.active_attempt,
+        runner_artifacts=required_runner_artifacts(submission),
     )
     return submission, state
 
@@ -510,6 +540,7 @@ def test_receipts_derive_pending_running_incomplete_and_terminal_state(tmp_path)
         plan.trial_id,
         submission,
         attempt=resumed.active_attempt,
+        runner_artifacts=required_runner_artifacts(submission),
     )
     assert terminal.status is TrialStatus.COMPLETED
     assert terminal.terminal_receipt is not None
@@ -600,13 +631,20 @@ def test_disk_replay_hydrates_and_binds_terminal_submission(tmp_path):
     submission_ref = store._write_json(
         config.run_id, "%s/submission.json" % base, failed
     )
+    runner_refs = write_required_runner_artifacts(
+        store,
+        config,
+        plan,
+        failed,
+        attempt=1,
+    )
     mismatched = StageReceipt.create(
         run_id=config.run_id,
         task_id=TASK_ID,
         trial_id=plan.trial_id,
         stage=StageName.AGENT,
         config_digest=trial.agent_config_digest,
-        artifacts=(submission_ref,),
+        artifacts=(submission_ref,) + runner_refs,
         attempt=1,
         terminal_status=TrialStatus.COMPLETED,
     )
@@ -664,6 +702,13 @@ def test_resume_only_commits_missing_legal_receipts_and_never_rewrites_submissio
     submission = completed_submission(plan.trial_id)
     submission_ref = store._write_json(
         config.run_id, "%s/submission.json" % base, submission
+    )
+    write_required_runner_artifacts(
+        store,
+        config,
+        plan,
+        submission,
+        attempt=2,
     )
     submission_path = store.root / config.run_id / Path(
         *submission_ref.relative_path.split("/")
@@ -869,8 +914,11 @@ def test_evaluation_total_budget_is_preflighted_before_artifacts_publish(tmp_pat
         evaluator_timeout_seconds=300,
         max_agent_output_bytes=256,
         max_trace_bytes=256,
-        max_execution_artifact_file_bytes=650,
-        max_execution_artifact_total_bytes=650,
+        # The final v1 Judge execution config is larger than the old
+        # scalar-Judge fixture.  Leave enough per-file room for it while
+        # keeping the cumulative budget intentionally too small.
+        max_execution_artifact_file_bytes=5_100,
+        max_execution_artifact_total_bytes=5_100,
         max_parallel_trials=1,
     )
     snapshot = make_case_snapshot()

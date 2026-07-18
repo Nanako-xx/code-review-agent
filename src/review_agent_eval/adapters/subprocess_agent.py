@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -44,6 +45,14 @@ _READ_CHUNK_BYTES = 16 * 1024
 _POLL_SECONDS = 0.02
 _THREAD_JOIN_SECONDS = 5.0
 _PROCESS_WAIT_SECONDS = 5.0
+_DESCENDANT_SCAN_SECONDS = 0.10
+_DESCENDANT_FREEZE_ROUNDS = 4
+_DESCENDANT_REAP_SECONDS = 1.0
+_MAX_POSIX_PROCESS_ENTRIES = 100_000
+_MAX_TRACKED_DESCENDANTS = 16_384
+_MAX_PROC_STAT_BYTES = 4_096
+_MAX_PS_OUTPUT_BYTES = 8 * 1024 * 1024
+_PS_SNAPSHOT_TIMEOUT_SECONDS = 0.5
 _WINDOWS_CREATE_SUSPENDED = 0x00000004
 _WINDOWS_KILLED_EXIT_CODES = frozenset(
     {
@@ -70,6 +79,226 @@ class BoundedProcessResult:
     returncode: Optional[int]
     failure_code: Optional[FailureCode]
     output_bytes: int
+
+
+@dataclass(frozen=True)
+class _PosixProcessIdentity:
+    pid: int
+    parent_pid: int
+    birth_marker: str
+    state: str
+
+    @property
+    def terminated(self) -> bool:
+        return self.state[:1].upper() in {"X", "Z"}
+
+
+def _parse_linux_process_stat(data: bytes) -> Optional[_PosixProcessIdentity]:
+    """Parse the identity fields whose positions follow Linux's ``comm`` field."""
+
+    if not data or len(data) > _MAX_PROC_STAT_BYTES:
+        return None
+    opening = data.find(b"(")
+    closing = data.rfind(b")")
+    if opening <= 0 or closing <= opening or closing + 2 >= len(data):
+        return None
+    try:
+        pid = int(data[:opening].strip())
+        fields = data[closing + 2 :].split()
+        if len(fields) < 20:
+            return None
+        state = fields[0].decode("ascii", errors="strict")
+        parent_pid = int(fields[1])
+        start_time = int(fields[19])
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if pid <= 0 or parent_pid < 0 or start_time < 0 or len(state) != 1:
+        return None
+    return _PosixProcessIdentity(
+        pid=pid,
+        parent_pid=parent_pid,
+        birth_marker="proc:%d" % start_time,
+        state=state,
+    )
+
+
+def _read_linux_process_snapshot(
+    proc_root: Path = Path("/proc"),
+) -> Optional[Tuple[Dict[int, _PosixProcessIdentity], bool]]:
+    """Return a bounded Linux process snapshot, or ``None`` without procfs."""
+
+    try:
+        entries = os.scandir(proc_root)
+    except OSError:
+        return None
+    processes: Dict[int, _PosixProcessIdentity] = {}
+    complete = True
+    with entries:
+        for index, entry in enumerate(entries):
+            if index >= _MAX_POSIX_PROCESS_ENTRIES:
+                complete = False
+                break
+            if not entry.name.isdecimal():
+                continue
+            try:
+                stat_path = Path(entry.path) / "stat"
+                with stat_path.open("rb") as stream:
+                    data = stream.read(_MAX_PROC_STAT_BYTES + 1)
+            except OSError:
+                # Processes can disappear between scandir and open. An inaccessible
+                # unrelated process must not make every adapter cleanup fail.
+                continue
+            identity = _parse_linux_process_stat(data)
+            if identity is None or identity.pid != int(entry.name):
+                continue
+            processes[identity.pid] = identity
+    return processes, complete
+
+
+def _read_ps_process_snapshot(
+) -> Optional[Tuple[Dict[int, _PosixProcessIdentity], bool]]:
+    """Best-effort process snapshot for POSIX hosts without Linux procfs."""
+
+    executable = next(
+        (
+            candidate
+            for candidate in ("/bin/ps", "/usr/bin/ps")
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK)
+        ),
+        None,
+    )
+    if executable is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [executable, "-axo", "pid=,ppid=,lstart=,state="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=_PS_SNAPSHOT_TIMEOUT_SECONDS,
+            env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            close_fds=True,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0 or len(completed.stdout) > _MAX_PS_OUTPUT_BYTES:
+        return None
+
+    processes: Dict[int, _PosixProcessIdentity] = {}
+    complete = True
+    for index, raw_line in enumerate(completed.stdout.splitlines()):
+        if index >= _MAX_POSIX_PROCESS_ENTRIES:
+            complete = False
+            break
+        fields = raw_line.decode("utf-8", errors="replace").split()
+        if len(fields) < 4:
+            continue
+        try:
+            pid = int(fields[0])
+            parent_pid = int(fields[1])
+        except ValueError:
+            continue
+        if pid <= 0 or parent_pid < 0:
+            continue
+        processes[pid] = _PosixProcessIdentity(
+            pid=pid,
+            parent_pid=parent_pid,
+            birth_marker="ps:" + " ".join(fields[2:-1]),
+            state=fields[-1],
+        )
+    return processes, complete
+
+
+def _read_posix_process_snapshot(
+) -> Optional[Tuple[Dict[int, _PosixProcessIdentity], bool]]:
+    proc_snapshot = (
+        _read_linux_process_snapshot()
+        if sys.platform.startswith("linux")
+        else None
+    )
+    if proc_snapshot is not None and proc_snapshot[1]:
+        return proc_snapshot
+    ps_snapshot = _read_ps_process_snapshot()
+    if ps_snapshot is not None:
+        return ps_snapshot
+    return proc_snapshot
+
+
+def _collect_posix_descendants(
+    root_pid: int,
+    processes: Mapping[int, _PosixProcessIdentity],
+    *,
+    additional_roots: Sequence[int] = (),
+) -> Tuple[Dict[int, _PosixProcessIdentity], bool]:
+    children: Dict[int, List[_PosixProcessIdentity]] = {}
+    for identity in processes.values():
+        children.setdefault(identity.parent_pid, []).append(identity)
+
+    descendants: Dict[int, _PosixProcessIdentity] = {}
+    pending = list(dict.fromkeys((root_pid, *additional_roots)))
+    seen = set(pending)
+    complete = True
+    while pending:
+        parent_pid = pending.pop()
+        for identity in children.get(parent_pid, ()):
+            if identity.pid in seen:
+                continue
+            if len(descendants) >= _MAX_TRACKED_DESCENDANTS:
+                complete = False
+                pending.clear()
+                break
+            seen.add(identity.pid)
+            descendants[identity.pid] = identity
+            pending.append(identity.pid)
+    return descendants, complete
+
+
+class _PosixDescendantTracker:
+    """Remember descendants even after ``setsid`` and later re-parenting."""
+
+    def __init__(self, root_pid: int) -> None:
+        self.root_pid = root_pid
+        self._known: Dict[int, str] = {}
+        self.complete = True
+
+    def observe(self) -> Tuple[_PosixProcessIdentity, ...]:
+        snapshot = _read_posix_process_snapshot()
+        if snapshot is None:
+            if self._known:
+                self.complete = False
+            return ()
+        processes, snapshot_complete = snapshot
+        known_roots = tuple(
+            pid
+            for pid, marker in self._known.items()
+            if (identity := processes.get(pid)) is not None
+            and identity.birth_marker == marker
+            and not identity.terminated
+        )
+        descendants, tree_complete = _collect_posix_descendants(
+            self.root_pid,
+            processes,
+            additional_roots=known_roots,
+        )
+        self.complete = self.complete and snapshot_complete and tree_complete
+        for identity in descendants.values():
+            if (
+                identity.pid not in self._known
+                and len(self._known) >= _MAX_TRACKED_DESCENDANTS
+            ):
+                self.complete = False
+                continue
+            self._known[identity.pid] = identity.birth_marker
+
+        return tuple(
+            identity
+            for pid, marker in self._known.items()
+            if (identity := processes.get(pid)) is not None
+            and identity.birth_marker == marker
+            and not identity.terminated
+        )
 
 
 class _OutputState:
@@ -278,11 +507,138 @@ def _write_pipe(stream: BinaryIO, data: bytes, state: _OutputState) -> None:
             pass
 
 
+def _read_current_posix_identity(
+    expected: _PosixProcessIdentity,
+) -> Optional[_PosixProcessIdentity]:
+    if not expected.birth_marker.startswith("proc:"):
+        # The ps fallback has already returned this identity in the immediately
+        # preceding bounded snapshot. Re-running ps once per descendant would
+        # make cleanup time scale quadratically without closing its TOCTOU race.
+        return expected
+    try:
+        with (Path("/proc") / str(expected.pid) / "stat").open("rb") as stream:
+            return _parse_linux_process_stat(
+                stream.read(_MAX_PROC_STAT_BYTES + 1)
+            )
+    except OSError:
+        return None
+
+
+def _signal_posix_identity(
+    identity: _PosixProcessIdentity,
+    signal_number: signal.Signals,
+) -> bool:
+    """Signal only the process generation observed by the tracker."""
+
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if callable(pidfd_open) and callable(pidfd_send_signal):
+        descriptor: Optional[int] = None
+        try:
+            descriptor = pidfd_open(identity.pid, 0)
+            current = _read_current_posix_identity(identity)
+            if (
+                current is None
+                or current.birth_marker != identity.birth_marker
+                or current.terminated
+            ):
+                return True
+            pidfd_send_signal(descriptor, signal_number, None, 0)
+            return True
+        except ProcessLookupError:
+            return True
+        except OSError as exc:
+            if exc.errno == errno.ESRCH:
+                return True
+            if exc.errno not in {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP}:
+                return False
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    current = _read_current_posix_identity(identity)
+    if (
+        current is None
+        or current.birth_marker != identity.birth_marker
+        or current.terminated
+    ):
+        return True
+    try:
+        os.kill(identity.pid, signal_number)
+    except ProcessLookupError:
+        return True
+    except OSError as exc:
+        return exc.errno == errno.ESRCH
+    return True
+
+
+def _signal_posix_group(process_group: int, signal_number: signal.Signals) -> bool:
+    try:
+        os.killpg(process_group, signal_number)
+    except ProcessLookupError:
+        return True
+    except OSError as exc:
+        return exc.errno == errno.ESRCH
+    return True
+
+
+def _freeze_posix_process_tree(
+    process: subprocess.Popen[bytes],
+    tracker: Optional[_PosixDescendantTracker],
+) -> bool:
+    successful = _signal_posix_group(process.pid, signal.SIGSTOP)
+    if tracker is None:
+        return successful
+
+    previously_seen: set[Tuple[int, str]] = set()
+    stable_rounds = 0
+    for _ in range(_DESCENDANT_FREEZE_ROUNDS):
+        identities = tracker.observe()
+        current = {(identity.pid, identity.birth_marker) for identity in identities}
+        for identity in identities:
+            successful = (
+                _signal_posix_identity(identity, signal.SIGSTOP) and successful
+            )
+        if current.issubset(previously_seen):
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+            previously_seen.update(current)
+        if stable_rounds >= 1:
+            break
+        time.sleep(_POLL_SECONDS)
+    return successful and tracker.complete
+
+
+def _kill_tracked_posix_descendants(
+    tracker: Optional[_PosixDescendantTracker],
+) -> bool:
+    if tracker is None:
+        return True
+    successful = True
+    deadline = time.monotonic() + _DESCENDANT_REAP_SECONDS
+    while True:
+        identities = tracker.observe()
+        if not identities:
+            return successful and tracker.complete
+        for identity in identities:
+            successful = (
+                _signal_posix_identity(identity, signal.SIGKILL) and successful
+            )
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_POLL_SECONDS)
+
+
 def _terminate_process_tree(
     process: subprocess.Popen[bytes],
     job: _WindowsProcessJob,
+    tracker: Optional[_PosixDescendantTracker] = None,
 ) -> bool:
-    """Terminate the isolated group/Job and reap its leader without waiting forever."""
+    """Terminate the isolated Job/session plus known detached descendants."""
 
     successful = True
     if os.name == "nt":
@@ -291,12 +647,15 @@ def _terminate_process_tree(
         except Exception:
             successful = False
     else:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            successful = False
+        successful = _freeze_posix_process_tree(process, tracker)
+        if tracker is not None:
+            for identity in tracker.observe():
+                successful = (
+                    _signal_posix_identity(identity, signal.SIGKILL) and successful
+                )
+        successful = (
+            _signal_posix_group(process.pid, signal.SIGKILL) and successful
+        )
 
     try:
         process.wait(timeout=_PROCESS_WAIT_SECONDS)
@@ -312,6 +671,8 @@ def _terminate_process_tree(
             return False
     except OSError:
         successful = False
+    if os.name != "nt":
+        successful = _kill_tracked_posix_descendants(tracker) and successful
     return successful and process.poll() is not None
 
 
@@ -340,9 +701,11 @@ def run_bounded_process(
     environment: Mapping[str, str],
     timeout_seconds: Any,
     max_output_bytes: int,
+    cancel_event: Optional[threading.Event] = None,
 ) -> BoundedProcessResult:
     process: Optional[subprocess.Popen[bytes]] = None
     job: Optional[_WindowsProcessJob] = None
+    descendant_tracker: Optional[_PosixDescendantTracker] = None
     state = _OutputState(max_output_bytes)
     threads: List[threading.Thread] = []
     returncode: Optional[int] = None
@@ -373,6 +736,8 @@ def run_bounded_process(
             bufsize=0,
             **platform,
         )
+        if os.name != "nt":
+            descendant_tracker = _PosixDescendantTracker(process.pid)
         job.assign(process)
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise OSError("subprocess pipes were not created")
@@ -404,7 +769,15 @@ def run_bounded_process(
         _resume_windows_process(process)
 
         deadline = time.monotonic() + float(timeout_seconds)
+        next_descendant_scan = 0.0
         while True:
+            now = time.monotonic()
+            if descendant_tracker is not None and now >= next_descendant_scan:
+                descendant_tracker.observe()
+                next_descendant_scan = now + _DESCENDANT_SCAN_SECONDS
+            if cancel_event is not None and cancel_event.is_set():
+                terminal_failure = FailureCode.PROCESS_KILLED
+                break
             if state.overflow.is_set():
                 terminal_failure = FailureCode.OUTPUT_OVERFLOW
                 break
@@ -427,7 +800,11 @@ def run_bounded_process(
         if process is not None and job is not None:
             if returncode is None:
                 returncode = process.poll()
-            cleanup_ok = _terminate_process_tree(process, job)
+            cleanup_ok = _terminate_process_tree(
+                process,
+                job,
+                descendant_tracker,
+            )
             if returncode is None:
                 returncode = process.returncode
 
@@ -523,6 +900,8 @@ class SubprocessAgentAdapter:
         workspace: Path,
         config: AgentRunConfig,
         clarification_channel: ClarificationChannel,
+        *,
+        cancel_event: Optional[threading.Event] = None,
     ) -> EvalSubmission:
         del clarification_channel  # Generic v1 is one-shot and has no channel wire.
         started = time.monotonic()
@@ -578,6 +957,7 @@ class SubprocessAgentAdapter:
                 environment=environment,
                 timeout_seconds=config.timeout_seconds,
                 max_output_bytes=config.max_output_bytes,
+                cancel_event=cancel_event,
             )
         except Exception:
             return _failed_submission(

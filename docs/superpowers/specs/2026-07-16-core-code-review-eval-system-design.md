@@ -874,7 +874,7 @@ Clarification Script 只存在于 evaluator-facing Case view。Agent-facing `Eva
 
 ### 12.1 评分对象
 
-只评 `EvalSubmission.intent`：
+只评 `EvalSubmission.intent`，并读取 evaluator-facing 的 Intent truth、Clarification Script 以及与本 Trial/Transcript hash-bound 的 Harness-private clarification receipt；不读取 Agent trace、Runtime、Session、Memory、Reviewer 状态或内部规划：
 
 ```text
 goal
@@ -908,6 +908,43 @@ unknown
 
 `inferred` 不天然等于错误；只有缺少输入或代码依据的推断才是 unsupported。
 
+### 12.2.1 v1 规范化与 generated claim 投影
+
+Intent matching 使用固定的 `unicode-nfc-whitespace-casefold-v1` normalization policy：先做 Unicode NFC，再将 Unicode 空白折叠为一个 ASCII 空格并去除首尾空格，最后执行 Unicode `casefold`。不删除标点，不做词干化、关键词猜测或代码标识符改写。
+
+`SubmissionIntent` 同时包含结构化字段和 provenance claims，二者不得简单相加造成重复计分，也不得只信任其中一份。Evaluator 按以下规则生成 assignment units：
+
+1. `goal`、`acceptance_criteria`、`scope`、`constraints` 中的非 null/非空文本先按 dimension 生成结构化 claim；
+2. `SubmissionIntent.claims` 中与结构化 claim 具有相同 dimension 且 normalized text 相等的 claim，按 canonical claim ID 一对一 overlay，并保留其 `claim_id/source`；
+3. 未被 overlay 的结构化 claim 和剩余 provenance claim 都保留为独立 generated claim；
+4. 任何语义重复都不在 hydration 或 normalization 阶段去重；多出的重复项必须进入 unmatched/precision 结果。
+
+结构化 claim 的内部 ID 由 versioned evaluator 根据 dimension、规范化前文本和重复序号稳定生成；Agent 提供的 opaque claim ID 只作为 provenance 和审计身份，不被当作语义身份。
+按 canonical `SubmissionIntent` 的既有字段上限，v1 generated projection 最多包含 1793 项（1024 provenance claims，加 goal 与三组最多各 256 项的结构化列表）；Result/hydration 必须支持该完整上限，不能让合法 Submission 在 overlay 后越界。
+
+### 12.2.2 v1 候选、Judge boundary 与权重
+
+候选只在相同 Intent dimension 内生成。原文完全相等使用 deterministic `exact`，normalized text 相等使用 deterministic `normalized`；其余候选只生成 typed `IntentSemanticJudgeRequest`，确定性层不得猜测语义结果。每个 request 具有绑定 generated/truth item ID、dimension、文本摘要和稳定 request ID；Task 9 负责把它转换成盲化的 Model Judge 请求，Task 8 只接受严格的 typed decision，不直接调用模型。
+
+Judge decision 的 relation 为 `equivalent`、`partially_equivalent`、`contradicted`、`different` 或 `unknown`，并可带有界整数 `score_ppm`（0–999999）。`different`/`unknown` 不生成 assignment edge。
+
+Assignment edge weight 是固定的正整数：
+
+| edge source/relation | weight |
+|---|---:|
+| deterministic exact | 4,000,000 |
+| deterministic normalized | 3,900,000 |
+| semantic full relation | 2,000,000 + `score_ppm` |
+| semantic partial relation | 1,000,000 + `score_ppm` |
+
+对 expected truth，`equivalent`/`partially_equivalent`/`contradicted` 分别产生 `supported`/`partially_supported`/`contradicted`；对 forbidden truth，`equivalent` 或 `partially_equivalent` 产生 `contradicted`，其它 relation 不产生 edge。`required`/optional、`explicit`/`inferred` 不改变语义匹配权重。Assignment 先最大化总权重，再使用 Assignment policy v1 的 canonical lexicographic tie-break；每个 generated/truth item 最多出现一次。
+
+单 Case 的 unresolved semantic candidate edge 上限为 65536；deterministic exact/normalized pair 不消耗这项 Judge 预算。为防止大量重复文本形成无界的确定性矩阵或 Judge request 展开，v1 对全部 candidate record 另设 131072 的总数上限和 64 MiB canonical JSON 累计上限；全部 Judge request 设 64 MiB canonical JSON 累计上限，其中重复展开的 generated/truth UTF-8 文本也单独受 64 MiB 累计上限约束；全部 Judge decision 设 16 MiB canonical JSON 累计上限，其中 `reason_refs` 另受 8 MiB 累计上限约束。任一上限超过时均 fail closed；candidate/request 上限返回 Harness-owned `ungraded/limit_exceeded`，非法或过量 decision merge 被拒绝，不得静默裁剪候选、reason refs 或把未调查的 pair 当作 unsupported。
+
+可评分结果的 hydration 必须重新验证完整候选图：每个相同 dimension 的 generated/truth pair 恰好出现一次，semantic candidate 与 Judge request 一一覆盖，然后才允许重算全局 Assignment 和 canonical status。缺失 deterministic edge、semantic candidate 或待处理 request 的截断结果一律拒绝，不能把删边后的局部最优伪装成全局最优，也不能把被删掉的 Judge 工作伪装成已完成。
+
+最终所有 Judge decision 已完整且没有 unknown 时，未被选中的 generated claim（包括重复 claim）归类为 `unsupported`；仍有 pending/failed/unknown 的相关候选时归类为 `unknown`。`inferred` 本身不产生惩罚。
+
 ### 12.3 Clarification
 
 评测：
@@ -916,6 +953,22 @@ unknown
 - 不应问时是否继续；
 - 问题是否针对会改变 Review 结论的 material claim；
 - 得到回答后是否正确更新 Intent。
+
+Clarification policy 的 v1 真值表如下：
+
+| policy | decision rule | failure/diagnostic |
+|---|---|---|
+| `required` | 至少一个 material claim 被正确匹配并实际提问；`defer` 虽消费答案但仍保持 unresolved | 未提问、wrong dimension/material claim、未消费答案分别保留 reason code |
+| `optional` | 提问或继续都不因 decision 本身扣分；若提问，仍独立检查 materiality、answer consumption 和 update | 各子项单独记录，不合并成一个分数 |
+| `not_required` | 不应提出问题；已提出的问题记为 unnecessary，未解决的问题记为 unnecessary-blocking | 不得把不必要的问题伪装成成功澄清 |
+
+`confirm` 的每个 `resolved_value` 必须出现在最终 projected Intent 的同一 dimension；`correct` 必须出现 corrected values 且原 material claim 被替换；`reject` 要求原 material claim 不再存在；`skip/defer` 不要求 update，但 `defer` 必须单独计为 unresolved。Question materiality 和答案消费以 Harness-private matcher receipt 为准，不从 Agent 自报文本重新猜测。
+
+### 12.3.1 Claim judgement 与 truth semantics
+
+Required expected truth 只影响 recall denominator；optional expected truth 不因缺失降低 recall 或 Case pass，但其生成匹配仍进入 claim precision 明细。命中 forbidden claim 始终是 `contradicted`。`partially_supported` 与 `contradicted` 独立计数，不能折算成 `supported`。Judge 未完成、Judge failure 或上下文不足只能产生 `unknown/ungraded`，不能默认正例或负例。
+
+`intent_truth.scorable=false` 时不生成 Judge request，所有 Intent metric denominator 为 null/not-scorable；生成的 claim 仍可作为审计输出保存，但不能被记为零分或满分。由于不可评分 `IntentTruth` 只有 `scorable=false`、null authority/policy 和空 claims 这一种 canonical 表示，`not_scorable` evaluation hydration 必须重算并校验该唯一 truth digest；不得仅凭空候选图或可篡改的 status/reason 接受不可评分结果。
 
 ### 12.4 Intent Metrics
 
@@ -929,6 +982,10 @@ intent_case_pass_rate
 ```
 
 不要求 Agent 和 ground truth 使用完全相同的措辞。
+
+### 12.5 Intent Evaluation Result v1
+
+Task 8 输出严格、可 hydration 的 `eval_intent_evaluation_v1`，至少包含：`evaluator_revision`、`submission_intent_digest`、`intent_truth_digest`、`clarification_script_digest`、normalization/assignment policy version、generated claim projection、truth claim references、逐 claim candidate/match/judgement/reason、matched 与 unmatched 集合、typed Judge requests/decisions、clarification decisions、以及带明确分子/分母和 null coverage 的 metric inputs。每条实际 transcript exchange 保存 matcher digest 与完整 canonical receipt digest；receipt 缺失时二者均为 null，materiality/answer-consumption/update 也不得由 transcript 猜测。输出只绑定 immutable Submission、Case truth、Clarification receipt 和 evaluator revision；不得把 Agent/model/provider identity 当作 claim 语义证据。
 
 ## 13. Review Evaluator
 
@@ -1060,6 +1117,8 @@ Matching：A1 -> T1，A3 -> T2，A2 为 unmatched duplicate
 
 匹配边的权重只衡量两条 Finding 是否指向同一实质问题，包括根因、触发条件、影响和必要的位置关系。Evidence 可以帮助 Judge 理解 Agent 的 claim，但 Evidence 的完整性与支持度不得直接决定 `issue_match`，否则“问题找对但证据引用错误”会被错误地折叠成“问题没有找对”。
 
+Task 10 的 v1 edge policy 固定如下：原始 `claim` 完全相等时可产生 deterministic exact 等价边；其余候选必须经过 Finding equivalence Judge。`partially_equivalent`、`different` 和 `unknown` 均不产生正权 Assignment edge，也不能单独命中 known-invalid；只有 `equivalent` 才表示同一实质问题。Location 结果始终完整保存为候选/定位审计信号，不得用“不命中位置”删除语义候选，也不得把位置分数、severity、actionability 或 Evidence 状态加入 issue edge weight。若同一 Case 的 expected 与 known-invalid Finding 出现 canonical claim 冲突，Evaluator 必须 fail closed，不能用 known-invalid-first 静默掩盖标注矛盾。
+
 ### 13.7 Judgement
 
 ```text
@@ -1129,6 +1188,8 @@ AND evidence_integrity = valid
 AND evidence_support = supported
 ```
 
+`ReviewEvaluationResult` 是受控的 evaluator artifact，不是可由调用方自由拼装的普通 DTO。公开裸构造和 `dataclasses.replace` 必须拒绝；可信结果只能由 `ReviewEvaluator.evaluate()` 在完成候选图、Judge receipt、Assignment、Outcome、coverage 和 metric projection 后内部产生。`from_dict/from_json` 必须接收真实 Submission、ReviewTruth、ReviewEvaluator 与 `JudgeExecutionResult` 集合，重新执行完整确定性评测，并将输入 canonical payload 与重放结果逐字节比较后返回重放结果。这样每条 receipt 的 request/task/request digest、evaluator execution digest 与真实 `JudgeExecutionResult.digest()` 才具有来源绑定；任何伪造 semantic decision、result digest、Submission/Truth/context digest 或删改候选图的 artifact 都必须拒绝。
+
 ### 13.8 Review Metrics
 
 ```text
@@ -1155,6 +1216,26 @@ issue_precision = confirmed issue matches / all reported findings
 issue_recall = matched required truth issues / all required truth issues
 publishable_finding_precision = strict valid findings / all reported findings
 ```
+
+Task 11 的 v1 severity 权重固定为 `low=1`、`medium=2`、`high=4`、`critical=8`，policy version 为 `severity-weight-policy-v1`；完整权重表及其 canonical digest 必须进入 Trial/Case/Aggregate score identity。`severity_weighted_recall` 只对 required expected truth 计算：分子是已匹配 required truth 的权重和，分母是全部 required truth 的权重和。缺权重、未知 severity、版本或 digest 不匹配必须 fail closed，不能临时退回 1/2/3/4。
+
+Task 11 的 v1 Line 指标固定为 `assigned-truth-location-v1`：
+
+- `line_precision = 最终 confirmed Assignment 中定位正确的数量 / 最终 confirmed Assignment 中 truth 至少有一个 location 的数量`；
+- `line_recall = 定位正确的 required truth Assignment 数量 / 至少有一个 location 的 required truth 数量`；
+- “定位正确”只允许读取该 Finding 最终 Assignment 对应 truth 的 `LocationAuditRecord.match.matched`；其他 expected/known-invalid 候选位置即使匹配，也不能替最终 Assignment 得分；
+- Agent 位置缺失时仍进入有 location 的 Assignment 分母并判未定位；truth 自身没有 location 时不进入 Line 分母；
+- Line 指标与 issue match、Evidence、severity/actionability 分开保存，不能反向改变 Assignment。
+
+所有 Ratio 使用 aggregate numerator/denominator 的 ratio-of-sums，不平均 Trial 或 Case 百分比。`0/0` 的 value 为 null 并标记 `zero_denominator`；not-scorable、ungraded、missing coverage 与真实 0 必须分开。Agent 的 failed/blocked/invalid-output Trial 始终进入 failure-rate 分母；Outcome 是否按 miss 计入由版本化 `failure_outcome_policy` 显式控制，默认 `count_as_missed-v1`，不能静默从质量指标和 coverage 中消失。Judge failure 只进入独立 Judge/ungraded coverage，不冒充 Agent failure 或产品 Finding 结论。
+
+failed/blocked Submission 已经产生的非 null Intent 或 Review 仍必须由对应 Evaluator 正常评分，同时独立计入 Agent failure；只有缺失的部分才适用 `failure_outcome_policy`。若非 null 部分因 Judge failure/ungraded 而不可评分，它保持 `ungraded`，不能再被 Agent failure policy 覆盖成 miss。缺失输出不会虚构 precision 分母：默认 policy 只把可定义的 recall/case-pass/severity/line-recall outcome 计为 miss，其余 precision/rate 显式标记 `failure_excluded` 或 `missing`。
+
+这里的“缺失”必须区分两种来源：Agent 没有产生该部分输出时，才可按 Agent failure policy 计 miss；Agent 已产生非 null 输出但对应 Evaluator artifact 尚未产生、丢失或无法加载时，必须标记 `missing_evaluation`/`missing`，不能伪装成 Agent 漏报。另一侧已有的 Evaluator result 仍独立评分，不能因为两侧没有成对完成就丢弃。
+
+Case/Aggregate coverage 分开保存 `planned_trial_count`、`terminal_trial_count`、`intent_scored_trial_count`、`review_scored_trial_count` 和 `fully_scored_trial_count`，不得用一个实际只代表 Review 的含糊 `scored_trial_count`。F1 由 aggregate Precision 与 Recall 派生，没有单一独立 Trial coverage；F1 artifact 必须同时引用两侧 coverage，特别是在 failure-as-miss 使 Recall 计 miss、Precision 排除同一失败 Trial 时，不能只复制 Precision coverage。Case/Aggregate hydration 必须逐一验证 source Trial 的 score ID、digest、task 和 trial ID；只比较 trial ID 不足以形成来源绑定。
+
+Metrics compatibility 至少绑定 Run/Suite/Snapshot/Trial count、protocol、truth completeness、novel policy、Agent 与 clarification matcher config、Evaluator execution、Intent/Review evaluator revision，以及包含完整 severity/Line policy snapshot 的 MetricsPolicy。Cost currency 使用集合级 single-currency-or-missing 规则：同一聚合可混合某一真实 currency 与 missing，但两个不同真实 currency 必须拒绝。所有 cost 都缺失时仍保存 `observed=0 / population=N / missing=N`，不能用 `cost=null` 丢掉 coverage。
 
 这样既能区分“是否发现真实问题”，也能区分“这条 Finding 是否带着足够可靠的 Evidence 可以交给用户”。F1 是辅助指标，不能掩盖 Recall、fabricated rate 和 Evidence 质量的真实权衡。
 
@@ -1194,6 +1275,35 @@ judge_failed / ungraded
 ```
 
 禁止默认判成 plausible、confirmed 或 fabricated。
+
+#### 14.3.1 Judge 协议与执行边界
+
+Task 9 的 Judge 不是一个面向所有任务的通用打分 Prompt，而是四个版本化、互相独立的 Judge profile：
+
+```text
+intent_equivalence
+finding_equivalence
+novel_factuality
+evidence_support
+```
+
+每个 profile 都固定自己的 model/provider/adapter identity、模型参数、system-prompt digest、rubric/version/digest、response schema/version/digest、context builder 和 parser version。它们全部进入 `EvaluatorExecutionConfig`；这些配置用于复现、缓存隔离和分组，不形成额外产品分数。
+
+Judge 只通过项目统一的 `ModelAdapter` 与 factory 发起 `ModelTurnRequest`。Eval business module 不直接拼接 OpenAI、DeepSeek、Claude 等 HTTP。Judge request 强制：
+
+- `tools=[]`、`tool_results=[]`、`tool_choice=none`；
+- 有界 request timeout、request deadline、input/output byte/token budgets；
+- adapter capability preflight 必须证明 tool choice、timeout 和 response byte limit；第三方 adapter 缺少任一能力时在执行前拒绝；
+- 每次 retry 新建 adapter，且每个 attempt 保存 typed status、elapsed、bounded output digest、Provider/model identity 和 failure；
+- response 的 Provider/model identity 必须与 profile 完全一致，identity drift、tool call、截断、超限和 schema 解析失败均 fail closed。
+
+`unknown` 是模型成功执行后对语义信息不足的合法分类，因此 Judge execution status 仍是 `graded`；Provider error、timeout、invalid output、capability/identity failure 属于 `judge_failed`；上游数据缺失、策略跳过或不可评分则是 `ungraded`。三者不得互相伪装。
+
+同一个 immutable blind model turn digest 加完整 `EvaluatorExecutionConfig.digest()` 形成 cache key。只有 `graded` 结果可写入 cache；失败结果永不缓存。`judge_input.json` 和 `judge_output.json` 使用 typed aggregate artifact，分别保存完整有界输入和带 attempt 的输出，并通过 evaluator execution digest、input artifact digest 及 request 集合做交叉绑定。
+
+Intent Judge 的 `judge_failed` 必须转换为带 request ID、failure code 和 execution digest 的 `IntentSemanticJudgeFailure`，进入 Intent evaluator 的独立 failure 集合；它会使 Intent evaluation 成为 `ungraded`，但不会被当作 `pending_judge` 或语义 `unknown`。Judge decision 的 reason refs 只能引用该 request 的 generated/truth source ID。
+
+使用 fake/scripted Model Adapter 的单元测试只验证上述协议、blind context、结构化解析、failure taxonomy、retry/cache 与路由；预先把 relation/factuality/support 写入模型输出再解析，不能证明真实 Judge model 作出了正确语义判断。真实模型对同义改写、相邻但不同 issue、错误根因、compound Finding、novel factuality 和 Evidence support 的准确性，必须使用独立人工标注 Case 与 calibration set 测量，并报告与人工的一致率。协议测试通过不得被表述成语义能力已经通过。
 
 ### 14.4 Blind Judge
 
@@ -1257,6 +1367,14 @@ pass^k
 模型、Prompt 和 Agent 内部策略是 Run 配置，不是额外评分维度。
 
 ## 16. Metrics 与报告
+
+`summary.json` 是报告层的权威 canonical 数据投影，底层 immutable Submission、Intent/Review evaluation、Judge receipt 与 Score artifact 仍是其可重放根来源。`report.md` 只能由已验证的 summary/inspection 对象纯渲染：不读 repository 或其他文件、不调用模型、不运行 Scorer/Aggregator，也不从 Markdown 反向恢复数据。已持久化 summary/inspection 的 hydration 必须接收真实根来源，完整重放并逐字节比较 canonical payload；顶层报告对象禁止公开裸构造和 `dataclasses.replace`。
+
+同一 Run 中 protocol、truth completeness、novel policy 或其他 `ScoreCompatibilityKey` 不同的 Case 必须形成独立 partition；报告可以同时展示多个 partition，但不能生成跨 partition 的质量 roll-up。Run/Suite/Snapshot/Agent/Evaluator identity 不一致则整份报告拒绝，不能借 partition 掩盖。分组标签只能来自持久化 `CaseDimension` 的共同真实投影，不能由报告层从 Finding 文本猜测。
+
+Inspect 直接复用 canonical EvalInput、Submission、IntentEvaluationResult、ReviewEvaluationResult、TrialScore 和 receipt/ref payload，因而保留 claim/Finding Assignment、Judge receipt、Location audit、Evidence diagnostics、clarification receipt 与 trace ref；不另造第二套匹配或 Evidence 语义。Trace 只展示 ref/capture 元数据，不嵌入 raw trace content、hidden reasoning、credential 或本地绝对路径。
+
+Inspect 对 EvalInput、Submission、Intent/Review evaluation 与 TrialScore 使用明确版本化的 `eval_redacted_artifact_projection_v1` wrapper，绑定原 artifact digest、source ID/schema 和 redaction list；不得把替换过敏感字段的 payload 继续冒充原 canonical artifact。所有 TraceRef（包括 opaque value）、绝对/遍历路径和 URL 都只显示稳定 opaque projection，避免“把本地路径伪装成 opaque ID”或在 URL userinfo/query 中夹带凭据。
 
 ### 16.1 首页指标
 

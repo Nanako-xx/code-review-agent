@@ -271,7 +271,14 @@ class AdapterCompatibility:
 
 @runtime_checkable
 class AgentUnderTestAdapter(Protocol):
-    """The only execution interface understood by the Eval Runner."""
+    """The only execution interface understood by the Eval Runner.
+
+    Adapters are trusted Harness integration code.  ``run`` must observe the
+    supplied cancellation event and terminate every process/HTTP/IPC resource
+    it owns before returning.  Untrusted Agents must remain behind that
+    Adapter-managed boundary; accepting and ignoring cancellation is a
+    protocol violation.
+    """
 
     def compatibility(
         self,
@@ -286,6 +293,8 @@ class AgentUnderTestAdapter(Protocol):
         workspace: Path,
         config: AgentRunConfig,
         clarification_channel: ClarificationChannel,
+        *,
+        cancel_event: Any,
     ) -> EvalSubmission:
         ...
 

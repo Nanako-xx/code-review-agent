@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import FrozenInstanceError
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import pytest
 
@@ -12,9 +12,13 @@ from review_agent_eval.cases import RunCaseSnapshot, SuiteCase, SuiteManifest
 from review_agent_eval.config import (
     AgentConfigSnapshot,
     ClarificationMatcherSnapshot,
+    DEFAULT_JUDGE_CACHE_POLICY_VERSION,
     EvalRunConfig,
     EvaluatorExecutionConfig,
     EvaluatorRunConfig,
+    JudgeExecutionBudgets,
+    JudgeKind,
+    JudgeProfileSnapshot,
     ResourceBudgets,
     SuiteRunConfig,
     derive_case_path_id,
@@ -138,20 +142,71 @@ def agent_config(
     )
 
 
+def _identity_digest(label: str) -> str:
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def judge_profile(
+    kind: JudgeKind,
+    *,
+    judge_version: str = "judge-v1",
+    model: str = "judge-model",
+) -> JudgeProfileSnapshot:
+    slug = kind.value
+    return JudgeProfileSnapshot(
+        schema_version="eval_judge_profile_v1",
+        kind=kind,
+        judge_id=f"{slug}-judge",
+        judge_version=judge_version,
+        adapter_id="unified-model-adapter",
+        adapter_version="adapter-v1",
+        adapter_config_digest=_identity_digest(f"{slug}:adapter-config"),
+        provider="provider-j",
+        model=model,
+        model_artifact_digest=None,
+        parameters={"temperature": 0, "reasoning_effort": "medium"},
+        system_prompt_version=f"{slug}-system-v1",
+        system_prompt_digest=_identity_digest(f"{slug}:system-prompt"),
+        rubric_id=f"{slug}-rubric",
+        rubric_version=f"{slug}-rubric-v7",
+        rubric_digest=_identity_digest(f"{slug}:rubric"),
+        response_schema_version=f"eval_{slug}_judge_response_v1",
+        response_schema_digest=_identity_digest(f"{slug}:response-schema"),
+        context_builder_version=f"{slug}-context-v1",
+        parser_version=f"{slug}-parser-v1",
+    )
+
+
 def evaluator_config(
-    *, judge_version: str = "judge-v1", model: str = "judge-model"
+    *,
+    judge_version: str = "judge-v1",
+    model: str = "judge-model",
+    judge_profiles: Optional[Sequence[JudgeProfileSnapshot]] = None,
 ) -> EvaluatorRunConfig:
+    profiles = (
+        tuple(judge_profiles)
+        if judge_profiles is not None
+        else tuple(
+            judge_profile(kind, judge_version=judge_version, model=model)
+            for kind in JudgeKind
+        )
+    )
     return EvaluatorRunConfig(
         evaluator_id="core-evaluator",
         evaluator_version="1.2.0",
         grader_version="grader-v4",
-        judge_version=judge_version,
-        model=model,
-        provider="provider-j",
-        parameters={"temperature": 0, "reasoning_effort": "medium"},
-        rubric_version="rubric-v7",
-        rubric_digest="c" * 64,
+        judge_profiles=profiles,
     )
+
+
+def judge_budgets(**overrides: Any) -> JudgeExecutionBudgets:
+    payload = JudgeExecutionBudgets.defaults(
+        evaluator_timeout_seconds=300,
+        max_execution_artifact_file_bytes=16 * 1024 * 1024,
+        max_execution_artifact_total_bytes=128 * 1024 * 1024,
+    ).to_dict()
+    payload.update(overrides)
+    return JudgeExecutionBudgets.from_dict(payload)
 
 
 def matcher_config(
@@ -255,8 +310,16 @@ def test_final_run_config_records_complete_reproduction_identity_and_round_trips
         config.clarification_matcher
     )
     assert config.evaluator_config_digest == canonical_sha256(config.evaluator)
-    assert config.evaluator.judge_version == "judge-v1"
-    assert config.evaluator.rubric_version == "rubric-v7"
+    assert tuple(item.kind for item in config.evaluator.judge_profiles) == tuple(
+        sorted(JudgeKind, key=lambda item: item.value)
+    )
+    assert all(
+        item.judge_version == "judge-v1"
+        for item in config.evaluator.judge_profiles
+    )
+    assert config.evaluator.profile(
+        JudgeKind.INTENT_EQUIVALENCE
+    ).rubric_version == "intent_equivalence-rubric-v7"
     assert config.suite.manifest_digest == case_snapshot.manifest.digest()
     assert config.suite.case_snapshot_id == case_snapshot.snapshot_id
     assert config.suite.case_snapshot_digest == case_snapshot.snapshot_digest
@@ -275,9 +338,162 @@ def test_final_run_config_records_complete_reproduction_identity_and_round_trips
     assert load_eval_run_config(encoded).digest() == config.digest()
 
 
+def test_judge_profiles_round_trip_sort_and_use_distinct_typed_contracts() -> None:
+    reversed_profiles = tuple(reversed(tuple(judge_profile(kind) for kind in JudgeKind)))
+    evaluator = evaluator_config(judge_profiles=reversed_profiles)
+    canonical = evaluator_config()
+
+    assert tuple(item.kind for item in evaluator.judge_profiles) == tuple(
+        sorted(JudgeKind, key=lambda item: item.value)
+    )
+    assert len({item.rubric_digest for item in evaluator.judge_profiles}) == 4
+    assert len({item.response_schema_version for item in evaluator.judge_profiles}) == 4
+    assert len({item.response_schema_digest for item in evaluator.judge_profiles}) == 4
+    assert evaluator.digest() == canonical.digest()
+    for profile in evaluator.judge_profiles:
+        assert JudgeProfileSnapshot.from_json(profile.to_json()) == profile
+        assert profile.digest() == canonical_sha256(profile)
+        assert profile.parameters["temperature"] == 0
+
+
+def test_evaluator_requires_exactly_one_profile_per_judge_kind() -> None:
+    profiles = list(evaluator_config().judge_profiles)
+
+    with pytest.raises(SchemaError, match="each JudgeKind exactly once"):
+        evaluator_config(judge_profiles=profiles[:-1])
+
+    duplicate = profiles[:-1] + [profiles[0]]
+    with pytest.raises(SchemaError, match="each JudgeKind exactly once"):
+        evaluator_config(judge_profiles=duplicate)
+
+    payload = evaluator_config().to_dict()
+    payload["judge_profiles"][0]["kind"] = "unsupported_judge"
+    with pytest.raises(SchemaError, match="unknown Judge kind"):
+        EvaluatorRunConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "identity_field",
+    [
+        "rubric_id",
+        "rubric_version",
+        "rubric_digest",
+        "response_schema_version",
+        "response_schema_digest",
+    ],
+)
+def test_evaluator_rejects_duplicate_rubric_or_schema_identity(
+    identity_field: str,
+) -> None:
+    payload = evaluator_config().to_dict()
+    payload["judge_profiles"][1][identity_field] = payload["judge_profiles"][0][
+        identity_field
+    ]
+
+    with pytest.raises(SchemaError, match=f"distinct {identity_field}"):
+        EvaluatorRunConfig.from_dict(payload)
+
+
+def test_evaluator_v1_rejects_legacy_scalar_judge_schema() -> None:
+    legacy = {
+        "evaluator_id": "core-evaluator",
+        "evaluator_version": "1.2.0",
+        "grader_version": "grader-v4",
+        "judge_version": "judge-v1",
+        "model": "judge-model",
+        "provider": "provider-j",
+        "parameters": {},
+        "rubric_version": "rubric-v7",
+        "rubric_digest": "c" * 64,
+    }
+    with pytest.raises(SchemaError, match="unknown field"):
+        EvaluatorRunConfig.from_dict(legacy)
+
+    assert set(evaluator_config().to_dict()) == {
+        "evaluator_id",
+        "evaluator_version",
+        "grader_version",
+        "judge_profiles",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("judge_id", "changed-judge"),
+        ("judge_version", "judge-v2"),
+        ("adapter_id", "changed-adapter"),
+        ("adapter_version", "adapter-v2"),
+        ("adapter_config_digest", "1" * 64),
+        ("provider", "provider-k"),
+        ("model", "judge-model-v2"),
+        ("model_artifact_digest", "2" * 64),
+        ("parameters", {"temperature": 0.25}),
+        ("system_prompt_version", "system-v2"),
+        ("system_prompt_digest", "3" * 64),
+        ("rubric_id", "changed-rubric"),
+        ("rubric_version", "rubric-v8"),
+        ("rubric_digest", "4" * 64),
+        ("response_schema_version", "changed-response-v2"),
+        ("response_schema_digest", "5" * 64),
+        ("context_builder_version", "context-v2"),
+        ("parser_version", "parser-v2"),
+    ],
+)
+def test_every_judge_profile_identity_dimension_changes_evaluator_identity(
+    field: str,
+    value: object,
+) -> None:
+    original = evaluator_config()
+    target = original.profile(JudgeKind.INTENT_EQUIVALENCE)
+    changed_payload = target.to_dict()
+    changed_payload[field] = value
+    changed_profile = JudgeProfileSnapshot.from_dict(changed_payload)
+    changed = evaluator_config(
+        judge_profiles=tuple(
+            changed_profile if item.kind is target.kind else item
+            for item in original.judge_profiles
+        )
+    )
+
+    assert changed.digest() != original.digest()
+
+
+def test_judge_profile_strict_hydration_safe_json_and_deep_freeze() -> None:
+    profile = judge_profile(JudgeKind.EVIDENCE_SUPPORT)
+    payload = profile.to_dict()
+    payload["unknown"] = True
+    with pytest.raises(SchemaError, match="unknown field"):
+        JudgeProfileSnapshot.from_dict(payload)
+
+    payload = profile.to_dict()
+    payload["parameters"] = {"client_secret": "ordinary-secret"}
+    with pytest.raises(SchemaError) as caught:
+        JudgeProfileSnapshot.from_dict(payload)
+    assert "ordinary-secret" not in str(caught.value)
+
+    nested_payload = profile.to_dict()
+    nested_payload["parameters"] = {"nested": {"values": [1, 2]}}
+    nested = JudgeProfileSnapshot.from_dict(nested_payload)
+    with pytest.raises(TypeError):
+        nested.parameters["nested"]["new"] = True
+    assert nested.parameters["nested"]["values"] == (1, 2)
+
+    payload = profile.to_dict()
+    payload.pop("response_schema_digest")
+    with pytest.raises(SchemaError, match="missing field"):
+        JudgeProfileSnapshot.from_dict(payload)
+
+
 def test_config_exports_only_final_protocol_names() -> None:
     assert AgentConfigSnapshot.__name__ == "AgentConfigSnapshot"
+    assert JudgeProfileSnapshot.__name__ == "JudgeProfileSnapshot"
+    assert JudgeExecutionBudgets.__name__ == "JudgeExecutionBudgets"
     assert config_module.SuiteCase is SuiteCase
+    assert "JudgeKind" in config_module.__all__
+    assert "JudgeProfileSnapshot" in config_module.__all__
+    assert "JudgeExecutionBudgets" in config_module.__all__
+    assert "MAX_JUDGE_TOKEN_BUDGET" in config_module.__all__
     assert not hasattr(config_module, "AgentRunConfig")
     for alias in (
         "RunConfig",
@@ -452,11 +668,234 @@ def test_evaluator_execution_config_binds_timeout_limits_and_judge() -> None:
     assert EvaluatorExecutionConfig.from_json(execution.to_json()) == execution
     assert execution.digest() != changed_timeout.digest()
     assert execution.evaluator_config_digest == evaluator.digest()
+    assert execution.cache_policy_version == DEFAULT_JUDGE_CACHE_POLICY_VERSION
+    assert execution.judge_budgets.attempt_timeout_seconds <= (
+        execution.evaluator_timeout_seconds
+    )
+    assert execution.judge_budgets.request_deadline_seconds <= (
+        execution.evaluator_timeout_seconds
+    )
+    assert execution.judge_budgets.attempt_timeout_seconds <= (
+        execution.judge_budgets.request_deadline_seconds
+    )
 
     payload = execution.to_dict()
     payload["evaluator_config_digest"] = "0" * 64
     with pytest.raises(SchemaError, match="digest"):
         EvaluatorExecutionConfig.from_dict(payload)
+
+    payload = execution.to_dict()
+    payload.pop("judge_budgets")
+    with pytest.raises(SchemaError, match="missing field"):
+        EvaluatorExecutionConfig.from_dict(payload)
+
+    with pytest.raises(SchemaError) as caught:
+        EvaluatorExecutionConfig.from_resource_budgets(
+            evaluator,
+            resources,
+            cache_policy_version="api_key=ordinary-secret",
+        )
+    assert "ordinary-secret" not in str(caught.value)
+
+
+def test_judge_execution_budgets_round_trip_and_enforce_hierarchy() -> None:
+    original = judge_budgets()
+    assert original.max_reason_refs == 32
+    assert JudgeExecutionBudgets.from_json(original.to_json()) == original
+
+    invalid_mutations = (
+        ("max_attempts_per_request", 0),
+        ("attempt_timeout_seconds", 0),
+        ("request_deadline_seconds", 0),
+        (
+            "attempt_timeout_seconds",
+            original.request_deadline_seconds + 1,
+        ),
+        (
+            "request_deadline_seconds",
+            original.attempt_timeout_seconds
+            * original.max_attempts_per_request
+            - 1,
+        ),
+        ("max_parallel_requests", 0),
+        ("max_context_blocks_per_request", 0),
+        (
+            "max_context_block_bytes",
+            original.max_context_bytes_per_request + 1,
+        ),
+        (
+            "max_context_bytes_per_request",
+            original.max_model_request_bytes + 1,
+        ),
+        (
+            "max_model_request_bytes",
+            original.max_total_judge_request_bytes + 1,
+        ),
+        (
+            "max_model_response_bytes",
+            original.max_total_judge_response_bytes + 1,
+        ),
+        ("max_model_request_tokens", 0),
+        ("max_model_response_tokens", True),
+        (
+            "max_model_request_tokens",
+            original.max_total_judge_request_tokens + 1,
+        ),
+        (
+            "max_model_response_tokens",
+            original.max_total_judge_response_tokens + 1,
+        ),
+        (
+            "max_reason_refs",
+            original.max_context_blocks_per_request + 3,
+        ),
+        ("max_reason_refs", 33),
+    )
+    for field, value in invalid_mutations:
+        payload = original.to_dict()
+        payload[field] = value
+        with pytest.raises(SchemaError):
+            JudgeExecutionBudgets.from_dict(payload)
+
+    payload = original.to_dict()
+    payload["unknown"] = 1
+    with pytest.raises(SchemaError, match="unknown field"):
+        JudgeExecutionBudgets.from_dict(payload)
+
+    duplicate = original.to_json().replace(
+        '"max_attempts_per_request":2',
+        '"max_attempts_per_request":2,"max_attempts_per_request":2',
+        1,
+    )
+    with pytest.raises(SchemaError, match="duplicate"):
+        JudgeExecutionBudgets.from_json(duplicate)
+
+    with pytest.raises(FrozenInstanceError):
+        original.max_model_response_tokens = 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_attempts_per_request", 1),
+        ("attempt_timeout_seconds", 59),
+        ("request_deadline_seconds", 121),
+        ("max_parallel_requests", 3),
+        ("max_context_blocks_per_request", 255),
+        ("max_context_block_bytes", 500 * 1024),
+        ("max_context_bytes_per_request", 5 * 1024 * 1024),
+        ("max_model_request_bytes", 7 * 1024 * 1024),
+        ("max_model_response_bytes", 900 * 1024),
+        ("max_model_request_tokens", 120_000),
+        ("max_model_response_tokens", 7_000),
+        ("max_reason_refs", 31),
+        ("max_total_judge_request_bytes", 63 * 1024 * 1024),
+        ("max_total_judge_response_bytes", 15 * 1024 * 1024),
+        ("max_total_judge_request_tokens", 1_000_000),
+        ("max_total_judge_response_tokens", 60_000),
+    ],
+)
+def test_every_judge_budget_dimension_changes_execution_identity(
+    field: str,
+    value: object,
+) -> None:
+    original_budgets = judge_budgets()
+    changed_payload = original_budgets.to_dict()
+    changed_payload[field] = value
+    changed_budgets = JudgeExecutionBudgets.from_dict(changed_payload)
+    evaluator = evaluator_config()
+    resources = budgets()
+
+    original = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator,
+        resources,
+        judge_budgets=original_budgets,
+    )
+    changed = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator,
+        resources,
+        judge_budgets=changed_budgets,
+    )
+
+    assert changed_budgets.digest() != original_budgets.digest()
+    assert changed.digest() != original.digest()
+
+
+def test_execution_cross_validates_judge_and_artifact_budgets() -> None:
+    evaluator = evaluator_config()
+    base = judge_budgets()
+
+    with pytest.raises(SchemaError, match="attempt timeout"):
+        EvaluatorExecutionConfig.create(
+            evaluator=evaluator,
+            evaluator_timeout_seconds=base.attempt_timeout_seconds - 1,
+            max_execution_artifact_file_bytes=16 * 1024 * 1024,
+            max_execution_artifact_total_bytes=128 * 1024 * 1024,
+            judge_budgets=base,
+        )
+
+    deadline_payload = base.to_dict()
+    deadline_payload["request_deadline_seconds"] = 301
+    with pytest.raises(SchemaError, match="request deadline"):
+        EvaluatorExecutionConfig.create(
+            evaluator=evaluator,
+            evaluator_timeout_seconds=300,
+            max_execution_artifact_file_bytes=16 * 1024 * 1024,
+            max_execution_artifact_total_bytes=128 * 1024 * 1024,
+            judge_budgets=JudgeExecutionBudgets.from_dict(deadline_payload),
+        )
+
+    with pytest.raises(SchemaError, match="model request bytes"):
+        EvaluatorExecutionConfig.create(
+            evaluator=evaluator,
+            evaluator_timeout_seconds=300,
+            max_execution_artifact_file_bytes=base.max_model_request_bytes - 1,
+            max_execution_artifact_total_bytes=128 * 1024 * 1024,
+            judge_budgets=base,
+        )
+
+    with pytest.raises(SchemaError, match="total Judge request bytes"):
+        EvaluatorExecutionConfig.create(
+            evaluator=evaluator,
+            evaluator_timeout_seconds=300,
+            max_execution_artifact_file_bytes=16 * 1024 * 1024,
+            max_execution_artifact_total_bytes=(
+                base.max_total_judge_request_bytes - 1
+            ),
+            judge_budgets=base,
+        )
+
+
+def test_budget_and_cache_policy_change_execution_digest_and_evaluation_id(
+    case_snapshot: RunCaseSnapshot,
+) -> None:
+    config = run_config(case_snapshot)
+    original = EvaluatorExecutionConfig.from_resource_budgets(
+        config.evaluator,
+        config.resource_budgets,
+    )
+    changed_budget_payload = original.judge_budgets.to_dict()
+    changed_budget_payload["max_attempts_per_request"] -= 1
+    changed_budget = EvaluatorExecutionConfig.from_resource_budgets(
+        config.evaluator,
+        config.resource_budgets,
+        judge_budgets=JudgeExecutionBudgets.from_dict(changed_budget_payload),
+    )
+    changed_cache = EvaluatorExecutionConfig.from_resource_budgets(
+        config.evaluator,
+        config.resource_budgets,
+        cache_policy_version="semantic-judge-cache-v2",
+    )
+
+    assert original.digest() != changed_budget.digest()
+    assert original.digest() != changed_cache.digest()
+    original_id = derive_evaluation_id(config.run_id, original.digest(), "v1")
+    assert original_id != derive_evaluation_id(
+        config.run_id, changed_budget.digest(), "v1"
+    )
+    assert original_id != derive_evaluation_id(
+        config.run_id, changed_cache.digest(), "v1"
+    )
 
 
 @pytest.mark.parametrize(

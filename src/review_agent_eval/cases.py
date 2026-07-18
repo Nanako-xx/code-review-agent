@@ -953,6 +953,40 @@ class RunCaseSnapshot(_JsonModel):
     def eval_input(self, task_id: str) -> EvalInput:
         return self.case(task_id).input
 
+    def select(self, task_ids: Iterable[str]) -> "RunCaseSnapshot":
+        """Return a new truth-free snapshot containing only ``task_ids``.
+
+        Filtering is a Run-level operation.  It must produce a new snapshot
+        identity rather than mutating the immutable snapshot that was used to
+        make the original Run plan.  The entries already contain the complete
+        Agent-facing projection, so this operation never needs to reopen or
+        copy the private Case truth.
+        """
+
+        if type(task_ids) not in (tuple, list, set, frozenset):
+            raise SchemaError("snapshot task_ids must be a bounded collection")
+        normalized = tuple(
+            _identifier(item, "snapshot.task_ids[%d]" % index)
+            for index, item in enumerate(task_ids)
+        )
+        if not normalized:
+            raise SchemaError("filtered Case snapshot may not be empty")
+        if len(normalized) != len(set(normalized)):
+            raise SchemaError("snapshot task_ids contains duplicates")
+        wanted = set(normalized)
+        entries = tuple(item for item in self.cases if item.task_id in wanted)
+        if len(entries) != len(wanted):
+            missing = sorted(wanted.difference(item.task_id for item in entries))
+            raise SchemaError(
+                "snapshot task_ids are not bound by the snapshot: %s" % missing
+            )
+        return RunCaseSnapshot(
+            schema_version=self.SCHEMA_VERSION,
+            snapshot_id=_snapshot_id(self.manifest, entries),
+            manifest=self.manifest,
+            cases=entries,
+        )
+
     @property
     def snapshot_digest(self) -> str:
         """Canonical run snapshot SHA, distinct from every upstream digest."""

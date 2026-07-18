@@ -1,6 +1,6 @@
 # Core Code Review Eval System 实施计划
 
-**状态：** 执行中（Task 1–5 已完成，下一步 Task 6）
+**状态：** Task 1–11 已完成，下一步 Task 12（prepare/run-agent/evaluate/inspect CLI）
 
 **设计来源：** `docs/superpowers/specs/2026-07-16-core-code-review-eval-system-design.md`
 
@@ -397,26 +397,26 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 **RED 测试：**
 
-- [ ] Runner 严格执行 load input -> prepare isolated workspace -> invoke Adapter -> validate Submission -> persist terminal artifacts。
-- [ ] 正常零 Finding 输出写 completed Submission；truth 中有 issue 时后续 Recall 为零，但 Runner 不改写状态。
-- [ ] timeout、non-zero exit、killed process、output overflow、invalid JSON、schema mismatch、blocked 和 Adapter exception 各有稳定状态/错误码。
-- [ ] 所有失败路径都写 submission、stdout/stderr 摘要、timing 和 manifest terminal receipt；不因缺 comments 文件跳过 Case。
-- [ ] terminal receipt 与 Submission 一一对应；pending/running/incomplete 不得被 evaluate 命令当成零 Finding 成功结果。
-- [ ] resume 不重复运行已有 terminal Trial；只对没有 terminal receipt 且 policy 允许的 Trial 重试。
-- [ ] 并行 Case/Trial 的 workspace、run artifact、端口、环境和产品状态相互隔离。
-- [ ] 中断和 cancellation 终止完整子进程树，并保留可读诊断。
-- [ ] Runner 不读取 truth、不计算 metric、不调用 Judge。
-- [ ] Adapter capability preflight 在任何 Trial plan/workspace 创建前运行；strict 模式以稳定 incompatibility reason 拒绝整个 Run，filter 模式必须先生成新的 Suite Snapshot/Run ID 与 capability coverage，不产生伪 `adapter_error` Submission。
-- [ ] Harness-private clarification match receipts 按 Trial 持久化并由 terminal receipt 绑定；Agent trace/Submission 不得包含完整候选答案表。
-- [ ] command-output 只有在 Harness 自己观察或执行命令并生成完整 immutable attestation 时才可进入 Evidence；attestation 绑定 Trial、revision、argv、exit code、stream、完整 bytes/hash/size，任何 truncated 或 self-reported product output 都保持 missing。
+- [x] Runner 严格执行 load input -> prepare isolated workspace -> invoke Adapter -> validate Submission -> persist terminal artifacts。
+- [x] 正常零 Finding 输出写 completed Submission；truth 中有 issue 时后续 Recall 为零，但 Runner 不改写状态。
+- [x] timeout、non-zero exit、killed process、output overflow、invalid JSON、schema mismatch、blocked 和 Adapter exception 各有稳定状态/错误码。
+- [x] 所有 Agent/Adapter 执行失败路径都写 submission、stdout/stderr 摘要、timing 和 manifest terminal receipt；Repository/workspace/ArtifactStore、factory、matcher 等 Harness 基础设施失败保持 `incomplete`，不污染 Agent failure rate；不因缺 comments 文件跳过 Case。
+- [x] terminal receipt 与 Submission 一一对应；pending/running/incomplete 不得被 evaluate 命令当成零 Finding 成功结果。
+- [x] resume 不重复运行已有 terminal Trial；只对没有 terminal receipt 且 policy 允许的 Trial 重试。
+- [x] 并行 Case/Trial 的 workspace、run artifact、端口、环境和产品状态相互隔离。
+- [x] 中断和 cancellation 终止完整子进程树，并保留可读诊断。
+- [x] Runner 不读取 truth、不计算 metric、不调用 Judge。
+- [x] Adapter capability preflight 在任何 Trial plan/workspace 创建前运行；strict 模式以稳定 incompatibility reason 拒绝整个 Run，filter 模式必须先生成新的 Suite Snapshot/Run ID 与 capability coverage，不产生伪 `adapter_error` Submission。
+- [x] Harness-private clarification match receipts 按 Trial 持久化并由 terminal receipt 绑定；Agent trace/Submission 不得包含完整候选答案表。
+- [x] command-output 只有在 Harness 自己观察或执行命令并生成完整 immutable attestation 时才可进入 Evidence；attestation 绑定 Trial、revision、argv、exit code、stream、完整 bytes/hash/size，任何 truncated 或 self-reported product output 都保持 missing。
 
 **实现：**
 
-- [ ] 实现单 Trial 与有界 worker pool 调度、timeout/cancellation、terminal Submission factory。
-- [ ] 每个 Trial 固定 config digest、Case digest、workspace binding 和 Adapter version。
-- [ ] 将原始输出保存为有界 trace；报告只暴露脱敏摘要。
-- [ ] 持久化 capability preflight 结果、clarification match receipts 和可选 Runner command attestations；全部 create-only、hash-bound、受 execution artifact budget 约束。
-- [ ] 为后续重复 Trial 预留确定性 trial index/seed，但不把 seed 传给不支持它的 Agent 冒充可控随机性。
+- [x] 实现单 Trial 与有界 worker pool 调度、timeout/cancellation、terminal Submission factory。
+- [x] 每个 Trial 固定 config digest、Case digest、workspace binding 和 Adapter version。
+- [x] 将原始输出保存为有界 trace；报告只暴露脱敏摘要。
+- [x] 持久化 capability preflight 结果、clarification match receipts 和可选 Runner command attestations；全部 create-only、hash-bound、受 execution artifact budget 约束。
+- [x] 为后续重复 Trial 预留确定性 trial index/seed，但不把 seed 传给不支持它的 Agent 冒充可控随机性。
 
 **验证：**
 
@@ -425,6 +425,8 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 ```
 
 **提交边界：** `feat(eval): run isolated trials with terminal submissions`
+
+**完成记录（2026-07-16）：** Task 6 已完成。新增 `EvalRunner` 与 bounded worker pool，固定 Trial/attempt workspace 与 artifact namespace，执行 capability preflight、strict/filter 处理、resume/recovery、外部 cancellation、terminal Submission 和失败分类。Agent/Adapter 协议失败写 canonical Submission；Repository/workspace/ArtifactStore、factory、matcher、trace capture 等 Harness 基础设施失败保持 `incomplete`，不生成或计入 Agent failure Submission。每个终态绑定 required clarification/terminal audit artifact；local trace 使用有界、hash-bound 的安全捕获，超限或身份漂移 fail closed；POSIX subprocess 增加 detached descendant tracking，Windows 继续使用 Job Object。定向 Runner/ArtifactStore/Adapter 回归通过；全量 `tests/eval` 为 476 passed、6 skipped；产品 models/hydration/architecture boundary 回归 63 passed。验证使用全新的短 basetemp，避免 Windows 长路径与复用临时目录造成的环境假失败。
 
 ---
 
@@ -445,22 +447,22 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 **RED 测试：**
 
-- [ ] path 使用规范 POSIX repo-relative 形式；wrong path、case collision、absolute/escape、deleted-side 错误都不会位置命中。
-- [ ] side 与 line-range overlap/distance 产生确定性候选分数；缺位置不会自动成功，也不会阻止后续合法 root-cause 语义匹配。
-- [ ] Evidence ID 必须存在且被 Finding 引用；missing、duplicate、dangling ref 明确分类。
-- [ ] hydration 可安全保留有界 symbolic HEAD/branch 等坏值；Checker 只接受 Case 的 exact base/head/diff range，并把其他值 deterministic invalid。
-- [ ] repository-file Evidence 从固定 Git object 重读 exact lines，按 UTF-8/LF 规范计算 excerpt/hash；path/line/hash/excerpt 任一不符为 deterministic invalid。
-- [ ] repository-diff Evidence 只可对 exact base..head/path 重放固定完整 diff；不接受 Agent workspace 未提交内容。
-- [ ] command-output 必须解析 Harness/Adapter attestation，external-record 必须解析 Agent 可见 existing-CI entry；缺 attestation/source 为 invalid。
-- [ ] Evidence anchor 不要求相同位置；它只作为后续 support Judge 的事实提示，不参与 integrity 伪造通过。
-- [ ] 问题命中但 Evidence 行号错误时保留独立 `issue_match` 输入，Evidence 结果为 invalid/unsupported。
+- [x] path 使用规范 POSIX repo-relative 形式；wrong path、case collision、absolute/escape、deleted-side 错误都不会位置命中。
+- [x] side 与 line-range overlap/distance 产生确定性候选分数；缺位置不会自动成功，也不会阻止后续合法 root-cause 语义匹配。
+- [x] Evidence ID 必须存在且被 Finding 引用；missing、duplicate、dangling ref 明确分类。
+- [x] hydration 可安全保留有界 symbolic HEAD/branch 等坏值；Checker 只接受 Case 的 exact base/head/diff range，并把其他值 deterministic invalid。
+- [x] repository-file Evidence 从固定 Git object 重读 exact lines，按 UTF-8/LF 规范计算 excerpt/hash；path/line/hash/excerpt 任一不符为 deterministic invalid。
+- [x] repository-diff Evidence 只可对 exact base..head/path 重放固定完整 diff；不接受 Agent workspace 未提交内容。
+- [x] command-output 必须解析 Harness/Adapter attestation，external-record 必须解析 Agent 可见 existing-CI entry；缺 attestation/source 为 invalid。
+- [x] Evidence anchor 不要求相同位置；它只作为后续 support Judge 的事实提示，不参与 integrity 伪造通过。
+- [x] 问题命中但 Evidence 行号错误时保留独立 `issue_match` 输入，Evidence 结果为 invalid/unsupported。
 
 **实现：**
 
-- [ ] 实现 location normalization、candidate generation 与可配置但版本化的 line-distance policy。
-- [ ] 实现 `EvidenceIntegrityResult(valid|invalid|missing)`、稳定 reason code 和仓库重放读取。
-- [ ] Integrity Checker 不调用 LLM、不判断 Finding 是否真实，只验证提交材料的身份和内容。
-- [ ] 所有 repository read 有字节/行数/path 边界，并绑定 PreparedRepository 的 base/head。
+- [x] 实现 location normalization、candidate generation 与可配置但版本化的 line-distance policy。
+- [x] 实现 `EvidenceIntegrityResult(valid|invalid|missing)`、稳定 reason code 和仓库重放读取。
+- [x] Integrity Checker 不调用 LLM、不判断 Finding 是否真实，只验证提交材料的身份和内容。
+- [x] 所有 repository read 有字节/行数/path 边界，并绑定 PreparedRepository 的 base/head。
 
 **验证：**
 
@@ -469,6 +471,8 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 ```
 
 **提交边界：** `feat(eval): verify evidence integrity and location candidates`
+
+**完成记录（2026-07-16）：** Task 7 已完成。Location Matcher 使用 replay-bound base/head extent catalog、共享 canonical repository path policy、显式 truth location target，以及版本化 exact/overlap/distance 整数评分；真实 EOF、side、deleted-file、UTF-8/行数预算和 case-wide cardinality 均 fail closed，不匹配仍保留给后续 root-cause 语义 matcher。Evidence Integrity Checker 对 `repository_file`、`repository_diff`、`command_output`、`external_record` 执行 exact replay，独立产出 `valid|invalid|missing` 与稳定 reason code；完整 file excerpt/hash、canonical diff、Harness-private command attestation 和 existing-CI record 均严格绑定。Repository replay 统一使用 literal pathspec，diff 前后复核 index、manifest、object closure 与 Git provenance，并增加 logical tree expansion budget；同一 canonical file/diff source 可跨 Evidence ID 共享 source cache，但每条 Evidence 仍独立验证 excerpt/hash。全量 `tests/eval` 共收集 628 项，622 passed、6 skipped；产品 models/hydration/architecture boundary 回归 63 passed。独立子 Agent 最终复核 PASS。
 
 ### Task 8：全局一对一 Assignment 与 Intent Evaluator
 
@@ -483,21 +487,24 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 **RED 测试：**
 
-- [ ] 最大权重二分图分配得到全局最优而不是贪心结果；输入顺序、dict 顺序和同分候选不改变稳定结果。
-- [ ] 一个 generated item 和一个 truth item 最多各匹配一次；重复 claim 不增加 Recall，额外重复项留在 unmatched。
-- [ ] 不同 Intent dimension 不互相候选；显式 exact/normalized match 在无需 Judge 时确定性完成。
-- [ ] supported、partially_supported、unsupported、contradicted、unknown 独立计数；`inferred` 本身不等于 unsupported。
-- [ ] required truth、optional truth、forbidden claim 和 unscorable Intent 语义正确。
-- [ ] clarification required/optional/not-required、是否提问、问题 materiality、答案消费和更新后 Intent 分开评分。
-- [ ] 应问未问、不该问却阻塞、问错维度、得到答案未更新 Intent 都有稳定 reason code。
-- [ ] semantic unresolved pair 只生成 Judge request，不由确定性层猜测语义结果。
+- [x] 最大权重二分图分配得到全局最优而不是贪心结果；输入顺序、dict 顺序和同分候选不改变稳定结果。
+- [x] 一个 generated item 和一个 truth item 最多各匹配一次；重复 claim 不增加 Recall，额外重复项留在 unmatched。
+- [x] 不同 Intent dimension 不互相候选；显式 exact/normalized match 在无需 Judge 时确定性完成。
+- [x] supported、partially_supported、unsupported、contradicted、unknown 独立计数；`inferred` 本身不等于 unsupported。
+- [x] required truth、optional truth、forbidden claim 和 unscorable Intent 语义正确。
+- [x] clarification required/optional/not-required、是否提问、问题 materiality、答案消费和更新后 Intent 分开评分。
+- [x] 应问未问、不该问却阻塞、问错维度、得到答案未更新 Intent 都有稳定 reason code。
+- [x] semantic unresolved pair 只生成 Judge request，不由确定性层猜测语义结果。
 
 **实现：**
 
-- [ ] 使用 stdlib 实现精确多项式时间最大权重二分图分配与稳定 lexicographic tie-break，不新增运行时科学计算依赖。
-- [ ] 实现 Intent normalization、候选矩阵、deterministic match、Judge request 和最终 claim assignment 合并。
-- [ ] Intent evaluator 只读取 Submission.intent 与 intent truth/clarification transcript，不读取 Agent 内部 trace。
-- [ ] 输出完整 claim-level matches、unmatched、clarification decisions 和 metric inputs。
+- [x] 使用 stdlib 实现精确多项式时间最大权重二分图分配与稳定 lexicographic tie-break，不新增运行时科学计算依赖。
+- [x] 实现 Intent normalization、候选矩阵、deterministic match、Judge request 和最终 claim assignment 合并。
+- [x] Intent evaluator 只读取 Submission.intent 与 intent truth/clarification transcript，不读取 Agent 内部 trace。
+- [x] 输出完整 claim-level matches、unmatched、clarification decisions 和 metric inputs。
+- [x] 对 candidate records、Judge requests、Judge decisions、`reason_refs` 和 request text 实施独立 case-wide byte budgets；超限 fail closed。
+- [x] hydration 重算相同 dimension 的完整候选图、Judge request 覆盖、全局 Assignment 与 canonical status；拒绝截断图和伪造 limit/not-scorable 结果。
+- [x] 不可评分 truth 绑定唯一 canonical digest；保留合法 audit projection 但所有 metric denominator 为 null。
 
 **验证：**
 
@@ -506,6 +513,8 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 ```
 
 **提交边界：** `feat(eval): score intent claims with global assignment`
+
+**完成记录（2026-07-17）：** Task 8 已完成。新增精确最大权重二分图 Assignment、NFC/空白/casefold normalization、structured/provenance Intent projection、deterministic exact/normalized matching、bounded semantic Judge request/decision boundary、required/optional/forbidden metrics、clarification receipt 校验与严格 canonical hydration。结果验证完整同维度候选图和 request 覆盖，防止删边后伪造局部最优、pending/graded 状态或 `limit_exceeded`/`not_scorable`；candidate records 64 MiB、Judge requests 64 MiB、Judge decisions 16 MiB、`reason_refs` 8 MiB、request text 64 MiB 均 fail closed。Task 8 定向回归 94 passed；完整 `tests/eval` 共 722 项，716 passed、6 skipped；产品 models/hydration/architecture boundary 回归 63 passed。独立子 Agent 最终复核 PASS。
 
 ## Wave C2：Structured Semantic Judge
 
@@ -516,27 +525,28 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **所有权：**
 
 - 新建 `src/review_agent_eval/judge.py`
+- 新建 `src/review_agent_eval/adapters/model_adapter.py`（唯一 Eval→产品 Model Adapter 集成边界）
 - 新建 `tests/eval/test_judge.py`
 - 新建 `tests/eval/test_judge_rubrics.py`
 
 **RED 测试：**
 
-- [ ] Judge 只通过现有 `ModelAdapter`/factory 调用模型，Eval business modules 不直接拼 OpenAI/DeepSeek/Claude HTTP。
-- [ ] Intent equivalence、Finding equivalence/novel factuality 和 Evidence support 使用不同 response schema 与 rubric version。
-- [ ] Judge 输入包含盲化后的 generated item、truth/anchor、必要 diff/代码上下文和 Evidence，不包含 Agent/model/baseline/candidate 身份。
-- [ ] repository 文本被明确包裹为不可信数据，不能覆盖 Judge system/rubric 或请求额外工具权限。
-- [ ] structured JSON 拒绝未知 key、非法 ID、越权 classification、缺 reason refs 和非有限 score。
-- [ ] timeout、Provider error、invalid output、截断和上下文预算不足返回 judge_failed/ungraded/unknown，不默认分类。
-- [ ] 同一 immutable Judge input + config digest 可缓存重用；rubric/model/config 变化必须产生不同 cache key。
-- [ ] scripted Judge 覆盖同义改写、相邻但不同 issue、错误根因、compound Finding、真实 novel Finding、Evidence weak/unsupported。
+- [x] Judge 只通过现有 `ModelAdapter`/factory 调用模型，Eval business modules 不直接拼 OpenAI/DeepSeek/Claude HTTP。
+- [x] Intent equivalence、Finding equivalence/novel factuality 和 Evidence support 使用不同 response schema 与 rubric version。
+- [x] Judge 输入包含盲化后的 generated item、truth/anchor、必要 diff/代码上下文和 Evidence，不包含 Agent/model/baseline/candidate 身份。
+- [x] repository 文本被明确包裹为不可信数据，不能覆盖 Judge system/rubric 或请求额外工具权限。
+- [x] structured JSON 拒绝未知 key、非法 ID、越权 classification、缺 reason refs 和非有限 score。
+- [x] timeout、Provider error、invalid output、截断和上下文预算不足返回 judge_failed/ungraded/unknown，不默认分类。
+- [x] 同一 immutable Judge input + config digest 可缓存重用；rubric/model/config 变化必须产生不同 cache key。
+- [x] scripted protocol/routing fixtures 为四类 response schema 注入预定结果，覆盖 equivalent/different/unknown、novel factuality 与 Evidence support 等解析、重试和路由分支；这些 fixture 不作为模型语义准确性证据。
 
 **实现：**
 
-- [ ] 定义 versioned Judge request/result、bounded context builder、严格 parser 和 error taxonomy。
-- [ ] Judge 请求使用现有 `ModelTurnRequest` 且 `tool_choice=none`；不向 Judge 暴露 Agent 工具。
-- [ ] 保存完整有界 judge_input/output、Provider/model/rubric digest、attempt 与失败状态。
-- [ ] 支持固定重试次数，但每次 attempt 都可审计；重试耗尽仍 fail closed。
-- [ ] semantic score 只表示 issue/claim 等价；Evidence integrity 不进入 issue matching 权重。
+- [x] 定义 versioned Judge request/result、bounded context builder、严格 parser 和 error taxonomy。
+- [x] Judge 请求使用现有 `ModelTurnRequest` 且 `tool_choice=none`；不向 Judge 暴露 Agent 工具。
+- [x] 保存完整有界 judge_input/output、Provider/model/rubric digest、attempt 与失败状态。
+- [x] 支持固定重试次数，但每次 attempt 都可审计；重试耗尽仍 fail closed。
+- [x] semantic score 只表示 issue/claim 等价；Evidence integrity 不进入 issue matching 权重。
 
 **验证：**
 
@@ -545,6 +555,10 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 ```
 
 **提交边界：** `feat(eval): add blind structured semantic judges`
+
+**语义能力验收边界：** Task 9 的本地 fake/scripted tests 只证明协议、blind context、parser、failure taxonomy、retry/cache 和下游路由实现正确，不证明某个真实 Judge model 能识别同义改写、相邻但不同 issue、错误根因、compound Finding、真实 novel Finding 或 Evidence 支持强度。真实语义准确性由 Task 13 的人工标注 Case 与 Task 15 的 Judge calibration/人工一致率单独评测。
+
+**完成记录（2026-07-18）：** Task 9 定向 Judge/config/Intent/Model Adapter 回归 245 passed；完整 `tests/eval` 为 818 passed、6 skipped；产品核心/架构边界回归 116 passed；独立子 Agent 最终复审 PASS。实现四个独立 Judge profile/schema/rubric、严格盲化输入与不可信数据边界、Model Adapter capability preflight、固定 retry 与 typed attempt、硬 wall-clock timeout/deadline/byte/token budgets、有界 deadline/cleanup worker、canonical terminal failure hydration、identity/tool/truncation fail-closed、graded unknown 与 judge_failed/ungraded 分离、仅 graded cache、typed `judge_input.json`/`judge_output.json` aggregate binding 及 hydration 时 input/output 累计预算复核，以及 Intent `IntentSemanticJudgeFailure` 独立 resolution。包级 Judge 导出采用 lazy loading，通用 Eval adapter 不加载产品 Runtime；旧 artifact 预算 fixture 已按最终 v1 config 大小更新，未改变生产预算语义。这里的测试通过仅表示实现与协议通过，不表示真实模型语义准确率已经达标。
 
 ## Wave C3：Review Evaluator
 
@@ -560,23 +574,25 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 **RED 测试：**
 
-- [ ] location 只生成候选/定位指标；同一根因在定义点和调用点标注时可语义命中。
-- [ ] matching edge 只衡量根因、触发条件、影响和必要位置，不把 Evidence integrity/support 混入 issue score。
-- [ ] 全局一对一分配优于贪心，重复 Finding 只命中一次，compound Finding 最多命中一个 truth issue。
-- [ ] confirmed、plausible、fabricated、unknown 与 matched truth ID 独立保存；unmatched duplicate 不增加 Recall。
-- [ ] known-invalid exact/semantic 命中为 fabricated；单纯 Evidence path/hash 错误不自动 fabricated。
-- [ ] evaluator 先做 known-invalid、truth assignment、duplicate，再按 novel policy 分流；`forbid` 产生 `unknown + novel_disallowed`，不冒充 fabricated，只有 `verify` unmatched 进入 factuality Judge。
-- [ ] closed-world、expert-augmented、human-observed 对 unmatched Finding 使用各自 policy；human-observed 不因未命中人类评论自动误报。
-- [ ] Evidence support 在 integrity 之后独立判断 supported/weak/unsupported/unknown；invalid/missing 不可成为严格 publishable Finding。
-- [ ] `confirmed + valid + supported` 是唯一 strict publishable 条件；问题正确但证据错误、证据正确但问题错误都不可发布。
-- [ ] Judge 失败保留 ungraded，指标 denominator/coverage 显式，不吞掉 Case。
+- [x] location 只生成候选/定位指标；同一根因在定义点和调用点标注时可语义命中。
+- [x] matching edge 只衡量根因、触发条件、影响和必要位置，不把 Evidence integrity/support 混入 issue score。
+- [x] 全局一对一分配优于贪心，重复 Finding 只命中一次，compound Finding 最多命中一个 truth issue。
+- [x] confirmed、plausible、fabricated、unknown 与 matched truth ID 独立保存；unmatched duplicate 不增加 Recall。
+- [x] known-invalid exact/semantic 命中为 fabricated；单纯 Evidence path/hash 错误不自动 fabricated。
+- [x] evaluator 先做 known-invalid、truth assignment、duplicate，再按 novel policy 分流；`forbid` 产生 `unknown + novel_disallowed`，不冒充 fabricated，只有 `verify` unmatched 进入 factuality Judge。
+- [x] closed-world、expert-augmented、human-observed 对 unmatched Finding 使用各自 policy；human-observed 不因未命中人类评论自动误报。
+- [x] Evidence support 在 integrity 之后独立判断 supported/weak/unsupported/unknown；invalid/missing 不可成为严格 publishable Finding。
+- [x] `confirmed + valid + supported` 是唯一 strict publishable 条件；问题正确但证据错误、证据正确但问题错误都不可发布。
+- [x] Judge 失败保留 ungraded，指标 denominator/coverage 显式，不吞掉 Case。
+
+**Task 10 固定语义规则：** `partially_equivalent`、`different`、`unknown` 不生成 expected/known-invalid 正权边；只有 `equivalent` 才能命中 known-invalid 或进入一对一 Assignment。known-invalid 图必须先完整解析，任何 pending/failure/ungraded/semantic unknown 都不能当作“未命中”继续确认 Finding。所有 Judge receipt 绑定 request/task/request digest、evaluator execution digest 与真实 `JudgeExecutionResult.digest()`。
 
 **实现：**
 
-- [ ] 组合 deterministic candidate pairs、semantic Judge scores、global assignment 与 truth completeness policy。
-- [ ] 只对 `novel_finding_policy=verify` 的 unmatched Finding 运行 bounded factuality Judge；对 matched/verified-novel Finding分别运行 Evidence support Judge。
-- [ ] 输出每条 Finding 的 issue judgement、truth assignment、location、Evidence integrity/support、Judge refs 和 publishable 状态。
-- [ ] 保存完整 matching matrix/selected edges/unmatched reasons，支持 `inspect` 解释。
+- [x] 组合 deterministic candidate pairs、semantic Judge scores、global assignment 与 truth completeness policy。
+- [x] 只对 `novel_finding_policy=verify` 的 unmatched Finding 运行 bounded factuality Judge；对 matched/verified-novel Finding分别运行 Evidence support Judge。
+- [x] 输出每条 Finding 的 issue judgement、truth assignment、location、Evidence integrity/support、Judge refs 和 publishable 状态。
+- [x] 保存完整 matching matrix/selected edges/unmatched reasons，支持 `inspect` 解释。
 
 **验证：**
 
@@ -585,6 +601,8 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 ```
 
 **提交边界：** `feat(eval): reconcile review findings with strict evidence scoring`
+
+**完成记录（2026-07-18）：** Task 10 已完成。实现 known-invalid 优先的完整候选图、仅 `equivalent` 形成正权边、全局最大权重一对一 Assignment、duplicate/novel completeness 分流、独立 Evidence integrity/support 与唯一 strict publishable 投影；Location、Evidence 和 severity/actionability 均不进入 issue edge 权重。所有 semantic Candidate、Judge request、真实 `JudgeExecutionResult` receipt、Assignment、Outcome、unmatched truth、coverage 与 metric inputs 形成可重放外键闭环；custom Rubric catalog、scoped Context source digest 和执行 profile 完整绑定。`ReviewEvaluationResult` 只能由 `ReviewEvaluator.evaluate()` 内部构造，公开裸构造与 `dataclasses.replace` 均拒绝；`from_dict/from_json` 必须使用真实 Submission、Truth、Evaluator 与 Judge results 完整重放，逐字节比较 canonical payload 后返回重放结果，拒绝伪造 decision、receipt digest 或 source binding。Task 10 定向测试 26 passed；完整 `tests/eval` 为 869 passed、6 skipped；产品核心/hydration/架构边界回归 156 passed；独立子 Agent 最终复审 PASS。
 
 ---
 
@@ -600,26 +618,29 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 - 新建 `src/review_agent_eval/metrics.py`
 - 新建 `src/review_agent_eval/report.py`
+- 新建 `src/review_agent_eval/metrics_exports.py`
+- 新建 `src/review_agent_eval/report_exports.py`
 - 新建 `tests/eval/test_metrics.py`
 - 新建 `tests/eval/test_report.py`
+- 新建 `tests/eval/test_report_security_regressions.py`
 
 **RED 测试：**
 
-- [ ] Intent precision/recall、unsupported/contradicted rate、clarification accuracy 和 case pass 使用明确 denominator；零 denominator 为 null/not-scorable，不伪装 0 或 100%。
-- [ ] issue precision/recall/F1、severity-weighted recall、critical/high misses、fabricated/plausible/unknown rate 与 per-PR count 公式正确。
-- [ ] line precision/recall、Evidence validity/support rate 和 publishable Finding precision 从独立状态计算。
-- [ ] failed/blocked/invalid Submission 进入 failure rate，并按 policy 对 outcome metric 计入；不得从汇总中消失。
-- [ ] 不同 truth completeness、Suite、language、category、severity、context level、PR size 和 Agent config 分组，禁止不兼容汇总。
-- [ ] report 展示分子/分母、coverage、ungraded/Judge failure、严重漏报和误报 Case，不只显示百分比。
-- [ ] 时间/token/cost 只汇总真实提供值，missing coverage 单独报告。
-- [ ] 不生成单一 Overall Score。
+- [x] Intent precision/recall、unsupported/contradicted rate、clarification accuracy 和 case pass 使用明确 denominator；零 denominator 为 null/not-scorable，不伪装 0 或 100%。
+- [x] issue precision/recall/F1、severity-weighted recall、critical/high misses、fabricated/plausible/unknown rate 与 per-PR count 公式正确。
+- [x] line precision/recall、Evidence validity/support rate 和 publishable Finding precision 从独立状态计算。
+- [x] failed/blocked/invalid Submission 进入 failure rate，并按 policy 对 outcome metric 计入；不得从汇总中消失。
+- [x] 不同 truth completeness、Suite、language、category、severity、context level、PR size 和 Agent config 分组，禁止不兼容汇总。
+- [x] report 展示分子/分母、coverage、ungraded/Judge failure、严重漏报和误报 Case，不只显示百分比。
+- [x] 时间/token/cost 只汇总真实提供值，missing coverage 单独报告。
+- [x] 不生成单一 Overall Score。
 
 **实现：**
 
-- [ ] 定义 versioned case/trial score 与 aggregate metric models、公式和 group-by engine。
-- [ ] 生成 `summary.json` 与 `report.md`，首页聚焦 Intent、Review、Evidence、Failure 和成本。
-- [ ] 生成 inspect 所需的 Case timeline、claim/finding assignments、Judge/Evidence reason refs。
-- [ ] 对 incomplete ground truth 使用明确 metric label/annotation，避免与 closed-world leaderboard 混淆。
+- [x] 定义 versioned case/trial score 与 aggregate metric models、公式和 group-by engine。
+- [x] 生成 `summary.json` 与 `report.md`，首页聚焦 Intent、Review、Evidence、Failure 和成本。
+- [x] 生成 inspect 所需的 Case timeline、claim/finding assignments、Judge/Evidence reason refs。
+- [x] 对 incomplete ground truth 使用明确 metric label/annotation，避免与 closed-world leaderboard 混淆。
 
 **验证：**
 
@@ -628,6 +649,8 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 ```
 
 **提交边界：** `feat(eval): aggregate outcome metrics and explainable reports`
+
+**完成记录（2026-07-18）：** Task 11 已完成。实现 source-bound `TrialScore`/`CaseScore`/`AggregateScore`、ratio-of-sums 指标与双侧 F1 coverage、planned/terminal/Intent/Review/fully-scored coverage、兼容性 partition 和真实 Case dimension group-by；实现 canonical `summary.json`、纯 Markdown report、单 Trial inspect、严重漏报/误报/Evidence/Judge/Agent failure/usage diagnostics，且不生成 Overall Score。Report/Inspect 使用版本化 redacted artifact projection，TraceRef、路径、URL 与凭据不会以 canonical artifact 形状泄漏；RunManifest 的全部 TrialManifest SHA-256/size、Case/Trial/Agent/Evaluator/Score 来源均交叉绑定。Hydration 通过 canonical component snapshot、unbound replay 和 sealed models 拒绝 fake/subclass/instance shadowing/`object.__setattr__` 变异及 Submission A + Score B 绕过。Task 11 定向回归 46 passed；完整 `tests/eval` 为 915 passed、6 skipped；产品 models/context/hydration/architecture boundary 回归 87 passed；独立子 Agent 最终安全复审 PASS。
 
 ### Task 12：prepare/run-agent/evaluate/inspect CLI
 

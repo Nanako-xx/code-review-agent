@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -222,6 +223,26 @@ elif mode == "spawn-descendant":
         close_fds=True,
     )
     Path(extra[0]).write_text(str(child.pid), encoding="ascii")
+    time.sleep(60)
+elif mode == "spawn-detached-descendants":
+    detached_program = (
+        "import os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "grandchild = subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+        "    close_fds=True,\n"
+        "    start_new_session=True,\n"
+        ")\n"
+        "Path(sys.argv[1]).write_text(\n"
+        "    '%d\\n%d' % (os.getpid(), grandchild.pid), encoding='ascii'\n"
+        ")\n"
+        "time.sleep(60)\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", detached_program, extra[0]],
+        close_fds=True,
+        start_new_session=True,
+    )
     time.sleep(60)
 else:
     raise RuntimeError("unknown test mode")
@@ -821,8 +842,130 @@ def test_timeout_cannot_be_defeated_by_a_child_that_never_reads_large_stdin(
     _assert_failure(result, SubmissionStatus.FAILED, FailureCode.TIMEOUT)
 
 
+def _write_fake_proc_stat(
+    proc_root: Path,
+    pid: int,
+    parent_pid: int,
+    start_time: int,
+    *,
+    name: str = "worker",
+) -> None:
+    process_dir = proc_root / str(pid)
+    process_dir.mkdir()
+    fields_after_state = [
+        str(parent_pid),
+        *("0" for _ in range(17)),
+        str(start_time),
+    ]
+    (process_dir / "stat").write_text(
+        "%d (%s) S %s\n" % (pid, name, " ".join(fields_after_state)),
+        encoding="ascii",
+    )
+
+
+def test_proc_snapshot_collects_nested_descendants_independent_of_session(
+    tmp_path: Path,
+) -> None:
+    import review_agent_eval.adapters.subprocess_agent as adapter_module
+
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    _write_fake_proc_stat(proc_root, 100, 1, 10, name="root")
+    _write_fake_proc_stat(proc_root, 101, 100, 11, name="detached ) child")
+    _write_fake_proc_stat(proc_root, 102, 101, 12, name="nested detached")
+    _write_fake_proc_stat(proc_root, 200, 1, 13, name="unrelated")
+
+    snapshot = adapter_module._read_linux_process_snapshot(proc_root)
+
+    assert snapshot is not None
+    processes, complete = snapshot
+    descendants, tree_complete = adapter_module._collect_posix_descendants(
+        100, processes
+    )
+    assert complete
+    assert tree_complete
+    assert set(descendants) == {101, 102}
+    assert descendants[101].birth_marker == "proc:11"
+
+
+def test_ps_snapshot_fallback_preserves_parent_and_process_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import review_agent_eval.adapters.subprocess_agent as adapter_module
+
+    monkeypatch.setattr(adapter_module.os.path, "isfile", lambda _path: True)
+    monkeypatch.setattr(adapter_module.os, "access", lambda _path, _mode: True)
+    monkeypatch.setattr(
+        adapter_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                b"100 1 Thu Jul 16 09:00:00 2026 S\n"
+                b"101 100 Thu Jul 16 09:00:01 2026 Ss\n"
+            ),
+        ),
+    )
+
+    snapshot = adapter_module._read_ps_process_snapshot()
+
+    assert snapshot is not None
+    processes, complete = snapshot
+    assert complete
+    assert processes[101].parent_pid == 100
+    assert processes[101].birth_marker == "ps:Thu Jul 16 09:00:01 2026"
+    assert processes[101].state == "Ss"
+
+
+def test_descendant_tracker_retains_reparented_process_but_rejects_pid_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import review_agent_eval.adapters.subprocess_agent as adapter_module
+
+    identity = adapter_module._PosixProcessIdentity
+    snapshots = iter(
+        (
+            (
+                {
+                    100: identity(100, 1, "proc:10", "S"),
+                    101: identity(101, 100, "proc:11", "S"),
+                },
+                True,
+            ),
+            (
+                {
+                    101: identity(101, 1, "proc:11", "S"),
+                    102: identity(102, 101, "proc:12", "S"),
+                },
+                True,
+            ),
+            ({101: identity(101, 1, "proc:99", "S")}, True),
+        )
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "_read_posix_process_snapshot",
+        lambda: next(snapshots),
+    )
+    tracker = adapter_module._PosixDescendantTracker(100)
+
+    assert [item.pid for item in tracker.observe()] == [101]
+    assert [item.pid for item in tracker.observe()] == [101, 102]
+    assert tracker.observe() == ()
+
+
 def _process_is_running(pid: int) -> bool:
     if os.name != "nt":
+        stat_path = Path("/proc") / str(pid) / "stat"
+        try:
+            data = stat_path.read_bytes()
+            closing = data.rfind(b")")
+            state = data[closing + 2 :].split(maxsplit=1)[0]
+            if state in {b"X", b"Z"}:
+                return False
+        except (FileNotFoundError, IndexError, OSError):
+            pass
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -850,6 +993,25 @@ def _process_is_running(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def _wait_until_processes_stop(pids: Sequence[int]) -> bool:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not any(_process_is_running(pid) for pid in pids):
+            return True
+        time.sleep(0.02)
+    return not any(_process_is_running(pid) for pid in pids)
+
+
+def _force_stop_processes(pids: Sequence[int]) -> None:
+    if os.name == "nt":
+        return
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def test_timeout_terminates_descendant_process_tree(
     agent_program: Path,
     workspace: Path,
@@ -871,6 +1033,136 @@ def test_timeout_terminates_descendant_process_tree(
     while _process_is_running(descendant_pid) and time.monotonic() < deadline:
         time.sleep(0.02)
     assert not _process_is_running(descendant_pid)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX setsid")
+def test_timeout_terminates_nested_detached_setsid_descendants(
+    agent_program: Path,
+    workspace: Path,
+    eval_input: EvalInput,
+) -> None:
+    pid_path = workspace / "detached-timeout-descendants.pid"
+    config = _config(
+        eval_input,
+        _command(
+            agent_program,
+            "spawn-detached-descendants",
+            str(pid_path),
+        ),
+        timeout_seconds=0.75,
+    )
+    pids: tuple[int, ...] = ()
+
+    result = _run(SubprocessAgentAdapter(), eval_input, workspace, config)
+    assert pid_path.exists()
+    pids = tuple(int(value) for value in pid_path.read_text().splitlines())
+    try:
+        _assert_failure(result, SubmissionStatus.FAILED, FailureCode.TIMEOUT)
+        assert len(pids) == 2
+        assert _wait_until_processes_stop(pids)
+    finally:
+        _force_stop_processes(pids)
+
+
+def test_cancellation_terminates_descendant_process_tree(
+    agent_program: Path,
+    workspace: Path,
+    eval_input: EvalInput,
+) -> None:
+    pid_path = workspace / "cancelled-descendant.pid"
+    config = _config(
+        eval_input,
+        _command(agent_program, "spawn-descendant", str(pid_path)),
+        timeout_seconds=30,
+    )
+    cancelled = threading.Event()
+    result_holder: Dict[str, EvalSubmission] = {}
+
+    worker = threading.Thread(
+        target=lambda: result_holder.setdefault(
+            "result",
+            SubprocessAgentAdapter().run(
+                eval_input,
+                workspace,
+                config,
+                _ForbiddenClarificationChannel(),  # type: ignore[arg-type]
+                cancel_event=cancelled,
+            ),
+        ),
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + 5
+    while not pid_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert pid_path.exists()
+    cancelled.set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    result = result_holder["result"]
+    _assert_failure(result, SubmissionStatus.FAILED, FailureCode.PROCESS_KILLED)
+    descendant_pid = int(pid_path.read_text(encoding="ascii"))
+    deadline = time.monotonic() + 5
+    while _process_is_running(descendant_pid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not _process_is_running(descendant_pid)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX setsid")
+def test_cancellation_terminates_nested_detached_setsid_descendants(
+    agent_program: Path,
+    workspace: Path,
+    eval_input: EvalInput,
+) -> None:
+    pid_path = workspace / "detached-cancelled-descendants.pid"
+    config = _config(
+        eval_input,
+        _command(
+            agent_program,
+            "spawn-detached-descendants",
+            str(pid_path),
+        ),
+        timeout_seconds=30,
+    )
+    cancelled = threading.Event()
+    result_holder: Dict[str, EvalSubmission] = {}
+    pids: tuple[int, ...] = ()
+    worker = threading.Thread(
+        target=lambda: result_holder.setdefault(
+            "result",
+            SubprocessAgentAdapter().run(
+                eval_input,
+                workspace,
+                config,
+                _ForbiddenClarificationChannel(),  # type: ignore[arg-type]
+                cancel_event=cancelled,
+            ),
+        ),
+        daemon=True,
+    )
+
+    worker.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert pid_path.exists()
+        pids = tuple(int(value) for value in pid_path.read_text().splitlines())
+        cancelled.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        _assert_failure(
+            result_holder["result"],
+            SubmissionStatus.FAILED,
+            FailureCode.PROCESS_KILLED,
+        )
+        assert len(pids) == 2
+        assert _wait_until_processes_stop(pids)
+    finally:
+        cancelled.set()
+        worker.join(5)
+        _force_stop_processes(pids)
 
 
 def test_nonzero_exit_and_raw_stderr_do_not_leak_secrets(

@@ -1,11 +1,20 @@
 import json
+import threading
+import time
+from dataclasses import FrozenInstanceError
 
 import pytest
 
+import review_agent.model_adapter as model_adapter_module
 from review_agent.model_adapter import (
+    MAX_ALLOWED_RESPONSE_BYTES,
+    MAX_HTTP_DEADLINE_WORKERS,
+    PROVIDER_RESPONSE_TOO_LARGE_ERROR,
     FakeToolCallingAdapter,
+    ModelAdapterCapabilities,
     OpenAICompatibleConfig,
     OpenAICompatibleToolAdapter,
+    _urllib_transport,
 )
 from review_agent.model_protocol import (
     ModelResponse,
@@ -16,6 +25,47 @@ from review_agent.model_protocol import (
     ModelTurnRequest,
     ModelTurnResponse,
 )
+
+
+class _BoundedHttpResponse:
+    def __init__(self, body: bytes):
+        self.body = body
+        self.read_sizes = []
+        self.close_calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        return self.body if size is None or size < 0 else self.body[:size]
+
+    def close(self):
+        self.close_calls += 1
+
+
+class _BlockingReadHttpResponse(_BoundedHttpResponse):
+    def __init__(self, body: bytes):
+        super().__init__(body)
+        self.read_started = threading.Event()
+        self.read_finished = threading.Event()
+        self.closed = threading.Event()
+
+    def read(self, size=-1):
+        self.read_started.set()
+        self.closed.wait(timeout=1.0)
+        try:
+            return super().read(size)
+        finally:
+            self.read_finished.set()
+
+    def close(self):
+        super().close()
+        self.closed.set()
 
 
 def make_request(tool_results=None):
@@ -44,6 +94,56 @@ def test_openai_compatible_config_lives_in_model_adapter():
     assert OpenAICompatibleConfig.__module__ == "review_agent.model_adapter"
 
 
+def test_model_adapter_capabilities_are_frozen():
+    capabilities = ModelAdapterCapabilities(
+        supports_tool_choice_none=True,
+        enforces_request_timeout=False,
+        max_response_bytes=None,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        capabilities.enforces_request_timeout = True
+
+
+def test_model_adapter_capabilities_expose_canonical_audit_fields():
+    capabilities = ModelAdapterCapabilities(
+        supports_tool_choice_none=True,
+        enforces_request_timeout=True,
+        max_response_bytes=2048,
+    )
+
+    assert capabilities.tool_choice_none is True
+    assert capabilities.request_timeout is True
+    assert capabilities.response_byte_limit == 2048
+    assert capabilities.to_dict() == {
+        "tool_choice_none": True,
+        "request_timeout": True,
+        "response_byte_limit": 2048,
+    }
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"supports_tool_choice_none": 1},
+        {"enforces_request_timeout": "yes"},
+        {"max_response_bytes": True},
+        {"max_response_bytes": 0},
+        {"max_response_bytes": MAX_ALLOWED_RESPONSE_BYTES + 1},
+    ],
+)
+def test_model_adapter_capabilities_require_strict_values(values):
+    parameters = {
+        "supports_tool_choice_none": True,
+        "enforces_request_timeout": True,
+        "max_response_bytes": 1024,
+        **values,
+    }
+
+    with pytest.raises(ValueError):
+        ModelAdapterCapabilities(**parameters)
+
+
 @pytest.mark.parametrize("timeout", [0, -1, float("nan")])
 def test_openai_compatible_config_requires_finite_positive_timeout(timeout):
     with pytest.raises(ValueError, match="timeout_seconds"):
@@ -52,6 +152,22 @@ def test_openai_compatible_config_requires_finite_positive_timeout(timeout):
             api_key="secret",
             model="review-model",
             timeout_seconds=timeout,
+        )
+
+
+@pytest.mark.parametrize(
+    "max_response_bytes",
+    [True, 0, -1, 1.5, "1024", MAX_ALLOWED_RESPONSE_BYTES + 1],
+)
+def test_openai_compatible_config_requires_bounded_positive_integer_response_limit(
+    max_response_bytes,
+):
+    with pytest.raises(ValueError, match="max_response_bytes"):
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+            max_response_bytes=max_response_bytes,
         )
 
 
@@ -70,6 +186,14 @@ def test_fake_adapter_returns_scripted_tool_call():
     assert response.kind is ModelResponseKind.TOOL_CALLS
     assert response.tool_calls[0].tool_name == "compare_base_head"
     assert response.provider_name == "fake-tool-calling"
+
+
+def test_fake_adapter_reports_only_capabilities_it_can_enforce():
+    adapter = FakeToolCallingAdapter([])
+
+    assert adapter.capabilities.supports_tool_choice_none is True
+    assert adapter.capabilities.enforces_request_timeout is False
+    assert adapter.capabilities.max_response_bytes is None
 
 
 def test_fake_adapter_can_compute_final_response_from_request():
@@ -195,6 +319,446 @@ def test_openai_compatible_adapter_converts_final_text_response():
     assert response.kind is ModelResponseKind.FINAL
     assert response.final_text == '{"status": "partial"}'
     assert response.provider_name == "openai-compatible"
+
+
+def test_default_transport_capabilities_bind_configured_response_limit():
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+            max_response_bytes=4096,
+        )
+    )
+
+    assert adapter.capabilities == ModelAdapterCapabilities(
+        supports_tool_choice_none=True,
+        enforces_request_timeout=True,
+        max_response_bytes=4096,
+    )
+
+
+def test_custom_transport_defaults_to_unproven_transport_capabilities():
+    def transport(url, headers, payload, timeout_seconds):
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+
+    assert adapter.capabilities == ModelAdapterCapabilities(
+        supports_tool_choice_none=True,
+        enforces_request_timeout=False,
+        max_response_bytes=None,
+    )
+
+
+def test_custom_transport_can_explicitly_prove_strict_capabilities():
+    def transport(url, headers, payload, timeout_seconds):
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    capabilities = ModelAdapterCapabilities(
+        supports_tool_choice_none=True,
+        enforces_request_timeout=True,
+        max_response_bytes=2048,
+    )
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+            max_response_bytes=4096,
+        ),
+        transport=transport,
+        capabilities=capabilities,
+    )
+
+    assert adapter.capabilities == capabilities
+
+
+def test_custom_transport_rejects_invalid_or_overstated_capabilities():
+    def transport(url, headers, payload, timeout_seconds):
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    config = OpenAICompatibleConfig(
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model="review-model",
+        max_response_bytes=1024,
+    )
+
+    with pytest.raises(TypeError, match="capabilities"):
+        OpenAICompatibleToolAdapter(
+            config,
+            transport=transport,
+            capabilities={"enforces_request_timeout": True},
+        )
+    with pytest.raises(ValueError, match="may not exceed"):
+        OpenAICompatibleToolAdapter(
+            config,
+            transport=transport,
+            capabilities=ModelAdapterCapabilities(
+                supports_tool_choice_none=True,
+                enforces_request_timeout=True,
+                max_response_bytes=2048,
+            ),
+        )
+
+
+def test_default_transport_accepts_response_at_exact_byte_limit(monkeypatch):
+    body = json.dumps(
+        {"choices": [{"message": {"content": "exact"}}]},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    http_response = _BoundedHttpResponse(body)
+    monkeypatch.setattr(
+        "review_agent.model_adapter.urllib.request.urlopen",
+        lambda request, timeout: http_response,
+    )
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="credential-must-not-leak",
+            model="review-model",
+            max_response_bytes=len(body),
+        )
+    )
+
+    response = adapter.complete_turn(make_request())
+
+    assert response.kind is ModelResponseKind.FINAL
+    assert response.final_text == "exact"
+    assert http_response.read_sizes == [len(body) + 1]
+
+
+def test_default_transport_passes_request_timeout_to_http_layer(monkeypatch):
+    body = b'{"choices":[{"message":{"content":"ok"}}]}'
+    http_response = _BoundedHttpResponse(body)
+    captured = {}
+
+    def urlopen(request, timeout):
+        captured["timeout"] = timeout
+        return http_response
+
+    monkeypatch.setattr(
+        "review_agent.model_adapter.urllib.request.urlopen",
+        urlopen,
+    )
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+            timeout_seconds=60,
+            max_response_bytes=len(body),
+        )
+    )
+    request = make_request()
+    request.parameters["timeout_seconds"] = 2.5
+
+    response = adapter.complete_turn(request)
+
+    assert response.kind is ModelResponseKind.FINAL
+    assert captured["timeout"] == 2.5
+    assert http_response.read_sizes == [len(body) + 1]
+
+
+def test_default_transport_wall_clock_deadline_covers_slow_urlopen(monkeypatch):
+    urlopen_started = threading.Event()
+    release_urlopen = threading.Event()
+    urlopen_finished = threading.Event()
+
+    def slow_urlopen(request, timeout):
+        urlopen_started.set()
+        try:
+            release_urlopen.wait(timeout=1.0)
+            raise OSError("released slow urlopen")
+        finally:
+            urlopen_finished.set()
+
+    monkeypatch.setattr(
+        "review_agent.model_adapter.urllib.request.urlopen",
+        slow_urlopen,
+    )
+
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="wall-clock timeout"):
+            _urllib_transport(
+                "https://example.test/v1/chat/completions",
+                {},
+                {"model": "review-model"},
+                0.05,
+                max_response_bytes=1024,
+            )
+    finally:
+        release_urlopen.set()
+    elapsed = time.monotonic() - started_at
+
+    assert urlopen_started.is_set()
+    assert elapsed < 0.5
+    assert urlopen_finished.wait(timeout=0.5)
+
+
+def test_default_transport_rechecks_deadline_after_worker_slot_admission(
+    monkeypatch,
+):
+    class LateAdmissionSlots:
+        acquire_calls = 0
+        release_calls = 0
+
+        def acquire(self, *, timeout):
+            self.acquire_calls += 1
+            time.sleep(timeout + 0.02)
+            return True
+
+        def release(self):
+            self.release_calls += 1
+
+    slots = LateAdmissionSlots()
+    monkeypatch.setattr(model_adapter_module, "_HTTP_DEADLINE_SLOTS", slots)
+    monkeypatch.setattr(
+        model_adapter_module.threading,
+        "Thread",
+        lambda *args, **kwargs: pytest.fail(
+            "deadline-expired admission must not create a worker"
+        ),
+    )
+
+    with pytest.raises(TimeoutError, match="wall-clock timeout"):
+        _urllib_transport(
+            "https://example.test/v1/chat/completions",
+            {},
+            {"model": "review-model"},
+            0.01,
+            max_response_bytes=1024,
+        )
+
+    assert slots.acquire_calls == 1
+    assert slots.release_calls == 1
+
+
+def test_default_transport_releases_close_slot_when_cleanup_thread_start_fails(
+    monkeypatch,
+):
+    class RecordingCloseSlots:
+        acquire_calls = 0
+        release_calls = 0
+
+        def acquire(self, *, blocking):
+            assert blocking is False
+            self.acquire_calls += 1
+            return True
+
+        def release(self):
+            self.release_calls += 1
+
+    body = b'{"choices":[{"message":{"content":"late"}}]}'
+    http_response = _BlockingReadHttpResponse(body)
+    close_slots = RecordingCloseSlots()
+    real_thread = threading.Thread
+
+    def thread_factory(*args, **kwargs):
+        if kwargs.get("name") == "model-adapter-http-timeout-close":
+            raise OSError("cleanup thread unavailable")
+        return real_thread(*args, **kwargs)
+
+    monkeypatch.setattr(model_adapter_module, "_HTTP_CLOSE_SLOTS", close_slots)
+    monkeypatch.setattr(model_adapter_module.threading, "Thread", thread_factory)
+    monkeypatch.setattr(
+        model_adapter_module.urllib.request,
+        "urlopen",
+        lambda request, timeout: http_response,
+    )
+
+    try:
+        with pytest.raises(TimeoutError, match="wall-clock timeout"):
+            _urllib_transport(
+                "https://example.test/v1/chat/completions",
+                {},
+                {"model": "review-model"},
+                0.02,
+                max_response_bytes=len(body),
+            )
+        assert close_slots.acquire_calls == 1
+        assert close_slots.release_calls == 1
+    finally:
+        http_response.closed.set()
+    assert http_response.read_finished.wait(timeout=0.5)
+    cleanup_deadline = time.monotonic() + 0.5
+    while time.monotonic() < cleanup_deadline and any(
+        thread.name == "model-adapter-http-deadline"
+        for thread in threading.enumerate()
+    ):
+        time.sleep(0.01)
+    assert not any(
+        thread.name == "model-adapter-http-deadline"
+        for thread in threading.enumerate()
+    )
+
+
+def test_default_transport_bounds_permanently_blocked_deadline_workers(monkeypatch):
+    release_workers = threading.Event()
+    start_callers = threading.Event()
+    all_started = threading.Event()
+    state_lock = threading.Lock()
+    started = 0
+    finished = 0
+    caller_failures = []
+
+    def permanently_blocked_urlopen(request, timeout):
+        nonlocal started, finished
+        with state_lock:
+            started += 1
+            if started == MAX_HTTP_DEADLINE_WORKERS:
+                all_started.set()
+        try:
+            release_workers.wait(timeout=5.0)
+            raise OSError("released blocked urlopen")
+        finally:
+            with state_lock:
+                finished += 1
+
+    monkeypatch.setattr(
+        "review_agent.model_adapter.urllib.request.urlopen",
+        permanently_blocked_urlopen,
+    )
+
+    def run_timed_request():
+        start_callers.wait(timeout=1.0)
+        try:
+            _urllib_transport(
+                "https://example.test/v1/chat/completions",
+                {},
+                {"model": "review-model"},
+                0.5,
+                max_response_bytes=1024,
+            )
+        except TimeoutError:
+            return
+        except BaseException as error:
+            with state_lock:
+                caller_failures.append(error)
+        else:
+            with state_lock:
+                caller_failures.append(AssertionError("request unexpectedly succeeded"))
+
+    callers = [
+        threading.Thread(target=run_timed_request, name=f"timeout-caller-{index}")
+        for index in range(MAX_HTTP_DEADLINE_WORKERS)
+    ]
+
+    try:
+        for caller in callers:
+            caller.start()
+        start_callers.set()
+        assert all_started.wait(timeout=2.0)
+
+        with pytest.raises(TimeoutError, match="wall-clock timeout"):
+            _urllib_transport(
+                "https://example.test/v1/chat/completions",
+                {},
+                {"model": "review-model"},
+                0.02,
+                max_response_bytes=1024,
+            )
+        with state_lock:
+            assert started == MAX_HTTP_DEADLINE_WORKERS
+        for caller in callers:
+            caller.join(timeout=1.0)
+        assert not any(caller.is_alive() for caller in callers)
+        with state_lock:
+            assert caller_failures == []
+    finally:
+        start_callers.set()
+        release_workers.set()
+        for caller in callers:
+            caller.join(timeout=1.0)
+
+    cleanup_deadline = time.monotonic() + 2.0
+    while time.monotonic() < cleanup_deadline:
+        with state_lock:
+            counts_match = finished == started
+        active_deadline_workers = any(
+            thread.name == "model-adapter-http-deadline"
+            for thread in threading.enumerate()
+        )
+        if counts_match and not active_deadline_workers:
+            break
+        time.sleep(0.01)
+    with state_lock:
+        assert finished == started
+    assert not any(
+        thread.name == "model-adapter-http-deadline"
+        for thread in threading.enumerate()
+    )
+
+
+def test_default_transport_wall_clock_deadline_covers_slow_read_and_closes_response(
+    monkeypatch,
+):
+    body = b'{"choices":[{"message":{"content":"late"}}]}'
+    http_response = _BlockingReadHttpResponse(body)
+    monkeypatch.setattr(
+        "review_agent.model_adapter.urllib.request.urlopen",
+        lambda request, timeout: http_response,
+    )
+
+    started_at = time.monotonic()
+    with pytest.raises(TimeoutError, match="wall-clock timeout"):
+        _urllib_transport(
+            "https://example.test/v1/chat/completions",
+            {},
+            {"model": "review-model"},
+            0.05,
+            max_response_bytes=len(body),
+        )
+    elapsed = time.monotonic() - started_at
+
+    assert http_response.read_started.is_set()
+    assert elapsed < 0.5
+    assert http_response.closed.wait(timeout=0.5)
+    assert http_response.read_finished.wait(timeout=0.5)
+    assert http_response.close_calls == 1
+
+
+def test_default_transport_rejects_limit_plus_one_without_leaking_body_or_credentials(
+    monkeypatch,
+):
+    body_secret = "response-body-must-not-leak"
+    credential = "credential-must-not-leak"
+    body = json.dumps(
+        {"choices": [{"message": {"content": body_secret}}]},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    configured_limit = len(body) - 1
+    http_response = _BoundedHttpResponse(body)
+    monkeypatch.setattr(
+        "review_agent.model_adapter.urllib.request.urlopen",
+        lambda request, timeout: http_response,
+    )
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key=credential,
+            model="review-model",
+            max_response_bytes=configured_limit,
+        )
+    )
+
+    response = adapter.complete_turn(make_request())
+
+    assert response.kind is ModelResponseKind.INVALID
+    assert response.error == PROVIDER_RESPONSE_TOO_LARGE_ERROR
+    assert response.raw == {}
+    assert body_secret not in response.error
+    assert credential not in response.error
+    assert http_response.read_sizes == [configured_limit + 1]
 
 
 def test_openai_compatible_adapter_includes_prior_assistant_tool_call_before_tool_result():

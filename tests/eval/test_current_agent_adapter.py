@@ -908,10 +908,13 @@ def test_correct_answer_must_round_trip_through_product_semicolon_protocol() -> 
         current_module._answer_input(invalid, question)
 
 
-def test_only_current_agent_adapter_may_import_product_modules() -> None:
+def test_only_explicit_product_adapter_boundaries_may_import_product_modules() -> None:
     package_root = Path(__file__).resolve().parents[2] / "src" / "review_agent_eval"
     violations = []
-    current_imports = []
+    allowed_imports = {
+        "adapters/current_agent.py": [],
+        "adapters/model_adapter.py": [],
+    }
     for path in package_root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
@@ -923,11 +926,11 @@ def test_only_current_agent_adapter_may_import_product_modules() -> None:
             for module in modules:
                 if module == "review_agent" or module.startswith("review_agent."):
                     relative = path.relative_to(package_root).as_posix()
-                    if relative == "adapters/current_agent.py":
-                        current_imports.append(module)
+                    if relative in allowed_imports:
+                        allowed_imports[relative].append(module)
                     else:
                         violations.append((relative, module))
-    assert current_imports
+    assert all(allowed_imports.values())
     assert not violations
 
 

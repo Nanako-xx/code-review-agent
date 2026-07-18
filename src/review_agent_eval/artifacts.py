@@ -54,6 +54,7 @@ from .models import (
     SubmissionFailure,
     SubmissionStatus,
     SubmissionUsage,
+    TraceType,
     TrialStatus,
     _JsonModel,
     _array,
@@ -74,16 +75,48 @@ from .models import (
 EVAL_RUN_MANIFEST_SCHEMA_VERSION = "eval_run_manifest_v1"
 EVAL_TRIAL_MANIFEST_SCHEMA_VERSION = "eval_trial_manifest_v1"
 EVAL_STAGE_RECEIPT_SCHEMA_VERSION = "eval_stage_receipt_v1"
+EVAL_RUN_PREFLIGHT_SCHEMA_VERSION = "eval_run_capability_preflight_v1"
+EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION = "eval_preflight_candidate_v1"
 
 MAX_RUN_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_TRIAL_MANIFEST_BYTES = 1024 * 1024
 MAX_STAGE_RECEIPT_BYTES = 2 * 1024 * 1024
+MAX_RUN_PREFLIGHT_BYTES = MAX_RUN_CASE_SNAPSHOT_BYTES
+MAX_PREFLIGHT_CANDIDATE_BYTES = MAX_RUN_CASE_SNAPSHOT_BYTES
 MAX_MANIFEST_TRIALS = 100_000
 MAX_RECEIPT_ARTIFACTS = 128
 MAX_ARTIFACT_PATH_CHARS = 2_048
 MAX_TRIAL_ATTEMPTS = 10_000
 DEFAULT_MAX_FILE_BYTES = MAX_RUN_CASE_SNAPSHOT_BYTES
 DEFAULT_MAX_TOTAL_READ_BYTES = 512 * 1024 * 1024
+# Runner-owned execution metadata is deliberately a small, named surface.
+# Callers cannot use the terminal path as an untyped arbitrary artifact sink.
+MAX_RUNNER_ARTIFACTS = 16
+MAX_RUNNER_ARTIFACT_NAME_CHARS = 128
+_RUNNER_ARTIFACT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\.json$")
+_KNOWN_RUNNER_ARTIFACT_NAMES = frozenset(
+    {
+        "capability_preflight.json",
+        "clarification_match_receipts.json",
+        "terminal_summary.json",
+        "workspace_manifest.json",
+        "command_attestations.json",
+        "trace_capture.json",
+    }
+)
+_CONTROL_RUNNER_ARTIFACT_NAMES = frozenset(
+    {
+        "clarification_match_receipts.json",
+        "terminal_summary.json",
+    }
+)
+_MANDATORY_EXECUTION_RUNNER_ARTIFACT_NAMES = frozenset(
+    {"trace_capture.json"}
+)
+_REQUIRED_RUNNER_ARTIFACT_NAMES = (
+    _CONTROL_RUNNER_ARTIFACT_NAMES
+    | _MANDATORY_EXECUTION_RUNNER_ARTIFACT_NAMES
+)
 DIRECTORY_FSYNC_SUPPORTED = os.name != "nt"
 
 
@@ -91,7 +124,7 @@ _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _ATTEMPT_RE = re.compile(r"^attempt-[0-9]{4,5}$")
 _TEMP_FILE_RE = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
 _INTERNAL_DIRECTORIES = frozenset(
-    {".locks", "cases", "trials", "receipts", "evaluations"}
+    {".locks", "cases", "trials", "receipts", "evaluations", "preflights"}
 )
 _TERMINAL_STATUSES = frozenset(
     {
@@ -111,6 +144,14 @@ class ArtifactConflictError(ArtifactError):
 
 class ArtifactIntegrityError(ArtifactError):
     """Stored bytes fail canonical, size, hash, or identity validation."""
+
+
+class ExecutionArtifactBudgetError(ArtifactIntegrityError):
+    """Optional execution metadata exceeded its configured byte/count budget."""
+
+
+class RequiredExecutionArtifactBudgetError(ArtifactIntegrityError):
+    """A mandatory trace/attestation cannot fit the execution budget."""
 
 
 class ArtifactSecurityError(ArtifactIntegrityError):
@@ -157,6 +198,26 @@ def _relative_artifact_path(value: Any, context: str = "artifact path") -> str:
     for part in parts:
         validate_path_segment(part, context)
     return value
+
+
+def _runner_artifact_name(value: Any) -> str:
+    """Validate one Runner-owned JSON metadata filename."""
+
+    if (
+        type(value) is not str
+        or len(value) > MAX_RUNNER_ARTIFACT_NAME_CHARS
+        or _RUNNER_ARTIFACT_NAME_RE.fullmatch(value) is None
+        or value not in _KNOWN_RUNNER_ARTIFACT_NAMES
+    ):
+        raise SchemaError("unknown or unsafe Runner artifact name")
+    return value
+
+
+def _required_runner_artifact_names(submission: EvalSubmission) -> frozenset[str]:
+    names = set(_CONTROL_RUNNER_ARTIFACT_NAMES)
+    if submission.trace_ref is not None and submission.trace_ref.type is TraceType.LOCAL_PATH:
+        names.update(_MANDATORY_EXECUTION_RUNNER_ARTIFACT_NAMES)
+    return frozenset(names)
 
 
 @dataclass(frozen=True)
@@ -2059,44 +2120,40 @@ class ArtifactStore:
             )
 
     def create_run(
-        self, config: EvalRunConfig, case_snapshot: RunCaseSnapshot
+        self,
+        config: EvalRunConfig,
+        case_snapshot: RunCaseSnapshot,
+        *,
+        run_preflight: Any = None,
     ) -> RunManifest:
         """Materialize the complete immutable Run/Trial plan, manifest last."""
 
         self._validate_snapshot_binding(config, case_snapshot)
-        run_dir = self._run_dir(config.run_id)
-        self._assert_directory(self.root)
-        with self._guard_parent_directory(run_dir) as parent_descriptor:
-            try:
-                if parent_descriptor is None:
-                    os.mkdir(run_dir, 0o700)
-                else:
-                    os.mkdir(
-                        run_dir.name,
-                        0o700,
-                        dir_fd=parent_descriptor,
-                    )
-                    os.fsync(parent_descriptor)
-            except FileExistsError as exc:
-                raise ArtifactConflictError(
-                    "run instance already exists; use a new run_instance_key"
-                ) from exc
-            except OSError as exc:
-                raise ArtifactSecurityError("could not create run directory") from exc
-        self._assert_directory(run_dir)
-        for fixed in (".locks", "cases", "evaluations", "receipts"):
-            self._ensure_directory(run_dir / fixed)
-        config_ref = self._write_json(
-            config.run_id,
-            "run_config.json",
-            config,
-            maximum=MAX_EVAL_RUN_CONFIG_BYTES,
+        config_data = canonical_json_bytes(config)
+        snapshot_data = canonical_json_bytes(case_snapshot)
+        if len(config_data) > min(self.max_file_bytes, MAX_EVAL_RUN_CONFIG_BYTES):
+            raise ArtifactIntegrityError("Run Config exceeds its storage byte limit")
+        if len(snapshot_data) > min(
+            self.max_file_bytes, MAX_RUN_CASE_SNAPSHOT_BYTES
+        ):
+            raise ArtifactIntegrityError("Case Snapshot exceeds its storage byte limit")
+        preflight_bytes = b""
+        if run_preflight is not None:
+            validate_safe_json(run_preflight, "capability preflight")
+            # The final envelope adds only fixed-size digests/field names.
+            # Reserve space before creating the Run directory so an
+            # unpersistable preflight cannot strand an immutable Run ID.
+            preflight_bytes = canonical_json_bytes(run_preflight)
+            effective_limit = min(self.max_file_bytes, MAX_RUN_PREFLIGHT_BYTES)
+            if len(preflight_bytes) + 2_048 > effective_limit:
+                raise ArtifactIntegrityError(
+                    "Run capability preflight cannot fit its receipt envelope"
+                )
+        config_ref = self._planned_artifact_ref(
+            config.run_id, "run_config.json", config_data
         )
-        snapshot_ref = self._write_json(
-            config.run_id,
-            "case_snapshot.json",
-            case_snapshot,
-            maximum=MAX_RUN_CASE_SNAPSHOT_BYTES,
+        snapshot_ref = self._planned_artifact_ref(
+            config.run_id, "case_snapshot.json", snapshot_data
         )
         initial_evaluator_execution_digest = (
             EvaluatorExecutionConfig.from_resource_budgets(
@@ -2104,15 +2161,14 @@ class ArtifactStore:
             ).digest()
         )
         plans: List[RunTrialPlan] = []
+        trial_payloads: List[
+            Tuple[str, TrialManifest, bytes, ArtifactRef]
+        ] = []
         for case in config.suite.cases:
             case_path_id = derive_case_path_id(case.task_id)
             for trial_index in range(1, config.trial_count + 1):
                 trial_id = derive_trial_id(config.run_id, case.task_id, trial_index)
                 relative_base = "cases/%s/trials/%s" % (case_path_id, trial_id)
-                for suffix in (".locks", "receipts", "evaluations"):
-                    self._ensure_directory(
-                        self._target(config.run_id, relative_base) / suffix
-                    )
                 trial_manifest = TrialManifest(
                     schema_version=TrialManifest.SCHEMA_VERSION,
                     run_id=config.run_id,
@@ -2128,11 +2184,19 @@ class ArtifactStore:
                         initial_evaluator_execution_digest
                     ),
                 )
-                manifest_ref = self._write_json(
-                    config.run_id,
-                    "%s/trial_manifest.json" % relative_base,
-                    trial_manifest,
-                    maximum=MAX_TRIAL_MANIFEST_BYTES,
+                trial_data = canonical_json_bytes(trial_manifest)
+                if len(trial_data) > min(
+                    self.max_file_bytes, MAX_TRIAL_MANIFEST_BYTES
+                ):
+                    raise ArtifactIntegrityError(
+                        "Trial manifest exceeds its storage byte limit"
+                    )
+                relative_manifest = "%s/trial_manifest.json" % relative_base
+                manifest_ref = self._planned_artifact_ref(
+                    config.run_id, relative_manifest, trial_data
+                )
+                trial_payloads.append(
+                    (relative_base, trial_manifest, trial_data, manifest_ref)
                 )
                 plans.append(
                     RunTrialPlan(
@@ -2156,6 +2220,80 @@ class ArtifactStore:
             ),
             trials=tuple(plans),
         )
+        manifest_data = canonical_json_bytes(manifest)
+        if len(manifest_data) > min(self.max_file_bytes, MAX_RUN_MANIFEST_BYTES):
+            raise ArtifactIntegrityError("Run manifest exceeds its storage byte limit")
+        read_floor = (
+            len(config_data)
+            + len(snapshot_data)
+            + len(preflight_bytes)
+            + len(manifest_data)
+            + sum(len(item[2]) for item in trial_payloads)
+            + config.resource_budgets.max_execution_artifact_total_bytes
+        )
+        if read_floor > self.max_total_read_bytes:
+            raise ArtifactIntegrityError(
+                "Run plan and execution budget exceed ArtifactStore read capacity"
+            )
+        run_dir = self._run_dir(config.run_id)
+        self._assert_directory(self.root)
+        with self._guard_parent_directory(run_dir) as parent_descriptor:
+            try:
+                if parent_descriptor is None:
+                    os.mkdir(run_dir, 0o700)
+                else:
+                    os.mkdir(
+                        run_dir.name,
+                        0o700,
+                        dir_fd=parent_descriptor,
+                    )
+                    os.fsync(parent_descriptor)
+            except FileExistsError as exc:
+                raise ArtifactConflictError(
+                    "run instance already exists; use a new run_instance_key"
+                ) from exc
+            except OSError as exc:
+                raise ArtifactSecurityError("could not create run directory") from exc
+        self._assert_directory(run_dir)
+        for fixed in (".locks", "cases", "evaluations", "receipts"):
+            self._ensure_directory(run_dir / fixed)
+        config_ref_written = self._write_json(
+            config.run_id,
+            "run_config.json",
+            config,
+            maximum=MAX_EVAL_RUN_CONFIG_BYTES,
+        )
+        snapshot_ref_written = self._write_json(
+            config.run_id,
+            "case_snapshot.json",
+            case_snapshot,
+            maximum=MAX_RUN_CASE_SNAPSHOT_BYTES,
+        )
+        if config_ref_written != config_ref or snapshot_ref_written != snapshot_ref:
+            raise ArtifactIntegrityError(
+                "Run plan input artifact identity changed before publication"
+            )
+        for relative_base, trial_manifest, trial_data, manifest_ref in trial_payloads:
+            for suffix in (".locks", "receipts", "evaluations"):
+                self._ensure_directory(
+                    self._target(config.run_id, relative_base) / suffix
+                )
+            written = self._write_json(
+                config.run_id,
+                "%s/trial_manifest.json" % relative_base,
+                trial_manifest,
+                maximum=MAX_TRIAL_MANIFEST_BYTES,
+            )
+            if written != manifest_ref or canonical_json_bytes(trial_manifest) != trial_data:
+                raise ArtifactIntegrityError(
+                    "Trial manifest identity changed before publication"
+                )
+        if run_preflight is not None:
+            self._write_run_preflight_payload(
+                config,
+                manifest,
+                run_preflight,
+            )
         # This is the Run-plan commit marker and is always published last.
         self._write_json(
             config.run_id,
@@ -2164,6 +2302,157 @@ class ArtifactStore:
             maximum=MAX_RUN_MANIFEST_BYTES,
         )
         return manifest
+
+    def _write_run_preflight_payload(
+        self,
+        config: EvalRunConfig,
+        manifest: RunManifest,
+        preflight: Any,
+    ) -> ArtifactRef:
+        validate_safe_json(preflight, "capability preflight")
+        preflight_bytes = canonical_json_bytes(preflight)
+        envelope = {
+            "schema_version": EVAL_RUN_PREFLIGHT_SCHEMA_VERSION,
+            "run_id": config.run_id,
+            "run_manifest_digest": manifest.digest(),
+            "run_config_digest": config.digest(),
+            "preflight_digest": hashlib.sha256(preflight_bytes).hexdigest(),
+            "preflight": preflight,
+        }
+        validate_safe_json(envelope, "capability preflight envelope")
+        return self._write_json(
+            config.run_id,
+            "receipts/capability_preflight.json",
+            envelope,
+            maximum=MAX_RUN_PREFLIGHT_BYTES,
+        )
+
+    def write_run_preflight(self, run_id: str, preflight: Any) -> ArtifactRef:
+        """Persist one hash-bound, Run-level capability preflight receipt.
+
+        The receipt is deliberately separate from Trial terminal artifacts and
+        binds the accepted immutable Run manifest/config.  Rejected strict
+        candidates use ``write_preflight_candidate`` because no Run manifest
+        exists for them.  Neither form is an evaluator artifact or Case truth.
+        """
+
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        return self._write_run_preflight_payload(
+            bundle.config,
+            bundle.manifest,
+            preflight,
+        )
+
+    def write_preflight_candidate(
+        self,
+        run_id: str,
+        *,
+        run_config_digest: str,
+        case_snapshot_digest: str,
+        preflight: Any,
+    ) -> ArtifactRef:
+        """Persist a rejected candidate before an immutable Run exists."""
+
+        validate_run_id(run_id)
+        _digest(run_config_digest, "preflight candidate.run_config_digest")
+        _digest(case_snapshot_digest, "preflight candidate.case_snapshot_digest")
+        validate_safe_json(preflight, "capability preflight")
+        preflight_bytes = canonical_json_bytes(preflight)
+        envelope = {
+            "schema_version": EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION,
+            "run_id": run_id,
+            "run_config_digest": run_config_digest,
+            "case_snapshot_digest": case_snapshot_digest,
+            "preflight_digest": hashlib.sha256(preflight_bytes).hexdigest(),
+            "preflight": preflight,
+        }
+        validate_safe_json(envelope, "preflight candidate envelope")
+        data = canonical_json_bytes(envelope)
+        if len(data) > min(self.max_file_bytes, MAX_PREFLIGHT_CANDIDATE_BYTES):
+            raise ArtifactIntegrityError("preflight candidate exceeds its byte limit")
+        self._ensure_directory(self.root / "preflights")
+        path = self.root / "preflights" / (run_id + ".json")
+        self._write_bytes_exclusive(path, data)
+        return ArtifactRef(
+            relative_path="preflights/%s.json" % run_id,
+            sha256=hashlib.sha256(data).hexdigest(),
+            size_bytes=len(data),
+        )
+
+    def load_preflight_candidate(self, run_id: str) -> Any:
+        """Read a rejected candidate receipt without creating a Run."""
+
+        validate_run_id(run_id)
+        budget = _ReadBudget(self.max_total_read_bytes)
+        path = self.root / "preflights" / (run_id + ".json")
+        payload = self._read_json(
+            path,
+            budget=budget,
+            maximum=MAX_PREFLIGHT_CANDIDATE_BYTES,
+        )
+        if type(payload) is not dict:
+            raise ArtifactIntegrityError("preflight candidate is not an object")
+        expected_fields = {
+            "schema_version",
+            "run_id",
+            "run_config_digest",
+            "case_snapshot_digest",
+            "preflight_digest",
+            "preflight",
+        }
+        if (
+            set(payload) != expected_fields
+            or payload.get("schema_version")
+            != EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION
+            or payload.get("run_id") != run_id
+            or "preflight" not in payload
+        ):
+            raise ArtifactIntegrityError("preflight candidate binding is invalid")
+        try:
+            _digest(
+                payload.get("run_config_digest"),
+                "preflight candidate.run_config_digest",
+            )
+            _digest(
+                payload.get("case_snapshot_digest"),
+                "preflight candidate.case_snapshot_digest",
+            )
+        except SchemaError as exc:
+            raise ArtifactIntegrityError(
+                "preflight candidate digests are invalid"
+            ) from exc
+        digest = hashlib.sha256(
+            canonical_json_bytes(payload["preflight"])
+        ).hexdigest()
+        if payload.get("preflight_digest") != digest:
+            raise ArtifactIntegrityError("preflight candidate digest is invalid")
+        return payload
+
+    def load_run_preflight(self, run_id: str) -> Any:
+        """Read and verify the immutable Run-level capability receipt."""
+
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        payload = self._read_json(
+            self._run_dir(run_id) / "receipts/capability_preflight.json",
+            budget=budget,
+            maximum=MAX_RUN_PREFLIGHT_BYTES,
+        )
+        if not isinstance(payload, dict):
+            raise ArtifactIntegrityError("Run capability preflight is not an object")
+        if (
+            payload.get("schema_version") != EVAL_RUN_PREFLIGHT_SCHEMA_VERSION
+            or payload.get("run_id") != run_id
+            or payload.get("run_manifest_digest") != bundle.manifest.digest()
+            or payload.get("run_config_digest") != bundle.config.digest()
+            or "preflight" not in payload
+        ):
+            raise ArtifactIntegrityError("Run capability preflight binding is invalid")
+        preflight_bytes = canonical_json_bytes(payload["preflight"])
+        if payload.get("preflight_digest") != hashlib.sha256(preflight_bytes).hexdigest():
+            raise ArtifactIntegrityError("Run capability preflight digest is invalid")
+        return payload["preflight"]
 
     def _read_run_manifest(
         self, run_id: str, *, budget: _ReadBudget
@@ -2459,6 +2748,11 @@ class ArtifactStore:
         for artifact in receipt.artifacts:
             if artifact is submission_ref:
                 continue
+            artifact_name = artifact.relative_path.rsplit("/", 1)[-1]
+            execution_runner = (
+                "/runner/" in artifact.relative_path
+                and artifact_name not in _CONTROL_RUNNER_ARTIFACT_NAMES
+            )
             self._read_bytes(
                 self._target(plan.run_id, artifact.relative_path),
                 expected_sha256=artifact.sha256,
@@ -2466,6 +2760,8 @@ class ArtifactStore:
                 budget=budget,
                 maximum_bytes=(
                     bundle.config.resource_budgets.max_execution_artifact_file_bytes
+                    if execution_runner
+                    else self.max_file_bytes
                 ),
             )
         payload = self._read_json(
@@ -2475,6 +2771,19 @@ class ArtifactStore:
             maximum=MAX_EVAL_SUBMISSION_BYTES,
         )
         submission = EvalSubmission.from_dict(payload)
+        runner_names = {
+            artifact.relative_path.rsplit("/", 1)[-1]
+            for artifact in receipt.artifacts
+            if "/runner/" in artifact.relative_path
+        }
+        missing_required = _required_runner_artifact_names(submission).difference(
+            runner_names
+        )
+        if missing_required:
+            raise ArtifactIntegrityError(
+                "terminal receipt lacks required Runner artifacts: %s"
+                % sorted(missing_required)
+            )
         if receipt.terminal_status is None:
             raise ArtifactIntegrityError("terminal receipt lacks terminal status")
         expected_failure = (
@@ -2491,6 +2800,70 @@ class ArtifactStore:
                 "Submission does not match its terminal receipt or verified Run"
             )
         return submission
+
+    def _recoverable_runner_artifacts(
+        self,
+        run_id: str,
+        plan: TrialManifest,
+        *,
+        attempt: int,
+        budget: _ReadBudget,
+        maximum_bytes: int,
+    ) -> Tuple[ArtifactRef, ...]:
+        """Return only known, canonical Runner metadata left by an interrupted write."""
+
+        runner_root = self._trial_dir(plan) / "runner"
+        if not os.path.lexists(runner_root):
+            return ()
+        self._assert_directory(runner_root)
+        runner_dir = runner_root / ("attempt-%04d" % attempt)
+        if not os.path.lexists(runner_dir):
+            return ()
+        self._assert_directory(runner_dir)
+        refs: List[ArtifactRef] = []
+        try:
+            entries = sorted(os.scandir(runner_dir), key=lambda item: item.name)
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "could not inspect interrupted Runner artifacts"
+            ) from exc
+        for entry in entries:
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "could not inspect interrupted Runner artifact"
+                ) from exc
+            if _unsafe_node(info) or not stat.S_ISREG(info.st_mode):
+                raise ArtifactSecurityError(
+                    "Runner artifact tree contains an unsafe filesystem node"
+                )
+            name = _runner_artifact_name(entry.name)
+            path = runner_dir / name
+            artifact_maximum = (
+                self.max_file_bytes
+                if name in _CONTROL_RUNNER_ARTIFACT_NAMES
+                else maximum_bytes
+            )
+            data = self._read_bytes(
+                path,
+                expected_sha256=None,
+                expected_size=None,
+                budget=budget,
+                maximum_bytes=artifact_maximum,
+            )
+            value = _strict_json_loads(
+                data,
+                min(self.max_file_bytes, artifact_maximum),
+                "Runner artifact JSON",
+            )
+            if canonical_json_bytes(value) != data:
+                raise ArtifactIntegrityError(
+                    "interrupted Runner artifact is not canonical JSON"
+                )
+            validate_safe_json(value, "Runner artifact")
+            refs.append(self._artifact_ref(run_id, path, data))
+        return tuple(refs)
 
     def _attempt_indices(self, plan: TrialManifest) -> Tuple[int, ...]:
         receipts = self._trial_dir(plan) / "receipts"
@@ -2885,10 +3258,15 @@ class ArtifactStore:
                     raise ArtifactSecurityError(
                         "execution artifact tree contains a special file"
                     )
-                if (
-                    "evaluations" in relative_parts
-                    and entry.name != "receipt.json"
-                ):
+                is_evaluation_artifact = (
+                    "evaluations" in relative_parts and entry.name != "receipt.json"
+                )
+                is_runner_artifact = (
+                    "runner" in relative_parts
+                    and entry.name in _KNOWN_RUNNER_ARTIFACT_NAMES
+                    and entry.name not in _CONTROL_RUNNER_ARTIFACT_NAMES
+                )
+                if is_evaluation_artifact or is_runner_artifact:
                     total += metadata.st_size
         return total
 
@@ -2907,6 +3285,7 @@ class ArtifactStore:
         submission: EvalSubmission,
         *,
         attempt: int,
+        runner_artifacts: Optional[Dict[str, Any]] = None,
     ) -> TrialState:
         return self._finalize_submission(
             run_id,
@@ -2915,6 +3294,7 @@ class ArtifactStore:
             submission,
             attempt=attempt,
             allow_incomplete=False,
+            runner_artifacts=runner_artifacts,
         )
 
     def _finalize_submission(
@@ -2926,9 +3306,23 @@ class ArtifactStore:
         *,
         attempt: int,
         allow_incomplete: bool,
+        runner_artifacts: Optional[Dict[str, Any]] = None,
     ) -> TrialState:
         if not isinstance(submission, EvalSubmission):
             raise TypeError("submission must be an EvalSubmission")
+        if runner_artifacts is not None:
+            if type(runner_artifacts) is not dict:
+                raise TypeError("runner_artifacts must be a dict or None")
+            if len(runner_artifacts) > MAX_RUNNER_ARTIFACTS:
+                raise ExecutionArtifactBudgetError(
+                    "Runner artifact count exceeds its bounded limit"
+                )
+            normalized_runner_artifacts = {}
+            for name, value in runner_artifacts.items():
+                normalized_name = _runner_artifact_name(name)
+                validate_safe_json(value, "Runner artifact")
+                normalized_runner_artifacts[normalized_name] = value
+            runner_artifacts = normalized_runner_artifacts
         _integer(attempt, "attempt", minimum=1, maximum=MAX_TRIAL_ATTEMPTS)
         budget = _ReadBudget(self.max_total_read_bytes)
         bundle = self._load_verified_run_bundle(run_id, budget=budget)
@@ -2966,41 +3360,191 @@ class ArtifactStore:
                     "completed Submission requires committed prepare stage"
                 )
             base = "cases/%s/trials/%s" % (plan.case_path_id, trial_id)
-            submission_ref = self._write_json(
-                run_id,
-                "%s/submission.json" % base,
-                submission,
-                maximum=MAX_EVAL_SUBMISSION_BYTES,
+            planned_control: List[Tuple[str, Any, bytes, ArtifactRef]] = []
+            planned_mandatory: List[Tuple[str, Any, bytes, ArtifactRef]] = []
+            planned_optional: List[Tuple[str, Any, bytes, ArtifactRef]] = []
+            execution_limit = min(
+                self.max_file_bytes,
+                bundle.config.resource_budgets.max_execution_artifact_file_bytes,
             )
-            artifacts: List[ArtifactRef] = [submission_ref]
-            if submission.trace_ref is not None:
-                artifacts.append(
-                    self._write_json(
-                        run_id,
-                        "%s/trace_ref.json" % base,
-                        submission.trace_ref,
-                    )
+            for name, value in (runner_artifacts or {}).items():
+                relative_path = "%s/runner/attempt-%04d/%s" % (
+                    base,
+                    attempt,
+                    name,
                 )
-            receipt = StageReceipt.create(
-                run_id=run_id,
-                task_id=task_id,
-                trial_id=trial_id,
-                stage=StageName.AGENT,
-                config_digest=plan.agent_config_digest,
-                artifacts=artifacts,
-                attempt=attempt,
-                terminal_status=terminal_status,
-                failure_code=(
-                    None if submission.failure is None else submission.failure.code
-                ),
-            )
-            # Unique terminal receipt is always the final create-only write.
-            self._write_json(
-                run_id,
-                self._receipt_path(plan, StageName.AGENT),
-                receipt,
-                maximum=MAX_STAGE_RECEIPT_BYTES,
-            )
+                data = canonical_json_bytes(value)
+                control = name in _CONTROL_RUNNER_ARTIFACT_NAMES
+                mandatory = name in _MANDATORY_EXECUTION_RUNNER_ARTIFACT_NAMES
+                artifact_limit = self.max_file_bytes if control else execution_limit
+                if len(data) > artifact_limit:
+                    if control:
+                        raise ArtifactIntegrityError(
+                            "required Runner artifact exceeds its control-plane byte limit"
+                        )
+                    if mandatory:
+                        raise RequiredExecutionArtifactBudgetError(
+                            "required trace exceeds its execution byte limit"
+                        )
+                    raise ExecutionArtifactBudgetError(
+                        "Runner artifact exceeds its execution byte limit"
+                    )
+                planned = (
+                    relative_path,
+                    value,
+                    data,
+                    self._planned_artifact_ref(run_id, relative_path, data),
+                )
+                if control:
+                    planned_control.append(planned)
+                elif mandatory:
+                    planned_mandatory.append(planned)
+                else:
+                    planned_optional.append(planned)
+
+            # Optional Runner metadata is execution-plane data.  Reserve its
+            # missing bytes under the run-wide lock so parallel Trials cannot
+            # exceed the cumulative budget.  Required clarification/terminal/
+            # trace audit artifacts follow control-plane limits and cannot be
+            # dropped by an optional execution budget.  Local trace capture is
+            # mandatory execution data: it consumes the budget and makes the
+            # Trial incomplete rather than disappearing when it cannot fit.
+            budget_lock = self._run_dir(run_id) / ".locks" / "execution-budget.lock"
+            with self._lock(budget_lock):
+                missing_control: List[Tuple[str, Any, bytes, ArtifactRef]] = []
+                for item in planned_control:
+                    relative_path, _value, _data, expected_ref = item
+                    target = self._target(run_id, relative_path)
+                    if self._exists_regular(target):
+                        self._read_bytes(
+                            target,
+                            expected_sha256=expected_ref.sha256,
+                            expected_size=expected_ref.size_bytes,
+                            budget=_ReadBudget(self.max_total_read_bytes),
+                            maximum_bytes=self.max_file_bytes,
+                        )
+                    else:
+                        missing_control.append(item)
+
+                missing_mandatory: List[Tuple[str, Any, bytes, ArtifactRef]] = []
+                mandatory_bytes = 0
+                for item in planned_mandatory:
+                    relative_path, _value, data, expected_ref = item
+                    target = self._target(run_id, relative_path)
+                    if self._exists_regular(target):
+                        self._read_bytes(
+                            target,
+                            expected_sha256=expected_ref.sha256,
+                            expected_size=expected_ref.size_bytes,
+                            budget=_ReadBudget(self.max_total_read_bytes),
+                            maximum_bytes=execution_limit,
+                        )
+                    else:
+                        missing_mandatory.append(item)
+                        mandatory_bytes += len(data)
+                missing_optional: List[Tuple[str, Any, bytes, ArtifactRef]] = []
+                optional_bytes = 0
+                for item in planned_optional:
+                    relative_path, _value, data, expected_ref = item
+                    target = self._target(run_id, relative_path)
+                    if self._exists_regular(target):
+                        self._read_bytes(
+                            target,
+                            expected_sha256=expected_ref.sha256,
+                            expected_size=expected_ref.size_bytes,
+                            budget=_ReadBudget(self.max_total_read_bytes),
+                            maximum_bytes=execution_limit,
+                        )
+                    else:
+                        missing_optional.append(item)
+                        optional_bytes += len(data)
+                current_bytes = self._execution_artifact_total_bytes(run_id)
+                if (
+                    current_bytes + mandatory_bytes
+                    > bundle.config.resource_budgets.max_execution_artifact_total_bytes
+                ):
+                    raise RequiredExecutionArtifactBudgetError(
+                        "required trace exceeds the cumulative execution budget"
+                    )
+                if (
+                    current_bytes + mandatory_bytes + optional_bytes
+                    > bundle.config.resource_budgets.max_execution_artifact_total_bytes
+                ):
+                    raise ExecutionArtifactBudgetError(
+                        "Runner artifacts exceed the configured cumulative byte limit"
+                    )
+                for relative_path, value, _data, expected_ref in missing_control:
+                    written = self._write_json(
+                        run_id,
+                        relative_path,
+                        value,
+                        maximum=self.max_file_bytes,
+                    )
+                    if written != expected_ref:
+                        raise ArtifactIntegrityError(
+                            "required Runner artifact publication changed identity"
+                        )
+                for relative_path, value, _data, expected_ref in missing_mandatory:
+                    written = self._write_json(
+                        run_id,
+                        relative_path,
+                        value,
+                        maximum=execution_limit,
+                    )
+                    if written != expected_ref:
+                        raise ArtifactIntegrityError(
+                            "required trace publication changed its identity"
+                        )
+                for relative_path, value, _data, expected_ref in missing_optional:
+                    written = self._write_json(
+                        run_id,
+                        relative_path,
+                        value,
+                        maximum=execution_limit,
+                    )
+                    if written != expected_ref:
+                        raise ArtifactIntegrityError(
+                            "Runner artifact publication changed its planned identity"
+                        )
+
+                submission_ref = self._write_json(
+                    run_id,
+                    "%s/submission.json" % base,
+                    submission,
+                    maximum=MAX_EVAL_SUBMISSION_BYTES,
+                )
+                artifacts: List[ArtifactRef] = [submission_ref]
+                artifacts.extend(item[3] for item in planned_control)
+                artifacts.extend(item[3] for item in planned_mandatory)
+                artifacts.extend(item[3] for item in planned_optional)
+                if submission.trace_ref is not None:
+                    artifacts.append(
+                        self._write_json(
+                            run_id,
+                            "%s/trace_ref.json" % base,
+                            submission.trace_ref,
+                        )
+                    )
+                receipt = StageReceipt.create(
+                    run_id=run_id,
+                    task_id=task_id,
+                    trial_id=trial_id,
+                    stage=StageName.AGENT,
+                    config_digest=plan.agent_config_digest,
+                    artifacts=artifacts,
+                    attempt=attempt,
+                    terminal_status=terminal_status,
+                    failure_code=(
+                        None if submission.failure is None else submission.failure.code
+                    ),
+                )
+                # Unique terminal receipt is always the final create-only write.
+                self._write_json(
+                    run_id,
+                    self._receipt_path(plan, StageName.AGENT),
+                    receipt,
+                    maximum=MAX_STAGE_RECEIPT_BYTES,
+                )
         return self.load_trial_state(run_id, task_id, trial_id)
 
     def abandon_trial(
@@ -3052,6 +3596,46 @@ class ArtifactStore:
                 retryable=False,
             ),
         )
+        # Abandonment is an ArtifactStore-owned terminal path rather than an
+        # Agent execution path, but it still has to publish the same required
+        # control-plane audit artifacts as a normal Runner commit.  Keep the
+        # payload deliberately minimal and free of the caller's diagnostic
+        # message; the canonical Submission already carries the bounded,
+        # validated failure text.
+        runner_artifacts = {
+            "clarification_match_receipts.json": {
+                "schema_version": "eval_clarification_match_receipts_v1",
+                "trial_id": trial_id,
+                "matcher_digest": config.clarification_matcher.digest(),
+                "receipts": [],
+            },
+            "terminal_summary.json": {
+                "schema_version": "eval_terminal_summary_v1",
+                "run_id": run_id,
+                "task_id": task_id,
+                "trial_id": trial_id,
+                "attempt": state.active_attempt,
+                "status": submission.status.value,
+                "failure_code": failure_code.value,
+                "elapsed_seconds": None,
+                "stdout": {
+                    "bytes": 0,
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                    "sha256_scope": "captured_prefix",
+                    "summary_bytes": 0,
+                    "truncated": False,
+                },
+                "stderr": {
+                    "bytes": 0,
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                    "sha256_scope": "captured_prefix",
+                    "summary_bytes": 0,
+                    "truncated": False,
+                },
+                "adapter_id": "artifact-store.abandonment",
+                "adapter_version": "1",
+            },
+        }
         return self._finalize_submission(
             run_id,
             task_id,
@@ -3059,6 +3643,7 @@ class ArtifactStore:
             submission,
             attempt=state.active_attempt,
             allow_incomplete=True,
+            runner_artifacts=runner_artifacts,
         )
 
     def load_existing_submission(
@@ -3201,13 +3786,35 @@ class ArtifactStore:
                     raise ArtifactIntegrityError(
                         "orphan completed Submission lacks committed prepare stage"
                     )
+                runner_refs = self._recoverable_runner_artifacts(
+                    run_id,
+                    plan,
+                    attempt=state.active_attempt,
+                    budget=budget,
+                    maximum_bytes=min(
+                        self.max_file_bytes,
+                        bundle.config.resource_budgets.max_execution_artifact_file_bytes,
+                    ),
+                )
+                runner_names = {
+                    ref.relative_path.rsplit("/", 1)[-1]
+                    for ref in runner_refs
+                }
+                missing_required = _required_runner_artifact_names(submission).difference(
+                    runner_names
+                )
+                if missing_required:
+                    raise ArtifactIntegrityError(
+                        "orphan Submission lacks required Runner artifacts: %s"
+                        % sorted(missing_required)
+                    )
                 terminal = StageReceipt.create(
                     run_id=run_id,
                     task_id=task_id,
                     trial_id=trial_id,
                     stage=StageName.AGENT,
                     config_digest=plan.agent_config_digest,
-                    artifacts=(submission_ref,),
+                    artifacts=(submission_ref,) + runner_refs,
                     attempt=state.active_attempt,
                     terminal_status=self._submission_status(submission),
                     failure_code=(
@@ -3444,15 +4051,23 @@ __all__ = [
     "EVAL_RUN_MANIFEST_SCHEMA_VERSION",
     "EVAL_TRIAL_MANIFEST_SCHEMA_VERSION",
     "EVAL_STAGE_RECEIPT_SCHEMA_VERSION",
+    "EVAL_RUN_PREFLIGHT_SCHEMA_VERSION",
+    "EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION",
     "MAX_RUN_MANIFEST_BYTES",
     "MAX_TRIAL_MANIFEST_BYTES",
     "MAX_STAGE_RECEIPT_BYTES",
+    "MAX_RUN_PREFLIGHT_BYTES",
+    "MAX_PREFLIGHT_CANDIDATE_BYTES",
+    "MAX_RUNNER_ARTIFACTS",
+    "MAX_RUNNER_ARTIFACT_NAME_CHARS",
     "DEFAULT_MAX_FILE_BYTES",
     "DEFAULT_MAX_TOTAL_READ_BYTES",
     "DIRECTORY_FSYNC_SUPPORTED",
     "ArtifactError",
     "ArtifactConflictError",
     "ArtifactIntegrityError",
+    "ExecutionArtifactBudgetError",
+    "RequiredExecutionArtifactBudgetError",
     "ArtifactSecurityError",
     "ArtifactStateError",
     "RunStatus",

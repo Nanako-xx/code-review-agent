@@ -34,6 +34,10 @@ class ClarificationProtocolError(RuntimeError):
     """A channel operation cannot be represented by the canonical protocol."""
 
 
+class ClarificationMatcherError(ClarificationProtocolError):
+    """The Harness-owned material-claim matcher failed its contract."""
+
+
 @runtime_checkable
 class MaterialClaimMatcher(Protocol):
     """Versionable semantic boundary for matching an asked material claim."""
@@ -234,7 +238,7 @@ class ClarificationSession:
             "clarification matcher config digest",
         )
         if snapshot.digest() != expected_matcher_digest:
-            raise ClarificationProtocolError(
+            raise ClarificationMatcherError(
                 "clarification matcher snapshot does not match the Run binding"
             )
         selected_factory = matcher_factory or BuiltinMaterialClaimMatcherFactory()
@@ -246,7 +250,7 @@ class ClarificationSession:
         if not isinstance(matcher, MaterialClaimMatcher):
             raise TypeError("clarification matcher must implement MaterialClaimMatcher")
         if matcher.binding_digest != expected_matcher_digest:
-            raise ClarificationProtocolError(
+            raise ClarificationMatcherError(
                 "clarification matcher does not match the run binding"
             )
         self.__script = script
@@ -379,11 +383,11 @@ class ClarificationSession:
                     scripted_answer.material_claim,
                 )
             except Exception as exc:
-                raise ClarificationProtocolError(
+                raise ClarificationMatcherError(
                     "material claim matcher failed"
                 ) from exc
             if type(equivalent) is not bool:
-                raise ClarificationProtocolError(
+                raise ClarificationMatcherError(
                     "material claim matcher must return bool"
                 )
             action_eligible = not (
@@ -500,6 +504,7 @@ class ClarificationSession:
 __all__ = [
     "BuiltinMaterialClaimMatcherFactory",
     "ClarificationChannel",
+    "ClarificationMatcherError",
     "ClarificationProtocolError",
     "ClarificationSession",
     "MaterialClaimMatcher",

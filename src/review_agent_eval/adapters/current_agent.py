@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
+import re
+import stat
+import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-import re
-import stat
-import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from review_agent.artifacts import artifact_schema
@@ -626,6 +627,8 @@ class CurrentAgentAdapter:
         workspace: Path,
         config: AgentRunConfig,
         clarification_channel: ClarificationChannel,
+        *,
+        cancel_event: Optional[threading.Event] = None,
     ) -> EvalSubmission:
         started = time.monotonic()
         transcript: List[SubmissionClarificationExchange] = []
@@ -673,6 +676,7 @@ class CurrentAgentAdapter:
                 environment=environment,
                 deadline=deadline,
                 remaining_output=remaining_output,
+                cancel_event=cancel_event,
             )
             remaining_output -= min(result.output_bytes, remaining_output)
             if result.failure_code is not None:
@@ -766,6 +770,7 @@ class CurrentAgentAdapter:
                     environment=environment,
                     deadline=deadline,
                     remaining_output=remaining_output,
+                    cancel_event=cancel_event,
                 )
                 remaining_output -= min(result.output_bytes, remaining_output)
                 if result.failure_code is not None:
@@ -912,6 +917,7 @@ class CurrentAgentAdapter:
         environment: Mapping[str, str],
         deadline: float,
         remaining_output: int,
+        cancel_event: Optional[threading.Event] = None,
     ) -> BoundedProcessResult:
         remaining_time = deadline - time.monotonic()
         if remaining_time <= 0:
@@ -928,14 +934,16 @@ class CurrentAgentAdapter:
                 failure_code=FailureCode.OUTPUT_OVERFLOW,
                 output_bytes=0,
             )
-        return self._process_runner(
-            argv,
-            stdin_bytes=stdin_bytes,
-            workspace=workspace,
-            environment=environment,
-            timeout_seconds=remaining_time,
-            max_output_bytes=remaining_output,
-        )
+        kwargs = {
+            "stdin_bytes": stdin_bytes,
+            "workspace": workspace,
+            "environment": environment,
+            "timeout_seconds": remaining_time,
+            "max_output_bytes": remaining_output,
+        }
+        if cancel_event is not None:
+            kwargs["cancel_event"] = cancel_event
+        return self._process_runner(argv, **kwargs)
 
     @staticmethod
     def _trace_ref(run_dir: Path, workspace: Path) -> TraceRef:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import Enum
 from types import MappingProxyType
 from typing import Any, ClassVar, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
@@ -42,6 +43,9 @@ from .models import (
 
 EVAL_RUN_CONFIG_SCHEMA_VERSION = "eval_run_config_v1"
 EVALUATOR_EXECUTION_CONFIG_SCHEMA_VERSION = "eval_evaluator_execution_config_v1"
+JUDGE_PROFILE_SCHEMA_VERSION = "eval_judge_profile_v1"
+JUDGE_EXECUTION_BUDGETS_SCHEMA_VERSION = "eval_judge_execution_budgets_v1"
+DEFAULT_JUDGE_CACHE_POLICY_VERSION = "semantic-judge-cache-v1"
 
 # A Suite Manifest may be 16 MiB and SuiteRunConfig intentionally preserves
 # the selected canonical SuiteCase bindings.  The Run Config therefore needs
@@ -55,6 +59,11 @@ MAX_VERSION_CHARS = 256
 MAX_AGENT_NAME_CHARS = 512
 MAX_ARTIFACT_BUDGET_BYTES = 1 << 40
 MAX_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
+MAX_JUDGE_ATTEMPTS_PER_REQUEST = 16
+MAX_JUDGE_REQUESTS = 65_536
+MAX_JUDGE_CONTEXT_BLOCKS_PER_REQUEST = 4_096
+MAX_JUDGE_REASON_REFS = 32
+MAX_JUDGE_TOKEN_BUDGET = 1 << 40
 
 
 _PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -560,32 +569,273 @@ class AgentConfigSnapshot(_JsonModel):
         }
 
 
+class JudgeKind(str, Enum):
+    INTENT_EQUIVALENCE = "intent_equivalence"
+    FINDING_EQUIVALENCE = "finding_equivalence"
+    NOVEL_FACTUALITY = "novel_factuality"
+    EVIDENCE_SUPPORT = "evidence_support"
+
+
+def _judge_kind(value: Any, context: str) -> JudgeKind:
+    if type(value) is not str:
+        raise SchemaError("%s must be a string enum value" % context)
+    try:
+        return JudgeKind(value)
+    except ValueError as exc:
+        raise SchemaError("%s has an unknown Judge kind" % context) from exc
+
+
+@dataclass(frozen=True)
+class JudgeProfileSnapshot(_JsonModel):
+    """Complete output-affecting identity for one semantic Judge kind."""
+
+    SCHEMA_VERSION: ClassVar[str] = JUDGE_PROFILE_SCHEMA_VERSION
+
+    schema_version: str
+    kind: JudgeKind
+    judge_id: str
+    judge_version: str
+    adapter_id: str
+    adapter_version: str
+    adapter_config_digest: str
+    provider: str
+    model: str
+    model_artifact_digest: Optional[str]
+    parameters: Mapping[str, Any]
+    system_prompt_version: str
+    system_prompt_digest: str
+    rubric_id: str
+    rubric_version: str
+    rubric_digest: str
+    response_schema_version: str
+    response_schema_digest: str
+    context_builder_version: str
+    parser_version: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != self.SCHEMA_VERSION:
+            raise SchemaError("JudgeProfileSnapshot has an unknown schema_version")
+        if type(self.kind) is not JudgeKind:
+            raise SchemaError("judge profile.kind must be a JudgeKind")
+        _identifier(self.judge_id, "judge profile.judge_id")
+        _version(self.judge_version, "judge profile.judge_version")
+        _identifier(self.adapter_id, "judge profile.adapter_id")
+        _version(self.adapter_version, "judge profile.adapter_version")
+        _digest(
+            self.adapter_config_digest,
+            "judge profile.adapter_config_digest",
+        )
+        _version(self.provider, "judge profile.provider")
+        _version(self.model, "judge profile.model")
+        if self.model_artifact_digest is not None:
+            _digest(
+                self.model_artifact_digest,
+                "judge profile.model_artifact_digest",
+            )
+        object.__setattr__(
+            self,
+            "parameters",
+            _json_object(self.parameters, "judge profile.parameters"),
+        )
+        _version(
+            self.system_prompt_version,
+            "judge profile.system_prompt_version",
+        )
+        _digest(
+            self.system_prompt_digest,
+            "judge profile.system_prompt_digest",
+        )
+        _identifier(self.rubric_id, "judge profile.rubric_id")
+        _version(self.rubric_version, "judge profile.rubric_version")
+        _digest(self.rubric_digest, "judge profile.rubric_digest")
+        _version(
+            self.response_schema_version,
+            "judge profile.response_schema_version",
+        )
+        _digest(
+            self.response_schema_digest,
+            "judge profile.response_schema_digest",
+        )
+        _version(
+            self.context_builder_version,
+            "judge profile.context_builder_version",
+        )
+        _version(self.parser_version, "judge profile.parser_version")
+        validate_safe_json(self.to_dict(), "judge profile")
+        _check_model_size(
+            self,
+            MAX_EVAL_RUN_CONFIG_BYTES,
+            "JudgeProfileSnapshot",
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "JudgeProfileSnapshot":
+        payload = _object(value, "JudgeProfileSnapshot")
+        fields = (
+            "schema_version",
+            "kind",
+            "judge_id",
+            "judge_version",
+            "adapter_id",
+            "adapter_version",
+            "adapter_config_digest",
+            "provider",
+            "model",
+            "model_artifact_digest",
+            "parameters",
+            "system_prompt_version",
+            "system_prompt_digest",
+            "rubric_id",
+            "rubric_version",
+            "rubric_digest",
+            "response_schema_version",
+            "response_schema_digest",
+            "context_builder_version",
+            "parser_version",
+        )
+        _exact_fields(payload, fields, "JudgeProfileSnapshot")
+        model_artifact_digest = payload["model_artifact_digest"]
+        if model_artifact_digest is not None:
+            model_artifact_digest = _digest(
+                model_artifact_digest,
+                "judge profile.model_artifact_digest",
+            )
+        return cls(
+            schema_version=payload["schema_version"],
+            kind=_judge_kind(payload["kind"], "judge profile.kind"),
+            judge_id=_identifier(payload["judge_id"], "judge profile.judge_id"),
+            judge_version=_version(
+                payload["judge_version"], "judge profile.judge_version"
+            ),
+            adapter_id=_identifier(
+                payload["adapter_id"], "judge profile.adapter_id"
+            ),
+            adapter_version=_version(
+                payload["adapter_version"], "judge profile.adapter_version"
+            ),
+            adapter_config_digest=_digest(
+                payload["adapter_config_digest"],
+                "judge profile.adapter_config_digest",
+            ),
+            provider=_version(payload["provider"], "judge profile.provider"),
+            model=_version(payload["model"], "judge profile.model"),
+            model_artifact_digest=model_artifact_digest,
+            parameters=_object(payload["parameters"], "judge profile.parameters"),
+            system_prompt_version=_version(
+                payload["system_prompt_version"],
+                "judge profile.system_prompt_version",
+            ),
+            system_prompt_digest=_digest(
+                payload["system_prompt_digest"],
+                "judge profile.system_prompt_digest",
+            ),
+            rubric_id=_identifier(
+                payload["rubric_id"], "judge profile.rubric_id"
+            ),
+            rubric_version=_version(
+                payload["rubric_version"], "judge profile.rubric_version"
+            ),
+            rubric_digest=_digest(
+                payload["rubric_digest"], "judge profile.rubric_digest"
+            ),
+            response_schema_version=_version(
+                payload["response_schema_version"],
+                "judge profile.response_schema_version",
+            ),
+            response_schema_digest=_digest(
+                payload["response_schema_digest"],
+                "judge profile.response_schema_digest",
+            ),
+            context_builder_version=_version(
+                payload["context_builder_version"],
+                "judge profile.context_builder_version",
+            ),
+            parser_version=_version(
+                payload["parser_version"], "judge profile.parser_version"
+            ),
+        )
+
+    @classmethod
+    def from_json(cls, data: Any) -> "JudgeProfileSnapshot":
+        return cls.from_dict(
+            _strict_json_loads(
+                data,
+                MAX_EVAL_RUN_CONFIG_BYTES,
+                "JudgeProfileSnapshot JSON",
+            )
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind.value,
+            "judge_id": self.judge_id,
+            "judge_version": self.judge_version,
+            "adapter_id": self.adapter_id,
+            "adapter_version": self.adapter_version,
+            "adapter_config_digest": self.adapter_config_digest,
+            "provider": self.provider,
+            "model": self.model,
+            "model_artifact_digest": self.model_artifact_digest,
+            "parameters": _thaw_json(self.parameters),
+            "system_prompt_version": self.system_prompt_version,
+            "system_prompt_digest": self.system_prompt_digest,
+            "rubric_id": self.rubric_id,
+            "rubric_version": self.rubric_version,
+            "rubric_digest": self.rubric_digest,
+            "response_schema_version": self.response_schema_version,
+            "response_schema_digest": self.response_schema_digest,
+            "context_builder_version": self.context_builder_version,
+            "parser_version": self.parser_version,
+        }
+
+
 @dataclass(frozen=True)
 class EvaluatorRunConfig(_JsonModel):
     evaluator_id: str
     evaluator_version: str
     grader_version: str
-    judge_version: str
-    model: str
-    provider: str
-    parameters: Mapping[str, Any]
-    rubric_version: str
-    rubric_digest: str
+    judge_profiles: Tuple[JudgeProfileSnapshot, ...]
 
     def __post_init__(self) -> None:
         _identifier(self.evaluator_id, "evaluator.evaluator_id")
         _version(self.evaluator_version, "evaluator.evaluator_version")
         _version(self.grader_version, "evaluator.grader_version")
-        _version(self.judge_version, "evaluator.judge_version")
-        _version(self.model, "evaluator.model")
-        _version(self.provider, "evaluator.provider")
+        if type(self.judge_profiles) not in (list, tuple):
+            raise SchemaError("evaluator.judge_profiles must be a list or tuple")
+        profiles = tuple(self.judge_profiles)
+        if len(profiles) != len(JudgeKind):
+            raise SchemaError(
+                "evaluator.judge_profiles must contain each JudgeKind exactly once"
+            )
+        if any(type(item) is not JudgeProfileSnapshot for item in profiles):
+            raise SchemaError(
+                "evaluator.judge_profiles must contain JudgeProfileSnapshot values"
+            )
+        kinds = [item.kind for item in profiles]
+        if set(kinds) != set(JudgeKind) or len(kinds) != len(set(kinds)):
+            raise SchemaError(
+                "evaluator.judge_profiles must contain each JudgeKind exactly once"
+            )
+        for identity_field in (
+            "rubric_id",
+            "rubric_version",
+            "rubric_digest",
+            "response_schema_version",
+            "response_schema_digest",
+        ):
+            identities = [getattr(item, identity_field) for item in profiles]
+            if len(identities) != len(set(identities)):
+                raise SchemaError(
+                    "evaluator.judge_profiles must use a distinct %s for each "
+                    "JudgeKind" % identity_field
+                )
         object.__setattr__(
             self,
-            "parameters",
-            _json_object(self.parameters, "evaluator.parameters"),
+            "judge_profiles",
+            tuple(sorted(profiles, key=lambda item: item.kind.value)),
         )
-        _version(self.rubric_version, "evaluator.rubric_version")
-        _digest(self.rubric_digest, "evaluator.rubric_digest")
+        validate_safe_json(self.to_dict(), "evaluator")
 
     @classmethod
     def from_dict(cls, value: Any) -> "EvaluatorRunConfig":
@@ -596,14 +846,14 @@ class EvaluatorRunConfig(_JsonModel):
                 "evaluator_id",
                 "evaluator_version",
                 "grader_version",
-                "judge_version",
-                "model",
-                "provider",
-                "parameters",
-                "rubric_version",
-                "rubric_digest",
+                "judge_profiles",
             ),
             "evaluator",
+        )
+        profiles = _array(
+            payload["judge_profiles"],
+            "evaluator.judge_profiles",
+            len(JudgeKind),
         )
         return cls(
             evaluator_id=_identifier(
@@ -615,31 +865,25 @@ class EvaluatorRunConfig(_JsonModel):
             grader_version=_version(
                 payload["grader_version"], "evaluator.grader_version"
             ),
-            judge_version=_version(
-                payload["judge_version"], "evaluator.judge_version"
-            ),
-            model=_version(payload["model"], "evaluator.model"),
-            provider=_version(payload["provider"], "evaluator.provider"),
-            parameters=_object(payload["parameters"], "evaluator.parameters"),
-            rubric_version=_version(
-                payload["rubric_version"], "evaluator.rubric_version"
-            ),
-            rubric_digest=_digest(
-                payload["rubric_digest"], "evaluator.rubric_digest"
+            judge_profiles=tuple(
+                JudgeProfileSnapshot.from_dict(item) for item in profiles
             ),
         )
+
+    def profile(self, kind: JudgeKind) -> JudgeProfileSnapshot:
+        if type(kind) is not JudgeKind:
+            raise SchemaError("kind must be a JudgeKind")
+        for profile in self.judge_profiles:
+            if profile.kind is kind:
+                return profile
+        raise SchemaError("evaluator has no profile for Judge kind")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "evaluator_id": self.evaluator_id,
             "evaluator_version": self.evaluator_version,
             "grader_version": self.grader_version,
-            "judge_version": self.judge_version,
-            "model": self.model,
-            "provider": self.provider,
-            "parameters": _thaw_json(self.parameters),
-            "rubric_version": self.rubric_version,
-            "rubric_digest": self.rubric_digest,
+            "judge_profiles": [item.to_dict() for item in self.judge_profiles],
         }
 
 
@@ -870,12 +1114,348 @@ class ResourceBudgets(_JsonModel):
 
 
 @dataclass(frozen=True)
+class JudgeExecutionBudgets(_JsonModel):
+    """Bound every semantic-Judge attempt, deadline, token, and byte surface."""
+
+    SCHEMA_VERSION: ClassVar[str] = JUDGE_EXECUTION_BUDGETS_SCHEMA_VERSION
+
+    schema_version: str
+    max_attempts_per_request: int
+    attempt_timeout_seconds: Any
+    request_deadline_seconds: Any
+    max_parallel_requests: int
+    max_context_blocks_per_request: int
+    max_context_block_bytes: int
+    max_context_bytes_per_request: int
+    max_model_request_bytes: int
+    max_model_response_bytes: int
+    max_model_request_tokens: int
+    max_model_response_tokens: int
+    max_reason_refs: int
+    max_total_judge_request_bytes: int
+    max_total_judge_response_bytes: int
+    max_total_judge_request_tokens: int
+    max_total_judge_response_tokens: int
+
+    def __post_init__(self) -> None:
+        if self.schema_version != self.SCHEMA_VERSION:
+            raise SchemaError("JudgeExecutionBudgets has an unknown schema_version")
+        _integer(
+            self.max_attempts_per_request,
+            "judge budgets.max_attempts_per_request",
+            minimum=1,
+            maximum=MAX_JUDGE_ATTEMPTS_PER_REQUEST,
+        )
+        _positive_number(
+            self.attempt_timeout_seconds,
+            "judge budgets.attempt_timeout_seconds",
+        )
+        _positive_number(
+            self.request_deadline_seconds,
+            "judge budgets.request_deadline_seconds",
+        )
+        if self.attempt_timeout_seconds > self.request_deadline_seconds:
+            raise SchemaError(
+                "Judge attempt timeout may not exceed request deadline"
+            )
+        if (
+            self.attempt_timeout_seconds * self.max_attempts_per_request
+            > self.request_deadline_seconds
+        ):
+            raise SchemaError(
+                "Judge request deadline must cover every configured attempt timeout"
+            )
+        _integer(
+            self.max_parallel_requests,
+            "judge budgets.max_parallel_requests",
+            minimum=1,
+            maximum=MAX_JUDGE_REQUESTS,
+        )
+        _integer(
+            self.max_context_blocks_per_request,
+            "judge budgets.max_context_blocks_per_request",
+            minimum=1,
+            maximum=MAX_JUDGE_CONTEXT_BLOCKS_PER_REQUEST,
+        )
+        for name in (
+            "max_context_block_bytes",
+            "max_context_bytes_per_request",
+            "max_model_request_bytes",
+            "max_model_response_bytes",
+            "max_total_judge_request_bytes",
+            "max_total_judge_response_bytes",
+        ):
+            _integer(
+                getattr(self, name),
+                "judge budgets.%s" % name,
+                minimum=1,
+                maximum=MAX_ARTIFACT_BUDGET_BYTES,
+            )
+        for name in (
+            "max_model_request_tokens",
+            "max_model_response_tokens",
+            "max_total_judge_request_tokens",
+            "max_total_judge_response_tokens",
+        ):
+            _integer(
+                getattr(self, name),
+                "judge budgets.%s" % name,
+                minimum=1,
+                maximum=MAX_JUDGE_TOKEN_BUDGET,
+            )
+        _integer(
+            self.max_reason_refs,
+            "judge budgets.max_reason_refs",
+            minimum=1,
+            maximum=MAX_JUDGE_REASON_REFS,
+        )
+        if self.max_context_block_bytes > self.max_context_bytes_per_request:
+            raise SchemaError(
+                "judge context block bytes may not exceed per-request context bytes"
+            )
+        if self.max_context_bytes_per_request > self.max_model_request_bytes:
+            raise SchemaError(
+                "judge per-request context bytes may not exceed model request bytes"
+            )
+        if self.max_model_request_bytes > self.max_total_judge_request_bytes:
+            raise SchemaError(
+                "judge model request bytes may not exceed total Judge request bytes"
+            )
+        if self.max_model_response_bytes > self.max_total_judge_response_bytes:
+            raise SchemaError(
+                "judge model response bytes may not exceed total Judge response bytes"
+            )
+        if self.max_model_request_tokens > self.max_total_judge_request_tokens:
+            raise SchemaError(
+                "judge model request tokens may not exceed total Judge request tokens"
+            )
+        if self.max_model_response_tokens > self.max_total_judge_response_tokens:
+            raise SchemaError(
+                "judge model response tokens may not exceed total Judge response tokens"
+            )
+        if self.max_reason_refs > self.max_context_blocks_per_request + 2:
+            raise SchemaError(
+                "judge reason refs may not exceed context blocks plus two subject refs"
+            )
+        validate_safe_json(self.to_dict(), "judge budgets")
+        _check_model_size(
+            self,
+            MAX_EVAL_RUN_CONFIG_BYTES,
+            "JudgeExecutionBudgets",
+        )
+
+    @classmethod
+    def defaults(
+        cls,
+        *,
+        evaluator_timeout_seconds: Any = 60,
+        max_execution_artifact_file_bytes: int = 32 * 1024 * 1024,
+        max_execution_artifact_total_bytes: int = 512 * 1024 * 1024,
+    ) -> "JudgeExecutionBudgets":
+        timeout = _positive_number(
+            evaluator_timeout_seconds,
+            "evaluator_timeout_seconds",
+        )
+        file_bytes = _integer(
+            max_execution_artifact_file_bytes,
+            "max_execution_artifact_file_bytes",
+            minimum=1,
+            maximum=MAX_ARTIFACT_BUDGET_BYTES,
+        )
+        total_bytes = _integer(
+            max_execution_artifact_total_bytes,
+            "max_execution_artifact_total_bytes",
+            minimum=1,
+            maximum=MAX_ARTIFACT_BUDGET_BYTES,
+        )
+        if file_bytes > total_bytes:
+            raise SchemaError(
+                "max_execution_artifact_file_bytes may not exceed total bytes"
+            )
+        model_request_bytes = min(8 * 1024 * 1024, file_bytes)
+        context_bytes = min(6 * 1024 * 1024, model_request_bytes)
+        max_attempts = 2
+        request_deadline = min(120, timeout)
+        return cls(
+            schema_version=cls.SCHEMA_VERSION,
+            max_attempts_per_request=max_attempts,
+            attempt_timeout_seconds=min(60, request_deadline / max_attempts),
+            request_deadline_seconds=request_deadline,
+            max_parallel_requests=4,
+            max_context_blocks_per_request=256,
+            max_context_block_bytes=min(512 * 1024, context_bytes),
+            max_context_bytes_per_request=context_bytes,
+            max_model_request_bytes=model_request_bytes,
+            max_model_response_bytes=min(1024 * 1024, file_bytes),
+            max_model_request_tokens=131_072,
+            max_model_response_tokens=8_192,
+            max_reason_refs=MAX_JUDGE_REASON_REFS,
+            max_total_judge_request_bytes=min(64 * 1024 * 1024, total_bytes),
+            max_total_judge_response_bytes=min(16 * 1024 * 1024, total_bytes),
+            max_total_judge_request_tokens=1_048_576,
+            max_total_judge_response_tokens=65_536,
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "JudgeExecutionBudgets":
+        payload = _object(value, "JudgeExecutionBudgets")
+        fields = (
+            "schema_version",
+            "max_attempts_per_request",
+            "attempt_timeout_seconds",
+            "request_deadline_seconds",
+            "max_parallel_requests",
+            "max_context_blocks_per_request",
+            "max_context_block_bytes",
+            "max_context_bytes_per_request",
+            "max_model_request_bytes",
+            "max_model_response_bytes",
+            "max_model_request_tokens",
+            "max_model_response_tokens",
+            "max_reason_refs",
+            "max_total_judge_request_bytes",
+            "max_total_judge_response_bytes",
+            "max_total_judge_request_tokens",
+            "max_total_judge_response_tokens",
+        )
+        _exact_fields(payload, fields, "JudgeExecutionBudgets")
+        return cls(
+            schema_version=payload["schema_version"],
+            max_attempts_per_request=_integer(
+                payload["max_attempts_per_request"],
+                "judge budgets.max_attempts_per_request",
+                minimum=1,
+                maximum=MAX_JUDGE_ATTEMPTS_PER_REQUEST,
+            ),
+            attempt_timeout_seconds=_positive_number(
+                payload["attempt_timeout_seconds"],
+                "judge budgets.attempt_timeout_seconds",
+            ),
+            request_deadline_seconds=_positive_number(
+                payload["request_deadline_seconds"],
+                "judge budgets.request_deadline_seconds",
+            ),
+            max_parallel_requests=_integer(
+                payload["max_parallel_requests"],
+                "judge budgets.max_parallel_requests",
+                minimum=1,
+                maximum=MAX_JUDGE_REQUESTS,
+            ),
+            max_context_blocks_per_request=_integer(
+                payload["max_context_blocks_per_request"],
+                "judge budgets.max_context_blocks_per_request",
+                minimum=1,
+                maximum=MAX_JUDGE_CONTEXT_BLOCKS_PER_REQUEST,
+            ),
+            max_context_block_bytes=_integer(
+                payload["max_context_block_bytes"],
+                "judge budgets.max_context_block_bytes",
+                minimum=1,
+                maximum=MAX_ARTIFACT_BUDGET_BYTES,
+            ),
+            max_context_bytes_per_request=_integer(
+                payload["max_context_bytes_per_request"],
+                "judge budgets.max_context_bytes_per_request",
+                minimum=1,
+                maximum=MAX_ARTIFACT_BUDGET_BYTES,
+            ),
+            max_model_request_bytes=_integer(
+                payload["max_model_request_bytes"],
+                "judge budgets.max_model_request_bytes",
+                minimum=1,
+                maximum=MAX_ARTIFACT_BUDGET_BYTES,
+            ),
+            max_model_response_bytes=_integer(
+                payload["max_model_response_bytes"],
+                "judge budgets.max_model_response_bytes",
+                minimum=1,
+                maximum=MAX_ARTIFACT_BUDGET_BYTES,
+            ),
+            max_model_request_tokens=_integer(
+                payload["max_model_request_tokens"],
+                "judge budgets.max_model_request_tokens",
+                minimum=1,
+                maximum=MAX_JUDGE_TOKEN_BUDGET,
+            ),
+            max_model_response_tokens=_integer(
+                payload["max_model_response_tokens"],
+                "judge budgets.max_model_response_tokens",
+                minimum=1,
+                maximum=MAX_JUDGE_TOKEN_BUDGET,
+            ),
+            max_reason_refs=_integer(
+                payload["max_reason_refs"],
+                "judge budgets.max_reason_refs",
+                minimum=1,
+                maximum=MAX_JUDGE_REASON_REFS,
+            ),
+            max_total_judge_request_bytes=_integer(
+                payload["max_total_judge_request_bytes"],
+                "judge budgets.max_total_judge_request_bytes",
+                minimum=1,
+                maximum=MAX_ARTIFACT_BUDGET_BYTES,
+            ),
+            max_total_judge_response_bytes=_integer(
+                payload["max_total_judge_response_bytes"],
+                "judge budgets.max_total_judge_response_bytes",
+                minimum=1,
+                maximum=MAX_ARTIFACT_BUDGET_BYTES,
+            ),
+            max_total_judge_request_tokens=_integer(
+                payload["max_total_judge_request_tokens"],
+                "judge budgets.max_total_judge_request_tokens",
+                minimum=1,
+                maximum=MAX_JUDGE_TOKEN_BUDGET,
+            ),
+            max_total_judge_response_tokens=_integer(
+                payload["max_total_judge_response_tokens"],
+                "judge budgets.max_total_judge_response_tokens",
+                minimum=1,
+                maximum=MAX_JUDGE_TOKEN_BUDGET,
+            ),
+        )
+
+    @classmethod
+    def from_json(cls, data: Any) -> "JudgeExecutionBudgets":
+        return cls.from_dict(
+            _strict_json_loads(
+                data,
+                MAX_EVAL_RUN_CONFIG_BYTES,
+                "JudgeExecutionBudgets JSON",
+            )
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "max_attempts_per_request": self.max_attempts_per_request,
+            "attempt_timeout_seconds": self.attempt_timeout_seconds,
+            "request_deadline_seconds": self.request_deadline_seconds,
+            "max_parallel_requests": self.max_parallel_requests,
+            "max_context_blocks_per_request": self.max_context_blocks_per_request,
+            "max_context_block_bytes": self.max_context_block_bytes,
+            "max_context_bytes_per_request": self.max_context_bytes_per_request,
+            "max_model_request_bytes": self.max_model_request_bytes,
+            "max_model_response_bytes": self.max_model_response_bytes,
+            "max_model_request_tokens": self.max_model_request_tokens,
+            "max_model_response_tokens": self.max_model_response_tokens,
+            "max_reason_refs": self.max_reason_refs,
+            "max_total_judge_request_bytes": self.max_total_judge_request_bytes,
+            "max_total_judge_response_bytes": self.max_total_judge_response_bytes,
+            "max_total_judge_request_tokens": self.max_total_judge_request_tokens,
+            "max_total_judge_response_tokens": self.max_total_judge_response_tokens,
+        }
+
+
+@dataclass(frozen=True)
 class EvaluatorExecutionConfig(_JsonModel):
     SCHEMA_VERSION: ClassVar[str] = EVALUATOR_EXECUTION_CONFIG_SCHEMA_VERSION
 
     schema_version: str
     evaluator: EvaluatorRunConfig
     evaluator_config_digest: str
+    judge_budgets: JudgeExecutionBudgets
+    cache_policy_version: str
     evaluator_timeout_seconds: Any
     max_execution_artifact_file_bytes: int
     max_execution_artifact_total_bytes: int
@@ -893,7 +1473,15 @@ class EvaluatorExecutionConfig(_JsonModel):
             raise SchemaError(
                 "evaluator execution config digest does not match evaluator"
             )
-        _positive_number(
+        if not isinstance(self.judge_budgets, JudgeExecutionBudgets):
+            raise SchemaError(
+                "evaluator execution.judge_budgets must be JudgeExecutionBudgets"
+            )
+        _version(
+            self.cache_policy_version,
+            "evaluator execution.cache_policy_version",
+        )
+        evaluator_timeout = _positive_number(
             self.evaluator_timeout_seconds,
             "evaluator execution.evaluator_timeout_seconds",
         )
@@ -916,6 +1504,42 @@ class EvaluatorExecutionConfig(_JsonModel):
             raise SchemaError(
                 "evaluator execution file bytes may not exceed total bytes"
             )
+        if self.judge_budgets.attempt_timeout_seconds > evaluator_timeout:
+            raise SchemaError(
+                "Judge attempt timeout may not exceed evaluator timeout"
+            )
+        if self.judge_budgets.request_deadline_seconds > evaluator_timeout:
+            raise SchemaError(
+                "Judge request deadline may not exceed evaluator timeout"
+            )
+        if (
+            self.judge_budgets.max_model_request_bytes
+            > self.max_execution_artifact_file_bytes
+        ):
+            raise SchemaError(
+                "Judge model request bytes may not exceed execution artifact file bytes"
+            )
+        if (
+            self.judge_budgets.max_model_response_bytes
+            > self.max_execution_artifact_file_bytes
+        ):
+            raise SchemaError(
+                "Judge model response bytes may not exceed execution artifact file bytes"
+            )
+        if (
+            self.judge_budgets.max_total_judge_request_bytes
+            > self.max_execution_artifact_total_bytes
+        ):
+            raise SchemaError(
+                "total Judge request bytes may not exceed total execution artifact bytes"
+            )
+        if (
+            self.judge_budgets.max_total_judge_response_bytes
+            > self.max_execution_artifact_total_bytes
+        ):
+            raise SchemaError(
+                "total Judge response bytes may not exceed total execution artifact bytes"
+            )
         validate_safe_json(self.to_dict(), "evaluator execution")
         _check_model_size(
             self,
@@ -931,13 +1555,29 @@ class EvaluatorExecutionConfig(_JsonModel):
         evaluator_timeout_seconds: Any,
         max_execution_artifact_file_bytes: int,
         max_execution_artifact_total_bytes: int,
+        judge_budgets: Optional[JudgeExecutionBudgets] = None,
+        cache_policy_version: str = DEFAULT_JUDGE_CACHE_POLICY_VERSION,
     ) -> "EvaluatorExecutionConfig":
         if not isinstance(evaluator, EvaluatorRunConfig):
             raise SchemaError("evaluator must be an EvaluatorRunConfig")
+        if judge_budgets is None:
+            judge_budgets = JudgeExecutionBudgets.defaults(
+                evaluator_timeout_seconds=evaluator_timeout_seconds,
+                max_execution_artifact_file_bytes=(
+                    max_execution_artifact_file_bytes
+                ),
+                max_execution_artifact_total_bytes=(
+                    max_execution_artifact_total_bytes
+                ),
+            )
+        elif not isinstance(judge_budgets, JudgeExecutionBudgets):
+            raise SchemaError("judge_budgets must be JudgeExecutionBudgets")
         return cls(
             schema_version=cls.SCHEMA_VERSION,
             evaluator=evaluator,
             evaluator_config_digest=evaluator.digest(),
+            judge_budgets=judge_budgets,
+            cache_policy_version=cache_policy_version,
             evaluator_timeout_seconds=evaluator_timeout_seconds,
             max_execution_artifact_file_bytes=max_execution_artifact_file_bytes,
             max_execution_artifact_total_bytes=max_execution_artifact_total_bytes,
@@ -948,6 +1588,9 @@ class EvaluatorExecutionConfig(_JsonModel):
         cls,
         evaluator: EvaluatorRunConfig,
         resource_budgets: ResourceBudgets,
+        *,
+        judge_budgets: Optional[JudgeExecutionBudgets] = None,
+        cache_policy_version: str = DEFAULT_JUDGE_CACHE_POLICY_VERSION,
     ) -> "EvaluatorExecutionConfig":
         if not isinstance(resource_budgets, ResourceBudgets):
             raise SchemaError("resource_budgets must be a ResourceBudgets")
@@ -960,6 +1603,8 @@ class EvaluatorExecutionConfig(_JsonModel):
             max_execution_artifact_total_bytes=(
                 resource_budgets.max_execution_artifact_total_bytes
             ),
+            judge_budgets=judge_budgets,
+            cache_policy_version=cache_policy_version,
         )
 
     @classmethod
@@ -971,6 +1616,8 @@ class EvaluatorExecutionConfig(_JsonModel):
                 "schema_version",
                 "evaluator",
                 "evaluator_config_digest",
+                "judge_budgets",
+                "cache_policy_version",
                 "evaluator_timeout_seconds",
                 "max_execution_artifact_file_bytes",
                 "max_execution_artifact_total_bytes",
@@ -983,6 +1630,13 @@ class EvaluatorExecutionConfig(_JsonModel):
             evaluator_config_digest=_digest(
                 payload["evaluator_config_digest"],
                 "evaluator execution.evaluator_config_digest",
+            ),
+            judge_budgets=JudgeExecutionBudgets.from_dict(
+                payload["judge_budgets"]
+            ),
+            cache_policy_version=_version(
+                payload["cache_policy_version"],
+                "evaluator execution.cache_policy_version",
             ),
             evaluator_timeout_seconds=_positive_number(
                 payload["evaluator_timeout_seconds"],
@@ -1017,6 +1671,8 @@ class EvaluatorExecutionConfig(_JsonModel):
             "schema_version": self.schema_version,
             "evaluator": self.evaluator.to_dict(),
             "evaluator_config_digest": self.evaluator_config_digest,
+            "judge_budgets": self.judge_budgets.to_dict(),
+            "cache_policy_version": self.cache_policy_version,
             "evaluator_timeout_seconds": self.evaluator_timeout_seconds,
             "max_execution_artifact_file_bytes": self.max_execution_artifact_file_bytes,
             "max_execution_artifact_total_bytes": self.max_execution_artifact_total_bytes,
@@ -1374,17 +2030,28 @@ def load_eval_run_config(data: Any) -> EvalRunConfig:
 __all__ = [
     "EVAL_RUN_CONFIG_SCHEMA_VERSION",
     "EVALUATOR_EXECUTION_CONFIG_SCHEMA_VERSION",
+    "JUDGE_PROFILE_SCHEMA_VERSION",
+    "JUDGE_EXECUTION_BUDGETS_SCHEMA_VERSION",
+    "DEFAULT_JUDGE_CACHE_POLICY_VERSION",
     "MAX_EVAL_RUN_CONFIG_BYTES",
     "MAX_PARAMETER_BYTES",
     "MAX_SUITE_CASES",
     "MAX_TRIAL_COUNT",
     "MAX_PLANNED_TRIALS",
+    "MAX_JUDGE_ATTEMPTS_PER_REQUEST",
+    "MAX_JUDGE_REQUESTS",
+    "MAX_JUDGE_CONTEXT_BLOCKS_PER_REQUEST",
+    "MAX_JUDGE_REASON_REFS",
+    "MAX_JUDGE_TOKEN_BUDGET",
     "ClarificationMatcherSnapshot",
     "AgentConfigSnapshot",
+    "JudgeKind",
+    "JudgeProfileSnapshot",
     "EvaluatorRunConfig",
     "SuiteCase",
     "SuiteRunConfig",
     "ResourceBudgets",
+    "JudgeExecutionBudgets",
     "EvaluatorExecutionConfig",
     "EvalRunConfig",
     "derive_trial_id",
