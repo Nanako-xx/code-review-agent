@@ -1,0 +1,102 @@
+{
+  "annotation_rationale": "The cleanup requirement is explicit and the context-manager deletion directly proves one file-handle lifecycle regression, so clarification is unnecessary.",
+  "authoring": {
+    "author_id": null,
+    "kind": "ai_assisted",
+    "source_version": "core-2026-07-19-v2",
+    "status": "draft_pending_human_author",
+    "truth_frozen_at": null
+  },
+  "case_binding": {
+    "canonical_case_digest": "79ce09c48504d933b9e560aface5c9aeccde5fa7b09d9f3c77abd3a85672fa6a",
+    "case_source_content_hash": "bce1f9b6d8715220e790dfd9391af9f8f2798de4641e44700f4b12393f9405cd",
+    "eval_input_digest": "ba92003450d01c6134ea08eb6a0f7967b7ceb72798df42e9ccbb31796f6e5ea7"
+  },
+  "case_version": 2,
+  "checklist": {
+    "agent_input_contains_no_truth": true,
+    "atomic_findings_reviewed": false,
+    "base_head_binding_reproduced": true,
+    "evidence_anchors_are_non_exclusive": false,
+    "fixture_contains_no_vcs_metadata": true,
+    "human_review_completed": false,
+    "known_invalid_traps_reviewed": false,
+    "semantic_truth_leakage_reviewed": false,
+    "severity_category_context_reviewed": false,
+    "truth_completeness_reviewed": false
+  },
+  "coverage": [
+    "diff_context",
+    "must_not_clarify",
+    "resource_leak"
+  ],
+  "disagreements": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "items": [],
+    "status": "pending_blind_review"
+  },
+  "human_review": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "annotation_protocol_version": "core-annotation-v1",
+    "author_id": null,
+    "base_revision": "0c662510e00df34b06f02c09652b586f2cc787bd",
+    "base_tree": "b7fd06b6acf01619c3127f2ef8ca253e06dd5224",
+    "blind_review_completed_at": null,
+    "blind_review_packet_digest": "77395c3799677411ff8c6b03c2204c8631bfb9fe816c33cf2f7ed359953ece12",
+    "blind_review_started_at": null,
+    "canonical_case_digest": "79ce09c48504d933b9e560aface5c9aeccde5fa7b09d9f3c77abd3a85672fa6a",
+    "case_version": 2,
+    "eval_input_digest": "ba92003450d01c6134ea08eb6a0f7967b7ceb72798df42e9ccbb31796f6e5ea7",
+    "final_decision": null,
+    "head_revision": "056514bc6dd12ccba0d053c14b6ea30a8c1fecb0",
+    "head_tree": "97c759a2ab74b00f164bffb488aa6ad18a9bafec",
+    "independent_annotation_digest": null,
+    "leakage_review_completed": false,
+    "review_batch_id": null,
+    "reviewer_id": null,
+    "schema_version": "core_human_review_record_v1",
+    "status": "pending_human_review",
+    "task_id": "core-py-017"
+  },
+  "intent_expectation": {
+    "clarification_decision": "must_not_ask",
+    "final_source": "explicit",
+    "final_status": "sufficient",
+    "initial_source": "explicit",
+    "initial_status": "sufficient"
+  },
+  "provenance_binding": {
+    "annotation_protocol_version": "core-annotation-v1",
+    "content_hash": "bce1f9b6d8715220e790dfd9391af9f8f2798de4641e44700f4b12393f9405cd",
+    "schema_version": "core_case_provenance_v1"
+  },
+  "repository_binding": {
+    "base_revision": "0c662510e00df34b06f02c09652b586f2cc787bd",
+    "base_tree": "b7fd06b6acf01619c3127f2ef8ca253e06dd5224",
+    "head_revision": "056514bc6dd12ccba0d053c14b6ea30a8c1fecb0",
+    "head_tree": "97c759a2ab74b00f164bffb488aa6ad18a9bafec",
+    "source_digest": "ca428f41c7b4c9cff9d8563e1311cf0fd238d9af5a0699a857402564c522d6aa"
+  },
+  "schema_version": "core_annotation_record_v1",
+  "suite_assignment": {
+    "promotion_evidence": null,
+    "split": "capability",
+    "status": "capability"
+  },
+  "suite_id": "core-capability",
+  "task_id": "core-py-017",
+  "truth_summary": {
+    "expected_finding_ids": [
+      "issue-0014"
+    ],
+    "expected_intent_ids": [
+      "intent-0036",
+      "intent-0037"
+    ],
+    "forbidden_intent_ids": [],
+    "known_invalid_finding_ids": [],
+    "truth_completeness": "closed_world"
+  }
+}

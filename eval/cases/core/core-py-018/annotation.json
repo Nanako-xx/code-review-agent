@@ -1,0 +1,105 @@
+{
+  "annotation_rationale": "The high-severity TLS defect is required; the separate low diagnostic regression is optional and must not hide it.",
+  "authoring": {
+    "author_id": null,
+    "kind": "ai_assisted",
+    "source_version": "core-2026-07-19-v2",
+    "status": "draft_pending_human_author",
+    "truth_frozen_at": null
+  },
+  "case_binding": {
+    "canonical_case_digest": "27b08a2353d5668f841db01cd7bd658a9c6f0cff7ef72ca55abdb3c51ea9b64a",
+    "case_source_content_hash": "1307af65724204d699ae886ddaccced5770e994125444c047c3823c2a6b08640",
+    "eval_input_digest": "3c4744678f7ce6989ad81ef5d425abb35b42f0bff6371c30dd711c2d9bd08e1d"
+  },
+  "case_version": 2,
+  "checklist": {
+    "agent_input_contains_no_truth": true,
+    "atomic_findings_reviewed": false,
+    "base_head_binding_reproduced": true,
+    "evidence_anchors_are_non_exclusive": false,
+    "fixture_contains_no_vcs_metadata": true,
+    "human_review_completed": false,
+    "known_invalid_traps_reviewed": false,
+    "semantic_truth_leakage_reviewed": false,
+    "severity_category_context_reviewed": false,
+    "truth_completeness_reviewed": false
+  },
+  "coverage": [
+    "high_miss",
+    "optional_low_finding",
+    "security",
+    "severity_calibration"
+  ],
+  "disagreements": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "items": [],
+    "status": "pending_blind_review"
+  },
+  "human_review": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "annotation_protocol_version": "core-annotation-v1",
+    "author_id": null,
+    "base_revision": "b0696771764a1dfbf23ee24cc28c6cd9788815db",
+    "base_tree": "0c80165e8db379eec92684091a9ee9d426476d13",
+    "blind_review_completed_at": null,
+    "blind_review_packet_digest": "8421f36a689014f5aa669583e4e404e6e3ad59f1a0f4b124310f9c02894fed0b",
+    "blind_review_started_at": null,
+    "canonical_case_digest": "27b08a2353d5668f841db01cd7bd658a9c6f0cff7ef72ca55abdb3c51ea9b64a",
+    "case_version": 2,
+    "eval_input_digest": "3c4744678f7ce6989ad81ef5d425abb35b42f0bff6371c30dd711c2d9bd08e1d",
+    "final_decision": null,
+    "head_revision": "ea84e157b8668f0109381809fa4d9a8b342a514b",
+    "head_tree": "866517bc1f89ba34411fac8c1f484e7c7194d787",
+    "independent_annotation_digest": null,
+    "leakage_review_completed": false,
+    "review_batch_id": null,
+    "reviewer_id": null,
+    "schema_version": "core_human_review_record_v1",
+    "status": "pending_human_review",
+    "task_id": "core-py-018"
+  },
+  "intent_expectation": {
+    "clarification_decision": "must_not_ask",
+    "final_source": "explicit",
+    "final_status": "sufficient",
+    "initial_source": "explicit",
+    "initial_status": "sufficient"
+  },
+  "provenance_binding": {
+    "annotation_protocol_version": "core-annotation-v1",
+    "content_hash": "1307af65724204d699ae886ddaccced5770e994125444c047c3823c2a6b08640",
+    "schema_version": "core_case_provenance_v1"
+  },
+  "repository_binding": {
+    "base_revision": "b0696771764a1dfbf23ee24cc28c6cd9788815db",
+    "base_tree": "0c80165e8db379eec92684091a9ee9d426476d13",
+    "head_revision": "ea84e157b8668f0109381809fa4d9a8b342a514b",
+    "head_tree": "866517bc1f89ba34411fac8c1f484e7c7194d787",
+    "source_digest": "06125f595890efd7a12e148afd92a1c56fd17bf22ce6f3d1ce4f15091fe4ca42"
+  },
+  "schema_version": "core_annotation_record_v1",
+  "suite_assignment": {
+    "promotion_evidence": null,
+    "split": "capability",
+    "status": "capability"
+  },
+  "suite_id": "core-capability",
+  "task_id": "core-py-018",
+  "truth_summary": {
+    "expected_finding_ids": [
+      "issue-0015",
+      "issue-0016"
+    ],
+    "expected_intent_ids": [
+      "intent-0038",
+      "intent-0039",
+      "intent-0040"
+    ],
+    "forbidden_intent_ids": [],
+    "known_invalid_finding_ids": [],
+    "truth_completeness": "closed_world"
+  }
+}

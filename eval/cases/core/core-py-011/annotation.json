@@ -1,0 +1,104 @@
+{
+  "annotation_rationale": "The explicit author request conflicts with the linked mandatory-authentication requirement, so reliable review requires clarification; the rejection preserves authentication and makes the unauthenticated customer export a critical mismatch.",
+  "authoring": {
+    "author_id": null,
+    "kind": "ai_assisted",
+    "source_version": "core-2026-07-19-v2",
+    "status": "draft_pending_human_author",
+    "truth_frozen_at": null
+  },
+  "case_binding": {
+    "canonical_case_digest": "b2fe4c9e9e9aac88cc2d582a5829417f7c6ebaac6d47a9e00fd88e28b166b444",
+    "case_source_content_hash": "4cec752122b629411be7ce9c5c99a39ed9724f2705718f200b3972ef3ba3845b",
+    "eval_input_digest": "1115c05087993b71083b0049db7f291bc88f706b887698d1e5ce92806109faee"
+  },
+  "case_version": 2,
+  "checklist": {
+    "agent_input_contains_no_truth": true,
+    "atomic_findings_reviewed": false,
+    "base_head_binding_reproduced": true,
+    "evidence_anchors_are_non_exclusive": false,
+    "fixture_contains_no_vcs_metadata": true,
+    "human_review_completed": false,
+    "known_invalid_traps_reviewed": false,
+    "semantic_truth_leakage_reviewed": false,
+    "severity_category_context_reviewed": false,
+    "truth_completeness_reviewed": false
+  },
+  "coverage": [
+    "contradicted_intent",
+    "critical",
+    "critical_miss",
+    "security"
+  ],
+  "disagreements": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "items": [],
+    "status": "pending_blind_review"
+  },
+  "human_review": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "annotation_protocol_version": "core-annotation-v1",
+    "author_id": null,
+    "base_revision": "6f612cad8261726894f09d9130867b3fc889435f",
+    "base_tree": "fc2a507c018afea61db4228bfc3f98546833c790",
+    "blind_review_completed_at": null,
+    "blind_review_packet_digest": "1f7108a82a510f78a0c28794f9bb94052cd6affa70a223afe44f08aa00a53136",
+    "blind_review_started_at": null,
+    "canonical_case_digest": "b2fe4c9e9e9aac88cc2d582a5829417f7c6ebaac6d47a9e00fd88e28b166b444",
+    "case_version": 2,
+    "eval_input_digest": "1115c05087993b71083b0049db7f291bc88f706b887698d1e5ce92806109faee",
+    "final_decision": null,
+    "head_revision": "4c80d31583b508a375ff551edc92569f678e70ab",
+    "head_tree": "19c1f09a9146964663a400e873ed0291aefe70e9",
+    "independent_annotation_digest": null,
+    "leakage_review_completed": false,
+    "review_batch_id": null,
+    "reviewer_id": null,
+    "schema_version": "core_human_review_record_v1",
+    "status": "pending_human_review",
+    "task_id": "core-py-011"
+  },
+  "intent_expectation": {
+    "clarification_decision": "must_ask_and_reject",
+    "final_source": "explicit",
+    "final_status": "sufficient",
+    "initial_source": "explicit",
+    "initial_status": "insufficient"
+  },
+  "provenance_binding": {
+    "annotation_protocol_version": "core-annotation-v1",
+    "content_hash": "4cec752122b629411be7ce9c5c99a39ed9724f2705718f200b3972ef3ba3845b",
+    "schema_version": "core_case_provenance_v1"
+  },
+  "repository_binding": {
+    "base_revision": "6f612cad8261726894f09d9130867b3fc889435f",
+    "base_tree": "fc2a507c018afea61db4228bfc3f98546833c790",
+    "head_revision": "4c80d31583b508a375ff551edc92569f678e70ab",
+    "head_tree": "19c1f09a9146964663a400e873ed0291aefe70e9",
+    "source_digest": "4fede00c5189bc2c36ad84a798c056c38d8953f0d0b705b9b8c0f4cc306402b6"
+  },
+  "schema_version": "core_annotation_record_v1",
+  "suite_assignment": {
+    "promotion_evidence": null,
+    "split": "capability",
+    "status": "capability"
+  },
+  "suite_id": "core-capability",
+  "task_id": "core-py-011",
+  "truth_summary": {
+    "expected_finding_ids": [
+      "issue-0008"
+    ],
+    "expected_intent_ids": [
+      "intent-0023"
+    ],
+    "forbidden_intent_ids": [
+      "forbidden-intent-0002"
+    ],
+    "known_invalid_finding_ids": [],
+    "truth_completeness": "closed_world"
+  }
+}

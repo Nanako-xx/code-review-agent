@@ -1,0 +1,105 @@
+{
+  "annotation_rationale": "Validation and timestamp refresh have different acceptance tests and fixes, so the two deletions are separate atomic truth items even when an Agent combines them in one Finding.",
+  "authoring": {
+    "author_id": null,
+    "kind": "ai_assisted",
+    "source_version": "core-2026-07-19-v2",
+    "status": "draft_pending_human_author",
+    "truth_frozen_at": null
+  },
+  "case_binding": {
+    "canonical_case_digest": "35ebc50bf0b444d39e19d8293a23d8a31f39c23585883b638cde032b4d67df3c",
+    "case_source_content_hash": "83c1351f16511885766af3d9c06fd14b7366c58f0a814df3d540a37f061e635b",
+    "eval_input_digest": "3ad36404565377620809a90d663bfd8f0fae9d0272dc56e621744d1d6bc24f84"
+  },
+  "case_version": 2,
+  "checklist": {
+    "agent_input_contains_no_truth": true,
+    "atomic_findings_reviewed": false,
+    "base_head_binding_reproduced": true,
+    "evidence_anchors_are_non_exclusive": false,
+    "fixture_contains_no_vcs_metadata": true,
+    "human_review_completed": false,
+    "known_invalid_traps_reviewed": false,
+    "semantic_truth_leakage_reviewed": false,
+    "severity_category_context_reviewed": false,
+    "truth_completeness_reviewed": false
+  },
+  "coverage": [
+    "atomic_findings",
+    "compound_finding_trap",
+    "diff_context",
+    "high_miss"
+  ],
+  "disagreements": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "items": [],
+    "status": "pending_blind_review"
+  },
+  "human_review": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "annotation_protocol_version": "core-annotation-v1",
+    "author_id": null,
+    "base_revision": "0dc4c3962410efaf095e10f32bbb62cb71e5ff92",
+    "base_tree": "0a56aef69171bb5bc987a2e3d4589b2685a3521e",
+    "blind_review_completed_at": null,
+    "blind_review_packet_digest": "549936cfd01cbe6c18ad3aa45592635da2b9fb1ec3f1fde784b2168ccc84aa1b",
+    "blind_review_started_at": null,
+    "canonical_case_digest": "35ebc50bf0b444d39e19d8293a23d8a31f39c23585883b638cde032b4d67df3c",
+    "case_version": 2,
+    "eval_input_digest": "3ad36404565377620809a90d663bfd8f0fae9d0272dc56e621744d1d6bc24f84",
+    "final_decision": null,
+    "head_revision": "972994bc8c614fddab9aa1dd5793caad6f9a70d9",
+    "head_tree": "56d23f94607d117f7d876a79a4258db015742b38",
+    "independent_annotation_digest": null,
+    "leakage_review_completed": false,
+    "review_batch_id": null,
+    "reviewer_id": null,
+    "schema_version": "core_human_review_record_v1",
+    "status": "pending_human_review",
+    "task_id": "core-py-012"
+  },
+  "intent_expectation": {
+    "clarification_decision": "must_not_ask",
+    "final_source": "explicit",
+    "final_status": "sufficient",
+    "initial_source": "explicit",
+    "initial_status": "sufficient"
+  },
+  "provenance_binding": {
+    "annotation_protocol_version": "core-annotation-v1",
+    "content_hash": "83c1351f16511885766af3d9c06fd14b7366c58f0a814df3d540a37f061e635b",
+    "schema_version": "core_case_provenance_v1"
+  },
+  "repository_binding": {
+    "base_revision": "0dc4c3962410efaf095e10f32bbb62cb71e5ff92",
+    "base_tree": "0a56aef69171bb5bc987a2e3d4589b2685a3521e",
+    "head_revision": "972994bc8c614fddab9aa1dd5793caad6f9a70d9",
+    "head_tree": "56d23f94607d117f7d876a79a4258db015742b38",
+    "source_digest": "790742c3e56469c7649df7c1b2bca347beff39dc8cf56de66bbe7c6db3c53eaa"
+  },
+  "schema_version": "core_annotation_record_v1",
+  "suite_assignment": {
+    "promotion_evidence": null,
+    "split": "capability",
+    "status": "capability"
+  },
+  "suite_id": "core-capability",
+  "task_id": "core-py-012",
+  "truth_summary": {
+    "expected_finding_ids": [
+      "issue-0009",
+      "issue-0010"
+    ],
+    "expected_intent_ids": [
+      "intent-0024",
+      "intent-0025",
+      "intent-0026"
+    ],
+    "forbidden_intent_ids": [],
+    "known_invalid_finding_ids": [],
+    "truth_completeness": "closed_world"
+  }
+}

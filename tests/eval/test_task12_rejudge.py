@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -8,6 +9,9 @@ import pytest
 
 from review_agent_eval.artifacts import ArtifactStore
 from review_agent_eval.cli import EXIT_OK, main
+from review_agent_eval.datasets import CaseBank
+from review_agent_eval.orchestrator import EvaluationOrchestrator
+from review_agent_eval.repository import RepositoryPreparer
 
 from .test_cli import _root_arguments, _without_message, _write_cli_suite
 
@@ -84,6 +88,22 @@ def test_rejudge_changes_report_identity_and_resume_reuses_exact_namespace(
         trial_id,
         first["evaluation_id"],
     )
+    git_executable = shutil.which("git")
+    assert git_executable is not None
+    with RepositoryPreparer(
+        suite_root=roots["suite"],
+        data_root=roots["data"],
+        workspace_root=roots["workspaces"],
+        git_executable=Path(git_executable).absolute(),
+    ) as preparer:
+        source_bound_first = EvaluationOrchestrator(
+            store,
+            CaseBank.open(roots["suite"]),
+            repository_preparer=preparer,
+        ).load_run_evaluation(run_id, first["evaluation_id"])
+    assert source_bound_first.summary.summary_id == first["summary_id"]
+    assert source_bound_first.report == first_namespace.report
+    assert source_bound_first.to_dict()["trials"] == first["trials"]
 
     resumed = _json_command(
         [*evaluation_args, "--resume"],

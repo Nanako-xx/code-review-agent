@@ -1,0 +1,103 @@
+{
+  "annotation_rationale": "The target value is unknowable from the initial request; the model may infer 21 from head, but the user corrects it to 14, making the head value a concrete correctness mismatch.",
+  "authoring": {
+    "author_id": null,
+    "kind": "ai_assisted",
+    "source_version": "core-2026-07-19-v2",
+    "status": "draft_pending_human_author",
+    "truth_frozen_at": null
+  },
+  "case_binding": {
+    "canonical_case_digest": "0ac8a9da43e8b759610d37de6bfe2a240920677708b9f0ecfd8596f0ee044b37",
+    "case_source_content_hash": "aa2e1fdfabaa6db54712093236fd11ce31d65f4aabbd89d1ab3f3f7eee8c19b6",
+    "eval_input_digest": "dfee6d8bbe9d74ec7f96800e168f36fe03bb785ca166e8a164d1334ce3531931"
+  },
+  "case_version": 2,
+  "checklist": {
+    "agent_input_contains_no_truth": true,
+    "atomic_findings_reviewed": false,
+    "base_head_binding_reproduced": true,
+    "evidence_anchors_are_non_exclusive": false,
+    "fixture_contains_no_vcs_metadata": true,
+    "human_review_completed": false,
+    "known_invalid_traps_reviewed": false,
+    "semantic_truth_leakage_reviewed": false,
+    "severity_category_context_reviewed": false,
+    "truth_completeness_reviewed": false
+  },
+  "coverage": [
+    "correctness",
+    "insufficient_intent",
+    "must_clarify",
+    "user_correction"
+  ],
+  "disagreements": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "items": [],
+    "status": "pending_blind_review"
+  },
+  "human_review": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "annotation_protocol_version": "core-annotation-v1",
+    "author_id": null,
+    "base_revision": "205c0c72e16a5405aa2ff6a712aef4ad69568b9f",
+    "base_tree": "68f95fd1fe5953028a479fc389bde1ba6581d6e9",
+    "blind_review_completed_at": null,
+    "blind_review_packet_digest": "c9a4a4f16b62699c89144e0adc978d6dba623b882a94575bc1422f150472a6e9",
+    "blind_review_started_at": null,
+    "canonical_case_digest": "0ac8a9da43e8b759610d37de6bfe2a240920677708b9f0ecfd8596f0ee044b37",
+    "case_version": 2,
+    "eval_input_digest": "dfee6d8bbe9d74ec7f96800e168f36fe03bb785ca166e8a164d1334ce3531931",
+    "final_decision": null,
+    "head_revision": "cd99f779b288e16aaf98243e89c5edd036496f23",
+    "head_tree": "50a6c013e341fef853ba92d88842b899e87b3c91",
+    "independent_annotation_digest": null,
+    "leakage_review_completed": false,
+    "review_batch_id": null,
+    "reviewer_id": null,
+    "schema_version": "core_human_review_record_v1",
+    "status": "pending_human_review",
+    "task_id": "core-py-003"
+  },
+  "intent_expectation": {
+    "clarification_decision": "must_ask_and_correct",
+    "final_source": "explicit",
+    "final_status": "sufficient",
+    "initial_source": "inferred",
+    "initial_status": "insufficient"
+  },
+  "provenance_binding": {
+    "annotation_protocol_version": "core-annotation-v1",
+    "content_hash": "aa2e1fdfabaa6db54712093236fd11ce31d65f4aabbd89d1ab3f3f7eee8c19b6",
+    "schema_version": "core_case_provenance_v1"
+  },
+  "repository_binding": {
+    "base_revision": "205c0c72e16a5405aa2ff6a712aef4ad69568b9f",
+    "base_tree": "68f95fd1fe5953028a479fc389bde1ba6581d6e9",
+    "head_revision": "cd99f779b288e16aaf98243e89c5edd036496f23",
+    "head_tree": "50a6c013e341fef853ba92d88842b899e87b3c91",
+    "source_digest": "b69aa07d2b35d8af71a75b53898eb0494dadd212d691d7dc556096f1cc388b73"
+  },
+  "schema_version": "core_annotation_record_v1",
+  "suite_assignment": {
+    "promotion_evidence": null,
+    "split": "regression",
+    "status": "pending_current_agent_baseline"
+  },
+  "suite_id": "core-regression",
+  "task_id": "core-py-003",
+  "truth_summary": {
+    "expected_finding_ids": [
+      "issue-0003"
+    ],
+    "expected_intent_ids": [
+      "intent-0006",
+      "intent-0007"
+    ],
+    "forbidden_intent_ids": [],
+    "known_invalid_finding_ids": [],
+    "truth_completeness": "closed_world"
+  }
+}

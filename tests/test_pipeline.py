@@ -19,6 +19,7 @@ from review_agent.model_protocol import (
     ModelTurnResponse,
 )
 from review_agent.models import QualityGateResult, ReviewRequest
+from review_agent.observations import ObservationStore
 from review_agent.pipeline import PHASE_MESSAGES, PipelineStageError, ReviewPipeline
 from review_agent.quality import QualityGateExecution
 from review_agent.resume import ResumeAction, ReviewSessionResumer
@@ -44,6 +45,7 @@ def _pipeline(
     risk_assessor: ModelStageConfig | None = None,
     portfolio_planner: ModelStageConfig | None = None,
     semantic_reconciler: ModelStageConfig | None = None,
+    existing_ci_evidence: tuple[str, ...] = (),
 ) -> tuple[ReviewPipeline, SessionStore, CheckpointStore]:
     base = run_git(git_repo, "rev-parse", "HEAD")
     changed_file = git_repo / changed_path
@@ -93,6 +95,7 @@ def _pipeline(
         base_revision=base,
         head_revision=head,
         user_intent="Preserve addition semantics",
+        existing_ci_evidence=existing_ci_evidence,
     )
     pipeline_kwargs = {}
     if adapter_factory_builder is not None:
@@ -108,6 +111,75 @@ def _pipeline(
         session_store,
         checkpoint_store,
     )
+
+
+def test_ci_evidence_reaches_each_reviewer_without_cross_reviewer_leakage(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    pipeline, session_store, _ = _pipeline(
+        git_repo,
+        review_id="review-ci-evidence-reviewers",
+        reviewer_mode="multi",
+        changed_path="auth.py",
+        existing_ci_evidence=("security suite passed", ""),
+    )
+
+    result = pipeline.execute()
+
+    assert session_store.load().status is RunStatus.COMPLETED
+    assert len(result.context.reviewer_executions) >= 2
+    assert result.context.intent_observations is not None
+    ci_observations = [
+        item
+        for item in result.context.intent_observations.list_observations()
+        if item.source.startswith("review_request.existing_ci_evidence:")
+    ]
+    assert len(ci_observations) == 2
+    ci_summaries = {
+        item.observation_id: result.context.intent_observations.summaries_by_id()[
+            item.observation_id
+        ]
+        for item in ci_observations
+    }
+    for execution in result.context.reviewer_executions:
+        model_context = "\n".join(
+            str(message["content"]) for message in execution.envelope.messages
+        )
+        assert all(
+            observation_id in model_context and summary in model_context
+            for observation_id, summary in ci_summaries.items()
+        )
+
+    head = result.context.manifest.revisions.resolved_head_sha
+    private_stores: dict[int, ObservationStore] = {}
+    private_ids: dict[int, str] = {}
+    for index in range(len(result.context.reviewer_executions)):
+        store = ObservationStore(tmp_path / f"private-reviewer-{index}")
+        observation = store.record(
+            source=f"reviewer.private:{index}",
+            revision=f"head@{head}",
+            path=None,
+            line_start=None,
+            line_end=None,
+            raw_content=f"private reviewer observation {index}",
+            context_view=f"Private reviewer observation {index}",
+        )
+        private_stores[index] = store
+        private_ids[index] = observation.observation_id
+
+    pipeline.context.reviewer_observations = private_stores
+    for index, current_store in private_stores.items():
+        authorized = pipeline._reviewer_authorized_observation_summaries(
+            current_store
+        )
+        assert set(ci_summaries).issubset(authorized)
+        assert private_ids[index] in authorized
+        assert all(
+            private_id not in authorized
+            for other_index, private_id in private_ids.items()
+            if other_index != index
+        )
 
 
 def test_review_pipeline_runs_all_phases_through_atomic_attempts(git_repo: Path) -> None:

@@ -1,0 +1,102 @@
+{
+  "annotation_rationale": "The request explicitly preserves lock lifecycle; deleting one finally block affects successful return, handled RuntimeError, and other exceptional exits but remains one root cause and one independently fixable Finding.",
+  "authoring": {
+    "author_id": null,
+    "kind": "ai_assisted",
+    "source_version": "core-2026-07-19-v2",
+    "status": "draft_pending_human_author",
+    "truth_frozen_at": null
+  },
+  "case_binding": {
+    "canonical_case_digest": "9cb894d2eea986ccae53846b30d0952a941f56c6773490dff1b442c975ac9475",
+    "case_source_content_hash": "3d0fe93fe74f5525ddedb3b446f99ad0dd7dd6378d172019f87b330cccc64f38",
+    "eval_input_digest": "255e5b24f99bebf66f1cecc1dbf6a2aff946d455d6b78d4ca2a7d2c66227ca44"
+  },
+  "case_version": 2,
+  "checklist": {
+    "agent_input_contains_no_truth": true,
+    "atomic_findings_reviewed": false,
+    "base_head_binding_reproduced": true,
+    "evidence_anchors_are_non_exclusive": false,
+    "fixture_contains_no_vcs_metadata": true,
+    "human_review_completed": false,
+    "known_invalid_traps_reviewed": false,
+    "semantic_truth_leakage_reviewed": false,
+    "severity_category_context_reviewed": false,
+    "truth_completeness_reviewed": false
+  },
+  "coverage": [
+    "duplicate_finding_trap",
+    "multi_location_one_issue",
+    "must_not_clarify"
+  ],
+  "disagreements": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "items": [],
+    "status": "pending_blind_review"
+  },
+  "human_review": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "annotation_protocol_version": "core-annotation-v1",
+    "author_id": null,
+    "base_revision": "39565aece64782a3909af7ec52e70e6632360410",
+    "base_tree": "b236f12f7c7d14d1cd9df01d15f2369c2c94bcde",
+    "blind_review_completed_at": null,
+    "blind_review_packet_digest": "40eb1c7dee46ef86dfb84a0faf7d0b56dd9efa7c90b6a11aec62beebe6a05926",
+    "blind_review_started_at": null,
+    "canonical_case_digest": "9cb894d2eea986ccae53846b30d0952a941f56c6773490dff1b442c975ac9475",
+    "case_version": 2,
+    "eval_input_digest": "255e5b24f99bebf66f1cecc1dbf6a2aff946d455d6b78d4ca2a7d2c66227ca44",
+    "final_decision": null,
+    "head_revision": "457bf4b29b75fdf64682cf33b44f5a8502b5d39d",
+    "head_tree": "010e5a25ce6bd63aec4f734e97346cbd3d855ea3",
+    "independent_annotation_digest": null,
+    "leakage_review_completed": false,
+    "review_batch_id": null,
+    "reviewer_id": null,
+    "schema_version": "core_human_review_record_v1",
+    "status": "pending_human_review",
+    "task_id": "core-py-013"
+  },
+  "intent_expectation": {
+    "clarification_decision": "must_not_ask",
+    "final_source": "explicit",
+    "final_status": "sufficient",
+    "initial_source": "explicit",
+    "initial_status": "sufficient"
+  },
+  "provenance_binding": {
+    "annotation_protocol_version": "core-annotation-v1",
+    "content_hash": "3d0fe93fe74f5525ddedb3b446f99ad0dd7dd6378d172019f87b330cccc64f38",
+    "schema_version": "core_case_provenance_v1"
+  },
+  "repository_binding": {
+    "base_revision": "39565aece64782a3909af7ec52e70e6632360410",
+    "base_tree": "b236f12f7c7d14d1cd9df01d15f2369c2c94bcde",
+    "head_revision": "457bf4b29b75fdf64682cf33b44f5a8502b5d39d",
+    "head_tree": "010e5a25ce6bd63aec4f734e97346cbd3d855ea3",
+    "source_digest": "37d9ce3394c52e49fdc8068fe6522666ecddcdba9c1a6f5e4cdca0a864ab327e"
+  },
+  "schema_version": "core_annotation_record_v1",
+  "suite_assignment": {
+    "promotion_evidence": null,
+    "split": "capability",
+    "status": "capability"
+  },
+  "suite_id": "core-capability",
+  "task_id": "core-py-013",
+  "truth_summary": {
+    "expected_finding_ids": [
+      "issue-0011"
+    ],
+    "expected_intent_ids": [
+      "intent-0027",
+      "intent-0028"
+    ],
+    "forbidden_intent_ids": [],
+    "known_invalid_finding_ids": [],
+    "truth_completeness": "closed_world"
+  }
+}

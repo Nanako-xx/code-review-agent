@@ -29,7 +29,13 @@ from .artifacts import (
 from .cases import EvalCase
 from .datasets import CaseBank
 from .config import EvalRunConfig, EvaluatorExecutionConfig, derive_evaluation_id
-from .intent_evaluator import IntentEvaluationResult, IntentEvaluator
+from .intent_evaluator import (
+    IntentEvaluationResult,
+    IntentEvaluator,
+    IntentSemanticJudgeDecision,
+    IntentSemanticJudgeFailure,
+    IntentSemanticJudgeUngraded,
+)
 from .judge import (
     BlindJudgeInput,
     JudgeExecutionResult,
@@ -582,28 +588,47 @@ class EvaluationOrchestrator:
         )
         case = self._case(config, task_id)
         execution = stored.evaluator_execution
-        intent_result = IntentEvaluationResult.from_dict(stored.intent_matches)
+        unbound_intent = IntentEvaluationResult._parse_unbound(
+            stored.intent_matches
+        )
+        semantic_decisions = tuple(
+            IntentSemanticJudgeDecision.from_dict(item)
+            for item in unbound_intent["judge_decisions"]
+        )
+        semantic_failures = tuple(
+            IntentSemanticJudgeFailure.from_dict(item)
+            for item in unbound_intent["judge_failures"]
+        )
+        semantic_ungraded = tuple(
+            IntentSemanticJudgeUngraded.from_dict(item)
+            for item in unbound_intent["judge_ungraded"]
+        )
         judge_input = JudgeInputArtifact.from_dict(
             stored.judge_input,
             evaluator_execution=execution,
         )
-        raw_output = stored.judge_output
-        bound_intent = (
-            intent_result
-            if isinstance(raw_output, Mapping)
-            and raw_output.get("intent_evaluation_digest") is not None
-            else None
-        )
-        judge_output = JudgeOutputArtifact.from_dict(
-            raw_output,
-            input_artifact=judge_input,
-            evaluator_execution=execution,
-            intent_evaluation=bound_intent,
-        )
         receipts, attestations, trace_capture = self._execution_metadata(
             run_id, task_id, trial_id
         )
-        del receipts
+        intent_result = IntentEvaluationResult.from_dict(
+            stored.intent_matches,
+            evaluator=IntentEvaluator(),
+            submission_intent=submission.intent,
+            intent_truth=case.intent_truth,
+            clarification_script=case.clarification_script,
+            clarification_match_receipts=tuple(receipts),
+            semantic_decisions=semantic_decisions,
+            semantic_failures=semantic_failures,
+            semantic_ungraded=semantic_ungraded,
+        )
+        judge_output = JudgeOutputArtifact.from_dict(
+            stored.judge_output,
+            input_artifact=judge_input,
+            evaluator_execution=execution,
+            intent_evaluation=(
+                intent_result if intent_result.judge_requests else None
+            ),
+        )
         review_result = None
         replay = self._replay(case)
         if stored.review_matches is not None:
@@ -763,6 +788,94 @@ class EvaluationOrchestrator:
             evaluation_revision=evaluation_revision,
             evaluator_execution=evaluator_execution,
             trials=tuple(bundles),
+            summary=summary,
+            report=report,
+        )
+
+    def load_run_evaluation(
+        self,
+        run_id: str,
+        evaluation_id: str,
+    ) -> RunEvaluationBundle:
+        """Source-bind every Trial and replay one committed Run evaluation."""
+
+        stored_run = self.artifact_store.load_run_evaluation(
+            run_id,
+            evaluation_id,
+        )
+        config = self.artifact_store.load_run_config(run_id)
+        manifest = self.artifact_store.load_run_manifest(run_id)
+        trials = tuple(
+            self.load_trial_evaluation(
+                run_id,
+                plan.task_id,
+                plan.trial_id,
+                evaluation_id,
+            )
+            for plan in manifest.trials
+        )
+        if not trials:
+            raise EvaluationOrchestrationError(
+                "committed Run evaluation has no Trial sources"
+            )
+        execution = trials[0].evaluator_execution
+        revision = trials[0].evaluation_revision
+        if (
+            execution.digest()
+            != stored_run.namespace.evaluator_execution_digest
+            or revision != stored_run.namespace.evaluation_revision
+            or any(
+                item.evaluation_id != evaluation_id
+                or item.evaluator_execution.digest() != execution.digest()
+                or item.evaluation_revision != revision
+                for item in trials
+            )
+        ):
+            raise EvaluationOrchestrationError(
+                "Run evaluation Trial namespaces have inconsistent identities"
+            )
+        sources = tuple(
+            TrialEvaluationSource(
+                eval_case=item.eval_case,
+                submission=item.submission,
+                intent_result=item.intent_result,
+                review_result=item.review_result,
+                trial_score=item.trial_score,
+                trial_index=item.trial_index,
+                trial_id=item.trial_id,
+                trial_manifest=self.artifact_store.load_trial_manifest(
+                    run_id,
+                    item.task_id,
+                    item.trial_id,
+                ),
+            )
+            for item in trials
+        )
+        cases_by_task = {item.task_id: item.eval_case for item in trials}
+        cases = tuple(cases_by_task[key] for key in sorted(cases_by_task))
+        summary = self.report_builder.hydrate_summary(
+            stored_run.summary,
+            run_config=config,
+            evaluator_execution=execution,
+            evaluation_revision=revision,
+            cases=cases,
+            sources=sources,
+            run_manifest=manifest,
+        )
+        report = render_run_markdown(summary)
+        if (
+            summary.summary_id != stored_run.namespace.summary_id
+            or report != stored_run.report
+        ):
+            raise EvaluationOrchestrationError(
+                "persisted Run report differs from source-bound replay"
+            )
+        return RunEvaluationBundle(
+            run_id=run_id,
+            evaluation_id=evaluation_id,
+            evaluation_revision=revision,
+            evaluator_execution=execution,
+            trials=trials,
             summary=summary,
             report=report,
         )

@@ -38,6 +38,7 @@ from ..clarification import ClarificationChannel, ClarificationProtocolError
 from ..config import ClarificationMatcherSnapshot
 from ..models import (
     EVAL_SUBMISSION_SCHEMA_VERSION,
+    MAX_EVAL_INPUT_BYTES,
     ClarificationAction,
     EvalInput,
     EvalSubmission,
@@ -56,6 +57,7 @@ from ..models import (
     SubmissionStatus,
     TraceRef,
     TraceType,
+    canonical_json_bytes,
     stable_id,
 )
 from ..submission import (
@@ -68,7 +70,6 @@ from .base import (
     AdapterIncompatibilityReason,
     AgentAdapterError,
     AgentAdapterIncompatibleError,
-    AgentInputCapability,
     AgentRunConfig,
 )
 from .subprocess_agent import (
@@ -97,6 +98,10 @@ _MAX_ARGUMENT_CHARS = 8_192
 _MAX_ENVIRONMENT_KEYS = 128
 _MAX_PRODUCT_JSON_BYTES = 16 * 1024 * 1024
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_CI_EVIDENCE_BUNDLE_SCHEMA_VERSION = "review_agent_ci_evidence_bundle_v1"
+_CI_EVIDENCE_CONTROL_DIRECTORY = PurePosixPath(".review-agent/eval-input")
+_CI_EVIDENCE_BUNDLE_PREFIX = "existing-ci-evidence."
+_CI_EVIDENCE_BUNDLE_SUFFIX = ".v1.json"
 
 _FORBIDDEN_REVIEW_ARGUMENTS = frozenset(
     {
@@ -109,6 +114,8 @@ _FORBIDDEN_REVIEW_ARGUMENTS = frozenset(
         "--description",
         "--requirement",
         "--project-rule",
+        "--ci-evidence",
+        "--ci-evidence-file",
         "--memory-mode",
         "--memory-root",
         "--non-interactive",
@@ -173,7 +180,12 @@ def _configuration(config: AgentRunConfig) -> _CurrentAdapterConfiguration:
     )
     for argument in review_arguments:
         option = argument.split("=", 1)[0]
-        if option in _FORBIDDEN_REVIEW_ARGUMENTS:
+        ci_file_abbreviation = (
+            option.startswith("--")
+            and len(option) > 2
+            and "--ci-evidence-file".startswith(option)
+        )
+        if option in _FORBIDDEN_REVIEW_ARGUMENTS or ci_file_abbreviation:
             raise _CurrentAdapterError(
                 "current Agent fixed arguments override invocation authority"
             )
@@ -551,11 +563,197 @@ def _answer_input(
     raise _CurrentAdapterError("unsupported clarification action")
 
 
+def _safe_control_directory(path: Path, context: str) -> os.stat_result:
+    try:
+        metadata = os.lstat(path)
+    except OSError as error:
+        raise _CurrentAdapterError("%s could not be inspected" % context) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or getattr(metadata, "st_file_attributes", 0) & _REPARSE_POINT
+    ):
+        raise _CurrentAdapterError("%s is not a safe directory" % context)
+    return metadata
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _read_created_ci_bundle(path: Path) -> bytes:
+    try:
+        before = os.lstat(path)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or getattr(before, "st_file_attributes", 0) & _REPARSE_POINT
+            or before.st_nlink != 1
+            or before.st_size > MAX_EVAL_INPUT_BYTES
+        ):
+            raise _CurrentAdapterError(
+                "current Agent CI evidence bundle is not a bounded regular file"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or not _same_identity(before, opened)
+            ):
+                raise _CurrentAdapterError(
+                    "current Agent CI evidence bundle changed before verification"
+                )
+            chunks: List[bytes] = []
+            remaining = MAX_EVAL_INPUT_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 64 * 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        path_after = os.lstat(path)
+        if (
+            len(data) > MAX_EVAL_INPUT_BYTES
+            or len(data) != after.st_size
+            or not _same_identity(opened, after)
+            or not _same_identity(after, path_after)
+            or path_after.st_nlink != 1
+        ):
+            raise _CurrentAdapterError(
+                "current Agent CI evidence bundle changed during verification"
+            )
+        return data
+    except _CurrentAdapterError:
+        raise
+    except OSError as error:
+        raise _CurrentAdapterError(
+            "current Agent CI evidence bundle could not be verified"
+        ) from error
+
+
+def _write_ci_evidence_bundle(workspace: Path, eval_input: EvalInput) -> Optional[str]:
+    evidence = eval_input.review_request.existing_ci_evidence
+    if not evidence:
+        return None
+    payload = {
+        "schema_version": _CI_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+        "entries": [item.to_dict() for item in evidence],
+    }
+    data = canonical_json_bytes(payload)
+    if len(data) > MAX_EVAL_INPUT_BYTES:
+        raise _CurrentAdapterError(
+            "current Agent CI evidence bundle exceeds the EvalInput byte limit"
+        )
+
+    review_root = workspace / ".review-agent"
+    control_root = review_root / "eval-input"
+    try:
+        if os.path.lexists(review_root):
+            review_metadata = _safe_control_directory(
+                review_root, "current Agent control root"
+            )
+        else:
+            os.mkdir(review_root, 0o700)
+            review_metadata = _safe_control_directory(
+                review_root, "current Agent control root"
+            )
+        if os.path.lexists(control_root):
+            raise _CurrentAdapterError(
+                "current Agent eval-input control root already exists"
+            )
+        os.mkdir(control_root, 0o700)
+        control_metadata = _safe_control_directory(
+            control_root, "current Agent eval-input control root"
+        )
+
+        bundle_digest = hashlib.sha256(data).hexdigest()
+        bundle_name = (
+            _CI_EVIDENCE_BUNDLE_PREFIX
+            + bundle_digest
+            + _CI_EVIDENCE_BUNDLE_SUFFIX
+        )
+        temporary = control_root / ("." + bundle_name + ".tmp")
+        destination = control_root / bundle_name
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+        )
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short write")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+        temporary_data = _read_created_ci_bundle(temporary)
+        if (
+            temporary_data != data
+            or hashlib.sha256(temporary_data).digest()
+            != hashlib.sha256(data).digest()
+        ):
+            raise _CurrentAdapterError(
+                "current Agent CI evidence bundle failed byte verification"
+            )
+        os.link(temporary, destination, follow_symlinks=False)
+        os.unlink(temporary)
+
+        final_data = _read_created_ci_bundle(destination)
+        if (
+            final_data != data
+            or canonical_json_bytes(json.loads(final_data.decode("utf-8"))) != data
+            or hashlib.sha256(final_data).digest() != hashlib.sha256(data).digest()
+        ):
+            raise _CurrentAdapterError(
+                "current Agent CI evidence bundle failed canonical verification"
+            )
+        if (
+            not _same_identity(
+                review_metadata,
+                _safe_control_directory(review_root, "current Agent control root"),
+            )
+            or not _same_identity(
+                control_metadata,
+                _safe_control_directory(
+                    control_root, "current Agent eval-input control root"
+                ),
+            )
+        ):
+            raise _CurrentAdapterError(
+                "current Agent CI evidence control path changed during publication"
+            )
+    except _CurrentAdapterError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError) as error:
+        raise _CurrentAdapterError(
+            "current Agent CI evidence bundle could not be published safely"
+        ) from error
+    return (_CI_EVIDENCE_CONTROL_DIRECTORY / bundle_name).as_posix()
+
+
 def _initial_argv(
     adapter: _CurrentAdapterConfiguration,
     eval_input: EvalInput,
     workspace: Path,
     memory_root: Path,
+    ci_evidence_file: Optional[str] = None,
 ) -> List[str]:
     request = eval_input.review_request
     repository = eval_input.repository
@@ -579,6 +777,8 @@ def _initial_argv(
             argv.append(option + value)
     argv.extend("--requirement=" + item for item in request.linked_requirements)
     argv.extend("--project-rule=" + item for item in request.project_rules)
+    if ci_evidence_file is not None:
+        argv.append("--ci-evidence-file=" + ci_evidence_file)
     return argv
 
 
@@ -598,6 +798,9 @@ def _resume_argv(
 class CurrentAgentAdapter:
     """Invoke and convert the current product through its public CLI/artifacts."""
 
+    ADAPTER_KIND = "current-agent-cli-v1"
+    ADAPTER_VERSION = "1"
+
     def __init__(
         self,
         *,
@@ -614,12 +817,7 @@ class CurrentAgentAdapter:
             config, AgentRunConfig
         ):
             raise TypeError("adapter compatibility requires canonical input/config")
-        unsupported = frozenset(
-            {AgentInputCapability.EXISTING_CI_EVIDENCE}
-            if eval_input.review_request.existing_ci_evidence
-            else ()
-        )
-        return AdapterCompatibility(unsupported=unsupported)
+        return AdapterCompatibility(unsupported=frozenset())
 
     def run(
         self,
@@ -647,8 +845,8 @@ class CurrentAgentAdapter:
                 raise _CurrentAdapterError("current Agent workspace is not a directory")
             adapter = _configuration(config)
             if not self.compatibility(eval_input, config).compatible:
-                raise AgentAdapterIncompatibleError(
-                    AdapterIncompatibilityReason.EXISTING_CI_EVIDENCE
+                raise _CurrentAdapterError(
+                    "current Agent input is incompatible with the product CLI"
                 )
             before = _safe_run_directories(resolved_workspace)
             if before:
@@ -657,6 +855,10 @@ class CurrentAgentAdapter:
                 )
             memory_root = (
                 resolved_workspace / ".review-agent" / "eval-memory" / config.trial_id
+            )
+            ci_evidence_file = _write_ci_evidence_bundle(
+                resolved_workspace,
+                eval_input,
             )
             environment = build_subprocess_environment(
                 adapter.environment_allowlist
@@ -670,6 +872,7 @@ class CurrentAgentAdapter:
                     eval_input,
                     resolved_workspace,
                     memory_root,
+                    ci_evidence_file,
                 ),
                 stdin_bytes=b"",
                 workspace=resolved_workspace,

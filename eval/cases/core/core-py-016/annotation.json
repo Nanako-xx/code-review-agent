@@ -1,0 +1,102 @@
+{
+  "annotation_rationale": "The request explicitly preserves alpha discovery, while proving the introduced identity mismatch requires relating the changed module metadata to the unchanged registry mapping.",
+  "authoring": {
+    "author_id": null,
+    "kind": "ai_assisted",
+    "source_version": "core-2026-07-19-v2",
+    "status": "draft_pending_human_author",
+    "truth_frozen_at": null
+  },
+  "case_binding": {
+    "canonical_case_digest": "c432b425592f8997f5ba2462fb4d3b880abcd8e94bfadfca27850702c2eb1ef7",
+    "case_source_content_hash": "c9c44b2949591dd08b5d6b02cca3bf2e62a6e1cd5bb2fd4112a2d73f3cc23574",
+    "eval_input_digest": "d5fc14e57a4685ef7198d50253b5a553b9159f7cf72bf0eeb80fd8a8557ac183"
+  },
+  "case_version": 2,
+  "checklist": {
+    "agent_input_contains_no_truth": true,
+    "atomic_findings_reviewed": false,
+    "base_head_binding_reproduced": true,
+    "evidence_anchors_are_non_exclusive": false,
+    "fixture_contains_no_vcs_metadata": true,
+    "human_review_completed": false,
+    "known_invalid_traps_reviewed": false,
+    "semantic_truth_leakage_reviewed": false,
+    "severity_category_context_reviewed": false,
+    "truth_completeness_reviewed": false
+  },
+  "coverage": [
+    "cross_file_invariant",
+    "must_not_clarify",
+    "repo_context"
+  ],
+  "disagreements": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "items": [],
+    "status": "pending_blind_review"
+  },
+  "human_review": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "annotation_protocol_version": "core-annotation-v1",
+    "author_id": null,
+    "base_revision": "cf611c0ce5335b1308617c6193612fceb0556e2e",
+    "base_tree": "b9050f715d22558ad16d06a2626b61f6170b06f1",
+    "blind_review_completed_at": null,
+    "blind_review_packet_digest": "3e29f3deb04a1ebef9b5b7270ee528ff9504042ed4cf31af6e1b2e8aed375f6b",
+    "blind_review_started_at": null,
+    "canonical_case_digest": "c432b425592f8997f5ba2462fb4d3b880abcd8e94bfadfca27850702c2eb1ef7",
+    "case_version": 2,
+    "eval_input_digest": "d5fc14e57a4685ef7198d50253b5a553b9159f7cf72bf0eeb80fd8a8557ac183",
+    "final_decision": null,
+    "head_revision": "26f26846fd1b79a0532abc9406803a03ea9f22f1",
+    "head_tree": "e71a698977c24e2aa49a7118bf74fe5b5e9753e8",
+    "independent_annotation_digest": null,
+    "leakage_review_completed": false,
+    "review_batch_id": null,
+    "reviewer_id": null,
+    "schema_version": "core_human_review_record_v1",
+    "status": "pending_human_review",
+    "task_id": "core-py-016"
+  },
+  "intent_expectation": {
+    "clarification_decision": "must_not_ask",
+    "final_source": "explicit",
+    "final_status": "sufficient",
+    "initial_source": "explicit",
+    "initial_status": "sufficient"
+  },
+  "provenance_binding": {
+    "annotation_protocol_version": "core-annotation-v1",
+    "content_hash": "c9c44b2949591dd08b5d6b02cca3bf2e62a6e1cd5bb2fd4112a2d73f3cc23574",
+    "schema_version": "core_case_provenance_v1"
+  },
+  "repository_binding": {
+    "base_revision": "cf611c0ce5335b1308617c6193612fceb0556e2e",
+    "base_tree": "b9050f715d22558ad16d06a2626b61f6170b06f1",
+    "head_revision": "26f26846fd1b79a0532abc9406803a03ea9f22f1",
+    "head_tree": "e71a698977c24e2aa49a7118bf74fe5b5e9753e8",
+    "source_digest": "e5338b9f95fefb219f8f864f2d6b759ea7a2c5580c7a94f1b21caf053abbdb05"
+  },
+  "schema_version": "core_annotation_record_v1",
+  "suite_assignment": {
+    "promotion_evidence": null,
+    "split": "capability",
+    "status": "capability"
+  },
+  "suite_id": "core-capability",
+  "task_id": "core-py-016",
+  "truth_summary": {
+    "expected_finding_ids": [
+      "issue-0013"
+    ],
+    "expected_intent_ids": [
+      "intent-0034",
+      "intent-0035"
+    ],
+    "forbidden_intent_ids": [],
+    "known_invalid_finding_ids": [],
+    "truth_completeness": "closed_world"
+  }
+}

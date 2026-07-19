@@ -1,0 +1,103 @@
+{
+  "annotation_rationale": "The one-line count change is meaningful only through unchanged same-file slicing and iteration, making this the Core file-context regression Case.",
+  "authoring": {
+    "author_id": null,
+    "kind": "ai_assisted",
+    "source_version": "core-2026-07-19-v2",
+    "status": "draft_pending_human_author",
+    "truth_frozen_at": null
+  },
+  "case_binding": {
+    "canonical_case_digest": "6863fa5cc3b8c25e040491b2f2d6edfa3f6ad071b8216c0faad136c53e1e3a60",
+    "case_source_content_hash": "d1998b2a887529abd0d071898595b27dae909fc86db10b72a9e6f318a1398f38",
+    "eval_input_digest": "3c0527fd8460dd06b4b807cd96894173d14a62df161ae66a71a7dc92cacfe1af"
+  },
+  "case_version": 2,
+  "checklist": {
+    "agent_input_contains_no_truth": true,
+    "atomic_findings_reviewed": false,
+    "base_head_binding_reproduced": true,
+    "evidence_anchors_are_non_exclusive": false,
+    "fixture_contains_no_vcs_metadata": true,
+    "human_review_completed": false,
+    "known_invalid_traps_reviewed": false,
+    "semantic_truth_leakage_reviewed": false,
+    "severity_category_context_reviewed": false,
+    "truth_completeness_reviewed": false
+  },
+  "coverage": [
+    "backward_compatibility",
+    "file_context",
+    "project_rule",
+    "regression"
+  ],
+  "disagreements": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "items": [],
+    "status": "pending_blind_review"
+  },
+  "human_review": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "annotation_protocol_version": "core-annotation-v1",
+    "author_id": null,
+    "base_revision": "71490a25699c65553319e4cbffb739e52c1a77c6",
+    "base_tree": "27fc5652973e9194fef338164bae684b4d81283b",
+    "blind_review_completed_at": null,
+    "blind_review_packet_digest": "9e32c20f721dff33a34e3f165e897c4596fe7e583b849264f18500993c6120d3",
+    "blind_review_started_at": null,
+    "canonical_case_digest": "6863fa5cc3b8c25e040491b2f2d6edfa3f6ad071b8216c0faad136c53e1e3a60",
+    "case_version": 2,
+    "eval_input_digest": "3c0527fd8460dd06b4b807cd96894173d14a62df161ae66a71a7dc92cacfe1af",
+    "final_decision": null,
+    "head_revision": "a1e998c8bb3fa1ea9f8d3e81075ab12d29e51210",
+    "head_tree": "7ca6ea830583d4c3f5f492c9a72f22fd5773f0cb",
+    "independent_annotation_digest": null,
+    "leakage_review_completed": false,
+    "review_batch_id": null,
+    "reviewer_id": null,
+    "schema_version": "core_human_review_record_v1",
+    "status": "pending_human_review",
+    "task_id": "core-py-006"
+  },
+  "intent_expectation": {
+    "clarification_decision": "must_not_ask",
+    "final_source": "explicit",
+    "final_status": "sufficient",
+    "initial_source": "explicit",
+    "initial_status": "sufficient"
+  },
+  "provenance_binding": {
+    "annotation_protocol_version": "core-annotation-v1",
+    "content_hash": "d1998b2a887529abd0d071898595b27dae909fc86db10b72a9e6f318a1398f38",
+    "schema_version": "core_case_provenance_v1"
+  },
+  "repository_binding": {
+    "base_revision": "71490a25699c65553319e4cbffb739e52c1a77c6",
+    "base_tree": "27fc5652973e9194fef338164bae684b4d81283b",
+    "head_revision": "a1e998c8bb3fa1ea9f8d3e81075ab12d29e51210",
+    "head_tree": "7ca6ea830583d4c3f5f492c9a72f22fd5773f0cb",
+    "source_digest": "7bb2afee94ad776d0ec4e10570b20173c1e987d594e2987aa6650d40b74b01a5"
+  },
+  "schema_version": "core_annotation_record_v1",
+  "suite_assignment": {
+    "promotion_evidence": null,
+    "split": "regression",
+    "status": "pending_current_agent_baseline"
+  },
+  "suite_id": "core-regression",
+  "task_id": "core-py-006",
+  "truth_summary": {
+    "expected_finding_ids": [
+      "issue-0005"
+    ],
+    "expected_intent_ids": [
+      "intent-0013",
+      "intent-0014"
+    ],
+    "forbidden_intent_ids": [],
+    "known_invalid_finding_ids": [],
+    "truth_completeness": "closed_world"
+  }
+}

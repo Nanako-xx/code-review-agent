@@ -1,12 +1,14 @@
 # Core Code Review Eval System 实施计划
 
-**状态：** Task 1–12 已完成；按当前决定暂缓 Task 13/公共数据集，后续任务等待确认
+**状态：** Task 1–12 已完成；Task 13 本地实现与可执行回归已完成，等待独立真人盲审和真实模型重复 baseline 两项外部门禁；Task 14+ 尚未开始
 
 **设计来源：** `docs/superpowers/specs/2026-07-16-core-code-review-eval-system-design.md`
 
 **目标：** 按已确认设计实现一套面向最终产品形态的黑盒 Code Review Eval System。系统只评测 Intent 是否理解正确、Review 是否正确，以 AACR-Bench 的数据集—Agent—Matcher—Metrics 工业骨架为主线，落实 Anthropic 关于 task/trial/grader/harness、环境隔离、重复 Trial、失败 transcript 和人类校准的方法，并接入本项目特有的 Intent Eval。
 
 **执行方式：** 建议 Subagent-Driven。按下述 Wave 和文件所有权并行，主线程负责共享协议、跨模块集成、设计一致性审查、全量回归和最终提交。这里的 Wave 是最终架构的依赖拆分，不允许引入之后会被替换的临时 schema、临时 matcher、简化 Runner 或仅服务演示的数据格式。
+
+**本地临时目录：** 本项目的构建 scratch、pytest `--basetemp` 和仓库外安全测试统一使用 `D:\tmp\code-review-agent\` 下的独立子目录，不再使用 `C:\tmp`。盲审工作包仍必须位于 Git 仓库外；长期保留的审批 ledger 不得放入临时目录。
 
 **技术栈：** Python frozen dataclasses/enums、stdlib JSON/Git/subprocess/hashlib/statistics、现有统一 Model Adapter、pytest；公共 Parquet 数据读取仅放在可选 `eval-public` 依赖中，核心 Harness 不依赖数据科学框架。
 
@@ -59,7 +61,7 @@
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest -q -p no:cacheprovider --basetemp 'C:\tmp\rae-b'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-b'
 ```
 
 实施基线：HEAD `ac87db4ab75b34ed73a5849de612e33f598c4742`，分支 `codex/core-code-review-eval-system`，Git `2.50.1.windows.1`，Python `3.9.23`。2026-07-16 使用短路径 `C:\tmp\rb` 完成全量 pytest，退出码为 0。先前长 basetemp 的 7 个 Memory CLI identity 失败已在短路径逐项复现为通过，确认为 Windows 路径环境问题而非代码回归。
@@ -198,7 +200,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_models.py tests/eval/test_schema_hydration.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t1'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_models.py tests/eval/test_schema_hydration.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t1'
 ```
 
 **完成记录（2026-07-16）：** Task 1 定向测试与产品模型、hydration、架构边界合并回归共 210 项通过。
@@ -239,7 +241,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_cases.py tests/eval/test_datasets.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t2'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_cases.py tests/eval/test_datasets.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t2'
 ```
 
 **提交边界：** `feat(eval): add versioned case bank and truth isolation`
@@ -279,7 +281,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_config.py tests/eval/test_artifacts.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t3'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_config.py tests/eval/test_artifacts.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t3'
 ```
 
 **提交边界：** `feat(eval): add immutable run artifacts and manifests`
@@ -320,7 +322,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_repository.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t4'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_repository.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t4'
 ```
 
 **提交边界：** `feat(eval): isolate reproducible repository trials`
@@ -376,7 +378,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_agent_adapter.py tests/eval/test_current_agent_adapter.py tests/eval/test_clarification_script.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t5'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_agent_adapter.py tests/eval/test_current_agent_adapter.py tests/eval/test_clarification_script.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t5'
 ```
 
 **完成记录（2026-07-16）：** Task 5 定向测试 91 项通过；完整 Eval 回归 430 项通过、3 项按平台/能力跳过（共 433 项）；产品 models/hydration/architecture boundary 回归 63 项通过。已落地 run-bound `ClarificationMatcherSnapshot`、sealed `AgentRunConfig`、Harness-private match receipt、strict ordered clarification transcript、generic/current black-box Adapter、preflight/dynamic incompatibility、canonical Submission/trace binding，以及 Observation/Evidence 的 revision/hash/authority 转换。未经 Harness immutable attestation 的 command output（含 truncated output）不会生成 Evidence；existing-CI 与无法 canonicalize 的 material claim 抛稳定 incompatibility，不计为产品 `adapter_error`。独立子 Agent 最终复核 PASS；Task 6 将负责在 Trial plan 前强制 capability gating，并持久化 match receipt/可选 Runner attestation。
@@ -421,7 +423,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_runner.py tests/eval/test_runner_failures.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t6'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_runner.py tests/eval/test_runner_failures.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t6'
 ```
 
 **提交边界：** `feat(eval): run isolated trials with terminal submissions`
@@ -467,7 +469,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_location_matcher.py tests/eval/test_evidence_checker.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t7'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_location_matcher.py tests/eval/test_evidence_checker.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t7'
 ```
 
 **提交边界：** `feat(eval): verify evidence integrity and location candidates`
@@ -509,7 +511,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_assignment.py tests/eval/test_intent_evaluator.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t8'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_assignment.py tests/eval/test_intent_evaluator.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t8'
 ```
 
 **提交边界：** `feat(eval): score intent claims with global assignment`
@@ -551,7 +553,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_judge.py tests/eval/test_judge_rubrics.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t9'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_judge.py tests/eval/test_judge_rubrics.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t9'
 ```
 
 **提交边界：** `feat(eval): add blind structured semantic judges`
@@ -597,7 +599,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_review_evaluator.py tests/eval/test_review_truth_completeness.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t10'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_review_evaluator.py tests/eval/test_review_truth_completeness.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t10'
 ```
 
 **提交边界：** `feat(eval): reconcile review findings with strict evidence scoring`
@@ -645,7 +647,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_metrics.py tests/eval/test_report.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t11'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_metrics.py tests/eval/test_report.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t11'
 ```
 
 **提交边界：** `feat(eval): aggregate outcome metrics and explainable reports`
@@ -685,7 +687,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_cli.py tests/eval/test_cli_failures.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t12'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_cli.py tests/eval/test_cli_failures.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t12'
 ```
 
 **提交边界：** `feat(eval): expose separated harness commands`
@@ -709,29 +711,31 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 **RED/数据验收：**
 
-- [ ] 首批至少 18 个小型 Python Case 覆盖 explicit Intent、合法 inferred Intent、必须澄清、不应澄清、unsupported/contradicted Intent 和用户纠正。
-- [ ] Review Case 覆盖 correctness/security/regression，diff/file/repo context，clean PR，pre-existing trap，wrong path/line/hash，fabricated Finding、duplicate Finding、compound Finding 和 high/critical miss。
-- [ ] 每个 Case 有可读任务说明、固定 base/head tree digest、Intent authority、原子 expected Finding、truth completeness、severity/category/context level 和标注 rationale。
-- [ ] Evidence anchor 只在确有帮助时提供，不把唯一文件片段当成唯一合法调查路径。
-- [ ] Ground truth 不出现在 repository tree、commit message、文件名、测试输出或 Agent-facing request。
-- [ ] capability 与 regression 使用同一 Case schema；区别只在 Suite policy/预期稳定性，不复制 Case 为两种格式。
-- [ ] golden Submissions 覆盖 perfect、empty、duplicate、fabricated、bad Evidence、Judge unknown，用于 grader 的确定性回归。
+- [x] 首批至少 18 个小型 Python Case 覆盖 explicit Intent、合法 inferred Intent、必须澄清、不应澄清、unsupported/contradicted Intent 和用户纠正。
+- [x] Review Case 覆盖 correctness/security/regression，diff/file/repo context，clean PR，pre-existing trap，wrong path/line/hash，fabricated Finding、duplicate Finding、compound Finding 和 high/critical miss。
+- [x] 每个 Case 有可读任务说明、固定 base/head tree digest、Intent authority、原子 expected Finding、truth completeness、severity/category/context level 和标注 rationale。
+- [x] Evidence anchor 只在确有帮助时提供，不把唯一文件片段当成唯一合法调查路径。
+- [x] Ground truth 不出现在 repository tree、commit message、文件名、测试输出或 Agent-facing request。
+- [x] capability 与 regression 使用同一 Case schema；区别只在 Suite policy/预期稳定性，不复制 Case 为两种格式。
+- [x] golden Submissions 覆盖 perfect、empty、duplicate、fabricated、bad Evidence、Judge unknown，用于 grader 的确定性回归。
 - [ ] 每个新增或修改 Case 通过 annotation checklist、自动 schema/hash 检查和至少一次人工审阅记录。
 
 **实现：**
 
-- [ ] 建立最终 Case 目录与 fixture tree 格式，不提交 nested `.git`。
-- [ ] 编写 Intent/Finding/Evidence 原子化、严重度、完整度和 disagreement 的标注指南。
-- [ ] 将已稳定通过的 Case放入 regression；当前产品尚不稳定的 Case放入 capability，迁移需显式 Suite version change。
-- [ ] 提供 case lint 命令/测试，防 truth leakage、重复 issue 和不稳定 fixture。
+- [x] 建立最终 Case 目录与 fixture tree 格式，不提交 nested `.git`。
+- [x] 编写 Intent/Finding/Evidence 原子化、严重度、完整度和 disagreement 的标注指南。
+- [x] 将已稳定通过的 Case放入 regression；当前产品尚不稳定的 Case放入 capability，迁移需显式 Suite version change。
+- [x] 提供 case lint 命令/测试，防 truth leakage、重复 issue 和不稳定 fixture。
 
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_core_suite.py tests/eval/test_core_golden_submissions.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t13'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_core_suite.py tests/eval/test_core_golden_submissions.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t13'
 ```
 
 **提交边界：** `test(eval): add audited core code review suites`
+
+**本地完成记录（2026-07-19）：** 已生成并固定 18 个 Case（10 Regression、8 Capability）和 106 个 Core 产物；Case/Suite v2、全局 opaque truth ID、单故障 Golden、CI Evidence 贯穿 Intent/Reviewer/resume、source-bound replay hydration、Promotion verifier 均已落地。人工标注协议采用仓库外 blind packet、独立 Reviewer response、必要时 Adjudicator C、evaluator-private immutable ledger 和 annotation projection；ClarificationScript 比较覆盖完整语义，ledger 保存并重放 canonical batch manifest，读取/写入路径拒绝 symlink、reparse point 和 hardlink。生成器 `--write`/`--check` 均通过；Task 13 可执行 Core 测试、完整 `tests/eval`（排除两项外部门禁）以及产品侧 Intent/Pipeline 回归均通过。当前不能关闭的两项真实门禁为：18 个 Case 尚未由独立真人 Reviewer B 完成 blind review（有 material disagreement 时还需 Adjudicator C），10 个 Regression Case 尚未使用用户配置的真实模型各完成至少 3 个 Trial 并通过 Promotion verifier；不得用 AI 身份、fake provider 或合成记录代替。
 
 ### Task 14：AACR-Bench 与 SWE-PRBench Adapters
 
@@ -767,7 +771,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_aacr_adapter.py tests/eval/test_swe_prbench_adapter.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t14'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_aacr_adapter.py tests/eval/test_swe_prbench_adapter.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t14'
 ```
 
 **提交边界：** `feat(eval): adapt aacr and swe pr review benchmarks`
@@ -818,7 +822,7 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_repeated_trials.py tests/eval/test_comparison.py tests/eval/test_calibration.py tests/eval/test_regression_gates.py -q -p no:cacheprovider --basetemp 'C:\tmp\rae-t15'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval/test_repeated_trials.py tests/eval/test_comparison.py tests/eval/test_calibration.py tests/eval/test_regression_gates.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-t15'
 ```
 
 **提交边界：** `feat(eval): compare repeated trials and enforce calibrated gates`
@@ -864,14 +868,14 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 **定向验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval -q -p no:cacheprovider --basetemp 'C:\tmp\rae-eval'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/eval -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-eval'
 ```
 
 **全量回归：**
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest -q -p no:cacheprovider --basetemp 'C:\tmp\rae-full'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\rae-full'
 ```
 
 **提交边界：** `docs(eval): complete harness integration and operating guide`
