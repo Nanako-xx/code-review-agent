@@ -12,15 +12,25 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import re
 import stat
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+)
 
 from .cases import MAX_RUN_CASE_SNAPSHOT_BYTES, RunCaseSnapshot
 from .config import (
@@ -77,6 +87,9 @@ EVAL_TRIAL_MANIFEST_SCHEMA_VERSION = "eval_trial_manifest_v1"
 EVAL_STAGE_RECEIPT_SCHEMA_VERSION = "eval_stage_receipt_v1"
 EVAL_RUN_PREFLIGHT_SCHEMA_VERSION = "eval_run_capability_preflight_v1"
 EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION = "eval_preflight_candidate_v1"
+EVAL_RUN_EVALUATION_NAMESPACE_SCHEMA_VERSION = (
+    "eval_run_evaluation_namespace_v1"
+)
 
 MAX_RUN_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_TRIAL_MANIFEST_BYTES = 1024 * 1024
@@ -117,6 +130,24 @@ _REQUIRED_RUNNER_ARTIFACT_NAMES = (
     _CONTROL_RUNNER_ARTIFACT_NAMES
     | _MANDATORY_EXECUTION_RUNNER_ARTIFACT_NAMES
 )
+_EVALUATION_JSON_ARTIFACT_NAMES = (
+    "evaluator_execution_config.json",
+    "intent_matches.json",
+    "review_matches.json",
+    "judge_input.json",
+    "judge_output.json",
+    "score.json",
+)
+_EVALUATION_OPTIONAL_ARTIFACT_NAMES = ("report.md",)
+_EVALUATION_NAMESPACE_FILENAMES = frozenset(
+    (
+        *_EVALUATION_JSON_ARTIFACT_NAMES,
+        *_EVALUATION_OPTIONAL_ARTIFACT_NAMES,
+        "receipt.json",
+        ".locks",
+    )
+)
+_RUN_EVALUATION_FILENAMES = frozenset({"summary.json", "report.md"})
 DIRECTORY_FSYNC_SUPPORTED = os.name != "nt"
 
 
@@ -940,6 +971,359 @@ class ResumePlan:
     completed_stages: Tuple[StageName, ...]
     missing_stages: Tuple[StageName, ...]
     terminal: bool
+
+
+def _canonical_payload_text(value: Any, context: str) -> str:
+    validate_safe_json(value, context)
+    return canonical_json_bytes(value).decode("utf-8", "strict")
+
+
+def _validated_artifact_text(
+    value: Any,
+    context: str,
+    *,
+    allow_rendered_environment_projection: bool = False,
+) -> str:
+    """Apply the secret boundary while tolerating canonical metric ``NAME=`` text.
+
+    The Run report renderer can legitimately emit several uppercase metric or
+    policy labels followed by ``=`` inside canonical JSON projections.  That
+    resembles a full environment dump to the generic heuristic.  Suppression
+    is narrowly limited to that final heuristic: URL userinfo, credentials,
+    secret values, and raw reasoning are checked first and still fail.
+    """
+
+    try:
+        return validate_safe_text(value, context)
+    except SchemaError as exc:
+        if (
+            allow_rendered_environment_projection
+            and str(exc)
+            == "%s contains a forbidden full environment dump" % context
+            and type(value) is str
+        ):
+            return value
+        raise
+
+
+def _decoded_payload(value: str) -> Any:
+    # Values are stored only after canonical UTF-8 validation.  Returning a
+    # fresh tree prevents callers from mutating the frozen bundle snapshot.
+    return json.loads(value)
+
+
+@dataclass(frozen=True)
+class EvaluationNamespace:
+    """Path-free metadata for one committed Trial evaluation namespace."""
+
+    run_id: str
+    task_id: str
+    trial_id: str
+    evaluation_id: str
+    evaluation_revision: str
+    evaluator_execution_digest: str
+    receipt: StageReceipt
+
+    def __post_init__(self) -> None:
+        validate_run_id(self.run_id)
+        _identifier(self.task_id, "evaluation namespace.task_id")
+        validate_trial_id_shape(self.trial_id)
+        validate_evaluation_id(
+            self.evaluation_id,
+            self.run_id,
+            self.evaluator_execution_digest,
+            self.evaluation_revision,
+        )
+        if type(self.receipt) is not StageReceipt:
+            raise SchemaError(
+                "evaluation namespace receipt must be a StageReceipt"
+            )
+        if (
+            self.receipt.stage is not StageName.EVALUATOR
+            or self.receipt.run_id != self.run_id
+            or self.receipt.task_id != self.task_id
+            or self.receipt.trial_id != self.trial_id
+            or self.receipt.evaluation_id != self.evaluation_id
+            or self.receipt.evaluation_revision != self.evaluation_revision
+            or self.receipt.config_digest != self.evaluator_execution_digest
+        ):
+            raise SchemaError(
+                "evaluation namespace receipt binding is inconsistent"
+            )
+        names = []
+        prefix = "cases/%s/trials/%s/evaluations/%s/" % (
+            derive_case_path_id(self.task_id),
+            self.trial_id,
+            self.evaluation_id,
+        )
+        for artifact in self.receipt.artifacts:
+            filename = artifact.relative_path.rsplit("/", 1)[-1]
+            if artifact.relative_path != prefix + filename:
+                raise SchemaError(
+                    "evaluation namespace artifact has the wrong path binding"
+                )
+            names.append(filename)
+        required = set(_EVALUATION_JSON_ARTIFACT_NAMES)
+        actual = set(names)
+        if (
+            len(names) != len(actual)
+            or not required.issubset(actual)
+            or not actual.issubset(
+                required | set(_EVALUATION_OPTIONAL_ARTIFACT_NAMES)
+            )
+        ):
+            raise SchemaError(
+                "evaluation namespace has an invalid artifact set"
+            )
+
+    @property
+    def artifacts(self) -> Tuple[ArtifactRef, ...]:
+        return self.receipt.artifacts
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "trial_id": self.trial_id,
+            "evaluation_id": self.evaluation_id,
+            "evaluation_revision": self.evaluation_revision,
+            "evaluator_execution_digest": self.evaluator_execution_digest,
+            "receipt": self.receipt.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class EvaluationArtifactBundle:
+    """Canonical, source-bound contents of one committed Trial evaluation."""
+
+    namespace: EvaluationNamespace
+    evaluator_execution: EvaluatorExecutionConfig
+    submission_digest: str
+    canonical_case_digest: str
+    trial_manifest_digest: str
+    _intent_matches_json: str = field(repr=False)
+    _review_matches_json: str = field(repr=False)
+    _judge_input_json: str = field(repr=False)
+    _judge_output_json: str = field(repr=False)
+    _score_json: str = field(repr=False)
+    _report: Optional[str] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.namespace) is not EvaluationNamespace:
+            raise TypeError("evaluation bundle namespace is invalid")
+        if type(self.evaluator_execution) is not EvaluatorExecutionConfig:
+            raise TypeError("evaluation bundle execution config is invalid")
+        if (
+            self.evaluator_execution.digest()
+            != self.namespace.evaluator_execution_digest
+        ):
+            raise ArtifactIntegrityError(
+                "evaluation execution config differs from namespace receipt"
+            )
+        _digest(self.submission_digest, "evaluation bundle.submission_digest")
+        _digest(
+            self.canonical_case_digest,
+            "evaluation bundle.canonical_case_digest",
+        )
+        _digest(
+            self.trial_manifest_digest,
+            "evaluation bundle.trial_manifest_digest",
+        )
+        for name in (
+            "_intent_matches_json",
+            "_review_matches_json",
+            "_judge_input_json",
+            "_judge_output_json",
+            "_score_json",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str:
+                raise TypeError("evaluation bundle payload snapshots must be strings")
+            decoded = _decoded_payload(value)
+            if _canonical_payload_text(decoded, "evaluation bundle payload") != value:
+                raise ArtifactIntegrityError(
+                    "evaluation bundle payload is not canonical"
+                )
+        if self._report is not None:
+            report = validate_safe_text(self._report, "evaluation report")
+            if "\r" in report:
+                raise ArtifactIntegrityError(
+                    "evaluation report must use canonical LF line endings"
+                )
+
+    @property
+    def run_id(self) -> str:
+        return self.namespace.run_id
+
+    @property
+    def task_id(self) -> str:
+        return self.namespace.task_id
+
+    @property
+    def trial_id(self) -> str:
+        return self.namespace.trial_id
+
+    @property
+    def evaluation_id(self) -> str:
+        return self.namespace.evaluation_id
+
+    @property
+    def evaluation_revision(self) -> str:
+        return self.namespace.evaluation_revision
+
+    @property
+    def receipt(self) -> StageReceipt:
+        return self.namespace.receipt
+
+    @property
+    def intent_matches(self) -> Any:
+        return _decoded_payload(self._intent_matches_json)
+
+    @property
+    def review_matches(self) -> Any:
+        return _decoded_payload(self._review_matches_json)
+
+    @property
+    def judge_input(self) -> Any:
+        return _decoded_payload(self._judge_input_json)
+
+    @property
+    def judge_output(self) -> Any:
+        return _decoded_payload(self._judge_output_json)
+
+    @property
+    def score(self) -> Any:
+        return _decoded_payload(self._score_json)
+
+    @property
+    def report(self) -> Optional[str]:
+        return self._report
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "namespace": self.namespace.to_dict(),
+            "evaluator_execution": self.evaluator_execution.to_dict(),
+            "submission_digest": self.submission_digest,
+            "canonical_case_digest": self.canonical_case_digest,
+            "trial_manifest_digest": self.trial_manifest_digest,
+            "intent_matches": self.intent_matches,
+            "review_matches": self.review_matches,
+            "judge_input": self.judge_input,
+            "judge_output": self.judge_output,
+            "score": self.score,
+            "report": self.report,
+        }
+
+
+@dataclass(frozen=True)
+class RunEvaluationNamespace:
+    """Metadata for one committed Run-level summary/report pair."""
+
+    schema_version: str
+    run_id: str
+    evaluation_id: str
+    evaluation_revision: str
+    evaluator_execution_digest: str
+    summary_id: str
+    summary: ArtifactRef
+    report: ArtifactRef
+
+    def __post_init__(self) -> None:
+        if self.schema_version != EVAL_RUN_EVALUATION_NAMESPACE_SCHEMA_VERSION:
+            raise SchemaError("Run evaluation namespace has an unknown schema")
+        validate_run_id(self.run_id)
+        validate_evaluation_id(
+            self.evaluation_id,
+            self.run_id,
+            self.evaluator_execution_digest,
+            self.evaluation_revision,
+        )
+        validate_path_segment(self.summary_id, "Run evaluation summary_id")
+        if type(self.summary) is not ArtifactRef or type(self.report) is not ArtifactRef:
+            raise SchemaError("Run evaluation namespace refs are invalid")
+        prefix = "evaluations/%s/" % self.evaluation_id
+        if (
+            self.summary.relative_path != prefix + "summary.json"
+            or self.report.relative_path != prefix + "report.md"
+        ):
+            raise SchemaError("Run evaluation namespace refs have wrong paths")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "evaluation_id": self.evaluation_id,
+            "evaluation_revision": self.evaluation_revision,
+            "evaluator_execution_digest": self.evaluator_execution_digest,
+            "summary_id": self.summary_id,
+            "summary": self.summary.to_dict(),
+            "report": self.report.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class RunEvaluationBundle:
+    """Canonical Run-level report projection without filesystem path handles."""
+
+    namespace: RunEvaluationNamespace
+    _summary_json: str = field(repr=False)
+    _report: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.namespace) is not RunEvaluationNamespace:
+            raise TypeError("Run evaluation bundle namespace is invalid")
+        summary = _decoded_payload(self._summary_json)
+        if type(summary) is not dict:
+            raise ArtifactIntegrityError(
+                "Run evaluation summary snapshot is not an object"
+            )
+        if _canonical_payload_text(summary, "Run evaluation summary") != self._summary_json:
+            raise ArtifactIntegrityError(
+                "Run evaluation summary snapshot is not canonical"
+            )
+        if summary.get("summary_id") != self.namespace.summary_id:
+            raise ArtifactIntegrityError(
+                "Run evaluation summary ID differs from namespace"
+            )
+        report = _validated_artifact_text(
+            self._report,
+            "Run evaluation report",
+            allow_rendered_environment_projection=True,
+        )
+        if "\r" in report:
+            raise ArtifactIntegrityError(
+                "Run evaluation report must use canonical LF line endings"
+            )
+
+    @property
+    def summary(self) -> Dict[str, Any]:
+        value = _decoded_payload(self._summary_json)
+        if type(value) is not dict:
+            raise ArtifactIntegrityError("Run evaluation summary is not an object")
+        return value
+
+    @property
+    def report(self) -> str:
+        return self._report
+
+    def hydrate_summary(self, **sources: Any) -> Any:
+        """Replay strict report hydration against caller-supplied root sources."""
+
+        from .report import RunReportSummary, render_run_markdown
+
+        hydrated = RunReportSummary.from_dict(self.summary, **sources)
+        if render_run_markdown(hydrated) != self.report:
+            raise ArtifactIntegrityError(
+                "persisted Run report differs from source-bound summary rendering"
+            )
+        return hydrated
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "namespace": self.namespace.to_dict(),
+            "summary": self.summary,
+            "report": self.report,
+        }
 
 
 @dataclass(frozen=True)
@@ -2021,6 +2405,48 @@ class ArtifactStore:
         validate_safe_json(value, "artifact")
         return value
 
+    def _read_text(
+        self,
+        path: Path,
+        *,
+        expected: Optional[ArtifactRef] = None,
+        budget: Optional[_ReadBudget] = None,
+        maximum: Optional[int] = None,
+        context: str = "report",
+        allow_rendered_environment_projection: bool = False,
+    ) -> str:
+        active_budget = budget or _ReadBudget(self.max_total_read_bytes)
+        data = self._read_bytes(
+            path,
+            expected_sha256=None if expected is None else expected.sha256,
+            expected_size=None if expected is None else expected.size_bytes,
+            budget=active_budget,
+            maximum_bytes=maximum,
+        )
+        try:
+            text = data.decode("utf-8", "strict")
+        except UnicodeDecodeError as exc:
+            raise ArtifactIntegrityError(
+                "%s is not canonical UTF-8 text" % context
+            ) from exc
+        try:
+            _validated_artifact_text(
+                text,
+                context,
+                allow_rendered_environment_projection=(
+                    allow_rendered_environment_projection
+                ),
+            )
+        except SchemaError as exc:
+            raise ArtifactIntegrityError(
+                "%s violates the safe text boundary" % context
+            ) from exc
+        if "\r" in text:
+            raise ArtifactIntegrityError(
+                "%s must use canonical LF line endings" % context
+            )
+        return text
+
     def _artifact_ref(self, run_id: str, path: Path, data: bytes) -> ArtifactRef:
         return ArtifactRef(
             relative_path=self._run_relative(run_id, path),
@@ -2045,9 +2471,21 @@ class ArtifactStore:
         return self._artifact_ref(run_id, path, data)
 
     def _write_text(
-        self, run_id: str, relative_path: str, value: str, *, maximum: int
+        self,
+        run_id: str,
+        relative_path: str,
+        value: str,
+        *,
+        maximum: int,
+        allow_rendered_environment_projection: bool = False,
     ) -> ArtifactRef:
-        text = validate_safe_text(value, "report")
+        text = _validated_artifact_text(
+            value,
+            "report",
+            allow_rendered_environment_projection=(
+                allow_rendered_environment_projection
+            ),
+        )
         if "\r" in text:
             raise SchemaError("report must use canonical LF line endings")
         data = text.encode("utf-8", "strict")
@@ -3667,6 +4105,339 @@ class ArtifactStore:
             raise ArtifactStateError("nonterminal Trial has no committed Submission")
         return submission
 
+    @staticmethod
+    def _evaluation_base(
+        plan: TrialManifest, evaluation_id: str
+    ) -> str:
+        validate_evaluation_id_shape(evaluation_id)
+        return "cases/%s/trials/%s/evaluations/%s" % (
+            plan.case_path_id,
+            plan.trial_id,
+            evaluation_id,
+        )
+
+    def _evaluation_directory_entries(self, directory: Path) -> frozenset[str]:
+        if not os.path.lexists(directory):
+            raise ArtifactStateError("evaluation namespace is not committed")
+        self._assert_directory(directory)
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "could not inspect evaluation namespace"
+            ) from exc
+        names = set()
+        for entry in entries:
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "could not inspect evaluation namespace entry"
+                ) from exc
+            if _unsafe_node(metadata):
+                raise ArtifactSecurityError(
+                    "evaluation namespace contains a link or reparse point"
+                )
+            if entry.name == ".locks":
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise ArtifactSecurityError(
+                        "evaluation lock namespace is not a directory"
+                    )
+                self._assert_directory(Path(entry.path))
+                try:
+                    lock_entries = list(os.scandir(entry.path))
+                except OSError as exc:
+                    raise ArtifactSecurityError(
+                        "could not inspect evaluation locks"
+                    ) from exc
+                for lock_entry in lock_entries:
+                    try:
+                        lock_metadata = lock_entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise ArtifactSecurityError(
+                            "could not inspect evaluation lock"
+                        ) from exc
+                    if (
+                        lock_entry.name != "evaluation.lock"
+                        or _unsafe_node(lock_metadata)
+                        or not stat.S_ISREG(lock_metadata.st_mode)
+                    ):
+                        raise ArtifactSecurityError(
+                            "evaluation lock namespace contains an unsafe entry"
+                        )
+                names.add(entry.name)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ArtifactSecurityError(
+                    "evaluation namespace contains a special file"
+                )
+            if entry.name not in _EVALUATION_NAMESPACE_FILENAMES:
+                raise ArtifactIntegrityError(
+                    "evaluation namespace contains an unknown artifact"
+                )
+            names.add(entry.name)
+        return frozenset(names)
+
+    def _load_evaluation_bundle(
+        self,
+        bundle: _VerifiedRunBundle,
+        plan: TrialManifest,
+        evaluation_id: str,
+        *,
+        budget: _ReadBudget,
+    ) -> EvaluationArtifactBundle:
+        state, submission = self._load_trial_state(
+            bundle, plan, budget=budget
+        )
+        if state.status not in _TERMINAL_STATUSES or submission is None:
+            raise ArtifactStateError(
+                "evaluation namespace requires a terminal Submission"
+            )
+        base = self._evaluation_base(plan, evaluation_id)
+        directory = self._target(plan.run_id, base)
+        names = self._evaluation_directory_entries(directory)
+        receipt_path = "%s/receipt.json" % base
+        if "receipt.json" not in names:
+            raise ArtifactStateError(
+                "evaluation namespace has no commit receipt"
+            )
+        receipt = self._load_receipt(
+            plan.run_id,
+            receipt_path,
+            budget=budget,
+        )
+        if (
+            receipt.stage is not StageName.EVALUATOR
+            or receipt.evaluation_id != evaluation_id
+            or receipt.evaluation_revision is None
+        ):
+            raise ArtifactIntegrityError(
+                "evaluation receipt has the wrong namespace binding"
+            )
+        self._validate_receipt_binding(
+            receipt,
+            plan,
+            config_digest=receipt.config_digest,
+        )
+        refs: Dict[str, ArtifactRef] = {}
+        expected_prefix = base + "/"
+        for artifact in receipt.artifacts:
+            filename = artifact.relative_path.rsplit("/", 1)[-1]
+            if (
+                artifact.relative_path != expected_prefix + filename
+                or filename in refs
+            ):
+                raise ArtifactIntegrityError(
+                    "evaluation receipt artifact path is not canonical"
+                )
+            refs[filename] = artifact
+        required = set(_EVALUATION_JSON_ARTIFACT_NAMES)
+        actual = set(refs)
+        if (
+            not required.issubset(actual)
+            or not actual.issubset(
+                required | set(_EVALUATION_OPTIONAL_ARTIFACT_NAMES)
+            )
+        ):
+            raise ArtifactIntegrityError(
+                "evaluation receipt has an incomplete or unknown artifact set"
+            )
+        committed_files = actual | {"receipt.json"}
+        if names.difference({".locks"}) != committed_files:
+            raise ArtifactIntegrityError(
+                "evaluation namespace contains uncommitted or missing artifacts"
+            )
+
+        config_payload = self._read_json(
+            self._target(
+                plan.run_id,
+                expected_prefix + "evaluator_execution_config.json",
+            ),
+            expected=refs["evaluator_execution_config.json"],
+            budget=budget,
+        )
+        try:
+            evaluator_execution = EvaluatorExecutionConfig.from_dict(
+                config_payload
+            )
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "evaluation execution config failed strict hydration"
+            ) from exc
+        execution_digest = evaluator_execution.digest()
+        if execution_digest != receipt.config_digest:
+            raise ArtifactIntegrityError(
+                "evaluation execution config differs from receipt"
+            )
+        validate_evaluation_id(
+            evaluation_id,
+            plan.run_id,
+            execution_digest,
+            receipt.evaluation_revision,
+        )
+        evaluation_limit = self._evaluation_artifact_limit(
+            evaluator_execution
+        )
+        if refs["evaluator_execution_config.json"].size_bytes > min(
+            self.max_file_bytes, evaluation_limit
+        ):
+            raise ArtifactIntegrityError(
+                "evaluation execution config exceeds its declared file limit"
+            )
+
+        payloads: Dict[str, str] = {}
+        for filename in _EVALUATION_JSON_ARTIFACT_NAMES[1:]:
+            payload = self._read_json(
+                self._target(plan.run_id, expected_prefix + filename),
+                expected=refs[filename],
+                budget=budget,
+                maximum=evaluation_limit,
+            )
+            payloads[filename] = _canonical_payload_text(
+                payload, "evaluation artifact"
+            )
+        report = None
+        if "report.md" in refs:
+            report = self._read_text(
+                self._target(plan.run_id, expected_prefix + "report.md"),
+                expected=refs["report.md"],
+                budget=budget,
+                maximum=evaluation_limit,
+                context="evaluation report",
+            )
+        namespace = EvaluationNamespace(
+            run_id=plan.run_id,
+            task_id=plan.task_id,
+            trial_id=plan.trial_id,
+            evaluation_id=evaluation_id,
+            evaluation_revision=receipt.evaluation_revision,
+            evaluator_execution_digest=execution_digest,
+            receipt=receipt,
+        )
+        return EvaluationArtifactBundle(
+            namespace=namespace,
+            evaluator_execution=evaluator_execution,
+            submission_digest=submission.digest(),
+            canonical_case_digest=plan.canonical_case_digest,
+            trial_manifest_digest=plan.digest(),
+            _intent_matches_json=payloads["intent_matches.json"],
+            _review_matches_json=payloads["review_matches.json"],
+            _judge_input_json=payloads["judge_input.json"],
+            _judge_output_json=payloads["judge_output.json"],
+            _score_json=payloads["score.json"],
+            _report=report,
+        )
+
+    def load_evaluation_bundle(
+        self,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        evaluation_id: str,
+    ) -> EvaluationArtifactBundle:
+        """Load one receipt-committed evaluation without repairing state."""
+
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        plan = self._load_trial_manifest(
+            bundle, task_id, trial_id, budget=budget
+        )
+        return self._load_evaluation_bundle(
+            bundle,
+            plan,
+            evaluation_id,
+            budget=budget,
+        )
+
+    def load_evaluation_namespace(
+        self,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        evaluation_id: str,
+    ) -> EvaluationNamespace:
+        """Load only the verified metadata for one committed evaluation."""
+
+        return self.load_evaluation_bundle(
+            run_id,
+            task_id,
+            trial_id,
+            evaluation_id,
+        ).namespace
+
+    def list_evaluations(
+        self,
+        run_id: str,
+        task_id: Optional[str] = None,
+        trial_id: Optional[str] = None,
+    ) -> Tuple[EvaluationNamespace, ...]:
+        """List committed Trial evaluations, failing on orphan/unsafe namespaces."""
+
+        if (task_id is None) is not (trial_id is None):
+            raise ValueError("task_id and trial_id must be provided together")
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        if task_id is None:
+            plans = tuple(
+                self._load_trial_manifest(
+                    bundle,
+                    item.task_id,
+                    item.trial_id,
+                    budget=budget,
+                )
+                for item in bundle.manifest.trials
+            )
+        else:
+            assert trial_id is not None
+            plans = (
+                self._load_trial_manifest(
+                    bundle,
+                    task_id,
+                    trial_id,
+                    budget=budget,
+                ),
+            )
+        namespaces: List[EvaluationNamespace] = []
+        for plan in plans:
+            root = self._trial_dir(plan) / "evaluations"
+            self._assert_directory(root)
+            try:
+                entries = sorted(os.scandir(root), key=lambda item: item.name)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "could not inspect Trial evaluation namespaces"
+                ) from exc
+            for entry in entries:
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise ArtifactSecurityError(
+                        "could not inspect Trial evaluation namespace"
+                    ) from exc
+                if _unsafe_node(metadata) or not stat.S_ISDIR(metadata.st_mode):
+                    raise ArtifactSecurityError(
+                        "Trial evaluations contain an unsafe entry"
+                    )
+                try:
+                    evaluation_id = validate_evaluation_id_shape(entry.name)
+                except (SchemaError, ValueError) as exc:
+                    raise ArtifactIntegrityError(
+                        "Trial evaluations contain an invalid namespace ID"
+                    ) from exc
+                loaded = self._load_evaluation_bundle(
+                    bundle,
+                    plan,
+                    evaluation_id,
+                    budget=budget,
+                )
+                namespaces.append(loaded.namespace)
+        return tuple(
+            sorted(
+                namespaces,
+                key=lambda item: (item.task_id, item.trial_id, item.evaluation_id),
+            )
+        )
+
     def recover_trial(
         self, run_id: str, task_id: str, trial_id: str
     ) -> ResumePlan:
@@ -3857,9 +4628,17 @@ class ArtifactStore:
         judge_output: Any,
         score: Any,
         report: Optional[str] = None,
+        resume: bool = False,
+        overwrite: bool = False,
     ) -> StageReceipt:
         """Create a versioned evaluator namespace without touching Submission."""
 
+        if type(resume) is not bool or type(overwrite) is not bool:
+            raise TypeError("resume and overwrite must be bool values")
+        if overwrite:
+            raise ArtifactConflictError(
+                "committed evaluation artifacts are immutable"
+            )
         if not isinstance(evaluator_execution, EvaluatorExecutionConfig):
             raise TypeError(
                 "evaluator_execution must be an EvaluatorExecutionConfig"
@@ -3953,8 +4732,59 @@ class ArtifactStore:
         with self._lock(budget_lock):
             with self._lock(evaluation_lock):
                 if self._exists_regular(self._target(run_id, receipt_path)):
-                    raise ArtifactConflictError(
-                        "evaluation version is already committed"
+                    if not resume:
+                        raise ArtifactConflictError(
+                            "evaluation version is already committed"
+                        )
+                    existing = self._load_evaluation_bundle(
+                        bundle,
+                        plan,
+                        evaluation_id,
+                        budget=_ReadBudget(self.max_total_read_bytes),
+                    )
+                    expected_values = (
+                        intent_matches,
+                        review_matches,
+                        judge_input,
+                        judge_output,
+                        score,
+                    )
+                    existing_values = (
+                        existing.intent_matches,
+                        existing.review_matches,
+                        existing.judge_input,
+                        existing.judge_output,
+                        existing.score,
+                    )
+                    if (
+                        existing.evaluator_execution != evaluator_execution
+                        or existing.report != report
+                        or any(
+                            canonical_json_bytes(actual)
+                            != canonical_json_bytes(expected)
+                            for actual, expected in zip(
+                                existing_values, expected_values
+                            )
+                        )
+                    ):
+                        raise ArtifactConflictError(
+                            "committed evaluation differs from resume inputs"
+                        )
+                    return existing.receipt
+                existing_names = self._evaluation_directory_entries(
+                    self._target(run_id, base)
+                )
+                planned_names = {
+                    relative_path.rsplit("/", 1)[-1]
+                    for relative_path, _value, _data, _artifact in planned_json
+                }
+                if planned_report is not None:
+                    planned_names.add("report.md")
+                if existing_names.difference({".locks"}).difference(
+                    planned_names
+                ):
+                    raise ArtifactIntegrityError(
+                        "evaluation namespace contains an unplanned orphan artifact"
                     )
                 missing_json: List[Tuple[str, Any, bytes, ArtifactRef]] = []
                 missing_bytes = 0
@@ -4028,6 +4858,420 @@ class ArtifactStore:
                 )
         return receipt
 
+    @staticmethod
+    def _validate_run_summary_binding(
+        bundle: _VerifiedRunBundle,
+        payload: Any,
+        *,
+        evaluation_id: str,
+        evaluator_execution_digest: str,
+        evaluation_revision: str,
+    ) -> str:
+        if type(payload) is not dict:
+            raise ArtifactIntegrityError(
+                "Run evaluation summary must be a JSON object"
+            )
+        expected_fields = {
+            "schema_version",
+            "report_revision",
+            "summary_id",
+            "source_bindings",
+            "identity",
+            "coverage",
+            "partitions",
+            "cases",
+            "diagnostics",
+        }
+        if set(payload) != expected_fields:
+            raise ArtifactIntegrityError(
+                "Run evaluation summary has an invalid top-level schema"
+            )
+        # Import lazily: report.py intentionally imports ArtifactStore models.
+        from .report import REPORT_REVISION, RUN_REPORT_SUMMARY_SCHEMA_VERSION
+
+        if (
+            payload["schema_version"] != RUN_REPORT_SUMMARY_SCHEMA_VERSION
+            or payload["report_revision"] != REPORT_REVISION
+        ):
+            raise ArtifactIntegrityError(
+                "Run evaluation summary has an unsupported schema or revision"
+            )
+        source_bindings = payload["source_bindings"]
+        if type(source_bindings) is not dict:
+            raise ArtifactIntegrityError(
+                "Run evaluation summary source bindings are invalid"
+            )
+        expected_bindings = {
+            "run_id": bundle.config.run_id,
+            "run_config_digest": bundle.config.digest(),
+            "run_manifest_digest": bundle.manifest.digest(),
+            "case_snapshot_id": bundle.config.suite.case_snapshot_id,
+            "case_snapshot_digest": bundle.config.suite.case_snapshot_digest,
+            "evaluation_id": evaluation_id,
+            "evaluation_revision": evaluation_revision,
+            "evaluator_execution_digest": evaluator_execution_digest,
+        }
+        if any(
+            source_bindings.get(name) != value
+            for name, value in expected_bindings.items()
+        ):
+            raise ArtifactIntegrityError(
+                "Run evaluation summary differs from verified Run sources"
+            )
+        identity = payload["identity"]
+        if type(identity) is not dict:
+            raise ArtifactIntegrityError(
+                "Run evaluation summary identity is invalid"
+            )
+        expected_suite = {
+            "suite_id": bundle.config.suite.suite_id,
+            "suite_version": bundle.config.suite.suite_version,
+            "manifest_digest": bundle.config.suite.manifest_digest,
+            "case_snapshot_id": bundle.config.suite.case_snapshot_id,
+            "case_snapshot_digest": bundle.config.suite.case_snapshot_digest,
+        }
+        evaluator_identity = identity.get("evaluator")
+        if (
+            identity.get("suite") != expected_suite
+            or identity.get("agent") != bundle.config.agent.to_dict()
+            or type(evaluator_identity) is not dict
+            or evaluator_identity.get("execution_config_digest")
+            != evaluator_execution_digest
+            or evaluator_identity.get("evaluation_id") != evaluation_id
+            or evaluator_identity.get("evaluation_revision")
+            != evaluation_revision
+        ):
+            raise ArtifactIntegrityError(
+                "Run evaluation summary identity differs from verified sources"
+            )
+        summary_id = payload["summary_id"]
+        validate_path_segment(summary_id, "Run evaluation summary_id")
+        identity_payload = dict(payload)
+        identity_payload.pop("summary_id")
+        if summary_id != stable_id(
+            "run-report-summary-v1", identity_payload
+        ):
+            raise ArtifactIntegrityError(
+                "Run evaluation summary ID is not canonical"
+            )
+        return summary_id
+
+    def _run_evaluation_directory_entries(
+        self, directory: Path
+    ) -> frozenset[str]:
+        if not os.path.lexists(directory):
+            return frozenset()
+        self._assert_directory(directory)
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "could not inspect Run evaluation namespace"
+            ) from exc
+        names = set()
+        for entry in entries:
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "could not inspect Run evaluation artifact"
+                ) from exc
+            if _unsafe_node(metadata) or not stat.S_ISREG(metadata.st_mode):
+                raise ArtifactSecurityError(
+                    "Run evaluation namespace contains an unsafe entry"
+                )
+            if entry.name not in _RUN_EVALUATION_FILENAMES:
+                raise ArtifactIntegrityError(
+                    "Run evaluation namespace contains an unknown artifact"
+                )
+            names.add(entry.name)
+        return frozenset(names)
+
+    def load_run_evaluation(
+        self, run_id: str, evaluation_id: str
+    ) -> RunEvaluationBundle:
+        """Load one committed Run summary/report pair without repair."""
+
+        validate_evaluation_id_shape(evaluation_id)
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        base = "evaluations/%s" % evaluation_id
+        directory = self._target(run_id, base)
+        names = self._run_evaluation_directory_entries(directory)
+        if not names:
+            raise ArtifactStateError("Run evaluation namespace is not committed")
+        if names != _RUN_EVALUATION_FILENAMES:
+            raise ArtifactIntegrityError(
+                "Run evaluation namespace is incomplete"
+            )
+        summary_path = self._target(run_id, base + "/summary.json")
+        summary_payload = self._read_json(
+            summary_path,
+            budget=budget,
+        )
+        if type(summary_payload) is not dict:
+            raise ArtifactIntegrityError(
+                "Run evaluation summary must be an object"
+            )
+        source_bindings = summary_payload.get("source_bindings")
+        if type(source_bindings) is not dict:
+            raise ArtifactIntegrityError(
+                "Run evaluation summary source bindings are invalid"
+            )
+        try:
+            evaluator_execution_digest = _digest(
+                source_bindings.get("evaluator_execution_digest"),
+                "Run evaluation evaluator_execution_digest",
+            )
+            evaluation_revision = validate_path_segment(
+                source_bindings.get("evaluation_revision"),
+                "Run evaluation revision",
+            )
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "Run evaluation source identity is invalid"
+            ) from exc
+        summary_id = self._validate_run_summary_binding(
+            bundle,
+            summary_payload,
+            evaluation_id=evaluation_id,
+            evaluator_execution_digest=evaluator_execution_digest,
+            evaluation_revision=evaluation_revision,
+        )
+        report_path = self._target(run_id, base + "/report.md")
+        report = self._read_text(
+            report_path,
+            budget=budget,
+            context="Run evaluation report",
+            allow_rendered_environment_projection=True,
+        )
+        summary_data = canonical_json_bytes(summary_payload)
+        report_data = report.encode("utf-8", "strict")
+        namespace = RunEvaluationNamespace(
+            schema_version=EVAL_RUN_EVALUATION_NAMESPACE_SCHEMA_VERSION,
+            run_id=run_id,
+            evaluation_id=evaluation_id,
+            evaluation_revision=evaluation_revision,
+            evaluator_execution_digest=evaluator_execution_digest,
+            summary_id=summary_id,
+            summary=self._artifact_ref(run_id, summary_path, summary_data),
+            report=self._artifact_ref(run_id, report_path, report_data),
+        )
+        return RunEvaluationBundle(
+            namespace=namespace,
+            _summary_json=summary_data.decode("utf-8", "strict"),
+            _report=report,
+        )
+
+    def list_run_evaluations(
+        self, run_id: str
+    ) -> Tuple[RunEvaluationNamespace, ...]:
+        """List committed Run report namespaces in stable ID order."""
+
+        bundle = self._load_verified_run_bundle(run_id)
+        root = self._run_dir(bundle.config.run_id) / "evaluations"
+        self._assert_directory(root)
+        try:
+            entries = sorted(os.scandir(root), key=lambda item: item.name)
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "could not inspect Run evaluation namespaces"
+            ) from exc
+        values: List[RunEvaluationNamespace] = []
+        for entry in entries:
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "could not inspect Run evaluation namespace"
+                ) from exc
+            if _unsafe_node(metadata) or not stat.S_ISDIR(metadata.st_mode):
+                raise ArtifactSecurityError(
+                    "Run evaluations contain an unsafe entry"
+                )
+            try:
+                evaluation_id = validate_evaluation_id_shape(entry.name)
+            except (SchemaError, ValueError) as exc:
+                raise ArtifactIntegrityError(
+                    "Run evaluations contain an invalid namespace ID"
+                ) from exc
+            values.append(
+                self.load_run_evaluation(run_id, evaluation_id).namespace
+            )
+        return tuple(sorted(values, key=lambda item: item.evaluation_id))
+
+    def write_run_evaluation(
+        self,
+        run_id: str,
+        *,
+        evaluator_execution: EvaluatorExecutionConfig,
+        revision: str,
+        summary: Any,
+        report: Optional[str] = None,
+        resume: bool = False,
+        overwrite: bool = False,
+    ) -> RunEvaluationBundle:
+        """Create one immutable Run summary/report pair, summary commit marker last."""
+
+        if type(resume) is not bool or type(overwrite) is not bool:
+            raise TypeError("resume and overwrite must be bool values")
+        if overwrite:
+            raise ArtifactConflictError(
+                "Run evaluation artifacts are immutable and cannot be overwritten"
+            )
+        if type(evaluator_execution) is not EvaluatorExecutionConfig:
+            raise TypeError(
+                "evaluator_execution must be an EvaluatorExecutionConfig"
+            )
+        revision = validate_path_segment(revision, "evaluation revision")
+        from .report import RunReportSummary, render_run_markdown
+
+        if type(summary) is not RunReportSummary:
+            raise TypeError("summary must be a sealed RunReportSummary")
+        bundle = self._load_verified_run_bundle(run_id)
+        execution_digest = evaluator_execution.digest()
+        evaluation_id = derive_evaluation_id(
+            run_id, execution_digest, revision
+        )
+        summary_payload = summary.to_dict()
+        self._validate_run_summary_binding(
+            bundle,
+            summary_payload,
+            evaluation_id=evaluation_id,
+            evaluator_execution_digest=execution_digest,
+            evaluation_revision=revision,
+        )
+        rendered = render_run_markdown(summary)
+        if report is None:
+            report_text = rendered
+        else:
+            report_text = _validated_artifact_text(
+                report,
+                "Run evaluation report",
+                allow_rendered_environment_projection=True,
+            )
+            if report_text != rendered:
+                raise ArtifactIntegrityError(
+                    "Run evaluation report differs from pure summary rendering"
+                )
+        if "\r" in report_text:
+            raise SchemaError(
+                "Run evaluation report must use canonical LF line endings"
+            )
+        summary_data = canonical_json_bytes(summary_payload)
+        report_data = report_text.encode("utf-8", "strict")
+        evaluation_limit = self._evaluation_artifact_limit(
+            evaluator_execution
+        )
+        effective_limit = min(self.max_file_bytes, evaluation_limit)
+        if len(summary_data) > effective_limit or len(report_data) > effective_limit:
+            raise ArtifactIntegrityError(
+                "Run evaluation artifact exceeds its execution byte limit"
+            )
+        base = "evaluations/%s" % evaluation_id
+        summary_path = base + "/summary.json"
+        report_path = base + "/report.md"
+        summary_ref = self._planned_artifact_ref(
+            run_id, summary_path, summary_data
+        )
+        report_ref = self._planned_artifact_ref(
+            run_id, report_path, report_data
+        )
+        run_lock = self._run_dir(run_id) / ".locks" / (
+            "run-evaluation-%s.lock" % evaluation_id
+        )
+        budget_lock = self._run_dir(run_id) / ".locks" / "execution-budget.lock"
+        with self._lock(budget_lock):
+            with self._lock(run_lock):
+                directory = self._target(run_id, base)
+                names = self._run_evaluation_directory_entries(directory)
+                if names and not resume:
+                    raise ArtifactConflictError(
+                        "Run evaluation namespace already exists; use resume"
+                    )
+                if names.difference(_RUN_EVALUATION_FILENAMES):
+                    raise ArtifactIntegrityError(
+                        "Run evaluation namespace contains unknown artifacts"
+                    )
+                has_summary = "summary.json" in names
+                has_report = "report.md" in names
+                if has_summary:
+                    if not has_report:
+                        raise ArtifactIntegrityError(
+                            "committed Run summary is missing report.md"
+                        )
+                    try:
+                        self._read_bytes(
+                            self._target(run_id, summary_path),
+                            expected_sha256=summary_ref.sha256,
+                            expected_size=summary_ref.size_bytes,
+                            budget=_ReadBudget(self.max_total_read_bytes),
+                            maximum_bytes=evaluation_limit,
+                        )
+                        self._read_bytes(
+                            self._target(run_id, report_path),
+                            expected_sha256=report_ref.sha256,
+                            expected_size=report_ref.size_bytes,
+                            budget=_ReadBudget(self.max_total_read_bytes),
+                            maximum_bytes=evaluation_limit,
+                        )
+                    except ArtifactIntegrityError as exc:
+                        raise ArtifactConflictError(
+                            "existing Run evaluation differs from requested sources"
+                        ) from exc
+                    return self.load_run_evaluation(run_id, evaluation_id)
+
+                missing_bytes = len(summary_data)
+                if has_report:
+                    try:
+                        self._read_bytes(
+                            self._target(run_id, report_path),
+                            expected_sha256=report_ref.sha256,
+                            expected_size=report_ref.size_bytes,
+                            budget=_ReadBudget(self.max_total_read_bytes),
+                            maximum_bytes=evaluation_limit,
+                        )
+                    except ArtifactIntegrityError as exc:
+                        raise ArtifactConflictError(
+                            "orphan Run report differs from requested sources"
+                        ) from exc
+                else:
+                    missing_bytes += len(report_data)
+                current_bytes = self._execution_artifact_total_bytes(run_id)
+                if (
+                    current_bytes + missing_bytes
+                    > evaluator_execution.max_execution_artifact_total_bytes
+                ):
+                    raise ArtifactIntegrityError(
+                        "execution artifacts exceed the configured cumulative byte limit"
+                    )
+                if not has_report:
+                    written_report = self._write_text(
+                        run_id,
+                        report_path,
+                        report_text,
+                        maximum=evaluation_limit,
+                        allow_rendered_environment_projection=True,
+                    )
+                    if written_report != report_ref:
+                        raise ArtifactIntegrityError(
+                            "Run report publication changed its planned identity"
+                        )
+                # summary.json is the authoritative projection and commit
+                # marker.  Resume may complete an exact orphan report, but
+                # nothing writes after a committed summary.
+                written_summary = self._write_json(
+                    run_id,
+                    summary_path,
+                    summary_payload,
+                    maximum=evaluation_limit,
+                )
+                if written_summary != summary_ref:
+                    raise ArtifactIntegrityError(
+                        "Run summary publication changed its planned identity"
+                    )
+        return self.load_run_evaluation(run_id, evaluation_id)
+
 def load_existing_submission(
     runs_root: os.PathLike[str] | str,
     run_id: str,
@@ -4053,6 +5297,7 @@ __all__ = [
     "EVAL_STAGE_RECEIPT_SCHEMA_VERSION",
     "EVAL_RUN_PREFLIGHT_SCHEMA_VERSION",
     "EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION",
+    "EVAL_RUN_EVALUATION_NAMESPACE_SCHEMA_VERSION",
     "MAX_RUN_MANIFEST_BYTES",
     "MAX_TRIAL_MANIFEST_BYTES",
     "MAX_STAGE_RECEIPT_BYTES",
@@ -4080,6 +5325,10 @@ __all__ = [
     "TrialState",
     "RunState",
     "ResumePlan",
+    "EvaluationNamespace",
+    "EvaluationArtifactBundle",
+    "RunEvaluationNamespace",
+    "RunEvaluationBundle",
     "derive_receipt_id",
     "ArtifactStore",
     "load_existing_submission",

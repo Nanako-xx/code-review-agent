@@ -1,6 +1,6 @@
 # Core Code Review Eval System 实施计划
 
-**状态：** Task 1–11 已完成，下一步 Task 12（prepare/run-agent/evaluate/inspect CLI）
+**状态：** Task 1–12 已完成；按当前决定暂缓 Task 13/公共数据集，后续任务等待确认
 
 **设计来源：** `docs/superpowers/specs/2026-07-16-core-code-review-eval-system-design.md`
 
@@ -666,21 +666,21 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 **RED 测试：**
 
-- [ ] 安装脚本为 `review-agent-eval`，不把 Eval 子命令塞进产品 `review-agent` Runtime。
-- [ ] `prepare` 只准备/验证指定 Suite 和 repository cache，不运行 Agent 或 Judge。
-- [ ] `run-agent` 只产生 Submission/trace，不加载 truth evaluator、不调用 Judge。
-- [ ] `evaluate` 只读既有 immutable Submission，写 versioned matches/score/report；可更换 Judge config 重评。
-- [ ] `inspect` 展示单 Case/Trial 的 input、submission、matches、Evidence/Judge 状态和可选 trace，不泄漏 secret。
-- [ ] 所有命令支持 JSON 输出、稳定 exit code、明确 dry-run/overwrite/resume 语义。
-- [ ] 路径、Run ID、Suite ID、并行度、timeout、trial count 和 Provider 参数严格校验。
-- [ ] CLI help 清楚区分 Agent provider 与 Judge provider；Judge 配置不能误传给被测 Agent。
+- [x] 安装脚本为 `review-agent-eval`，不把 Eval 子命令塞进产品 `review-agent` Runtime。
+- [x] `prepare` 只准备/验证指定 Suite 和 repository cache，不运行 Agent 或 Judge。
+- [x] `run-agent` 只产生 Submission/trace，不加载 truth evaluator、不调用 Judge。
+- [x] `evaluate` 只读既有 immutable Submission，写 versioned matches/score/report；可更换 Judge config 重评。
+- [x] `inspect` 展示单 Case/Trial 的 source binding、submission、matches、Evidence/Judge 状态和脱敏 trace 元数据，不泄漏 secret、绝对路径或 raw Judge context。
+- [x] 所有命令支持 JSON 输出、稳定 exit code、明确 dry-run/overwrite/resume 语义。
+- [x] 路径、Run ID、Suite ID、并行度、timeout、trial count 和 Provider 参数严格校验。
+- [x] CLI help 清楚区分 Agent provider 与 Judge provider；Judge 配置不能误传给被测 Agent。
 
 **实现：**
 
-- [ ] 在 `pyproject.toml` 增加 `review-agent-eval = "review_agent_eval.cli:main"`。
-- [ ] 本 Task 完整实现 `prepare/run-agent/evaluate/inspect` 四个独立命令；`compare/calibrate` 只在 Task 15 的最终能力完成时一起加入，不提前放置占位命令。
-- [ ] Provider 构建复用现有统一 Model Adapter factory，stage label 使用 `eval-judge`，凭证只从指定环境变量读取。
-- [ ] CLI 只负责编排组件，不复制 parser/evaluator/metric 业务逻辑。
+- [x] 在 `pyproject.toml` 增加 `review-agent-eval = "review_agent_eval.cli:main"`。
+- [x] 本 Task 完整实现 `prepare/run-agent/evaluate/inspect` 四个独立命令；`compare/calibrate` 只在 Task 15 的最终能力完成时一起加入，不提前放置占位命令。
+- [x] Provider 构建复用现有统一 Model Adapter factory，stage label 使用 `eval-judge`，凭证只从指定环境变量读取。
+- [x] CLI 只负责编排组件，不复制 parser/evaluator/metric 业务逻辑。
 
 **验证：**
 
@@ -689,6 +689,8 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 ```
 
 **提交边界：** `feat(eval): expose separated harness commands`
+
+**完成记录（2026-07-18）：** Task 12 已完成。新增独立 `review-agent-eval` 入口和 `prepare/run-agent/evaluate/inspect` 四阶段 CLI；`prepare` 是唯一允许 acquisition 的阶段，`run-agent/evaluate` 只消费已验证 cache，`inspect` 仅通过 receipt-bound ArtifactStore API 读取并输出严格 metadata projection。Agent/Judge 参数命名空间、factory 与凭证完全隔离；Judge provider/model/endpoint/API-key env 通过 canonical adapter digest 绑定 EvaluatorExecutionConfig，更换 Judge 或 execution budget 会生成新 evaluation namespace。完整 committed resume 只通过 ArtifactStore 校验 Run commit 与全部 Trial receipt/hash/source binding，在加载 Suite、Git/cache 或 Judge 前直接复用；不完整 namespace 才进入 source replay。Run/Trial evaluation、summary/report 均 create-only，`--no-resume` 在模型执行前拒绝既有或 orphan namespace；dry-run 明确区分静态校验与 deferred repository/provider 检查。Inspect 不直出任意持久化 Markdown，不复制 raw Finding/Evidence/Judge context，只展示安全计数、状态、digest 和 redacted Trace metadata。Repository CACHE_ONLY 初始化/退出改为 verify-only，不创建 control roots、不 harden/chmod、不 prune retained/trash。新增 CLI、失败分类、阶段隔离、inspect 安全、精确 resume、Judge 重评和 Artifact/Repository API 回归；完整 `tests/eval` 964 collected 全量通过（仅既有平台 skip），全项目 2459 collected 通过 Eval 全量与产品分组回归完成验证；一次 Revision 单测因 basetemp 位于父 Git 仓库内产生环境假失败，改用仓库外短 basetemp 后通过。
 
 ## Wave D2：Core Case Bank 与公共 Benchmark Adapters
 

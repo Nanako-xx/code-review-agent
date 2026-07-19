@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
 from typing import Protocol
 
 from review_agent.model_adapter import (
+    DEFAULT_MAX_RESPONSE_BYTES,
+    MAX_ALLOWED_RESPONSE_BYTES,
     FakeToolCallingAdapter,
     ModelAdapter,
     OpenAICompatibleConfig,
@@ -26,6 +29,30 @@ class ModelAdapterConfig:
     base_url: str | None
     api_key_env: str
     stage_label: str = "reviewer"
+    # These optional fields are runtime-only adapter budgets.  ``None`` keeps
+    # the historical OpenAI-compatible defaults and therefore preserves the
+    # product callers' existing behavior.  The Eval boundary supplies the
+    # Judge budgets explicitly; the API key is intentionally not a field here.
+    timeout_seconds: int | float | None = None
+    max_response_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.timeout_seconds is not None and (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or not math.isfinite(self.timeout_seconds)
+            or self.timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be a positive finite number")
+        if self.max_response_bytes is not None and (
+            type(self.max_response_bytes) is not int
+            or self.max_response_bytes < 1
+            or self.max_response_bytes > MAX_ALLOWED_RESPONSE_BYTES
+        ):
+            raise ValueError(
+                "max_response_bytes must be a positive integer no greater than "
+                f"{MAX_ALLOWED_RESPONSE_BYTES}"
+            )
 
 
 class ModelAdapterFactory(Protocol):
@@ -55,7 +82,11 @@ def build_model_adapter_factory_from_config(
     config: ModelAdapterConfig,
     *,
     stage_label: str | None = None,
+    timeout_seconds: int | float | None = None,
+    max_response_bytes: int | None = None,
 ) -> ModelAdapterFactory | None:
+    if not isinstance(config, ModelAdapterConfig):
+        raise TypeError("config must be a ModelAdapterConfig")
     stage_label = config.stage_label if stage_label is None else stage_label
     option_prefix = _option_prefix(stage_label)
     provider_name = config.provider_name or "none"
@@ -79,11 +110,31 @@ def build_model_adapter_factory_from_config(
             raise AdapterConfigError(
                 f"--{option_prefix}-base-url is required for openai-compatible provider"
             )
+        configured_timeout = (
+            config.timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        configured_response_limit = (
+            config.max_response_bytes
+            if max_response_bytes is None
+            else max_response_bytes
+        )
+        # Let OpenAICompatibleConfig perform the canonical finite/positive
+        # validation, but use the product defaults when no Eval budget was
+        # supplied.  This is deliberately resolved only after the provider
+        # and credential checks, so old callers retain their error ordering.
+        if configured_timeout is None:
+            configured_timeout = 60
+        if configured_response_limit is None:
+            configured_response_limit = DEFAULT_MAX_RESPONSE_BYTES
         return OpenAICompatibleModelAdapterFactory(
             OpenAICompatibleConfig(
                 base_url=config.base_url,
                 api_key=api_key,
                 model=config.model,
+                timeout_seconds=configured_timeout,
+                max_response_bytes=configured_response_limit,
             )
         )
     raise AdapterConfigError(f"unsupported {option_prefix} provider: {provider_name}")
