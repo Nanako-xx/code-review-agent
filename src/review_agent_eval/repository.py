@@ -179,6 +179,83 @@ class RepositoryLimitError(RepositoryPolicyError):
     """A fixed repository path or resource budget was exceeded."""
 
 
+class RepositoryMode(str, Enum):
+    """Whether repository sources may be acquired or only replayed from cache."""
+
+    ACQUIRE = "acquire"
+    CACHE_ONLY = "cache_only"
+
+
+class RepositoryCacheStatus(str, Enum):
+    """Stable result of a non-acquiring repository cache probe."""
+
+    AVAILABLE = "available"
+    MISSING = "missing"
+
+
+@dataclass(frozen=True)
+class CacheCheck:
+    """Path-free result of validating one canonical repository cache binding.
+
+    Corrupt, ambiguous, or unsafe cache state is never represented as a status:
+    those conditions fail closed with the corresponding repository exception.
+    ``MISSING`` therefore means only that no matching committed request index
+    exists for the descriptor and current verified Git executable.
+    """
+
+    repository_descriptor_digest: str
+    status: RepositoryCacheStatus
+    request_id: Optional[str] = None
+    cache_id: Optional[str] = None
+    prepared_repository_id: Optional[str] = None
+    manifest_digest: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        _digest(
+            self.repository_descriptor_digest,
+            "cache check.repository_descriptor_digest",
+        )
+        if not isinstance(self.status, RepositoryCacheStatus):
+            raise TypeError("cache check status must be a RepositoryCacheStatus")
+        values = (
+            self.request_id,
+            self.cache_id,
+            self.prepared_repository_id,
+            self.manifest_digest,
+        )
+        if self.status is RepositoryCacheStatus.MISSING:
+            if any(value is not None for value in values):
+                raise ValueError("missing cache check may not claim cache identity")
+            return
+        if any(value is None for value in values):
+            raise ValueError("available cache check requires complete cache identity")
+        assert self.request_id is not None
+        assert self.cache_id is not None
+        assert self.prepared_repository_id is not None
+        assert self.manifest_digest is not None
+        _identifier(self.request_id, "cache check.request_id")
+        _identifier(self.cache_id, "cache check.cache_id")
+        _identifier(
+            self.prepared_repository_id,
+            "cache check.prepared_repository_id",
+        )
+        _digest(self.manifest_digest, "cache check.manifest_digest")
+
+    @property
+    def available(self) -> bool:
+        return self.status is RepositoryCacheStatus.AVAILABLE
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "repository_descriptor_digest": self.repository_descriptor_digest,
+            "status": self.status.value,
+            "request_id": self.request_id,
+            "cache_id": self.cache_id,
+            "prepared_repository_id": self.prepared_repository_id,
+            "manifest_digest": self.manifest_digest,
+        }
+
+
 class WorkspaceRetentionPolicy(str, Enum):
     DELETE_ALWAYS = "delete_always"
     RETAIN_ON_FAILURE = "retain_on_failure"
@@ -1652,6 +1729,24 @@ def _secure_control_directory_authority(path: Path, context: str) -> None:
         raise RepositorySecurityError("%s permissions are not private" % context)
 
 
+def _verify_control_directory_authority(path: Path, context: str) -> None:
+    """Verify an already prepared control root without changing ACL/mode bits."""
+
+    info = _assert_secure_directory(path, context)
+    if os.name == "nt":
+        if _windows_path_owner_sid(path) != _windows_current_user_sid():
+            raise RepositorySecurityError(
+                "%s must be owned by the current user" % context
+            )
+        return
+    current = int(getattr(os, "geteuid", lambda: -1)())
+    owner = int(getattr(info, "st_uid", -2))
+    if owner != current or info.st_mode & 0o077:
+        raise RepositorySecurityError(
+            "%s permissions are not private" % context
+        )
+
+
 def _assert_suite_directory_authority(path: Path) -> None:
     info = _assert_secure_directory(path, "repository Suite root")
     if os.name == "nt":
@@ -2220,22 +2315,33 @@ class _GitRunner:
         *,
         git_executable: os.PathLike[str] | str,
         timeout_seconds: float = DEFAULT_GIT_TIMEOUT_SECONDS,
+        create_control_roots: bool = True,
     ) -> None:
+        if type(create_control_roots) is not bool:
+            raise TypeError("create_control_roots must be a bool")
         self.control_root = _ensure_secure_directory(
-            control_root, create=True, context="Git control root"
+            control_root,
+            create=create_control_roots,
+            context="Git control root",
         )
         self.tmp_root = _ensure_secure_directory(
-            self.control_root / "tmp", create=True, context="Git temporary root"
+            self.control_root / "tmp",
+            create=create_control_roots,
+            context="Git temporary root",
         )
         self.home = _ensure_secure_directory(
-            self.control_root / "home", create=True, context="Git isolated home"
+            self.control_root / "home",
+            create=create_control_roots,
+            context="Git isolated home",
         )
         self.config_home = _ensure_secure_directory(
-            self.control_root / "config", create=True, context="Git isolated config"
+            self.control_root / "config",
+            create=create_control_roots,
+            context="Git isolated config",
         )
         self.hooks = _ensure_secure_directory(
             self.control_root / "hooks-disabled",
-            create=True,
+            create=create_control_roots,
             context="Git disabled hooks root",
         )
         executable_path = _absolute_path(git_executable)
@@ -5312,6 +5418,7 @@ class RepositoryPreparer:
         git_executable: os.PathLike[str] | str,
         allow_remote: bool = False,
         acquisition_bindings: Iterable[RepositoryAcquisitionBinding] = (),
+        repository_mode: RepositoryMode = RepositoryMode.ACQUIRE,
         retention_policy: WorkspaceRetentionPolicy = WorkspaceRetentionPolicy.DELETE_ALWAYS,
         max_retained_workspaces: int = DEFAULT_MAX_RETAINED_WORKSPACES,
         max_retained_bytes: int = DEFAULT_MAX_RETAINED_BYTES,
@@ -5321,6 +5428,8 @@ class RepositoryPreparer:
     ) -> None:
         if type(allow_remote) is not bool:
             raise TypeError("allow_remote must be a bool")
+        if not isinstance(repository_mode, RepositoryMode):
+            raise TypeError("repository_mode must be a RepositoryMode")
         if not isinstance(retention_policy, WorkspaceRetentionPolicy):
             raise TypeError("retention_policy must be a WorkspaceRetentionPolicy")
         if type(max_retained_workspaces) is not int or not (
@@ -5356,23 +5465,30 @@ class RepositoryPreparer:
         suite = _ensure_secure_directory(
             suite, create=False, context="repository Suite root"
         )
+        create_control_roots = repository_mode is RepositoryMode.ACQUIRE
         data = _ensure_secure_directory(
-            data, create=True, context="repository .eval-data root"
+            data,
+            create=create_control_roots,
+            context="repository .eval-data root",
         )
         workspaces = _ensure_secure_directory(
-            workspaces, create=True, context="repository .eval-workspaces root"
+            workspaces,
+            create=create_control_roots,
+            context="repository .eval-workspaces root",
         )
         _assert_suite_directory_authority(suite)
-        _secure_control_directory_authority(
-            data, "repository .eval-data root"
+        authority_check = (
+            _secure_control_directory_authority
+            if create_control_roots
+            else _verify_control_directory_authority
         )
-        _secure_control_directory_authority(
-            workspaces, "repository .eval-workspaces root"
-        )
+        authority_check(data, "repository .eval-data root")
+        authority_check(workspaces, "repository .eval-workspaces root")
         self.suite_root = suite
         self.data_root = data
         self.workspace_root = workspaces
         self.allow_remote = allow_remote
+        self.repository_mode = repository_mode
         self.retention_policy = retention_policy
         self.max_retained_workspaces = max_retained_workspaces
         self.max_retained_bytes = max_retained_bytes
@@ -5387,36 +5503,51 @@ class RepositoryPreparer:
         }
 
         self.cache_root = _ensure_secure_directory(
-            data / "repositories", create=True, context="repository cache root"
+            data / "repositories",
+            create=create_control_roots,
+            context="repository cache root",
         )
         self.index_root = _ensure_secure_directory(
-            data / "indexes", create=True, context="repository index root"
+            data / "indexes",
+            create=create_control_roots,
+            context="repository index root",
         )
         self.staging_root = _ensure_secure_directory(
-            data / ".staging", create=True, context="repository staging root"
+            data / ".staging",
+            create=create_control_roots,
+            context="repository staging root",
         )
         self.lock_root = _ensure_secure_directory(
-            data / ".locks", create=True, context="repository lock root"
+            data / ".locks",
+            create=create_control_roots,
+            context="repository lock root",
         )
         self.reservation_root = _ensure_secure_directory(
             data / ".reservations",
-            create=True,
+            create=create_control_roots,
             context="repository reservation root",
         )
         self.data_store_lock_path = self.lock_root / "data-store.lock"
         self.active_root = _ensure_secure_directory(
-            workspaces / "active", create=True, context="active workspace root"
+            workspaces / "active",
+            create=create_control_roots,
+            context="active workspace root",
         )
         self.retained_root = _ensure_secure_directory(
-            workspaces / "retained", create=True, context="retained workspace root"
+            workspaces / "retained",
+            create=create_control_roots,
+            context="retained workspace root",
         )
         self.trash_root = _ensure_secure_directory(
-            workspaces / ".trash", create=True, context="workspace trash root"
+            workspaces / ".trash",
+            create=create_control_roots,
+            context="workspace trash root",
         )
         self._runner = _GitRunner(
             data / ".git-control",
             git_executable=git_executable,
             timeout_seconds=git_timeout_seconds,
+            create_control_roots=create_control_roots,
         )
         bindings: Dict[str, RepositoryAcquisitionBinding] = {}
         for binding in acquisition_bindings:
@@ -5429,9 +5560,12 @@ class RepositoryPreparer:
                 raise ValueError("duplicate repository acquisition binding")
             bindings[binding_repository_digest] = binding
         self._acquisition_bindings = bindings
-        if self.allow_remote:
+        if (
+            self.allow_remote
+            and self.repository_mode is RepositoryMode.ACQUIRE
+        ):
             self._runner.require_curlopt_resolve()
-        if os.name == "nt":
+        if os.name == "nt" and create_control_roots:
             for controlled_root, controlled_context in (
                 (self.cache_root, "repository cache tree"),
                 (self.index_root, "repository index tree"),
@@ -5470,11 +5604,15 @@ class RepositoryPreparer:
         )
         self._closed = False
         try:
-            self._prune_reservations()
-            self._prune_staging()
-            self._prune_orphan_caches()
-            self._prune_trash()
-            self._prune_retained()
+            # Cache-only consumers may create Trial workspaces, but they must
+            # never repair, prune, acquire, or publish repository source data.
+            # Prepare-mode startup retains the existing crash recovery policy.
+            if self.repository_mode is RepositoryMode.ACQUIRE:
+                self._prune_reservations()
+                self._prune_staging()
+                self._prune_orphan_caches()
+                self._prune_trash()
+                self._prune_retained()
             self._assert_data_root_budget()
         except BaseException:
             for handle in reversed(self._windows_root_handles):
@@ -5493,7 +5631,8 @@ class RepositoryPreparer:
         try:
             for lease in list(self._active_leases.values()):
                 lease.close()
-            self._prune_trash()
+            if self.repository_mode is RepositoryMode.ACQUIRE:
+                self._prune_trash()
         finally:
             self._closed = True
             for handle in reversed(self._windows_root_handles):
@@ -5822,6 +5961,169 @@ class RepositoryPreparer:
             )
         self._runner.require_curlopt_resolve()
         return binding
+
+    def _cache_binding_for(
+        self, descriptor: Repository
+    ) -> Optional[RepositoryAcquisitionBinding]:
+        """Resolve configured provenance without authorizing source acquisition."""
+
+        if descriptor.url is None:
+            return None
+        try:
+            _validate_https_url(descriptor.url)
+        except SchemaError as exc:
+            raise RepositorySecurityError(
+                "cached remote repository URL violates the HTTPS credential-free policy"
+            ) from exc
+        binding = self._acquisition_bindings.get(descriptor.digest())
+        if binding is not None and binding.repository != descriptor:
+            raise RepositoryIntegrityError(
+                "cached remote acquisition binding does not match Repository"
+            )
+        return binding
+
+    def _scan_cache_indexes(
+        self,
+        *,
+        repository_descriptor_digest: str,
+    ) -> Tuple[Dict[str, Any], ...]:
+        """Read matching committed indexes without repairing the index tree."""
+
+        try:
+            entries = sorted(
+                os.scandir(self.index_root), key=lambda item: item.name
+            )
+        except OSError as exc:
+            raise RepositorySecurityError(
+                "could not inspect repository cache indexes"
+            ) from exc
+        matches: List[Dict[str, Any]] = []
+        for entry in entries:
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise RepositorySecurityError(
+                    "could not inspect repository cache index"
+                ) from exc
+            if re.fullmatch(
+                r"\..+\.json\.[0-9a-f]{32}\.tmp", entry.name
+            ):
+                if _is_link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
+                    raise RepositorySecurityError(
+                        "repository cache-index temp entry is unsafe"
+                    )
+                # A cache-only process never adopts or removes an interrupted
+                # writer's temporary control file.
+                continue
+            if (
+                _is_link_or_reparse(info)
+                or not stat.S_ISREG(info.st_mode)
+                or not entry.name.endswith(".json")
+            ):
+                raise RepositorySecurityError(
+                    "repository cache index tree contains an unsafe entry"
+                )
+            index = _load_cache_index(Path(entry.path))
+            if (
+                index["repository_descriptor_digest"]
+                == repository_descriptor_digest
+                and index["git_version"] == self._runner.version
+                and index["git_executable_sha256"]
+                == self._runner.executable_sha256
+            ):
+                matches.append(index)
+        return tuple(matches)
+
+    def _cached_index_for(
+        self, descriptor: Repository
+    ) -> Optional[Tuple[Dict[str, Any], Optional[str]]]:
+        """Locate one exact request index without accessing the source."""
+
+        repository_descriptor_digest = descriptor.digest()
+        binding = self._cache_binding_for(descriptor)
+        binding_digest = None if binding is None else binding.digest()
+        if descriptor.url is None or binding is not None:
+            request_id = _request_id(
+                repository_descriptor_digest,
+                binding_digest,
+                self._runner.version,
+                self._runner.executable_sha256,
+            )
+            index_path = self.index_root / (request_id + ".json")
+            if not os.path.lexists(index_path):
+                return None
+            return _load_cache_index(index_path), binding_digest
+
+        # A post-prepare process may intentionally receive no remote
+        # acquisition authority.  It may reuse a single already-attested
+        # binding, but ambiguity is never resolved by guessing.
+        candidates = self._scan_cache_indexes(
+            repository_descriptor_digest=repository_descriptor_digest,
+        )
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise RepositoryIntegrityError(
+                "cached repository acquisition binding is ambiguous"
+            )
+        candidate = candidates[0]
+        candidate_binding_digest = candidate["acquisition_binding_digest"]
+        if candidate_binding_digest is None:
+            raise RepositoryIntegrityError(
+                "cached remote repository lacks acquisition provenance"
+            )
+        return candidate, candidate_binding_digest
+
+    def _load_cached_descriptor(
+        self, descriptor: Repository
+    ) -> Optional[Tuple[PreparedRepository, Dict[str, Any]]]:
+        located = self._cached_index_for(descriptor)
+        if located is None:
+            return None
+        index, acquisition_binding_digest = located
+        prepared = self._load_cached_from_index(
+            index,
+            expected_request_id=index["request_id"],
+            repository=descriptor,
+            acquisition_binding_digest=acquisition_binding_digest,
+        )
+        return prepared, index
+
+    def check_cached(self, descriptor: Repository) -> CacheCheck:
+        """Validate cache availability without acquiring or publishing source data."""
+
+        self._require_open()
+        if not isinstance(descriptor, Repository):
+            raise TypeError("descriptor must be the canonical Repository")
+        repository_descriptor_digest = descriptor.digest()
+        loaded = self._load_cached_descriptor(descriptor)
+        if loaded is None:
+            return CacheCheck(
+                repository_descriptor_digest=repository_descriptor_digest,
+                status=RepositoryCacheStatus.MISSING,
+            )
+        prepared, index = loaded
+        return CacheCheck(
+            repository_descriptor_digest=repository_descriptor_digest,
+            status=RepositoryCacheStatus.AVAILABLE,
+            request_id=index["request_id"],
+            cache_id=prepared.cache_id,
+            prepared_repository_id=prepared.manifest.prepared_repository_id,
+            manifest_digest=index["manifest_digest"],
+        )
+
+    def require_cached(self, descriptor: Repository) -> PreparedRepository:
+        """Return a fully verified cached repository or fail without acquisition."""
+
+        self._require_open()
+        if not isinstance(descriptor, Repository):
+            raise TypeError("descriptor must be the canonical Repository")
+        loaded = self._load_cached_descriptor(descriptor)
+        if loaded is None:
+            raise RepositoryPreparationError(
+                "repository cache is not prepared; run prepare first"
+            )
+        return loaded[0]
 
     def _load_cached_bundle_from_index(
         self,
@@ -6195,11 +6497,20 @@ class RepositoryPreparer:
             verify_cache,
         )
 
+    def open_replay_for(
+        self, descriptor: Repository
+    ) -> PreparedRepositoryReplay:
+        """Open read-only base/head replay from an existing verified cache only."""
+
+        return self.open_replay(self.require_cached(descriptor))
+
     def prepare(self, descriptor: Repository) -> PreparedRepository:
         self._require_open()
-        self._assert_data_root_budget()
         if not isinstance(descriptor, Repository):
             raise TypeError("descriptor must be the canonical Repository")
+        if self.repository_mode is RepositoryMode.CACHE_ONLY:
+            return self.require_cached(descriptor)
+        self._assert_data_root_budget()
         binding = self._binding_for(descriptor)
         repository_descriptor_digest = descriptor.digest()
         binding_digest = None if binding is None else binding.digest()
@@ -6582,13 +6893,16 @@ class RepositoryPreparer:
 
 __all__ = [
     "BuiltFixtureRepository",
+    "CacheCheck",
     "FixtureRepositoryBuilder",
     "PreparedRepository",
     "PreparedRepositoryManifest",
     "PreparedRepositoryReplay",
     "RepositoryAcquisitionBinding",
+    "RepositoryCacheStatus",
     "RepositoryIntegrityError",
     "RepositoryLimitError",
+    "RepositoryMode",
     "RepositoryPolicyError",
     "RepositoryPreparer",
     "RepositoryPreparationError",

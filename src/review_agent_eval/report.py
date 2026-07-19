@@ -1260,14 +1260,15 @@ class ReportBuilder:
             )
         except (SchemaError, ValueError) as exc:
             raise _error(str(exc)) from exc
-        if (
-            evaluator_execution.evaluator_config_digest
-            != run_config.evaluator_config_digest
-            or evaluator_execution.evaluator != run_config.evaluator
-        ):
-            raise _error(
-                "Evaluator execution does not match the immutable Run evaluator"
-            )
+        # The immutable Run stores the evaluator snapshot that was current
+        # when Agent execution was planned, but evaluator/Judge identity is
+        # deliberately absent from the Run ID.  Re-evaluation may therefore
+        # supply a different, fully versioned EvaluatorExecutionConfig.  Its
+        # digest plus ``evaluation_revision`` creates a new evaluation ID and
+        # every downstream result/receipt is source-bound to that execution.
+        # Requiring equality with ``run_config.evaluator`` here would make the
+        # documented "change Judge without rerunning the Agent" workflow
+        # impossible.
         execution_digest = evaluator_execution.digest()
         evaluation_id = derive_evaluation_id(
             run_config.run_id,
@@ -3098,7 +3099,7 @@ def render_trial_markdown(inspection: TrialInspection) -> str:
         for receipt in timeline:
             lines.append(
                 f"- `{receipt.get('stage')}` receipt `{receipt.get('receipt_id')}` "
-                f"status=`{receipt.get('terminal_status')}`"
+                f"status: `{receipt.get('terminal_status')}`"
             )
     else:
         lines.append("No stage receipts were supplied in this projection.")
@@ -3110,8 +3111,8 @@ def render_trial_markdown(inspection: TrialInspection) -> str:
             continue
         evaluation_payload = evaluation.get("payload", {})
         lines.append(
-            f"- {label}: status=`{evaluation_payload.get('status')}`, "
-            f"digest=`{evaluation.get('source_digest')}`"
+            f"- {label}: status: `{evaluation_payload.get('status')}`, "
+            f"digest: `{evaluation.get('source_digest')}`"
         )
     lines.append("")
     lines.extend(["## Judge receipts", ""])
@@ -3119,10 +3120,10 @@ def render_trial_markdown(inspection: TrialInspection) -> str:
     for phase in sorted(judge_refs):
         refs = judge_refs[phase]
         lines.append(
-            f"- {phase}: requests={len(refs.get('requests', []))}, "
-            f"decisions={len(refs.get('decisions', []))}, "
-            f"failures={len(refs.get('failures', []))}, "
-            f"ungraded={len(refs.get('ungraded', []))}"
+            f"- {phase}: requests: {len(refs.get('requests', []))}, "
+            f"decisions: {len(refs.get('decisions', []))}, "
+            f"failures: {len(refs.get('failures', []))}, "
+            f"ungraded: {len(refs.get('ungraded', []))}"
         )
     lines.extend(["", "## Evidence diagnostics", ""])
     lines.append(f"- Finding Evidence records: {len(payload.get('evidence_diagnostics', []))}")
