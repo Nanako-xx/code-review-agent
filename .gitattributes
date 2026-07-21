@@ -4,3 +4,4 @@ eval/annotation-guidelines.md text eol=lf
 eval/authoring/*.py text eol=lf
 eval/human-reviews/** text eol=lf
 tests/eval/test_core*.py text eol=lf
+tests/eval/fixtures/public_datasets/** text eol=lf
