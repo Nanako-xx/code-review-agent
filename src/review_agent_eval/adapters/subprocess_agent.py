@@ -866,6 +866,7 @@ def _failed_submission(
     *,
     eval_input: EvalInput,
     config: AgentRunConfig,
+    target_materialization_id: str,
     code: FailureCode,
     elapsed_seconds: float,
     retryable: bool,
@@ -873,6 +874,7 @@ def _failed_submission(
     return failure_submission(
         eval_input=eval_input,
         config=config,
+        target_materialization_id=target_materialization_id,
         code=code,
         message=_FAILURE_MESSAGES[code],
         retryable=retryable,
@@ -901,6 +903,7 @@ class SubprocessAgentAdapter:
         config: AgentRunConfig,
         clarification_channel: ClarificationChannel,
         *,
+        target_materialization_id: str,
         cancel_event: Optional[threading.Event] = None,
     ) -> EvalSubmission:
         del clarification_channel  # Generic v1 is one-shot and has no channel wire.
@@ -936,6 +939,7 @@ class SubprocessAgentAdapter:
             return _failed_submission(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.ADAPTER_ERROR,
                 elapsed_seconds=time.monotonic() - started,
                 retryable=False,
@@ -944,6 +948,7 @@ class SubprocessAgentAdapter:
             return _failed_submission(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.ADAPTER_ERROR,
                 elapsed_seconds=time.monotonic() - started,
                 retryable=True,
@@ -963,6 +968,7 @@ class SubprocessAgentAdapter:
             return _failed_submission(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.ADAPTER_ERROR,
                 elapsed_seconds=time.monotonic() - started,
                 retryable=True,
@@ -972,6 +978,7 @@ class SubprocessAgentAdapter:
             return _failed_submission(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=result.failure_code,
                 elapsed_seconds=elapsed,
                 retryable=result.failure_code
@@ -986,6 +993,7 @@ class SubprocessAgentAdapter:
             return _failed_submission(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.ADAPTER_ERROR,
                 elapsed_seconds=elapsed,
                 retryable=True,
@@ -999,6 +1007,7 @@ class SubprocessAgentAdapter:
             return _failed_submission(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=code,
                 elapsed_seconds=elapsed,
                 retryable=code is FailureCode.PROCESS_KILLED,
@@ -1009,6 +1018,7 @@ class SubprocessAgentAdapter:
                 result.stdout,
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 clarification_transcript=(),
             )
             submission = validate_submission_trace(
@@ -1030,6 +1040,7 @@ class SubprocessAgentAdapter:
             return _failed_submission(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=code,
                 elapsed_seconds=time.monotonic() - started,
                 retryable=False,
@@ -1038,6 +1049,7 @@ class SubprocessAgentAdapter:
             return _failed_submission(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.ADAPTER_ERROR,
                 elapsed_seconds=time.monotonic() - started,
                 retryable=True,

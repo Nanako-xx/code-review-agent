@@ -50,7 +50,6 @@ HEAD = "b" * 40
 EMPTY_HASH = hashlib.sha256(b"").hexdigest()
 CI_TEXT = "tests passed"
 CI_HASH = hashlib.sha256(CI_TEXT.encode("utf-8")).hexdigest()
-INPUT_DIGEST = "d" * 64
 MATERIALIZATION_ID = "materialization-001"
 
 
@@ -144,7 +143,7 @@ def submission_payload() -> dict:
         "task_id": "task-001",
         "agent_id": "agent-current",
         "trial_id": "trial-001",
-        "eval_input_digest": INPUT_DIGEST,
+        "eval_input_digest": EvalInput.from_dict(input_payload()).digest(),
         "target_materialization_id": MATERIALIZATION_ID,
         "status": "completed",
         "intent": intent_payload(),
@@ -1014,8 +1013,30 @@ def test_canonical_json_and_full_sha256_ids_are_stable_and_json_ready_only() -> 
     assert canonical_sha256(value) == hashlib.sha256(expected.encode("utf-8")).hexdigest()
 
     derived = stable_id("finding", "eval_submission_v2", {"claim": "x"})
+    assert derived == (
+        "finding-01f0a36e533b474486b4f7eab76f4db9"
+        "10c7cb73be7599d69f1f4b182671fd9b"
+    )
+    v1_payload = {
+        "namespace": "review_agent_eval.identity_v1",
+        "kind": "finding",
+        "identity": ["eval_submission_v2", {"claim": "x"}],
+    }
+    v1_vector = "finding-" + hashlib.sha256(
+        json.dumps(
+            v1_payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert v1_vector == (
+        "finding-0e0ccba55dc4a108d45f4d944a20f3c0"
+        "7df22fee0c45884e8206a52d929c609d"
+    )
     assert re.fullmatch(r"finding-[0-9a-f]{64}", derived)
-    assert derived == stable_id("finding", "eval_submission_v2", {"claim": "x"})
+    assert derived != v1_vector
     assert derived != stable_id("finding", "eval_submission_v2", {"claim": "y"})
 
     with pytest.raises(SchemaError):

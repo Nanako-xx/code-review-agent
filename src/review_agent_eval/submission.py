@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import stat
@@ -11,6 +10,7 @@ from typing import Any, Iterable, Optional, Tuple
 from .adapters.base import AgentAdapterError, AgentRunConfig
 from .models import (
     EVAL_SUBMISSION_SCHEMA_VERSION,
+    MAX_EVAL_SUBMISSION_BYTES,
     EvalInput,
     EvalSubmission,
     FailureCode,
@@ -23,6 +23,7 @@ from .models import (
     SubmissionStatus,
     SubmissionUsage,
     TraceRef,
+    _strict_json_loads,
     submission_status_for_failure,
 )
 
@@ -57,6 +58,16 @@ def failure_submission(
 ) -> EvalSubmission:
     """Build the one legal terminal status associated with ``code``."""
 
+    if not isinstance(eval_input, EvalInput):
+        raise TypeError("eval_input must be EvalInput")
+    if not isinstance(config, AgentRunConfig):
+        raise TypeError("config must be AgentRunConfig")
+    if eval_input.task_id != config.task_id:
+        raise SchemaError("failure submission eval_input task does not match config")
+    if eval_input.digest() != config.eval_input_digest:
+        raise SchemaError(
+            "failure submission eval_input_digest does not match config"
+        )
     status = submission_status_for_failure(code)
     if (
         status is SubmissionStatus.INVALID_OUTPUT
@@ -166,24 +177,27 @@ def parse_submission_output(
 
     if type(data) is not bytes:
         raise TypeError("Agent output must be bytes")
+    maximum = min(config.max_output_bytes, MAX_EVAL_SUBMISSION_BYTES)
+    if len(data) > maximum:
+        raise AgentAdapterError(
+            FailureCode.OUTPUT_OVERFLOW,
+            "Agent output exceeds its byte limit",
+            retryable=False,
+        )
     try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
+        payload = _strict_json_loads(
+            data,
+            MAX_EVAL_SUBMISSION_BYTES,
+            "EvalSubmission JSON",
+        )
+    except SchemaError as exc:
         raise AgentAdapterError(
             FailureCode.INVALID_JSON,
-            "Agent output is not valid UTF-8 JSON",
+            "Agent output is not one strict UTF-8 JSON document",
             retryable=False,
         ) from exc
     try:
-        json.loads(text)
-    except (json.JSONDecodeError, RecursionError) as exc:
-        raise AgentAdapterError(
-            FailureCode.INVALID_JSON,
-            "Agent output is not one valid JSON document",
-            retryable=False,
-        ) from exc
-    try:
-        submission = EvalSubmission.from_json(data)
+        submission = EvalSubmission.from_dict(payload)
     except (SchemaError, UnicodeError, ValueError, RecursionError) as exc:
         raise AgentAdapterError(
             FailureCode.SCHEMA_MISMATCH,

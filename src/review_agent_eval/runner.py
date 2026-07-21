@@ -602,6 +602,8 @@ def _invoke_adapter(
     config: AgentRunConfig,
     clarification_channel: ClarificationChannel,
     cancel_event: Any,
+    *,
+    target_materialization_id: str,
 ) -> EvalSubmission:
     if _adapter_supports_cancellation(adapter):
         return adapter.run(
@@ -609,9 +611,16 @@ def _invoke_adapter(
             workspace,
             config,
             clarification_channel,
+            target_materialization_id=target_materialization_id,
             cancel_event=cancel_event,
         )
-    return adapter.run(eval_input, workspace, config, clarification_channel)
+    return adapter.run(
+        eval_input,
+        workspace,
+        config,
+        clarification_channel,
+        target_materialization_id=target_materialization_id,
+    )
 
 
 def _failure_message(code: FailureCode) -> str:
@@ -621,7 +630,7 @@ def _failure_message(code: FailureCode) -> str:
         FailureCode.PROCESS_KILLED: "Agent execution was interrupted or killed",
         FailureCode.OUTPUT_OVERFLOW: "Agent output exceeded its configured limit",
         FailureCode.INVALID_JSON: "Agent output was not valid JSON",
-        FailureCode.SCHEMA_MISMATCH: "Agent output did not match EvalSubmission v1",
+        FailureCode.SCHEMA_MISMATCH: "Agent output did not match EvalSubmission v2",
         FailureCode.CLARIFICATION_REQUIRED: "Agent requires clarification",
         FailureCode.AGENT_BLOCKED: "Agent reported a blocked execution",
         FailureCode.ADAPTER_ERROR: "Agent Adapter failed at its execution boundary",
@@ -2274,6 +2283,10 @@ class EvalRunner:
                 workspace_binding_id = getattr(
                     getattr(entered, "manifest", None), "workspace_binding_id", None
                 )
+                if type(workspace_binding_id) is not str or not workspace_binding_id:
+                    raise RunnerError(
+                        "workspace did not expose a canonical target materialization ID"
+                    )
                 if not isinstance(workspace, Path):
                     raise RunnerError("workspace handle did not provide a Path")
                 workspace = workspace.resolve(strict=True)
@@ -2294,6 +2307,7 @@ class EvalRunner:
                         eval_input,
                         binding,
                         FailureCode.PROCESS_KILLED,
+                        target_materialization_id=workspace_binding_id,
                         elapsed=time.monotonic() - started,
                         retryable=False,
                     )
@@ -2309,12 +2323,14 @@ class EvalRunner:
                             binding,
                             controller.channel,
                             cancel_event,
+                            target_materialization_id=workspace_binding_id,
                         )
                         if cancel_event.is_set():
                             submission = self._failure_submission(
                                 eval_input,
                                 binding,
                                 FailureCode.PROCESS_KILLED,
+                                target_materialization_id=workspace_binding_id,
                                 elapsed=time.monotonic() - started,
                                 retryable=False,
                             )
@@ -2335,6 +2351,7 @@ class EvalRunner:
                                 candidate,
                                 eval_input=eval_input,
                                 config=binding,
+                                target_materialization_id=workspace_binding_id,
                                 clarification_transcript=controller.transcript,
                             )
                             candidate = validate_submission_trace(
@@ -2373,6 +2390,7 @@ class EvalRunner:
                             eval_input,
                             binding,
                             exc.code,
+                            target_materialization_id=workspace_binding_id,
                             elapsed=time.monotonic() - started,
                             retryable=exc.retryable,
                         )
@@ -2381,6 +2399,7 @@ class EvalRunner:
                             eval_input,
                             binding,
                             FailureCode.ADAPTER_ERROR,
+                            target_materialization_id=workspace_binding_id,
                             elapsed=time.monotonic() - started,
                             retryable=False,
                         )
@@ -2389,6 +2408,7 @@ class EvalRunner:
                             eval_input,
                             binding,
                             _exception_failure_code(exc),
+                            target_materialization_id=workspace_binding_id,
                             elapsed=time.monotonic() - started,
                             retryable=_exception_failure_code(exc)
                             in {FailureCode.TIMEOUT, FailureCode.PROCESS_KILLED},
@@ -2611,6 +2631,7 @@ class EvalRunner:
         binding: AgentRunConfig,
         code: FailureCode,
         *,
+        target_materialization_id: str,
         elapsed: float,
         retryable: bool,
     ) -> EvalSubmission:
@@ -2623,6 +2644,7 @@ class EvalRunner:
         return failure_submission(
             eval_input=eval_input,
             config=binding,
+            target_materialization_id=target_materialization_id,
             code=code,
             message=_failure_message(code),
             retryable=retryable,
@@ -2685,7 +2707,11 @@ class EvalRunner:
         diagnostic: str,
         preflight: CapabilityPreflight,
     ) -> TrialResult:
-        del suite_case
+        # A strict v2 Submission cannot be fabricated before a canonical
+        # per-attempt target materialization exists.  Keep this attempt
+        # recoverable; a resumed attempt will materialize first and can then
+        # bind any terminal Submission to that real identity.
+        del snapshot, suite_case, code, preflight
         state = self.artifact_store.load_trial_state(
             config.run_id, trial_manifest.task_id, trial_manifest.trial_id
         )
@@ -2704,42 +2730,27 @@ class EvalRunner:
             attempt = attempt_hint or state.active_attempt
         if attempt is None:
             raise RunnerError("cannot commit cancellation without a Trial attempt")
-        eval_input = snapshot.eval_input(trial_manifest.task_id)
-        binding = AgentRunConfig.bind(config, eval_input, trial_manifest.trial_index)
-        submission = self._failure_submission(
-            eval_input,
-            binding,
-            code,
-            elapsed=0.0,
-            retryable=False,
-        )
-        self._commit_submission(
-            config,
-            trial_manifest,
-            submission,
-            attempt=attempt,
-            controller=_LazyClarificationSession(
-                task_id=trial_manifest.task_id,
-                provider=self.case_provider,
-                binding=binding,
-                matcher_factory=self.matcher_factory,
-            ),
-            preflight=preflight,
-            workspace_handle=None,
-            workspace_path=None,
-            adapter=self.adapter,
-            elapsed=0.0,
-        )
         final = self.artifact_store.load_trial_state(
             config.run_id, trial_manifest.task_id, trial_manifest.trial_id
         )
+        if final.status is TrialStatus.RUNNING:
+            final = self.artifact_store.mark_trial_incomplete(
+                config.run_id,
+                trial_manifest.task_id,
+                trial_manifest.trial_id,
+                attempt=attempt,
+            )
+        if final.status is not TrialStatus.INCOMPLETE:
+            raise RunnerError(
+                "pre-materialization cancellation did not remain incomplete"
+            )
         return TrialResult(
             run_id=config.run_id,
             task_id=trial_manifest.task_id,
             trial_id=trial_manifest.trial_id,
             trial_index=trial_manifest.trial_index,
             status=final.status,
-            submission=submission,
+            submission=None,
             attempt=attempt,
             skipped=False,
             workspace_binding_id=None,

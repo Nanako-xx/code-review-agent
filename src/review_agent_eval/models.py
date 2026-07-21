@@ -56,6 +56,7 @@ MAX_COMMAND_ARGUMENTS = 256
 MAX_LINE_NUMBER = 2_147_483_647
 MAX_COUNTER = 9_223_372_036_854_775_807
 MAX_JSON_DEPTH = 128
+MAX_JSON_INTEGER_DIGITS = 4096
 
 
 class SchemaError(ValueError):
@@ -594,6 +595,19 @@ def _reject_constant(value: str) -> Any:
     raise _error("JSON contains non-standard numeric constant %s" % value)
 
 
+def _parse_json_integer(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise _error(
+            "JSON integer token exceeds the digit limit of %d"
+            % MAX_JSON_INTEGER_DIGITS
+        )
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise _error("JSON contains an invalid integer token") from exc
+
+
 def _strict_json_loads(data: Any, max_bytes: int, context: str) -> Any:
     if type(data) is bytes:
         if len(data) > max_bytes:
@@ -614,6 +628,7 @@ def _strict_json_loads(data: Any, max_bytes: int, context: str) -> Any:
             text,
             object_pairs_hook=_reject_duplicate_pairs,
             parse_constant=_reject_constant,
+            parse_int=_parse_json_integer,
         )
     except SchemaError:
         raise
@@ -3767,6 +3782,8 @@ def validate_submission_for_case(submission: EvalSubmission, case: EvalCase) -> 
         raise _error("case must be an EvalCase")
     if submission.task_id != case.task_id:
         raise _error("submission task_id does not match EvalCase task_id")
+    if submission.eval_input_digest != case.eval_input().digest():
+        raise _error("submission eval_input_digest does not match EvalCase input digest")
     if submission.intent is None:
         return
     answers = {item.answer_id: item for item in case.clarification_script.answers}
@@ -3846,6 +3863,7 @@ __all__ = [
     "MAX_LINE_NUMBER",
     "MAX_COUNTER",
     "MAX_JSON_DEPTH",
+    "MAX_JSON_INTEGER_DIGITS",
     "SchemaError",
     "UnsupportedProtocolVersionError",
     "RepositorySource",

@@ -222,6 +222,7 @@ def _failure(
     *,
     eval_input: EvalInput,
     config: AgentRunConfig,
+    target_materialization_id: str,
     code: FailureCode,
     elapsed: float,
     retryable: bool,
@@ -242,6 +243,7 @@ def _failure(
     submission = failure_submission(
         eval_input=eval_input,
         config=config,
+        target_materialization_id=target_materialization_id,
         code=code,
         message=messages[code],
         retryable=retryable,
@@ -826,6 +828,7 @@ class CurrentAgentAdapter:
         config: AgentRunConfig,
         clarification_channel: ClarificationChannel,
         *,
+        target_materialization_id: str,
         cancel_event: Optional[threading.Event] = None,
     ) -> EvalSubmission:
         started = time.monotonic()
@@ -886,6 +889,7 @@ class CurrentAgentAdapter:
                 return _failure(
                     eval_input=eval_input,
                     config=config,
+                    target_materialization_id=target_materialization_id,
                     code=result.failure_code,
                     elapsed=time.monotonic() - started,
                     retryable=result.failure_code
@@ -903,6 +907,7 @@ class CurrentAgentAdapter:
                     return _failure(
                         eval_input=eval_input,
                         config=config,
+                        target_materialization_id=target_materialization_id,
                         code=code,
                         elapsed=time.monotonic() - started,
                         retryable=code is FailureCode.PROCESS_KILLED,
@@ -959,6 +964,7 @@ class CurrentAgentAdapter:
                     return _failure(
                         eval_input=eval_input,
                         config=config,
+                        target_materialization_id=target_materialization_id,
                         code=FailureCode.CLARIFICATION_REQUIRED,
                         elapsed=time.monotonic() - started,
                         retryable=False,
@@ -980,6 +986,7 @@ class CurrentAgentAdapter:
                     return _failure(
                         eval_input=eval_input,
                         config=config,
+                        target_materialization_id=target_materialization_id,
                         code=result.failure_code,
                         elapsed=time.monotonic() - started,
                         retryable=result.failure_code
@@ -1007,6 +1014,7 @@ class CurrentAgentAdapter:
                     return _failure(
                         eval_input=eval_input,
                         config=config,
+                        target_materialization_id=target_materialization_id,
                         code=code,
                         elapsed=time.monotonic() - started,
                         retryable=code is FailureCode.PROCESS_KILLED,
@@ -1024,6 +1032,7 @@ class CurrentAgentAdapter:
                 submission = self._completed_submission(
                     eval_input=eval_input,
                     config=config,
+                    target_materialization_id=target_materialization_id,
                     run_dir=run_dir,
                     store=store,
                     manifest=manifest,
@@ -1045,6 +1054,7 @@ class CurrentAgentAdapter:
                 return _failure(
                     eval_input=eval_input,
                     config=config,
+                    target_materialization_id=target_materialization_id,
                     code=code,
                     elapsed=time.monotonic() - started,
                     retryable=False,
@@ -1054,6 +1064,7 @@ class CurrentAgentAdapter:
             return _failure(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.UNKNOWN,
                 elapsed=time.monotonic() - started,
                 retryable=True,
@@ -1066,6 +1077,7 @@ class CurrentAgentAdapter:
             return _failure(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.ADAPTER_ERROR,
                 elapsed=time.monotonic() - started,
                 retryable=False,
@@ -1074,6 +1086,7 @@ class CurrentAgentAdapter:
             return _failure(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=(
                     exc.code
                     if exc.code
@@ -1090,6 +1103,7 @@ class CurrentAgentAdapter:
             return _failure(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.SCHEMA_MISMATCH,
                 elapsed=time.monotonic() - started,
                 retryable=False,
@@ -1098,6 +1112,7 @@ class CurrentAgentAdapter:
             return _failure(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.ADAPTER_ERROR,
                 elapsed=time.monotonic() - started,
                 retryable=False,
@@ -1106,6 +1121,7 @@ class CurrentAgentAdapter:
             return _failure(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.SCHEMA_MISMATCH if run_dir else FailureCode.ADAPTER_ERROR,
                 elapsed=time.monotonic() - started,
                 retryable=False,
@@ -1160,6 +1176,7 @@ class CurrentAgentAdapter:
         *,
         eval_input: EvalInput,
         config: AgentRunConfig,
+        target_materialization_id: str,
         run_dir: Path,
         store: SessionStore,
         manifest: SessionManifest,
@@ -1210,6 +1227,8 @@ class CurrentAgentAdapter:
             task_id=eval_input.task_id,
             agent_id=config.agent_id,
             trial_id=config.trial_id,
+            eval_input_digest=config.eval_input_digest,
+            target_materialization_id=target_materialization_id,
             status=SubmissionStatus.COMPLETED,
             intent=intent,
             review=SubmissionReview(

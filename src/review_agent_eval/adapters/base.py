@@ -294,6 +294,7 @@ class AgentUnderTestAdapter(Protocol):
         config: AgentRunConfig,
         clarification_channel: ClarificationChannel,
         *,
+        target_materialization_id: str,
         cancel_event: Any,
     ) -> EvalSubmission:
         ...
