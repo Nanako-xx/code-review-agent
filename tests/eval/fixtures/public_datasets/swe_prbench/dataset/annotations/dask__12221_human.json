@@ -1,0 +1,84 @@
+{
+  "task_id": "dask__12221",
+  "pr_number": 12221,
+  "repo": "dask/dask",
+  "has_severity_annotations": false,
+  "has_requested_changes": false,
+  "total_comment_count": 4,
+  "substantive_comment_count": 3,
+  "changes_required": true,
+  "requested_change_count": 1,
+  "substantive_comment_ids": [
+    "c_1",
+    "c_2",
+    "c_3"
+  ],
+  "requested_changes": [
+    {
+      "comment_id": "c_1",
+      "body": "Out of scope: this should belong to `os.process_cpu_count`. As it is complicated to test without mocking, I did not investigate if any of it is actually implemented. Let's revisit this after Python 3.13 becomes the minimum version in a few years.",
+      "file": "dask/system.py",
+      "line": 82,
+      "diff_hunk": "@@ -50,19 +52,33 @@ def cpu_count():\n     - CPU Affinity (if set)\n     - Cgroups limit (if set)\n     \"\"\"\n-    count = os.cpu_count()\n-\n-    # Check CPU affinity if available\n+    if sys.version_info >= (3, 13):\n+        # Embeds CPU affinity checks\n+        count = os.process_cpu_count()\n+    elif hasattr(os, \"sched_getaffinity\"):\n+        # https://docs.python.org/3/library/os.html#interface-to-the-scheduler\n+        # \"only available on some Unix platforms\"; neither MacOS nor Windows\n+        count = len(os.sched_getaffinity(0))\n+    else:\n+        # Does not account for CPU affinity.\n+        # On exotic alternative Python implementations, it may return None.\n+        count = os.cpu_count() or 1\n+    assert count\n+\n+    # Additional CPU affinity check with psutil.\n+    # NOTE: do not limit this to Python <3.13: on Windows,\n+    # `psutil.Process().cpu_affinity(value)` does not change the reading of\n+    # os.process_cpu_count().\n     if psutil is not None:\n-        try:\n-            affinity_count = len(psutil.Process().cpu_affinity())\n-            if affinity_count > 0:\n-                count = min(count, affinity_count)\n-        except Exception:\n-            pass\n+        proc = psutil.Process()\n+        if hasattr(proc, \"cpu_affinity\"):\n+            affinity = proc.cpu_affinity()\n+            if affinity is not None:\n+                assert affinity\n+                count = min(count, len(affinity))\n \n     # Check cgroups if available\n-    if sys.platform == \"linux\":\n+    if LINUX:\n         quota, period = _try_extract_cgroup_cpu_quota()",
+      "severity": null,
+      "is_blocking": null,
+      "reviewer": "crusaderky",
+      "is_initiating_comment": true,
+      "is_reply": false,
+      "reply_to": null,
+      "requires_change": true,
+      "is_in_diff": false,
+      "thread_resolved": null
+    }
+  ],
+  "comments": [
+    {
+      "comment_id": "c_1",
+      "body": "Out of scope: this should belong to `os.process_cpu_count`. As it is complicated to test without mocking, I did not investigate if any of it is actually implemented. Let's revisit this after Python 3.13 becomes the minimum version in a few years.",
+      "file": "dask/system.py",
+      "line": 82,
+      "diff_hunk": "@@ -50,19 +52,33 @@ def cpu_count():\n     - CPU Affinity (if set)\n     - Cgroups limit (if set)\n     \"\"\"\n-    count = os.cpu_count()\n-\n-    # Check CPU affinity if available\n+    if sys.version_info >= (3, 13):\n+        # Embeds CPU affinity checks\n+        count = os.process_cpu_count()\n+    elif hasattr(os, \"sched_getaffinity\"):\n+        # https://docs.python.org/3/library/os.html#interface-to-the-scheduler\n+        # \"only available on some Unix platforms\"; neither MacOS nor Windows\n+        count = len(os.sched_getaffinity(0))\n+    else:\n+        # Does not account for CPU affinity.\n+        # On exotic alternative Python implementations, it may return None.\n+        count = os.cpu_count() or 1\n+    assert count\n+\n+    # Additional CPU affinity check with psutil.\n+    # NOTE: do not limit this to Python <3.13: on Windows,\n+    # `psutil.Process().cpu_affinity(value)` does not change the reading of\n+    # os.process_cpu_count().\n     if psutil is not None:\n-        try:\n-            affinity_count = len(psutil.Process().cpu_affinity())\n-            if affinity_count > 0:\n-                count = min(count, affinity_count)\n-        except Exception:\n-            pass\n+        proc = psutil.Process()\n+        if hasattr(proc, \"cpu_affinity\"):\n+            affinity = proc.cpu_affinity()\n+            if affinity is not None:\n+                assert affinity\n+                count = min(count, len(affinity))\n \n     # Check cgroups if available\n-    if sys.platform == \"linux\":\n+    if LINUX:\n         quota, period = _try_extract_cgroup_cpu_quota()",
+      "severity": null,
+      "is_blocking": null,
+      "reviewer": "crusaderky",
+      "is_initiating_comment": true,
+      "is_reply": false,
+      "reply_to": null,
+      "requires_change": true,
+      "is_in_diff": false,
+      "thread_resolved": null
+    },
+    {
+      "comment_id": "c_2",
+      "body": "Run most tests when psutil is not installed",
+      "file": "dask/tests/test_system.py",
+      "line": 12,
+      "diff_hunk": "@@ -3,37 +3,109 @@\n import builtins\n import io\n import os\n+import subprocess\n import sys\n+from contextlib import suppress\n \n import pytest\n \n-from dask.system import cpu_count\n-\n-psutil = pytest.importorskip(\"psutil\")",
+      "severity": null,
+      "is_blocking": null,
+      "reviewer": "crusaderky",
+      "is_initiating_comment": true,
+      "is_reply": false,
+      "reply_to": null,
+      "requires_change": false,
+      "is_in_diff": false,
+      "thread_resolved": null
+    },
+    {
+      "comment_id": "c_3",
+      "body": "```suggestion\n                assert affinity > 0\n```\n\nmore readable at a glance IMO.",
+      "file": "dask/system.py",
+      "line": 77,
+      "diff_hunk": "@@ -50,19 +52,33 @@ def cpu_count():\n     - CPU Affinity (if set)\n     - Cgroups limit (if set)\n     \"\"\"\n-    count = os.cpu_count()\n-\n-    # Check CPU affinity if available\n+    if sys.version_info >= (3, 13):\n+        # Embeds CPU affinity checks\n+        count = os.process_cpu_count()\n+    elif hasattr(os, \"sched_getaffinity\"):\n+        # https://docs.python.org/3/library/os.html#interface-to-the-scheduler\n+        # \"only available on some Unix platforms\"; neither MacOS nor Windows\n+        count = len(os.sched_getaffinity(0))\n+    else:\n+        # Does not account for CPU affinity.\n+        # On exotic alternative Python implementations, it may return None.\n+        count = os.cpu_count() or 1\n+    assert count\n+\n+    # Additional CPU affinity check with psutil.\n+    # NOTE: do not limit this to Python <3.13: on Windows,\n+    # `psutil.Process().cpu_affinity(value)` does not change the reading of\n+    # os.process_cpu_count().\n     if psutil is not None:\n-        try:\n-            affinity_count = len(psutil.Process().cpu_affinity())\n-            if affinity_count > 0:\n-                count = min(count, affinity_count)\n-        except Exception:\n-            pass\n+        proc = psutil.Process()\n+        if hasattr(proc, \"cpu_affinity\"):\n+            affinity = proc.cpu_affinity()\n+            if affinity is not None:\n+                assert affinity",
+      "severity": null,
+      "is_blocking": null,
+      "reviewer": "dcherian",
+      "is_initiating_comment": true,
+      "is_reply": false,
+      "reply_to": null,
+      "requires_change": false,
+      "is_in_diff": true,
+      "thread_resolved": null
+    }
+  ]
+}
