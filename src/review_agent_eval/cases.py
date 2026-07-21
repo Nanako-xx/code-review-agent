@@ -1,7 +1,7 @@
 """Immutable Suite/Case protocols and truth-safe Case projections.
 
 This module deliberately contains no dataset-specific parsing.  Dataset
-adapters emit the same Suite Manifest v1 and EvalCase v1 documents; the core
+adapters emit the same Suite Manifest v2 and EvalCase v2 documents; the core
 loader validates those documents without knowing which adapter produced them.
 """
 
@@ -17,6 +17,9 @@ from typing import Any, ClassVar, Dict, Iterable, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from .models import (
+    EVAL_CASE_SCHEMA_VERSION,
+    EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
     MAX_COUNTER,
     MAX_EVAL_CASE_BYTES,
     MAX_IDENTIFIER_CHARS,
@@ -28,8 +31,10 @@ from .models import (
     EvalCase,
     EvalInput,
     IntentAuthority,
+    ReviewTargetKind,
     SchemaError,
     TruthCompleteness,
+    UnsupportedProtocolVersionError,
     _JsonModel,
     _array,
     _check_model_size,
@@ -49,8 +54,13 @@ from .models import (
 )
 
 
-SUITE_MANIFEST_SCHEMA_VERSION = "suite_manifest_v1"
-RUN_CASE_SNAPSHOT_SCHEMA_VERSION = "eval_run_case_snapshot_v1"
+SUITE_MANIFEST_SCHEMA_VERSION = "suite_manifest_v2"
+RUN_CASE_SNAPSHOT_SCHEMA_VERSION = "eval_run_case_snapshot_v2"
+PUBLIC_SUITE_PREPARATION_BINDING_SCHEMA_VERSION = (
+    "public_suite_preparation_binding_v2"
+)
+REPOSITORY_MATERIALIZER_PROTOCOL = "repository-materializer-v2"
+FROZEN_CONTEXT_MATERIALIZER_PROTOCOL = "frozen-context-materializer-v2"
 
 MAX_SUITE_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_RUN_CASE_SNAPSHOT_BYTES = 256 * 1024 * 1024
@@ -166,6 +176,233 @@ def _license_name(value: Any, context: str) -> Optional[str]:
     return result
 
 
+def _require_protocol_version(actual: Any, expected: str, context: str) -> str:
+    if type(actual) is not str:
+        raise SchemaError("%s must be a string" % context)
+    if actual != expected:
+        raise UnsupportedProtocolVersionError(expected=expected, actual=actual)
+    return actual
+
+
+@dataclass(frozen=True)
+class WireContractV2(_JsonModel):
+    """The complete Case/Input/Submission/Target contract for one Suite."""
+
+    case_schema_version: str
+    input_schema_version: str
+    submission_schema_version: str
+    review_target_kind: ReviewTargetKind
+    materializer_protocol: str
+
+    def __post_init__(self) -> None:
+        _require_protocol_version(
+            self.case_schema_version,
+            EVAL_CASE_SCHEMA_VERSION,
+            "wire contract.case_schema_version",
+        )
+        _require_protocol_version(
+            self.input_schema_version,
+            EVAL_INPUT_SCHEMA_VERSION,
+            "wire contract.input_schema_version",
+        )
+        _require_protocol_version(
+            self.submission_schema_version,
+            EVAL_SUBMISSION_SCHEMA_VERSION,
+            "wire contract.submission_schema_version",
+        )
+        _require_enum(
+            ReviewTargetKind,
+            self.review_target_kind,
+            "wire contract.review_target_kind",
+        )
+        protocol = _identifier(
+            self.materializer_protocol,
+            "wire contract.materializer_protocol",
+        )
+        expected = {
+            ReviewTargetKind.REPOSITORY: REPOSITORY_MATERIALIZER_PROTOCOL,
+            ReviewTargetKind.FROZEN_CONTEXT: FROZEN_CONTEXT_MATERIALIZER_PROTOCOL,
+        }[self.review_target_kind]
+        if protocol != expected:
+            raise SchemaError(
+                "wire contract target kind and materializer protocol mismatch"
+            )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "WireContractV2":
+        payload = _object(value, "wire contract")
+        for field_name, expected in (
+            ("case_schema_version", EVAL_CASE_SCHEMA_VERSION),
+            ("input_schema_version", EVAL_INPUT_SCHEMA_VERSION),
+            ("submission_schema_version", EVAL_SUBMISSION_SCHEMA_VERSION),
+        ):
+            if field_name in payload:
+                _require_protocol_version(
+                    payload[field_name], expected, "wire contract.%s" % field_name
+                )
+        _exact_fields(
+            payload,
+            (
+                "case_schema_version",
+                "input_schema_version",
+                "submission_schema_version",
+                "review_target_kind",
+                "materializer_protocol",
+            ),
+            "wire contract",
+        )
+        return cls(
+            case_schema_version=_require_protocol_version(
+                payload["case_schema_version"],
+                EVAL_CASE_SCHEMA_VERSION,
+                "wire contract.case_schema_version",
+            ),
+            input_schema_version=_require_protocol_version(
+                payload["input_schema_version"],
+                EVAL_INPUT_SCHEMA_VERSION,
+                "wire contract.input_schema_version",
+            ),
+            submission_schema_version=_require_protocol_version(
+                payload["submission_schema_version"],
+                EVAL_SUBMISSION_SCHEMA_VERSION,
+                "wire contract.submission_schema_version",
+            ),
+            review_target_kind=_enum_value(
+                ReviewTargetKind,
+                payload["review_target_kind"],
+                "wire contract.review_target_kind",
+            ),
+            materializer_protocol=_identifier(
+                payload["materializer_protocol"],
+                "wire contract.materializer_protocol",
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "case_schema_version": self.case_schema_version,
+            "input_schema_version": self.input_schema_version,
+            "submission_schema_version": self.submission_schema_version,
+            "review_target_kind": self.review_target_kind.value,
+            "materializer_protocol": self.materializer_protocol,
+        }
+
+
+@dataclass(frozen=True)
+class PublicSuitePreparationBindingV2(_JsonModel):
+    """Evaluator-private trust roots for one prepared public Suite."""
+
+    schema_version: str
+    source_catalog_digest: str
+    acquisition_receipt_digest: str
+    source_manifest_digest: str
+    filter_manifest_digest: str
+    preparation_packet_digest: str
+    repository_catalog_digest: Optional[str]
+    frozen_bundle_trust_digest: Optional[str]
+
+    def __post_init__(self) -> None:
+        _require_protocol_version(
+            self.schema_version,
+            PUBLIC_SUITE_PREPARATION_BINDING_SCHEMA_VERSION,
+            "public preparation binding.schema_version",
+        )
+        for name in (
+            "source_catalog_digest",
+            "acquisition_receipt_digest",
+            "source_manifest_digest",
+            "filter_manifest_digest",
+            "preparation_packet_digest",
+        ):
+            _digest(getattr(self, name), "public preparation binding.%s" % name)
+        if self.repository_catalog_digest is not None:
+            _digest(
+                self.repository_catalog_digest,
+                "public preparation binding.repository_catalog_digest",
+            )
+        if self.frozen_bundle_trust_digest is not None:
+            _digest(
+                self.frozen_bundle_trust_digest,
+                "public preparation binding.frozen_bundle_trust_digest",
+            )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "PublicSuitePreparationBindingV2":
+        payload = _object(value, "public preparation binding")
+        if "schema_version" in payload:
+            _require_protocol_version(
+                payload["schema_version"],
+                PUBLIC_SUITE_PREPARATION_BINDING_SCHEMA_VERSION,
+                "public preparation binding.schema_version",
+            )
+        fields = (
+            "schema_version",
+            "source_catalog_digest",
+            "acquisition_receipt_digest",
+            "source_manifest_digest",
+            "filter_manifest_digest",
+            "preparation_packet_digest",
+            "repository_catalog_digest",
+            "frozen_bundle_trust_digest",
+        )
+        _exact_fields(payload, fields, "public preparation binding")
+        return cls(
+            schema_version=_require_protocol_version(
+                payload["schema_version"],
+                PUBLIC_SUITE_PREPARATION_BINDING_SCHEMA_VERSION,
+                "public preparation binding.schema_version",
+            ),
+            source_catalog_digest=_digest(
+                payload["source_catalog_digest"],
+                "public preparation binding.source_catalog_digest",
+            ),
+            acquisition_receipt_digest=_digest(
+                payload["acquisition_receipt_digest"],
+                "public preparation binding.acquisition_receipt_digest",
+            ),
+            source_manifest_digest=_digest(
+                payload["source_manifest_digest"],
+                "public preparation binding.source_manifest_digest",
+            ),
+            filter_manifest_digest=_digest(
+                payload["filter_manifest_digest"],
+                "public preparation binding.filter_manifest_digest",
+            ),
+            preparation_packet_digest=_digest(
+                payload["preparation_packet_digest"],
+                "public preparation binding.preparation_packet_digest",
+            ),
+            repository_catalog_digest=(
+                None
+                if payload["repository_catalog_digest"] is None
+                else _digest(
+                    payload["repository_catalog_digest"],
+                    "public preparation binding.repository_catalog_digest",
+                )
+            ),
+            frozen_bundle_trust_digest=(
+                None
+                if payload["frozen_bundle_trust_digest"] is None
+                else _digest(
+                    payload["frozen_bundle_trust_digest"],
+                    "public preparation binding.frozen_bundle_trust_digest",
+                )
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "source_catalog_digest": self.source_catalog_digest,
+            "acquisition_receipt_digest": self.acquisition_receipt_digest,
+            "source_manifest_digest": self.source_manifest_digest,
+            "filter_manifest_digest": self.filter_manifest_digest,
+            "preparation_packet_digest": self.preparation_packet_digest,
+            "repository_catalog_digest": self.repository_catalog_digest,
+            "frozen_bundle_trust_digest": self.frozen_bundle_trust_digest,
+        }
+
+
 @dataclass(frozen=True)
 class SuiteSource(_JsonModel):
     """Versioned provenance shared by all Cases in one Suite manifest."""
@@ -176,6 +413,7 @@ class SuiteSource(_JsonModel):
     source_uri: Optional[str]
     license: Optional[str]
     content_hash: str
+    preparation_binding: Optional[PublicSuitePreparationBindingV2] = None
 
     def __post_init__(self) -> None:
         _require_enum(SuiteKind, self.kind, "suite source.kind")
@@ -189,10 +427,31 @@ class SuiteSource(_JsonModel):
                 raise SchemaError("public suite source requires source_uri")
             if self.license is None:
                 raise SchemaError("public suite source requires license")
+            if not isinstance(
+                self.preparation_binding, PublicSuitePreparationBindingV2
+            ):
+                raise SchemaError(
+                    "public suite source requires preparation_binding"
+                )
+        elif self.preparation_binding is not None:
+            raise SchemaError(
+                "core/private suite source requires preparation_binding=null"
+            )
 
     @classmethod
     def from_dict(cls, value: Any) -> "SuiteSource":
         payload = _object(value, "suite source")
+        if payload.get("preparation_binding") is not None:
+            binding_payload = _object(
+                payload["preparation_binding"],
+                "suite source.preparation_binding",
+            )
+            if "schema_version" in binding_payload:
+                _require_protocol_version(
+                    binding_payload["schema_version"],
+                    PUBLIC_SUITE_PREPARATION_BINDING_SCHEMA_VERSION,
+                    "public preparation binding.schema_version",
+                )
         _exact_fields(
             payload,
             (
@@ -202,6 +461,7 @@ class SuiteSource(_JsonModel):
                 "source_uri",
                 "license",
                 "content_hash",
+                "preparation_binding",
             ),
             "suite source",
         )
@@ -220,6 +480,13 @@ class SuiteSource(_JsonModel):
             content_hash=_digest(
                 payload["content_hash"], "suite source.content_hash"
             ),
+            preparation_binding=(
+                None
+                if payload["preparation_binding"] is None
+                else PublicSuitePreparationBindingV2.from_dict(
+                    payload["preparation_binding"]
+                )
+            ),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -230,6 +497,11 @@ class SuiteSource(_JsonModel):
             "source_uri": self.source_uri,
             "license": self.license,
             "content_hash": self.content_hash,
+            "preparation_binding": (
+                None
+                if self.preparation_binding is None
+                else self.preparation_binding.to_dict()
+            ),
         }
 
 
@@ -282,7 +554,7 @@ class CaseDimension(_JsonModel):
 
 @dataclass(frozen=True)
 class SuiteCase(_JsonModel):
-    """One immutable Case binding in Suite Manifest v1."""
+    """One immutable Case binding in Suite Manifest v2."""
 
     task_id: str
     case_version: int
@@ -433,6 +705,7 @@ class SuiteManifest(_JsonModel):
     schema_version: str
     suite_id: str
     suite_version: str
+    wire_contract: WireContractV2
     source: SuiteSource
     cases: Tuple[SuiteCase, ...]
     _task_ids: Tuple[str, ...] = field(
@@ -442,12 +715,40 @@ class SuiteManifest(_JsonModel):
     )
 
     def __post_init__(self) -> None:
-        if self.schema_version != self.SCHEMA_VERSION:
-            raise SchemaError("SuiteManifest has an unknown schema_version")
+        _require_protocol_version(
+            self.schema_version,
+            self.SCHEMA_VERSION,
+            "SuiteManifest.schema_version",
+        )
         _identifier(self.suite_id, "suite manifest.suite_id")
         _identifier(self.suite_version, "suite manifest.suite_version")
+        if not isinstance(self.wire_contract, WireContractV2):
+            raise SchemaError(
+                "suite manifest.wire_contract must be a WireContractV2"
+            )
         if not isinstance(self.source, SuiteSource):
             raise SchemaError("suite manifest.source must be a SuiteSource")
+        binding = self.source.preparation_binding
+        if self.source.kind is SuiteKind.PUBLIC:
+            if not isinstance(binding, PublicSuitePreparationBindingV2):
+                raise SchemaError(
+                    "public Suite requires a complete preparation binding"
+                )
+            if self.wire_contract.review_target_kind is ReviewTargetKind.REPOSITORY:
+                if (
+                    binding.repository_catalog_digest is None
+                    or binding.frozen_bundle_trust_digest is not None
+                ):
+                    raise SchemaError(
+                        "Repository Suite preparation binding requires only repository_catalog_digest"
+                    )
+            elif (
+                binding.frozen_bundle_trust_digest is None
+                or binding.repository_catalog_digest is not None
+            ):
+                raise SchemaError(
+                    "Frozen Suite preparation binding requires only frozen_bundle_trust_digest"
+                )
         cases = _model_tuple(
             self.cases, SuiteCase, "suite manifest.cases", MAX_SUITE_CASES
         )
@@ -502,23 +803,55 @@ class SuiteManifest(_JsonModel):
     @classmethod
     def from_dict(cls, value: Any) -> "SuiteManifest":
         payload = _object(value, "SuiteManifest")
+        if "schema_version" not in payload:
+            raise SchemaError("SuiteManifest has missing field(s): schema_version")
+        _require_protocol_version(
+            payload["schema_version"],
+            cls.SCHEMA_VERSION,
+            "SuiteManifest.schema_version",
+        )
         _exact_fields(
             payload,
-            ("schema_version", "suite_id", "suite_version", "source", "cases"),
+            (
+                "schema_version",
+                "suite_id",
+                "suite_version",
+                "wire_contract",
+                "source",
+                "cases",
+            ),
             "SuiteManifest",
         )
-        if payload["schema_version"] != cls.SCHEMA_VERSION:
-            raise SchemaError("SuiteManifest has an unknown schema_version")
+        wire_contract = WireContractV2.from_dict(payload["wire_contract"])
+        suite_source = SuiteSource.from_dict(payload["source"])
         raw_cases = _array(
             payload["cases"], "suite manifest.cases", MAX_SUITE_CASES
         )
+        total_case_bytes = 0
+        for index, raw_case in enumerate(raw_cases):
+            case_payload = _object(
+                raw_case, "suite manifest.cases[%d]" % index
+            )
+            if "raw_file_size_bytes" in case_payload:
+                total_case_bytes += _integer(
+                    case_payload["raw_file_size_bytes"],
+                    "suite manifest.cases[%d].raw_file_size_bytes" % index,
+                    minimum=1,
+                    maximum=MAX_EVAL_CASE_BYTES,
+                )
+                if total_case_bytes > MAX_SUITE_TOTAL_CASE_BYTES:
+                    raise SchemaError(
+                        "suite manifest Case bytes exceed the cumulative limit of %d"
+                        % MAX_SUITE_TOTAL_CASE_BYTES
+                    )
         return cls(
             schema_version=payload["schema_version"],
             suite_id=_identifier(payload["suite_id"], "suite manifest.suite_id"),
             suite_version=_identifier(
                 payload["suite_version"], "suite manifest.suite_version"
             ),
-            source=SuiteSource.from_dict(payload["source"]),
+            wire_contract=wire_contract,
+            source=suite_source,
             cases=tuple(SuiteCase.from_dict(item) for item in raw_cases),
         )
 
@@ -553,6 +886,7 @@ class SuiteManifest(_JsonModel):
             "schema_version": self.schema_version,
             "suite_id": self.suite_id,
             "suite_version": self.suite_version,
+            "wire_contract": self.wire_contract.to_dict(),
             "source": self.source.to_dict(),
             "cases": [item.to_dict() for item in self.cases],
         }
@@ -561,16 +895,24 @@ class SuiteManifest(_JsonModel):
 def _validate_intent_contract(case: EvalCase) -> None:
     truth = case.intent_truth
     if not truth.scorable:
-        # EvalCase v1 already enforces the one canonical unscorable shape.
+        # EvalCase v2 already enforces the one canonical unscorable shape.
         return
 
     if (
         truth.authority is IntentAuthority.LINKED_REQUIREMENT
-        and not case.input.review_request.linked_requirements
+        and not getattr(
+            case.input.review_target, "review_request", None
+        )
     ):
         raise SchemaError(
-            "linked_requirement intent authority requires linked_requirements input"
+            "linked_requirement intent authority requires a Repository review request"
         )
+    if truth.authority is IntentAuthority.LINKED_REQUIREMENT:
+        review_request = case.input.review_target.review_request
+        if not review_request.linked_requirements:
+            raise SchemaError(
+                "linked_requirement intent authority requires linked_requirements input"
+            )
     if (
         truth.clarification_policy is ClarificationPolicy.REQUIRED
         and not case.clarification_script.answers
@@ -603,6 +945,24 @@ def validate_case_for_manifest(
         raise SchemaError("loaded Case task_id does not match its manifest task_id")
     if case.case_version != manifest_case.case_version:
         raise SchemaError("loaded Case version does not match its manifest version")
+    if case.schema_version != manifest.wire_contract.case_schema_version:
+        raise UnsupportedProtocolVersionError(
+            expected=manifest.wire_contract.case_schema_version,
+            actual=case.schema_version,
+        )
+    eval_input = case.eval_input()
+    if eval_input.schema_version != manifest.wire_contract.input_schema_version:
+        raise UnsupportedProtocolVersionError(
+            expected=manifest.wire_contract.input_schema_version,
+            actual=eval_input.schema_version,
+        )
+    if (
+        eval_input.review_target.kind
+        is not manifest.wire_contract.review_target_kind
+    ):
+        raise SchemaError(
+            "loaded Case target kind does not match the Suite wire contract"
+        )
     if case.review_truth.completeness is not manifest_case.truth_completeness:
         raise SchemaError(
             "loaded Case truth completeness does not match its manifest binding"
@@ -614,7 +974,7 @@ def validate_case_for_manifest(
         raise SchemaError(
             "loaded Case canonical Case digest does not match its manifest binding"
         )
-    if case.eval_input().digest() != manifest_case.eval_input_digest:
+    if eval_input.digest() != manifest_case.eval_input_digest:
         raise SchemaError(
             "loaded Case EvalInput digest does not match its manifest binding"
         )
@@ -659,7 +1019,7 @@ def _validate_case_source_for_manifest(
 
 @dataclass(frozen=True)
 class AgentCaseView(_JsonModel):
-    """An Agent-safe type whose only payload is canonical EvalInput v1."""
+    """An Agent-safe type whose only payload is canonical EvalInput v2."""
 
     input: EvalInput
 
@@ -690,16 +1050,28 @@ class AgentCaseView(_JsonModel):
         return self.input.task_id
 
     @property
+    def review_target(self):
+        return self.input.review_target
+
+    @property
     def repository(self):
-        return self.input.repository
+        repository = getattr(self.input.review_target, "repository", None)
+        if repository is None:
+            raise SchemaError("Frozen EvalInput has no repository")
+        return repository
 
     @property
     def review_request(self):
-        return self.input.review_request
+        review_request = getattr(
+            self.input.review_target, "review_request", None
+        )
+        if review_request is None:
+            raise SchemaError("Frozen EvalInput has no review_request")
+        return review_request
 
     def to_dict(self) -> Dict[str, Any]:
         # Do not add a wrapper schema here: the serialized Agent boundary is
-        # exactly EvalInput v1, and can never contain private Case fields.
+        # exactly EvalInput v2, and can never contain private Case fields.
         return self.input.to_dict()
 
 
@@ -789,30 +1161,12 @@ class RunCaseSnapshotEntry(_JsonModel):
 def _snapshot_id(
     manifest: SuiteManifest, entries: Sequence[RunCaseSnapshotEntry]
 ) -> str:
-    identity = [
-        {
-            "task_id": item.task_id,
-            "case_version": item.manifest_case.case_version,
-            "split": item.split.value,
-            "protocol_id": item.manifest_case.protocol_id,
-            "dimensions": [
-                dimension.to_dict()
-                for dimension in item.manifest_case.dimensions
-            ],
-            "raw_file_size_bytes": item.manifest_case.raw_file_size_bytes,
-            "raw_file_sha256": item.manifest_case.raw_file_sha256,
-            "canonical_case_digest": item.manifest_case.canonical_case_digest,
-            "eval_input_digest": item.manifest_case.eval_input_digest,
-            "truth_completeness": item.manifest_case.truth_completeness.value,
-            "case_source": item.source.to_dict(),
-        }
-        for item in entries
-    ]
     return stable_id(
         "run-case-snapshot",
         RUN_CASE_SNAPSHOT_SCHEMA_VERSION,
         manifest.digest(),
-        identity,
+        manifest.wire_contract.to_dict(),
+        [item.to_dict() for item in entries],
     )
 
 
@@ -825,14 +1179,26 @@ class RunCaseSnapshot(_JsonModel):
     schema_version: str
     snapshot_id: str
     manifest: SuiteManifest
+    wire_contract: WireContractV2
     cases: Tuple[RunCaseSnapshotEntry, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != self.SCHEMA_VERSION:
-            raise SchemaError("RunCaseSnapshot has an unknown schema_version")
+        _require_protocol_version(
+            self.schema_version,
+            self.SCHEMA_VERSION,
+            "RunCaseSnapshot.schema_version",
+        )
         validate_run_case_snapshot_id(self.snapshot_id)
         if not isinstance(self.manifest, SuiteManifest):
             raise SchemaError("run Case snapshot.manifest must be a SuiteManifest")
+        if not isinstance(self.wire_contract, WireContractV2):
+            raise SchemaError(
+                "run Case snapshot.wire_contract must be a WireContractV2"
+            )
+        if self.wire_contract != self.manifest.wire_contract:
+            raise SchemaError(
+                "run Case snapshot wire contract does not match its Suite manifest"
+            )
         entries = _model_tuple(
             self.cases,
             RunCaseSnapshotEntry,
@@ -865,6 +1231,13 @@ class RunCaseSnapshot(_JsonModel):
                 raise SchemaError(
                     "run Case snapshot input does not match its task_id binding"
                 )
+            if (
+                item.input.review_target.kind
+                is not self.wire_contract.review_target_kind
+            ):
+                raise SchemaError(
+                    "run Case snapshot Cases do not share a single wire contract"
+                )
 
         ordered = tuple(sorted(entries, key=lambda item: item.task_id))
         object.__setattr__(self, "cases", ordered)
@@ -885,7 +1258,8 @@ class RunCaseSnapshot(_JsonModel):
     ) -> "RunCaseSnapshot":
         if not isinstance(manifest, SuiteManifest):
             raise SchemaError("RunCaseSnapshot.build requires a SuiteManifest")
-        entries = []
+        pairs = []
+        target_kinds = set()
         for index, item in enumerate(cases):
             if index >= MAX_SUITE_CASES:
                 raise SchemaError(
@@ -897,9 +1271,25 @@ class RunCaseSnapshot(_JsonModel):
                     "run Case snapshot.cases[%d] must be a verified Case binding pair"
                     % index
                 )
+            if not isinstance(item[1], EvalCase):
+                raise SchemaError(
+                    "run Case snapshot.cases[%d] must contain an EvalCase" % index
+                )
+            pairs.append((item[0], item[1]))
+            target_kinds.add(item[1].eval_input().review_target.kind)
+        if not pairs:
+            raise SchemaError(
+                "run Case snapshot.cases must contain at least one Case"
+            )
+        if target_kinds != {manifest.wire_contract.review_target_kind}:
+            raise SchemaError(
+                "run Case snapshot Cases must share a single wire contract"
+            )
+        entries = []
+        for manifest_case, case in pairs:
             entries.append(
                 RunCaseSnapshotEntry.from_verified_case(
-                    item[0], item[1], manifest
+                    manifest_case, case, manifest
                 )
             )
         ordered = tuple(sorted(entries, key=lambda item: item.task_id))
@@ -907,26 +1297,69 @@ class RunCaseSnapshot(_JsonModel):
             schema_version=cls.SCHEMA_VERSION,
             snapshot_id=_snapshot_id(manifest, ordered),
             manifest=manifest,
+            wire_contract=manifest.wire_contract,
             cases=ordered,
         )
 
     @classmethod
     def from_dict(cls, value: Any) -> "RunCaseSnapshot":
         payload = _object(value, "RunCaseSnapshot")
+        if "schema_version" not in payload:
+            raise SchemaError(
+                "RunCaseSnapshot has missing field(s): schema_version"
+            )
+        _require_protocol_version(
+            payload["schema_version"],
+            cls.SCHEMA_VERSION,
+            "RunCaseSnapshot.schema_version",
+        )
         _exact_fields(
             payload,
-            ("schema_version", "snapshot_id", "manifest", "cases"),
+            (
+                "schema_version",
+                "snapshot_id",
+                "manifest",
+                "wire_contract",
+                "cases",
+            ),
             "RunCaseSnapshot",
         )
-        if payload["schema_version"] != cls.SCHEMA_VERSION:
-            raise SchemaError("RunCaseSnapshot has an unknown schema_version")
+        wire_contract = WireContractV2.from_dict(payload["wire_contract"])
+        manifest_payload = _object(
+            payload["manifest"], "RunCaseSnapshot.manifest"
+        )
+        if "schema_version" in manifest_payload:
+            _require_protocol_version(
+                manifest_payload["schema_version"],
+                SuiteManifest.SCHEMA_VERSION,
+                "RunCaseSnapshot.manifest.schema_version",
+            )
+        if "wire_contract" in manifest_payload:
+            WireContractV2.from_dict(manifest_payload["wire_contract"])
         raw_cases = _array(
             payload["cases"], "run Case snapshot.cases", MAX_SUITE_CASES
         )
+        for index, raw_case in enumerate(raw_cases):
+            entry_payload = _object(
+                raw_case, "run Case snapshot.cases[%d]" % index
+            )
+            if "input" not in entry_payload:
+                continue
+            input_payload = _object(
+                entry_payload["input"],
+                "run Case snapshot.cases[%d].input" % index,
+            )
+            if "schema_version" in input_payload:
+                _require_protocol_version(
+                    input_payload["schema_version"],
+                    EVAL_INPUT_SCHEMA_VERSION,
+                    "run Case snapshot.cases[%d].input.schema_version" % index,
+                )
         return cls(
             schema_version=payload["schema_version"],
             snapshot_id=validate_run_case_snapshot_id(payload["snapshot_id"]),
             manifest=SuiteManifest.from_dict(payload["manifest"]),
+            wire_contract=wire_contract,
             cases=tuple(RunCaseSnapshotEntry.from_dict(item) for item in raw_cases),
         )
 
@@ -984,6 +1417,7 @@ class RunCaseSnapshot(_JsonModel):
             schema_version=self.SCHEMA_VERSION,
             snapshot_id=_snapshot_id(self.manifest, entries),
             manifest=self.manifest,
+            wire_contract=self.wire_contract,
             cases=entries,
         )
 
@@ -998,6 +1432,7 @@ class RunCaseSnapshot(_JsonModel):
             "schema_version": self.schema_version,
             "snapshot_id": self.snapshot_id,
             "manifest": self.manifest.to_dict(),
+            "wire_contract": self.wire_contract.to_dict(),
             "cases": [item.to_dict() for item in self.cases],
         }
 
@@ -1078,6 +1513,9 @@ def load_run_case_snapshot(data: Any) -> RunCaseSnapshot:
 __all__ = [
     "SUITE_MANIFEST_SCHEMA_VERSION",
     "RUN_CASE_SNAPSHOT_SCHEMA_VERSION",
+    "PUBLIC_SUITE_PREPARATION_BINDING_SCHEMA_VERSION",
+    "REPOSITORY_MATERIALIZER_PROTOCOL",
+    "FROZEN_CONTEXT_MATERIALIZER_PROTOCOL",
     "MAX_SUITE_MANIFEST_BYTES",
     "MAX_RUN_CASE_SNAPSHOT_BYTES",
     "MAX_SUITE_CASES",
@@ -1085,6 +1523,8 @@ __all__ = [
     "MAX_CASE_DIMENSIONS",
     "CaseSplit",
     "SuiteKind",
+    "WireContractV2",
+    "PublicSuitePreparationBindingV2",
     "SuiteSource",
     "CaseDimension",
     "SuiteCase",

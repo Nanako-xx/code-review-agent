@@ -17,7 +17,13 @@ from review_agent_eval.cases import (
     SuiteManifest,
 )
 from review_agent_eval.datasets import CaseBank, CaseIntegrityError, DatasetError
-from review_agent_eval.models import EvalCase, EvalInput, SchemaError, canonical_json_bytes
+from review_agent_eval.models import (
+    EvalCase,
+    EvalInput,
+    SchemaError,
+    UnsupportedProtocolVersionError,
+    canonical_json_bytes,
+)
 
 
 BASE = "a" * 40
@@ -36,7 +42,7 @@ def case_payload(
     novel_policy: str = "forbid",
 ) -> dict:
     return {
-        "schema_version": "eval_case_v1",
+        "schema_version": "eval_case_v2",
         "task_id": task_id,
         "case_version": 1,
         "source": {
@@ -49,21 +55,24 @@ def case_payload(
             "content_hash": "c" * 64,
         },
         "input": {
-            "repository": {
-                "source": "fixture",
-                "path": "repositories/%s" % task_id,
-                "url": None,
-                "base_revision": BASE,
-                "head_revision": HEAD,
-            },
-            "review_request": {
-                "title": "Review %s" % task_id,
-                "description": None,
-                "user_intent": "Preserve behavior",
-                "review_focus": None,
-                "linked_requirements": ["REQ-1 preserve behavior"],
-                "project_rules": [],
-                "existing_ci_evidence": [],
+            "review_target": {
+                "kind": "repository",
+                "repository": {
+                    "source": "fixture",
+                    "path": "repositories/%s" % task_id,
+                    "url": None,
+                    "base_revision": BASE,
+                    "head_revision": HEAD,
+                },
+                "review_request": {
+                    "title": "Review %s" % task_id,
+                    "description": None,
+                    "user_intent": "Preserve behavior",
+                    "review_focus": None,
+                    "linked_requirements": ["REQ-1 preserve behavior"],
+                    "project_rules": [],
+                    "existing_ci_evidence": [],
+                },
             },
         },
         "clarification_script": {
@@ -99,6 +108,7 @@ def case_payload(
             "expected_findings": [],
             "known_invalid_findings": [],
         },
+        "review_evaluator_context": {"truth_contexts": []},
     }
 
 
@@ -138,9 +148,16 @@ def write_suite(
 
     public = kind == "public"
     manifest = {
-        "schema_version": "suite_manifest_v1",
+        "schema_version": "suite_manifest_v2",
         "suite_id": "suite-1",
         "suite_version": "suite-v1",
+        "wire_contract": {
+            "case_schema_version": "eval_case_v2",
+            "input_schema_version": "eval_input_v2",
+            "submission_schema_version": "eval_submission_v2",
+            "review_target_kind": "repository",
+            "materializer_protocol": "repository-materializer-v2",
+        },
         "source": {
             "kind": kind,
             "source_id": "dataset-source",
@@ -148,6 +165,20 @@ def write_suite(
             "source_uri": "https://example.test/dataset" if public else None,
             "license": "Apache-2.0" if public else None,
             "content_hash": "e" * 64,
+            "preparation_binding": (
+                {
+                    "schema_version": "public_suite_preparation_binding_v2",
+                    "source_catalog_digest": "1" * 64,
+                    "acquisition_receipt_digest": "2" * 64,
+                    "source_manifest_digest": "3" * 64,
+                    "filter_manifest_digest": "4" * 64,
+                    "preparation_packet_digest": "5" * 64,
+                    "repository_catalog_digest": "6" * 64,
+                    "frozen_bundle_trust_digest": None,
+                }
+                if public
+                else None
+            ),
         },
         "cases": entries,
     }
@@ -190,6 +221,24 @@ def test_case_bank_loads_verified_handles_and_keeps_agent_view_truth_free(
         bank.manifest = bank.manifest  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         handle.entry = handle.entry  # type: ignore[misc]
+
+
+def test_v2_suite_rejects_v1_case_file_before_nested_hydration(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest, _cases = write_suite(tmp_path)
+    v1_case = case_payload()
+    v1_case["schema_version"] = "eval_case_v1"
+    v1_case["legacy_unknown"] = True
+    raw = canonical_json_bytes(v1_case)
+    case_path = tmp_path / "cases" / "task-001.json"
+    case_path.write_bytes(raw)
+    manifest["cases"][0]["raw_file_size_bytes"] = len(raw)
+    manifest["cases"][0]["raw_file_sha256"] = hashlib.sha256(raw).hexdigest()
+    rewrite_manifest(manifest_path, manifest)
+
+    with pytest.raises(UnsupportedProtocolVersionError):
+        CaseBank.open(tmp_path)
 
 
 def test_bank_open_fails_for_missing_case_and_loaded_task_id_mismatch(
@@ -267,6 +316,33 @@ def test_raw_file_sha_and_canonical_case_digest_are_distinct_bindings(
     assert CaseBank.open(noncanonical_root).evaluator_case("task-001") == cases[0]
 
 
+def test_case_hash_hydration_and_canonical_digest_share_one_bounded_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_suite(tmp_path)
+    original = datasets_module._read_relative_regular_file
+    case_reads: list[bytes] = []
+
+    def counted(root, relative_path, maximum_bytes, context):
+        raw = original(root, relative_path, maximum_bytes, context)
+        if relative_path == "cases/task-001.json":
+            case_reads.append(raw)
+        return raw
+
+    monkeypatch.setattr(
+        datasets_module,
+        "_read_relative_regular_file",
+        counted,
+    )
+
+    bank = CaseBank.open(tmp_path)
+    assert len(case_reads) == 1
+    assert hashlib.sha256(case_reads[0]).hexdigest() == bank.handle(
+        "task-001"
+    ).raw_file_sha256
+
+
 def test_each_case_load_revalidates_canonical_case_digest(tmp_path: Path) -> None:
     manifest_path, manifest, _ = write_suite(tmp_path)
     manifest["cases"][0]["canonical_case_digest"] = "0" * 64
@@ -280,7 +356,9 @@ def test_case_tamper_cannot_pass_by_updating_only_file_hash(tmp_path: Path) -> N
     manifest_path, manifest, cases = write_suite(tmp_path)
     path = tmp_path / "cases" / "task-001.json"
     changed = cases[0].to_dict()
-    changed["input"]["review_request"]["title"] = "Tampered title"
+    changed["input"]["review_target"]["review_request"][
+        "title"
+    ] = "Tampered title"
     raw = canonical_json_bytes(changed)
     path.write_bytes(raw)
     manifest["cases"][0]["raw_file_size_bytes"] = len(raw)
@@ -307,6 +385,17 @@ def test_existing_bank_revalidates_manifest_before_every_case_use(tmp_path: Path
     rewrite_manifest(manifest_path, manifest)
 
     with pytest.raises(CaseIntegrityError, match="manifest changed"):
+        bank.evaluator_case("task-001")
+
+
+def test_existing_v2_bank_rejects_replaced_v1_manifest_at_root(tmp_path: Path) -> None:
+    manifest_path, manifest, _ = write_suite(tmp_path)
+    bank = CaseBank.open(tmp_path)
+    manifest["schema_version"] = "suite_manifest_v1"
+    manifest["legacy_unknown"] = True
+    rewrite_manifest(manifest_path, manifest)
+
+    with pytest.raises(UnsupportedProtocolVersionError):
         bank.evaluator_case("task-001")
 
 
@@ -360,9 +449,16 @@ def test_case_bank_rejects_symlink_or_reparse_point_escape(
         monkeypatch.setattr(datasets_module.os, "lstat", linked_lstat)
 
     manifest = {
-        "schema_version": "suite_manifest_v1",
+        "schema_version": "suite_manifest_v2",
         "suite_id": "suite-1",
         "suite_version": "suite-v1",
+        "wire_contract": {
+            "case_schema_version": "eval_case_v2",
+            "input_schema_version": "eval_input_v2",
+            "submission_schema_version": "eval_submission_v2",
+            "review_target_kind": "repository",
+            "materializer_protocol": "repository-materializer-v2",
+        },
         "source": {
             "kind": "core",
             "source_id": "dataset-source",
@@ -370,6 +466,7 @@ def test_case_bank_rejects_symlink_or_reparse_point_escape(
             "source_uri": None,
             "license": None,
             "content_hash": "e" * 64,
+            "preparation_binding": None,
         },
         "cases": [
             {
@@ -546,12 +643,17 @@ def test_run_snapshot_remains_immutable_after_source_case_changes(tmp_path: Path
     write_suite(tmp_path)
     bank = CaseBank.open(tmp_path)
     snapshot = bank.snapshot()
-    original_title = snapshot.case("task-001").input.review_request.title
+    original_title = (
+        snapshot.case("task-001").input.review_target.review_request.title
+    )
 
     path = tmp_path / "cases" / "task-001.json"
     path.write_bytes(b"{}")
 
-    assert snapshot.eval_input("task-001").review_request.title == original_title
+    assert (
+        snapshot.eval_input("task-001").review_target.review_request.title
+        == original_title
+    )
     assert RunCaseSnapshot.from_json(snapshot.to_json()) == snapshot
     assert "intent_truth" not in snapshot.to_json()
     assert "review_truth" not in snapshot.to_json()

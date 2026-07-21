@@ -28,8 +28,11 @@ from review_agent_eval.config import (
     validate_trial_id,
 )
 from review_agent_eval.models import (
+    EvidenceKind,
     EvalCase,
+    ReviewTargetKind,
     SchemaError,
+    UnsupportedProtocolVersionError,
     canonical_json,
     canonical_sha256,
 )
@@ -38,7 +41,7 @@ from review_agent_eval.models import (
 def _build_case_snapshot(task_id: str = "task-001") -> RunCaseSnapshot:
     case = EvalCase.from_dict(
         {
-            "schema_version": "eval_case_v1",
+            "schema_version": "eval_case_v2",
             "task_id": task_id,
             "case_version": 2,
             "source": {
@@ -51,21 +54,24 @@ def _build_case_snapshot(task_id: str = "task-001") -> RunCaseSnapshot:
                 "content_hash": "9" * 64,
             },
             "input": {
-                "repository": {
-                    "source": "fixture",
-                    "path": "repositories/case-001",
-                    "url": None,
-                    "base_revision": "a" * 40,
-                    "head_revision": "b" * 40,
-                },
-                "review_request": {
-                    "title": "Review authorization behavior",
-                    "description": None,
-                    "user_intent": "Keep authorization intact",
-                    "review_focus": None,
-                    "linked_requirements": [],
-                    "project_rules": [],
-                    "existing_ci_evidence": [],
+                "review_target": {
+                    "kind": "repository",
+                    "repository": {
+                        "source": "fixture",
+                        "path": "repositories/case-001",
+                        "url": None,
+                        "base_revision": "a" * 40,
+                        "head_revision": "b" * 40,
+                    },
+                    "review_request": {
+                        "title": "Review authorization behavior",
+                        "description": None,
+                        "user_intent": "Keep authorization intact",
+                        "review_focus": None,
+                        "linked_requirements": [],
+                        "project_rules": [],
+                        "existing_ci_evidence": [],
+                    },
                 },
             },
             "clarification_script": {"max_rounds": 1, "answers": []},
@@ -82,14 +88,22 @@ def _build_case_snapshot(task_id: str = "task-001") -> RunCaseSnapshot:
                 "expected_findings": [],
                 "known_invalid_findings": [],
             },
+            "review_evaluator_context": {"truth_contexts": []},
         }
     )
     case_bytes = case.to_json().encode("utf-8")
     manifest = SuiteManifest.from_dict(
         {
-            "schema_version": "suite_manifest_v1",
+            "schema_version": "suite_manifest_v2",
             "suite_id": "core-capability",
             "suite_version": "3",
+            "wire_contract": {
+                "case_schema_version": "eval_case_v2",
+                "input_schema_version": "eval_input_v2",
+                "submission_schema_version": "eval_submission_v2",
+                "review_target_kind": "repository",
+                "materializer_protocol": "repository-materializer-v2",
+            },
             "source": {
                 "kind": "core",
                 "source_id": "suite-source",
@@ -97,6 +111,7 @@ def _build_case_snapshot(task_id: str = "task-001") -> RunCaseSnapshot:
                 "source_uri": None,
                 "license": None,
                 "content_hash": "8" * 64,
+                "preparation_binding": None,
             },
             "cases": [
                 {
@@ -230,6 +245,29 @@ def suite_config(snapshot: RunCaseSnapshot) -> SuiteRunConfig:
     return SuiteRunConfig.from_case_snapshot(snapshot)
 
 
+def adapter_capabilities():
+    capability_type = getattr(config_module, "AdapterCapabilitiesV2")
+    return capability_type.from_dict(
+        {
+            "schema_version": "eval_adapter_capabilities_v2",
+            "adapter_id": "current-agent-cli-v2",
+            "adapter_version": "2",
+            "input_schema_version": "eval_input_v2",
+            "submission_schema_version": "eval_submission_v2",
+            "target_kinds": ["repository"],
+            "evidence_kinds": [
+                "repository_file",
+                "repository_diff",
+                "command_output",
+            ],
+            "clarification_protocol": "canonical-clarification-v2",
+            "trace_protocol": "local-trace-v2",
+            "subprocess_wire_version": None,
+            "isolation_profile": "repository-worktree-v2",
+        }
+    )
+
+
 def budgets(*, parallel: int = 2) -> ResourceBudgets:
     return ResourceBudgets(
         agent_timeout_seconds=900,
@@ -259,10 +297,42 @@ def run_config(
         clarification_matcher=matcher or matcher_config(),
         evaluator=evaluator or evaluator_config(),
         suite=suite or suite_config(snapshot),
+        adapter_capabilities=adapter_capabilities(),
         trial_count=trial_count,
         resource_budgets=resource_budgets
         or budgets(parallel=min(2, trial_count)),
     )
+
+
+def test_run_config_binds_wire_preparation_and_adapter_capabilities(
+    case_snapshot: RunCaseSnapshot,
+) -> None:
+    config = run_config(case_snapshot)
+
+    assert config.schema_version == "eval_run_config_v2"
+    assert config.wire_contract == case_snapshot.wire_contract
+    assert config.suite_preparation_binding_digest is None
+    assert config.adapter_capabilities == adapter_capabilities()
+    assert config.adapter_capabilities_digest == adapter_capabilities().digest()
+    assert config.target_kinds == (ReviewTargetKind.REPOSITORY,)
+    assert config.materializer_protocol == "repository-materializer-v2"
+
+    payload = config.to_dict()
+    payload["adapter_capabilities_digest"] = "0" * 64
+    with pytest.raises(SchemaError, match="adapter_capabilities_digest"):
+        EvalRunConfig.from_dict(payload)
+
+    payload = config.to_dict()
+    payload["wire_contract"]["materializer_protocol"] = (
+        "frozen-context-materializer-v2"
+    )
+    with pytest.raises(SchemaError, match="materializer|wire contract"):
+        EvalRunConfig.from_dict(payload)
+
+    payload = config.to_dict()
+    payload["target_kinds"] = ["frozen_context"]
+    with pytest.raises(SchemaError, match="target kind|target_kinds"):
+        EvalRunConfig.from_dict(payload)
 
 
 def test_suite_run_config_reuses_verified_snapshot_protocol_and_round_trips(
@@ -296,7 +366,7 @@ def test_final_run_config_records_complete_reproduction_identity_and_round_trips
 ) -> None:
     config = run_config(case_snapshot)
 
-    assert config.schema_version == "eval_run_config_v1"
+    assert config.schema_version == "eval_run_config_v2"
     assert config.run_instance_key == "instance-20260716-001"
     assert config.agent.agent_id == "agent-current"
     assert config.agent.commit == "a" * 40
@@ -493,6 +563,7 @@ def test_config_exports_only_final_protocol_names() -> None:
     assert "JudgeKind" in config_module.__all__
     assert "JudgeProfileSnapshot" in config_module.__all__
     assert "JudgeExecutionBudgets" in config_module.__all__
+    assert "AdapterCapabilitiesV2" in config_module.__all__
     assert "MAX_JUDGE_TOKEN_BUDGET" in config_module.__all__
     assert not hasattr(config_module, "AgentRunConfig")
     for alias in (
@@ -886,15 +957,33 @@ def test_budget_and_cache_policy_change_execution_digest_and_evaluation_id(
         config.resource_budgets,
         cache_policy_version="semantic-judge-cache-v2",
     )
+    changed_context = EvaluatorExecutionConfig.from_resource_budgets(
+        config.evaluator,
+        config.resource_budgets,
+        review_evaluator_context_policy_version="truth-scoped-context-v3",
+    )
+    changed_authority = EvaluatorExecutionConfig.from_resource_budgets(
+        config.evaluator,
+        config.resource_budgets,
+        metric_authority_policy_version="metric-authority-v3",
+    )
 
     assert original.digest() != changed_budget.digest()
     assert original.digest() != changed_cache.digest()
+    assert original.digest() != changed_context.digest()
+    assert original.digest() != changed_authority.digest()
     original_id = derive_evaluation_id(config.run_id, original.digest(), "v1")
     assert original_id != derive_evaluation_id(
         config.run_id, changed_budget.digest(), "v1"
     )
     assert original_id != derive_evaluation_id(
         config.run_id, changed_cache.digest(), "v1"
+    )
+    assert original_id != derive_evaluation_id(
+        config.run_id, changed_context.digest(), "v1"
+    )
+    assert original_id != derive_evaluation_id(
+        config.run_id, changed_authority.digest(), "v1"
     )
 
 
@@ -950,8 +1039,8 @@ def test_strict_hydration_rejects_unknown_duplicate_and_digest_mismatch(
         EvalRunConfig.from_dict(payload)
 
     duplicate = config.to_json().replace(
-        '"schema_version":"eval_run_config_v1"',
-        '"schema_version":"eval_run_config_v1","schema_version":"eval_run_config_v1"',
+        '"schema_version":"eval_run_config_v2"',
+        '"schema_version":"eval_run_config_v2","schema_version":"eval_run_config_v2"',
         1,
     )
     with pytest.raises(SchemaError, match="duplicate"):
@@ -1053,9 +1142,41 @@ def test_resource_and_trial_budgets_fail_closed(
             clarification_matcher=matcher_config(),
             evaluator=evaluator_config(),
             suite=suite_config(case_snapshot),
+            adapter_capabilities=adapter_capabilities(),
             trial_count=1,
             resource_budgets=budgets(parallel=2),
         )
+
+
+def test_v2_run_config_rejects_v1_roots_and_children_before_deeper_hydration(
+    case_snapshot: RunCaseSnapshot,
+) -> None:
+    config = run_config(case_snapshot)
+
+    v1_root = config.to_dict()
+    v1_root["schema_version"] = "eval_run_config_v1"
+    v1_root["legacy_unknown"] = True
+    with pytest.raises(UnsupportedProtocolVersionError):
+        EvalRunConfig.from_dict(v1_root)
+
+    v1_capability = config.to_dict()
+    v1_capability["adapter_capabilities"]["schema_version"] = (
+        "eval_adapter_capabilities_v1"
+    )
+    v1_capability["agent_config_digest"] = "malformed"
+    with pytest.raises(UnsupportedProtocolVersionError):
+        EvalRunConfig.from_dict(v1_capability)
+
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        config.evaluator,
+        config.resource_budgets,
+    )
+    v1_execution = execution.to_dict()
+    v1_execution["schema_version"] = "eval_evaluator_execution_config_v1"
+    v1_execution["legacy_unknown"] = True
+    v1_execution["evaluator"] = "malformed-but-deeper"
+    with pytest.raises(UnsupportedProtocolVersionError):
+        EvaluatorExecutionConfig.from_dict(v1_execution)
 
 
 def test_json_parameters_reject_non_json_and_non_finite_values() -> None:

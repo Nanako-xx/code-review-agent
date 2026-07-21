@@ -1,163 +1,200 @@
 from __future__ import annotations
 
 import json
-import shutil
-import sys
 from pathlib import Path
 
 import pytest
 
-from review_agent_eval.artifacts import ArtifactStore
-from review_agent_eval.cli import EXIT_OK, main
-from review_agent_eval.datasets import CaseBank
-from review_agent_eval.orchestrator import EvaluationOrchestrator
-from review_agent_eval.repository import RepositoryPreparer
+from review_agent_eval.config import EvaluatorExecutionConfig
+from review_agent_eval.models import (
+    UnsupportedProtocolVersionError,
+    canonical_json_bytes,
+)
 
-from .test_cli import _root_arguments, _without_message, _write_cli_suite
-
-
-def _json_command(
-    args: list[str],
-    capsys: pytest.CaptureFixture[str],
-) -> dict:
-    assert main(args) == EXIT_OK
-    captured = capsys.readouterr()
-    assert captured.err == ""
-    return json.loads(captured.out)
+from .test_artifacts import TASK_ID, complete_trial, make_store
+from .test_config import evaluator_config
 
 
-def test_rejudge_changes_report_identity_and_resume_reuses_exact_namespace(
+def _evaluation_values(score: int = 1) -> dict:
+    return {
+        "intent_matches": {"matches": ["intent-1"]},
+        "review_matches": {"matches": ["finding-1"]},
+        "judge_input": {"requests": []},
+        "judge_output": {"status": "graded", "results": []},
+        "score": {"total": score},
+        "report": "# Trial evaluation %d\n" % score,
+    }
+
+
+def test_rejudge_changes_execution_namespace_and_reuses_submission(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    roots, program = _write_cli_suite(tmp_path)
-    common = _root_arguments(roots)
-    agent_command = [
-        str(Path(sys.executable).resolve()),
-        str(program),
-        "success",
-        "{agent_id}",
-        "{task_id}",
-        "{trial_id}",
-    ]
-
-    prepare_args = [
-        "prepare",
-        *common,
-        "--agent-adapter",
-        "subprocess",
-        "--json",
-    ]
-    for item in agent_command:
-        prepare_args.extend(("--agent-command", item))
-    prepared = _json_command(prepare_args, capsys)
-    run_id = prepared["run_id"]
-
-    agent_run = _json_command(
-        ["run-agent", run_id, *common, "--json"],
-        capsys,
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
+    submission, _state = complete_trial(store, config, plan)
+    original_execution = EvaluatorExecutionConfig.from_resource_budgets(
+        config.evaluator,
+        config.resource_budgets,
     )
-    trial_id = agent_run["trials"][0]["trial_id"]
-    store = ArtifactStore(roots["runs"], create_root=False)
-    submission_before = store.load_existing_submission(
-        run_id,
-        "task-001",
-        trial_id,
+    revision = "task12-rejudge-v2"
+    first = store.write_evaluation(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        evaluator_execution=original_execution,
+        revision=revision,
+        **_evaluation_values(1),
+    )
+    assert first.evaluation_id is not None
+    first_bundle = store.load_evaluation_bundle(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        first.evaluation_id,
     )
 
-    evaluation_args = [
-        "evaluate",
-        run_id,
-        *common,
-        "--revision",
-        "rejudge-regression-v1",
-        "--judge-provider",
-        "fake",
-        "--judge-model",
-        "judge-model-v1",
-        "--json",
-    ]
-    first = _json_command(evaluation_args, capsys)
-    first_namespace = store.load_run_evaluation(
-        run_id,
-        first["evaluation_id"],
+    resumed = store.write_evaluation(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        evaluator_execution=original_execution,
+        revision=revision,
+        resume=True,
+        **_evaluation_values(1),
     )
-    first_trial_namespace = store.load_evaluation_bundle(
-        run_id,
-        "task-001",
-        trial_id,
-        first["evaluation_id"],
-    )
-    git_executable = shutil.which("git")
-    assert git_executable is not None
-    with RepositoryPreparer(
-        suite_root=roots["suite"],
-        data_root=roots["data"],
-        workspace_root=roots["workspaces"],
-        git_executable=Path(git_executable).absolute(),
-    ) as preparer:
-        source_bound_first = EvaluationOrchestrator(
-            store,
-            CaseBank.open(roots["suite"]),
-            repository_preparer=preparer,
-        ).load_run_evaluation(run_id, first["evaluation_id"])
-    assert source_bound_first.summary.summary_id == first["summary_id"]
-    assert source_bound_first.report == first_namespace.report
-    assert source_bound_first.to_dict()["trials"] == first["trials"]
+    assert resumed == first
 
-    resumed = _json_command(
-        [*evaluation_args, "--resume"],
-        capsys,
+    changed_judge_execution = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator_config(judge_version="judge-v2", model="judge-model-v2"),
+        config.resource_budgets,
     )
-    resumed_namespace = store.load_run_evaluation(
-        run_id,
-        resumed["evaluation_id"],
+    changed_judge = store.write_evaluation(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        evaluator_execution=changed_judge_execution,
+        revision=revision,
+        **_evaluation_values(2),
     )
-    resumed_trial_namespace = store.load_evaluation_bundle(
-        run_id,
-        "task-001",
-        trial_id,
-        resumed["evaluation_id"],
+    changed_budget_execution = EvaluatorExecutionConfig.create(
+        evaluator=config.evaluator,
+        evaluator_timeout_seconds=(
+            original_execution.evaluator_timeout_seconds + 1
+        ),
+        max_execution_artifact_file_bytes=(
+            original_execution.max_execution_artifact_file_bytes
+        ),
+        max_execution_artifact_total_bytes=(
+            original_execution.max_execution_artifact_total_bytes
+        ),
     )
-
-    changed_args = list(evaluation_args)
-    changed_args[changed_args.index("--judge-model") + 1] = "judge-model-v2"
-    changed = _json_command(changed_args, capsys)
-    changed_namespace = store.load_run_evaluation(
-        run_id,
-        changed["evaluation_id"],
+    changed_budget = store.write_evaluation(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        evaluator_execution=changed_budget_execution,
+        revision=revision,
+        **_evaluation_values(3),
     )
-    changed_trial_namespace = store.load_evaluation_bundle(
-        run_id,
-        "task-001",
-        trial_id,
-        changed["evaluation_id"],
+    changed_context_execution = EvaluatorExecutionConfig.from_resource_budgets(
+        config.evaluator,
+        config.resource_budgets,
+        review_evaluator_context_policy_version="truth-scoped-context-v3",
     )
-    submission_after = store.load_existing_submission(
-        run_id,
-        "task-001",
-        trial_id,
+    changed_context = store.write_evaluation(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        evaluator_execution=changed_context_execution,
+        revision=revision,
+        **_evaluation_values(4),
+    )
+    changed_authority_execution = EvaluatorExecutionConfig.from_resource_budgets(
+        config.evaluator,
+        config.resource_budgets,
+        metric_authority_policy_version="metric-authority-v3",
+    )
+    changed_authority = store.write_evaluation(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        evaluator_execution=changed_authority_execution,
+        revision=revision,
+        **_evaluation_values(5),
     )
 
-    # Same evaluator execution + revision resumes the exact immutable Run
-    # report namespace, including both ReportBuilder's summary and Markdown.
-    assert _without_message(resumed) == _without_message(first)
-    assert resumed_namespace.to_dict() == first_namespace.to_dict()
-    assert resumed_trial_namespace.to_dict() == first_trial_namespace.to_dict()
+    assert len(
+        {
+            first.evaluation_id,
+            changed_judge.evaluation_id,
+            changed_budget.evaluation_id,
+            changed_context.evaluation_id,
+            changed_authority.evaluation_id,
+        }
+    ) == 5
+    assert store.load_run_config(config.run_id).run_id == config.run_id
+    assert store.load_existing_submission(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+    ).digest() == submission.digest()
+    assert first_bundle.submission_digest == submission.digest()
+    assert len(store.list_evaluations(config.run_id)) == 5
 
-    # Changing only the Judge model changes the evaluator execution digest;
-    # the existing Submission remains the same source for both evaluations.
-    assert changed["evaluation_id"] != first["evaluation_id"]
-    assert changed["summary_id"] != first["summary_id"]
-    assert changed["report_digest"] != first["report_digest"]
-    assert changed_namespace.namespace.evaluator_execution_digest != (
-        first_namespace.namespace.evaluator_execution_digest
+
+def test_v1_evaluation_receipt_cannot_load_or_resume_rejudge(
+    tmp_path: Path,
+) -> None:
+    store, config, _manifest, plan, trial = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        config.evaluator,
+        config.resource_budgets,
     )
-    assert changed_namespace.report != first_namespace.report
-    assert changed_trial_namespace.evaluation_id != first_trial_namespace.evaluation_id
-    assert changed_trial_namespace.report != first_trial_namespace.report
-    assert changed_trial_namespace.submission_digest == (
-        first_trial_namespace.submission_digest
+    revision = "task12-v1-rejection"
+    receipt = store.write_evaluation(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        evaluator_execution=execution,
+        revision=revision,
+        **_evaluation_values(),
     )
-    assert submission_after.digest() == submission_before.digest()
-    assert len(store.list_run_evaluations(run_id)) == 2
+    assert receipt.evaluation_id is not None
+    evaluation_root = (
+        store.root
+        / config.run_id
+        / "cases"
+        / trial.case_path_id
+        / "trials"
+        / plan.trial_id
+        / "evaluations"
+    )
+    before_names = tuple(sorted(path.name for path in evaluation_root.iterdir()))
+    receipt_path = (
+        evaluation_root / receipt.evaluation_id / "receipt.json"
+    )
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "eval_stage_receipt_v1"
+    payload["legacy_unknown"] = True
+    receipt_path.write_bytes(canonical_json_bytes(payload))
+
+    with pytest.raises(UnsupportedProtocolVersionError):
+        store.load_evaluation_bundle(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            receipt.evaluation_id,
+        )
+    with pytest.raises(UnsupportedProtocolVersionError):
+        store.write_evaluation(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            evaluator_execution=execution,
+            revision=revision,
+            resume=True,
+            **_evaluation_values(),
+        )
+    assert tuple(sorted(path.name for path in evaluation_root.iterdir())) == (
+        before_names
+    )

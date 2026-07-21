@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import json
 from pathlib import Path
 
 import pytest
@@ -16,8 +16,12 @@ from review_agent_eval.config import (
     EvaluatorExecutionConfig,
     derive_evaluation_id,
 )
-from review_agent_eval.models import Repository, RepositorySource, canonical_json_bytes
-from review_agent_eval.report import ReportBuilder, render_run_markdown
+from review_agent_eval.models import (
+    Repository,
+    RepositorySource,
+    UnsupportedProtocolVersionError,
+    canonical_json_bytes,
+)
 from review_agent_eval.repository import (
     RepositoryCacheStatus,
     RepositoryMode,
@@ -28,11 +32,8 @@ from .test_artifacts import (
     TASK_ID,
     complete_trial,
     make_store,
-    required_runner_artifacts,
 )
 from .test_config import evaluator_config
-from .test_metrics import _case_and_snapshot
-from .test_report import _report_sources
 from .test_repository import _author_fixture, _preparer
 
 
@@ -256,126 +257,36 @@ def test_evaluation_bundle_rejects_orphan_and_receipt_bound_tampering(
         )
 
 
-def test_run_evaluation_summary_report_is_create_only_and_source_hydratable(
-    tmp_path: Path,
-) -> None:
-    case, _replay, execution, config, sources = _report_sources()
-    same_case, snapshot, _same_replay = _case_and_snapshot()
-    assert same_case == case
-    store = ArtifactStore(tmp_path / ".eval-runs")
-    run_manifest = store.create_run(config, snapshot)
+def test_v1_run_root_cannot_resume_load_or_rejudge(tmp_path: Path) -> None:
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    run_manifest_path = store.root / config.run_id / "run_manifest.json"
+    payload = json.loads(
+        run_manifest_path.read_text(encoding="utf-8")
+    )
+    payload["schema_version"] = "eval_run_manifest_v1"
+    payload["legacy_unknown"] = True
+    run_manifest_path.write_bytes(canonical_json_bytes(payload))
+    evaluation_root = (
+        store.root
+        / config.run_id
+        / "cases"
+        / plan.case_path_id
+        / "trials"
+        / plan.trial_id
+        / "evaluations"
+    )
+    before = tuple(evaluation_root.iterdir())
 
-    bound_sources = []
-    for source in sources:
-        assert source.submission is not None
-        plan = next(
-            item
-            for item in run_manifest.trials
-            if item.trial_id == source.submission.trial_id
-        )
-        running = store.start_trial(config.run_id, case.task_id, plan.trial_id)
-        assert running.active_attempt is not None
-        store.write_prepare_stage(
-            config.run_id,
-            case.task_id,
-            plan.trial_id,
-            case.eval_input(),
-            attempt=running.active_attempt,
-        )
-        store.finalize_submission(
-            config.run_id,
-            case.task_id,
-            plan.trial_id,
-            source.submission,
-            attempt=running.active_attempt,
-            runner_artifacts=required_runner_artifacts(source.submission),
-        )
-        store.write_evaluation(
-            config.run_id,
-            case.task_id,
-            plan.trial_id,
-            evaluator_execution=execution,
-            revision="metrics-eval-v1",
-            intent_matches=(
-                {"status": "not_available"}
-                if source.intent_result is None
-                else source.intent_result.to_dict()
-            ),
-            review_matches=(
-                {"status": "not_available"}
-                if source.review_result is None
-                else source.review_result.to_dict()
-            ),
-            judge_input={"requests": []},
-            judge_output={"results": []},
-            score=source.trial_score.to_dict(),
-        )
-        bound_sources.append(
-            replace(
-                source,
-                trial_manifest=store.load_trial_manifest(
-                    config.run_id,
-                    case.task_id,
-                    plan.trial_id,
-                ),
-            )
-        )
+    for operation in (
+        lambda: store.load_run_manifest(config.run_id),
+        lambda: store.load_run_config(config.run_id),
+        lambda: store.load_existing_submission(
+            config.run_id, TASK_ID, plan.trial_id
+        ),
+        lambda: store.recover_trial(config.run_id, TASK_ID, plan.trial_id),
+    ):
+        with pytest.raises(UnsupportedProtocolVersionError):
+            operation()
 
-    builder = ReportBuilder()
-    summary = builder.build_summary(
-        config,
-        execution,
-        "metrics-eval-v1",
-        eval_cases=(case,),
-        trial_sources=tuple(bound_sources),
-        run_manifest=run_manifest,
-    )
-    written = store.write_run_evaluation(
-        config.run_id,
-        evaluator_execution=execution,
-        revision="metrics-eval-v1",
-        summary=summary,
-    )
-    assert written.summary == summary.to_dict()
-    assert written.report == render_run_markdown(summary)
-    assert written.namespace.summary.relative_path.endswith("/summary.json")
-    assert written.namespace.report.relative_path.endswith("/report.md")
-    assert str(store.root) not in repr(written)
-    assert store.list_run_evaluations(config.run_id) == (written.namespace,)
-    hydrated = written.hydrate_summary(
-        builder=builder,
-        run_config=config,
-        evaluator_execution=execution,
-        evaluation_revision="metrics-eval-v1",
-        eval_cases=(case,),
-        trial_sources=tuple(bound_sources),
-        run_manifest=run_manifest,
-    )
-    assert hydrated.to_dict() == summary.to_dict()
-
-    detached_summary = written.summary
-    detached_summary["coverage"]["planned_trial_count"] = 999
-    assert written.summary == summary.to_dict()
-    with pytest.raises(ArtifactConflictError, match="use resume"):
-        store.write_run_evaluation(
-            config.run_id,
-            evaluator_execution=execution,
-            revision="metrics-eval-v1",
-            summary=summary,
-        )
-    resumed = store.write_run_evaluation(
-        config.run_id,
-        evaluator_execution=execution,
-        revision="metrics-eval-v1",
-        summary=summary,
-        resume=True,
-    )
-    assert resumed.namespace == written.namespace
-    with pytest.raises(ArtifactConflictError, match="cannot be overwritten"):
-        store.write_run_evaluation(
-            config.run_id,
-            evaluator_execution=execution,
-            revision="metrics-eval-v1",
-            summary=summary,
-            overwrite=True,
-        )
+    assert tuple(evaluation_root.iterdir()) == before
