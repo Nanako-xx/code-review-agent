@@ -933,6 +933,61 @@ def test_materialization_create_bounds_input_iterables(
     assert consumed == [0, 1, 2]
 
 
+@pytest.mark.parametrize("unbounded_field", ("artifacts", "agent_visible_files"))
+def test_stage_receipt_create_bounds_input_iterables(
+    monkeypatch, unbounded_field
+):
+    maximum_name = (
+        "MAX_RECEIPT_ARTIFACTS"
+        if unbounded_field == "artifacts"
+        else "MAX_AGENT_VISIBLE_FILES"
+    )
+    monkeypatch.setattr(artifact_module, maximum_name, 2)
+    consumed = []
+
+    def over_limit_values():
+        for index in range(3):
+            consumed.append(index)
+            body = ("receipt-%d" % index).encode("utf-8")
+            if unbounded_field == "artifacts":
+                yield ArtifactRef(
+                    relative_path="receipt/file-%d.json" % index,
+                    size_bytes=len(body),
+                    sha256=hashlib.sha256(body).hexdigest(),
+                )
+            else:
+                yield AgentVisibleFileBinding(
+                    role="repository_file",
+                    relative_path="target/repository/file-%d.py" % index,
+                    size_bytes=len(body),
+                    sha256=hashlib.sha256(body).hexdigest(),
+                )
+        raise AssertionError("StageReceipt consumed beyond its item limit")
+
+    values = {
+        "artifacts": (
+            over_limit_values() if unbounded_field == "artifacts" else ()
+        ),
+        "agent_visible_files": (
+            over_limit_values()
+            if unbounded_field == "agent_visible_files"
+            else ()
+        ),
+    }
+    with pytest.raises(SchemaError, match="item limit"):
+        StageReceipt.create(
+            run_id="run-" + "0" * 64,
+            task_id="task-001",
+            trial_id="trial-" + "0" * 64,
+            stage=StageName.START,
+            config_digest="1" * 64,
+            attempt=1,
+            artifacts=values["artifacts"],
+            agent_visible_files=values["agent_visible_files"],
+        )
+    assert consumed == [0, 1, 2]
+
+
 def test_materialization_schema_and_persisted_content_drift_fail_closed(tmp_path):
     store, config, _, plan, _trial = make_store(tmp_path)
     running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
@@ -1194,6 +1249,85 @@ def test_resume_only_commits_missing_legal_receipts_and_never_rewrites_submissio
     terminal_path = submission_path.parent / "receipts" / "terminal.json"
     assert terminal_path.is_file()
     assert store.load_existing_submission(config.run_id, TASK_ID, plan.trial_id) == submission
+
+
+@pytest.mark.parametrize("orphan_kind", ("input", "materialization", "submission"))
+def test_recovery_rejects_v1_orphans_before_committing_incomplete(
+    tmp_path, orphan_kind
+):
+    store, config, _manifest, plan, trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert running.active_attempt == 1
+    base = "cases/%s/trials/%s" % (trial.case_path_id, plan.trial_id)
+
+    if orphan_kind == "input":
+        payload = make_input().to_dict()
+        payload["schema_version"] = "eval_input_v1"
+        payload["legacy_unknown"] = True
+        relative_path = base + "/input.json"
+    elif orphan_kind == "materialization":
+        materialization = make_materialization(
+            config,
+            plan,
+            attempt=running.active_attempt,
+        )
+        payload = materialization.to_dict()
+        payload["schema_version"] = "eval_trial_materialization_v1"
+        payload["legacy_unknown"] = True
+        relative_path = (
+            base
+            + "/materializations/attempt-%04d/materialization_manifest.json"
+            % running.active_attempt
+        )
+        store._ensure_directory(
+            store._target(config.run_id, relative_path).parent
+        )
+    else:
+        payload = failed_submission(plan.trial_id, "orphan").to_dict()
+        payload["schema_version"] = "eval_submission_v1"
+        payload["legacy_unknown"] = True
+        relative_path = base + "/submission.json"
+
+    store._write_json(config.run_id, relative_path, payload)
+    incomplete_path = store._target(
+        config.run_id,
+        base + "/receipts/attempt-%04d/incomplete.json" % running.active_attempt,
+    )
+
+    with pytest.raises(UnsupportedProtocolVersionError):
+        store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert not incomplete_path.exists()
+
+
+def test_recovery_revalidates_failed_submission_input_digest_before_commit(
+    tmp_path,
+):
+    store, config, _manifest, plan, trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    bad_payload = failed_submission(plan.trial_id, "bad digest").to_dict()
+    bad_payload["eval_input_digest"] = "0" * 64
+    bad_submission = EvalSubmission.from_dict(bad_payload)
+    base = "cases/%s/trials/%s" % (trial.case_path_id, plan.trial_id)
+    store._write_json(
+        config.run_id,
+        base + "/submission.json",
+        bad_submission,
+    )
+    write_required_runner_artifacts(
+        store,
+        config,
+        plan,
+        bad_submission,
+        attempt=running.active_attempt,
+    )
+    terminal_path = store._target(
+        config.run_id,
+        base + "/receipts/terminal.json",
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="EvalInput digest"):
+        store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert not terminal_path.exists()
 
 
 def test_abandonment_atomically_commits_failed_process_killed_submission(tmp_path):

@@ -192,6 +192,15 @@ def test_v1_evaluation_receipt_cannot_load_or_resume_rejudge(
             plan.trial_id,
             evaluator_execution=execution,
             revision=revision,
+            **_evaluation_values(),
+        )
+    with pytest.raises(UnsupportedProtocolVersionError):
+        store.write_evaluation(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            evaluator_execution=execution,
+            revision=revision,
             resume=True,
             **_evaluation_values(),
         )

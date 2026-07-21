@@ -800,6 +800,70 @@ def test_suite_and_snapshot_resource_limits_fail_before_unbounded_consumption(
     assert consumed == [0, 1, 2, 3]
 
 
+def test_suite_manifest_byte_limit_precedes_child_and_manifest_sorting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = EvalCase.from_dict(case_payload())
+    manifest = manifest_for_case(case)
+    payload = manifest.to_dict()
+
+    def forbidden_sort(*_args, **_kwargs):
+        raise AssertionError("SuiteManifest sorted an oversized payload")
+
+    monkeypatch.setattr(cases_module, "MAX_SUITE_MANIFEST_BYTES", 1)
+    monkeypatch.setattr(cases_module, "sorted", forbidden_sort, raising=False)
+
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        SuiteManifest(
+            schema_version=manifest.schema_version,
+            suite_id=manifest.suite_id,
+            suite_version=manifest.suite_version,
+            wire_contract=manifest.wire_contract,
+            source=manifest.source,
+            cases=manifest.cases,
+        )
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        SuiteManifest.from_dict(payload)
+
+
+def test_snapshot_byte_limit_precedes_hydration_sort_hash_and_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = EvalCase.from_dict(case_payload())
+    snapshot = snapshot_for_case(case)
+    payload = snapshot.to_dict()
+
+    def forbidden_sort(*_args, **_kwargs):
+        raise AssertionError("RunCaseSnapshot sorted an oversized payload")
+
+    def forbidden_hash(*_args, **_kwargs):
+        raise AssertionError("RunCaseSnapshot hashed an oversized payload")
+
+    def forbidden_identity(*_args, **_kwargs):
+        raise AssertionError("RunCaseSnapshot derived an oversized identity")
+
+    monkeypatch.setattr(cases_module, "MAX_RUN_CASE_SNAPSHOT_BYTES", 1)
+    monkeypatch.setattr(cases_module, "sorted", forbidden_sort, raising=False)
+    monkeypatch.setattr(cases_module, "canonical_sha256", forbidden_hash)
+    monkeypatch.setattr(cases_module, "_snapshot_id", forbidden_identity)
+
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        RunCaseSnapshot(
+            schema_version=snapshot.schema_version,
+            snapshot_id=snapshot.snapshot_id,
+            manifest=snapshot.manifest,
+            wire_contract=snapshot.wire_contract,
+            cases=snapshot.cases,
+        )
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        RunCaseSnapshot.from_dict(payload)
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        RunCaseSnapshot.build(
+            snapshot.manifest,
+            ((snapshot.manifest.cases[0], case),),
+        )
+
+
 def test_manifest_canonical_json_matches_task1_json_configuration() -> None:
     case = EvalCase.from_dict(case_payload())
     manifest = manifest_for_case(case)

@@ -8,6 +8,7 @@ loader validates those documents without knowing which adapter produced them.
 from __future__ import annotations
 
 from bisect import bisect_left
+import json
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -37,7 +38,6 @@ from .models import (
     UnsupportedProtocolVersionError,
     _JsonModel,
     _array,
-    _check_model_size,
     _digest,
     _enum_value,
     _exact_fields,
@@ -182,6 +182,46 @@ def _require_protocol_version(actual: Any, expected: str, context: str) -> str:
     if actual != expected:
         raise UnsupportedProtocolVersionError(expected=expected, actual=actual)
     return actual
+
+
+def _json_size_default(value: Any) -> Any:
+    if isinstance(value, _JsonModel):
+        return value.to_dict()
+    if isinstance(value, Enum):
+        return value.value
+    raise TypeError("value is not JSON serializable")
+
+
+def _check_raw_payload_size(value: Any, maximum: int, context: str) -> None:
+    """Measure compact JSON bytes incrementally without sorting or hashing."""
+
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        allow_nan=False,
+        check_circular=True,
+        separators=(",", ":"),
+        sort_keys=False,
+        default=_json_size_default,
+    )
+    size = 0
+    try:
+        for chunk in encoder.iterencode(value):
+            size += len(chunk.encode("utf-8", "strict"))
+            if size > maximum:
+                raise SchemaError(
+                    "%s exceeds the canonical byte limit of %d"
+                    % (context, maximum)
+                )
+    except SchemaError:
+        raise
+    except (
+        TypeError,
+        ValueError,
+        UnicodeError,
+        OverflowError,
+        RecursionError,
+    ) as exc:
+        raise SchemaError("%s is not a valid bounded JSON payload" % context) from exc
 
 
 @dataclass(frozen=True)
@@ -754,6 +794,18 @@ class SuiteManifest(_JsonModel):
         )
         if not cases:
             raise SchemaError("suite manifest.cases must contain at least one Case")
+        _check_raw_payload_size(
+            {
+                "schema_version": self.schema_version,
+                "suite_id": self.suite_id,
+                "suite_version": self.suite_version,
+                "wire_contract": self.wire_contract,
+                "source": self.source,
+                "cases": cases,
+            },
+            MAX_SUITE_MANIFEST_BYTES,
+            "SuiteManifest",
+        )
 
         task_ids = set()
         portable_task_ids = set()
@@ -798,7 +850,6 @@ class SuiteManifest(_JsonModel):
             "_task_ids",
             tuple(item.task_id for item in ordered),
         )
-        _check_model_size(self, MAX_SUITE_MANIFEST_BYTES, "SuiteManifest")
 
     @classmethod
     def from_dict(cls, value: Any) -> "SuiteManifest":
@@ -826,6 +877,11 @@ class SuiteManifest(_JsonModel):
         suite_source = SuiteSource.from_dict(payload["source"])
         raw_cases = _array(
             payload["cases"], "suite manifest.cases", MAX_SUITE_CASES
+        )
+        _check_raw_payload_size(
+            payload,
+            MAX_SUITE_MANIFEST_BYTES,
+            "SuiteManifest",
         )
         total_case_bytes = 0
         for index, raw_case in enumerate(raw_cases):
@@ -1209,6 +1265,17 @@ class RunCaseSnapshot(_JsonModel):
             raise SchemaError(
                 "run Case snapshot.cases must contain at least one Case"
             )
+        _check_raw_payload_size(
+            {
+                "schema_version": self.schema_version,
+                "snapshot_id": self.snapshot_id,
+                "manifest": self.manifest,
+                "wire_contract": self.wire_contract,
+                "cases": entries,
+            },
+            MAX_RUN_CASE_SNAPSHOT_BYTES,
+            "RunCaseSnapshot",
+        )
         task_ids = set()
         for item in entries:
             if item.task_id in task_ids:
@@ -1246,9 +1313,6 @@ class RunCaseSnapshot(_JsonModel):
             raise SchemaError(
                 "run Case snapshot ID does not match its canonical identity payload"
             )
-        _check_model_size(
-            self, MAX_RUN_CASE_SNAPSHOT_BYTES, "RunCaseSnapshot"
-        )
 
     @classmethod
     def build(
@@ -1271,12 +1335,17 @@ class RunCaseSnapshot(_JsonModel):
                     "run Case snapshot.cases[%d] must be a verified Case binding pair"
                     % index
                 )
+            if not isinstance(item[0], SuiteCase):
+                raise SchemaError(
+                    "run Case snapshot.cases[%d] must contain a SuiteCase" % index
+                )
             if not isinstance(item[1], EvalCase):
                 raise SchemaError(
                     "run Case snapshot.cases[%d] must contain an EvalCase" % index
                 )
-            pairs.append((item[0], item[1]))
-            target_kinds.add(item[1].eval_input().review_target.kind)
+            eval_input = item[1].eval_input()
+            pairs.append((item[0], item[1], eval_input))
+            target_kinds.add(eval_input.review_target.kind)
         if not pairs:
             raise SchemaError(
                 "run Case snapshot.cases must contain at least one Case"
@@ -1285,8 +1354,26 @@ class RunCaseSnapshot(_JsonModel):
             raise SchemaError(
                 "run Case snapshot Cases must share a single wire contract"
             )
+        _check_raw_payload_size(
+            {
+                "schema_version": cls.SCHEMA_VERSION,
+                "snapshot_id": "run-case-snapshot-" + "0" * 64,
+                "manifest": manifest,
+                "wire_contract": manifest.wire_contract,
+                "cases": tuple(
+                    {
+                        "manifest_case": manifest_case,
+                        "source": case.source,
+                        "input": eval_input,
+                    }
+                    for manifest_case, case, eval_input in pairs
+                ),
+            },
+            MAX_RUN_CASE_SNAPSHOT_BYTES,
+            "RunCaseSnapshot",
+        )
         entries = []
-        for manifest_case, case in pairs:
+        for manifest_case, case, _eval_input in pairs:
             entries.append(
                 RunCaseSnapshotEntry.from_verified_case(
                     manifest_case, case, manifest
@@ -1355,6 +1442,11 @@ class RunCaseSnapshot(_JsonModel):
                     EVAL_INPUT_SCHEMA_VERSION,
                     "run Case snapshot.cases[%d].input.schema_version" % index,
                 )
+        _check_raw_payload_size(
+            payload,
+            MAX_RUN_CASE_SNAPSHOT_BYTES,
+            "RunCaseSnapshot",
+        )
         return cls(
             schema_version=payload["schema_version"],
             snapshot_id=validate_run_case_snapshot_id(payload["snapshot_id"]),

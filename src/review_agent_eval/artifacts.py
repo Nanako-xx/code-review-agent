@@ -1641,14 +1641,22 @@ class StageReceipt(_JsonModel):
             attempt=attempt,
             evaluation_id=evaluation_id,
             evaluation_revision=evaluation_revision,
-            artifacts=tuple(artifacts),
+            artifacts=_bounded_tuple(
+                artifacts,
+                "receipt.artifacts",
+                MAX_RECEIPT_ARTIFACTS,
+            ),
             materialization_manifest=materialization_manifest,
             materialization_manifest_digest=materialization_manifest_digest,
             materialization_id=materialization_id,
             eval_input_digest=eval_input_digest,
             review_target_digest=review_target_digest,
             prepared_source_id=prepared_source_id,
-            agent_visible_files=tuple(agent_visible_files),
+            agent_visible_files=_bounded_tuple(
+                agent_visible_files,
+                "receipt.agent_visible_files",
+                MAX_AGENT_VISIBLE_FILES,
+            ),
             adapter_capabilities_digest=adapter_capabilities_digest,
             target_access=target_access,
             terminal_status=terminal_status,
@@ -5721,31 +5729,10 @@ class ArtifactStore:
                     missing_stages=(),
                     terminal=True,
                 )
-            if state.status is TrialStatus.RUNNING and state.active_attempt is not None:
-                incomplete = StageReceipt.create(
-                    run_id=run_id,
-                    task_id=task_id,
-                    trial_id=trial_id,
-                    stage=StageName.INCOMPLETE,
-                    config_digest=plan.agent_config_digest,
-                    attempt=state.active_attempt,
-                )
-                self._write_json(
-                    run_id,
-                    self._receipt_path(
-                        plan, StageName.INCOMPLETE, state.active_attempt
-                    ),
-                    incomplete,
-                    maximum=MAX_STAGE_RECEIPT_BYTES,
-                )
-                state, _submission = self._load_trial_state(
-                    bundle,
-                    plan,
-                    budget=_ReadBudget(self.max_total_read_bytes),
-                )
-
             base = "cases/%s/trials/%s" % (plan.case_path_id, trial_id)
             input_path = "%s/input.json" % base
+            terminal_path = self._receipt_path(plan, StageName.AGENT)
+            submission_path = "%s/submission.json" % base
             prepare_committed = StageName.PREPARE in state.completed_stages
             prepare_receipt: Optional[StageReceipt] = None
             if state.active_attempt is not None:
@@ -5776,38 +5763,99 @@ class ArtifactStore:
                     self._target(run_id, materialization_path)
                 )
             )
-            if (
-                not prepare_committed
-                and input_exists
-                and materialization_exists
-            ):
-                if state.active_attempt is None:
-                    raise ArtifactIntegrityError(
-                        "orphan materialization has no started Trial attempt"
-                    )
+            terminal_exists = self._exists_regular(
+                self._target(run_id, terminal_path)
+            )
+            submission_exists = self._exists_regular(
+                self._target(run_id, submission_path)
+            )
+            input_ref: Optional[ArtifactRef] = None
+            eval_input: Optional[EvalInput] = None
+            if input_exists:
                 payload, input_ref = self._adopt_json(
                     run_id,
                     input_path,
                     budget=_ReadBudget(self.max_total_read_bytes),
                     maximum=MAX_EVAL_INPUT_BYTES,
                 )
-                eval_input = EvalInput.from_dict(payload)
+                try:
+                    eval_input = EvalInput.from_dict(payload)
+                except UnsupportedProtocolVersionError:
+                    raise
+                except (SchemaError, TypeError, ValueError) as exc:
+                    raise ArtifactIntegrityError(
+                        "orphan EvalInput failed strict hydration"
+                    ) from exc
                 if eval_input.task_id != task_id:
                     raise ArtifactIntegrityError("orphan EvalInput has wrong task_id")
                 if eval_input.digest() != plan.eval_input_digest:
                     raise ArtifactIntegrityError(
                         "orphan EvalInput digest does not match Trial plan"
                     )
+                if state.active_attempt is None:
+                    raise ArtifactIntegrityError(
+                        "orphan EvalInput has no started Trial attempt"
+                    )
+
+            materialization_ref: Optional[ArtifactRef] = None
+            materialization: Optional[TrialMaterializationManifest] = None
+            if materialization_exists:
                 materialization_payload, materialization_ref = self._adopt_json(
                     run_id,
                     materialization_path,
                     budget=_ReadBudget(self.max_total_read_bytes),
                     maximum=MAX_TRIAL_MATERIALIZATION_BYTES,
                 )
-                materialization = TrialMaterializationManifest.from_dict(
-                    materialization_payload
-                )
-                prepare_receipt = StageReceipt.create(
+                try:
+                    materialization = TrialMaterializationManifest.from_dict(
+                        materialization_payload
+                    )
+                except UnsupportedProtocolVersionError:
+                    raise
+                except (SchemaError, TypeError, ValueError) as exc:
+                    raise ArtifactIntegrityError(
+                        "orphan materialization failed strict hydration"
+                    ) from exc
+                if state.active_attempt is None:
+                    raise ArtifactIntegrityError(
+                        "orphan materialization has no started Trial attempt"
+                    )
+                if (
+                    materialization.run_id != plan.run_id
+                    or materialization.task_id != plan.task_id
+                    or materialization.trial_id != plan.trial_id
+                    or materialization.attempt != state.active_attempt
+                    or materialization.eval_input_digest != plan.eval_input_digest
+                    or materialization.wire_contract != plan.wire_contract
+                    or materialization.suite_preparation_binding_digest
+                    != plan.suite_preparation_binding_digest
+                    or materialization.adapter_capabilities_digest
+                    != plan.adapter_capabilities_digest
+                ):
+                    raise ArtifactIntegrityError(
+                        "orphan materialization differs from immutable Trial plan"
+                    )
+                if eval_input is not None and (
+                    materialization.review_target_digest
+                    != eval_input.review_target.digest()
+                ):
+                    raise ArtifactIntegrityError(
+                        "orphan materialization differs from EvalInput target"
+                    )
+
+            orphan_prepare: Optional[StageReceipt] = None
+            if (
+                not prepare_committed
+                and input_ref is not None
+                and eval_input is not None
+                and materialization_ref is not None
+                and materialization is not None
+            ):
+                if state.active_attempt is None:
+                    raise ArtifactIntegrityError(
+                        "orphan materialization has no started Trial attempt"
+                    )
+                orphan_prepare = StageReceipt.create(
                     run_id=run_id,
                     task_id=task_id,
                     trial_id=trial_id,
@@ -5834,34 +5882,32 @@ class ArtifactStore:
                 self._load_prepare_materialization(
                     bundle,
                     plan,
-                    prepare_receipt,
+                    orphan_prepare,
                     budget=_ReadBudget(self.max_total_read_bytes),
                 )
-                self._write_json(
-                    run_id,
-                    prepare_path,
-                    prepare_receipt,
-                    maximum=MAX_STAGE_RECEIPT_BYTES,
-                )
+                prepare_receipt = orphan_prepare
                 prepare_committed = True
 
-            terminal_path = self._receipt_path(plan, StageName.AGENT)
-            submission_path = "%s/submission.json" % base
-            if (
-                not self._exists_regular(self._target(run_id, terminal_path))
-                and self._exists_regular(self._target(run_id, submission_path))
-            ):
-                if state.active_attempt is None:
-                    raise ArtifactIntegrityError(
-                        "orphan Submission has no started Trial attempt"
-                    )
+            terminal: Optional[StageReceipt] = None
+            if not terminal_exists and submission_exists:
                 payload, submission_ref = self._adopt_json(
                     run_id,
                     submission_path,
                     budget=_ReadBudget(self.max_total_read_bytes),
                     maximum=MAX_EVAL_SUBMISSION_BYTES,
                 )
-                submission = EvalSubmission.from_dict(payload)
+                try:
+                    submission = EvalSubmission.from_dict(payload)
+                except UnsupportedProtocolVersionError:
+                    raise
+                except (SchemaError, TypeError, ValueError) as exc:
+                    raise ArtifactIntegrityError(
+                        "orphan Submission failed strict hydration"
+                    ) from exc
+                if state.active_attempt is None:
+                    raise ArtifactIntegrityError(
+                        "orphan Submission has no started Trial attempt"
+                    )
                 if (
                     submission.task_id != task_id
                     or submission.trial_id != trial_id
@@ -5924,6 +5970,55 @@ class ArtifactStore:
                         None if submission.failure is None else submission.failure.code
                     ),
                 )
+
+                self._validate_receipt_binding(
+                    terminal,
+                    plan,
+                    config_digest=plan.agent_config_digest,
+                )
+                self._load_terminal_submission(
+                    bundle,
+                    plan,
+                    terminal,
+                    prepare_receipt,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                )
+
+            # All candidate roots and projections are fully validated before
+            # recovery publishes any missing receipt.
+            if state.status is TrialStatus.RUNNING and state.active_attempt is not None:
+                incomplete = StageReceipt.create(
+                    run_id=run_id,
+                    task_id=task_id,
+                    trial_id=trial_id,
+                    stage=StageName.INCOMPLETE,
+                    config_digest=plan.agent_config_digest,
+                    attempt=state.active_attempt,
+                )
+                self._write_json(
+                    run_id,
+                    self._receipt_path(
+                        plan, StageName.INCOMPLETE, state.active_attempt
+                    ),
+                    incomplete,
+                    maximum=MAX_STAGE_RECEIPT_BYTES,
+                )
+                state, _submission = self._load_trial_state(
+                    bundle,
+                    plan,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                )
+
+            if orphan_prepare is not None:
+                self._write_json(
+                    run_id,
+                    prepare_path,
+                    orphan_prepare,
+                    maximum=MAX_STAGE_RECEIPT_BYTES,
+                )
+                prepare_committed = True
+
+            if terminal is not None:
                 # Recovery never rewrites Submission; it only writes the missing
                 # unique terminal commit marker, and does so last.
                 self._write_json(
@@ -6064,16 +6159,16 @@ class ArtifactStore:
         with self._lock(budget_lock):
             with self._lock(evaluation_lock):
                 if self._exists_regular(self._target(run_id, receipt_path)):
-                    if not resume:
-                        raise ArtifactConflictError(
-                            "evaluation version is already committed"
-                        )
                     existing = self._load_evaluation_bundle(
                         bundle,
                         plan,
                         evaluation_id,
                         budget=_ReadBudget(self.max_total_read_bytes),
                     )
+                    if not resume:
+                        raise ArtifactConflictError(
+                            "evaluation version is already committed"
+                        )
                     expected_values = (
                         intent_matches,
                         review_matches,
