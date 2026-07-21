@@ -1,4 +1,4 @@
-"""Public API for the canonical code-review evaluation protocols."""
+"""Public API for the canonical code-review evaluation v2 protocols."""
 
 from .models import *
 from .models import __all__

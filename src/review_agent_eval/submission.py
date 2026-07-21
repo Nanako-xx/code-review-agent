@@ -45,6 +45,7 @@ def failure_submission(
     *,
     eval_input: EvalInput,
     config: AgentRunConfig,
+    target_materialization_id: str,
     code: FailureCode,
     message: str,
     retryable: bool,
@@ -57,7 +58,10 @@ def failure_submission(
     """Build the one legal terminal status associated with ``code``."""
 
     status = submission_status_for_failure(code)
-    if status is SubmissionStatus.INVALID_OUTPUT:
+    if (
+        status is SubmissionStatus.INVALID_OUTPUT
+        or code is FailureCode.HARNESS_MATERIALIZATION_ERROR
+    ):
         intent = None
         review = None
         evidence = ()
@@ -66,6 +70,8 @@ def failure_submission(
         task_id=config.task_id,
         agent_id=config.agent_id,
         trial_id=config.trial_id,
+        eval_input_digest=config.eval_input_digest,
+        target_materialization_id=target_materialization_id,
         status=status,
         intent=intent,
         review=review,
@@ -85,6 +91,7 @@ def validate_submission_binding(
     *,
     eval_input: EvalInput,
     config: AgentRunConfig,
+    target_materialization_id: str,
     clarification_transcript: Optional[
         Iterable[SubmissionClarificationExchange]
     ] = None,
@@ -93,10 +100,28 @@ def validate_submission_binding(
 
     if not isinstance(submission, EvalSubmission):
         raise TypeError("submission must be EvalSubmission")
-    if submission.task_id != eval_input.task_id:
+    if (
+        submission.task_id != eval_input.task_id
+        or submission.task_id != config.task_id
+    ):
         raise AgentAdapterError(
             FailureCode.SCHEMA_MISMATCH,
             "Agent output task identity does not match the invocation",
+            retryable=False,
+        )
+    if (
+        eval_input.digest() != config.eval_input_digest
+        or submission.eval_input_digest != config.eval_input_digest
+    ):
+        raise AgentAdapterError(
+            FailureCode.SCHEMA_MISMATCH,
+            "Agent output input digest does not match the invocation",
+            retryable=False,
+        )
+    if submission.target_materialization_id != target_materialization_id:
+        raise AgentAdapterError(
+            FailureCode.SCHEMA_MISMATCH,
+            "Agent output target materialization does not match the invocation",
             retryable=False,
         )
     if submission.agent_id != config.agent_id:
@@ -132,6 +157,7 @@ def parse_submission_output(
     *,
     eval_input: EvalInput,
     config: AgentRunConfig,
+    target_materialization_id: str,
     clarification_transcript: Optional[
         Iterable[SubmissionClarificationExchange]
     ] = None,
@@ -161,13 +187,14 @@ def parse_submission_output(
     except (SchemaError, UnicodeError, ValueError, RecursionError) as exc:
         raise AgentAdapterError(
             FailureCode.SCHEMA_MISMATCH,
-            "Agent output does not satisfy EvalSubmission v1",
+            "Agent output does not satisfy EvalSubmission v2",
             retryable=False,
         ) from exc
     return validate_submission_binding(
         submission,
         eval_input=eval_input,
         config=config,
+        target_materialization_id=target_materialization_id,
         clarification_transcript=clarification_transcript,
     )
 

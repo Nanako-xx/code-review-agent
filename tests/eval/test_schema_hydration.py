@@ -19,6 +19,7 @@ from review_agent_eval.models import (
     EvalInput,
     EvalSubmission,
     SchemaError,
+    UnsupportedProtocolVersionError,
     canonical_json,
     load_eval_case,
     load_eval_input,
@@ -30,29 +31,34 @@ BASE = "a" * 40
 HEAD = "b" * 40
 TEXT = "ci ok"
 TEXT_HASH = hashlib.sha256(TEXT.encode("utf-8")).hexdigest()
+INPUT_DIGEST = "c" * 64
+MATERIALIZATION_ID = "materialization-001"
 
 
 def input_payload() -> dict:
     return {
-        "schema_version": "eval_input_v1",
+        "schema_version": "eval_input_v2",
         "task_id": "task-001",
-        "repository": {
-            "source": "fixture",
-            "path": "fixtures/repo",
-            "url": None,
-            "base_revision": BASE,
-            "head_revision": HEAD,
-        },
-        "review_request": {
-            "title": "Review",
-            "description": None,
-            "user_intent": None,
-            "review_focus": None,
-            "linked_requirements": [],
-            "project_rules": [],
-            "existing_ci_evidence": [
-                {"source_id": "ci-1", "text": TEXT, "content_hash": TEXT_HASH}
-            ],
+        "review_target": {
+            "kind": "repository",
+            "repository": {
+                "source": "fixture",
+                "path": "fixtures/repo",
+                "url": None,
+                "base_revision": BASE,
+                "head_revision": HEAD,
+            },
+            "review_request": {
+                "title": "Review",
+                "description": None,
+                "user_intent": None,
+                "review_focus": None,
+                "linked_requirements": [],
+                "project_rules": [],
+                "existing_ci_evidence": [
+                    {"source_id": "ci-1", "text": TEXT, "content_hash": TEXT_HASH}
+                ],
+            },
         },
     }
 
@@ -85,15 +91,14 @@ def intent_payload() -> dict:
 def evidence_payload(evidence_id: str = "evidence-1") -> dict:
     return {
         "evidence_id": evidence_id,
-        "kind": "repository_file",
-        "revision": "HEAD",
-        "path": "../unsafe-but-scorable.py",
-        "from_line": 9,
-        "to_line": 3,
-        "command": [],
-        "exit_code": 1,
-        "stream": "combined",
-        "source_ref": "missing-source",
+        "source": {
+            "kind": "repository_file",
+            "target_materialization_id": MATERIALIZATION_ID,
+            "revision": "HEAD",
+            "path": "../unsafe-but-scorable.py",
+            "from_line": 9,
+            "to_line": 3,
+        },
         "content_hash": "d" * 64,
         "excerpt": "evidence",
     }
@@ -115,10 +120,12 @@ def finding_payload(finding_id: str = "finding-1") -> dict:
 
 def submission_payload() -> dict:
     return {
-        "schema_version": "eval_submission_v1",
+        "schema_version": "eval_submission_v2",
         "task_id": "task-001",
         "agent_id": "agent-1",
         "trial_id": "trial-1",
+        "eval_input_digest": INPUT_DIGEST,
+        "target_materialization_id": MATERIALIZATION_ID,
         "status": "completed",
         "intent": intent_payload(),
         "review": {"findings": [], "uncertainties": []},
@@ -156,6 +163,12 @@ def expected_finding(truth_id: str = "truth-1") -> dict:
         "severity": "high",
         "category": "security",
         "required": True,
+        "metric_authority": {
+            "severity_scorable": True,
+            "severity_authority": "upstream_annotation",
+            "location_scorable": False,
+            "location_authority": None,
+        },
         "locations": [truth_location()],
         "evidence_anchors": [
             {"fact": "The guard is absent on the head revision.", "locations": []}
@@ -168,7 +181,7 @@ def expected_finding(truth_id: str = "truth-1") -> dict:
 def case_payload() -> dict:
     raw_input = input_payload()
     return {
-        "schema_version": "eval_case_v1",
+        "schema_version": "eval_case_v2",
         "task_id": "task-001",
         "case_version": 1,
         "source": {
@@ -180,10 +193,7 @@ def case_payload() -> dict:
             "license": None,
             "content_hash": "e" * 64,
         },
-        "input": {
-            "repository": raw_input["repository"],
-            "review_request": raw_input["review_request"],
-        },
+        "input": {"review_target": raw_input["review_target"]},
         "clarification_script": {"max_rounds": 1, "answers": [answer_payload()]},
         "intent_truth": {
             "scorable": True,
@@ -198,6 +208,7 @@ def case_payload() -> dict:
             "expected_findings": [expected_finding()],
             "known_invalid_findings": [],
         },
+        "review_evaluator_context": {"truth_contexts": []},
     }
 
 
@@ -235,7 +246,7 @@ def test_input_loader_checks_raw_byte_limit_before_json_decode() -> None:
 
 def test_recursive_duplicate_json_keys_are_rejected_before_hydration() -> None:
     duplicate_root = (
-        '{"schema_version":"eval_input_v1","schema_version":"eval_input_v1"}'
+        '{"schema_version":"eval_input_v2","schema_version":"eval_input_v2"}'
     )
     duplicate_nested = json.dumps(input_payload(), separators=(",", ":")).replace(
         '"source":"fixture"', '"source":"fixture","source":"git"'
@@ -257,9 +268,71 @@ def test_nonstandard_or_nonfinite_json_numbers_are_rejected(constant: str) -> No
 
 
 @pytest.mark.parametrize(
+    ("loader", "version", "expected"),
+    [
+        (load_eval_submission, "eval_submission_v1", "eval_submission_v2"),
+        (load_eval_case, "eval_case_v1", "eval_case_v2"),
+    ],
+)
+def test_v1_submission_and_case_roots_are_stably_rejected_before_hydration(
+    loader, version: str, expected: str
+) -> None:
+    with pytest.raises(UnsupportedProtocolVersionError) as exc_info:
+        loader(json.dumps({"schema_version": version}))
+
+    assert exc_info.value.code == "unsupported_protocol_version"
+    assert exc_info.value.expected == expected
+    assert exc_info.value.actual == version
+
+
+def test_unknown_review_target_and_evidence_source_kinds_fail_closed() -> None:
+    raw_input = input_payload()
+    raw_input["review_target"]["kind"] = "workspace"
+    with pytest.raises(SchemaError, match="unknown enum"):
+        EvalInput.from_dict(raw_input)
+
+    submission = submission_payload()
+    evidence = evidence_payload()
+    evidence["source"]["kind"] = "repository_search"
+    submission["evidence"] = [evidence]
+    with pytest.raises(SchemaError, match="unknown enum"):
+        EvalSubmission.from_dict(submission)
+
+
+def test_bool_cannot_impersonate_new_v2_target_or_source_integers() -> None:
+    frozen = {
+        "schema_version": "eval_input_v2",
+        "task_id": "frozen-task",
+        "review_target": {
+            "kind": "frozen_context",
+            "bundle_id": "bundle-1",
+            "record_id": "record-1",
+            "context_format": "rendered_text",
+            "rendered_sha256": "1" * 64,
+            "rendered_utf8_bytes": True,
+            "source_binding_digest": "2" * 64,
+        },
+    }
+    with pytest.raises(SchemaError, match="bool"):
+        EvalInput.from_dict(frozen)
+
+    submission = submission_payload()
+    evidence = evidence_payload()
+    evidence["source"]["from_line"] = True
+    submission["evidence"] = [evidence]
+    with pytest.raises(SchemaError, match="bool"):
+        EvalSubmission.from_dict(submission)
+
+
+@pytest.mark.parametrize(
     ("factory", "payload", "path", "value"),
     [
-        (EvalInput.from_dict, input_payload(), ("repository",), "extra"),
+        (
+            EvalInput.from_dict,
+            input_payload(),
+            ("review_target", "repository"),
+            "extra",
+        ),
         (EvalSubmission.from_dict, submission_payload(), ("usage",), "extra"),
         (EvalCase.from_dict, case_payload(), ("review_truth", "expected_findings", 0), "extra"),
     ],
@@ -276,8 +349,13 @@ def test_unknown_keys_at_every_layer_are_rejected(factory, payload, path, value)
 @pytest.mark.parametrize(
     ("factory", "payload", "path", "field"),
     [
-        (EvalInput.from_dict, input_payload(), (), "review_request"),
-        (EvalInput.from_dict, input_payload(), ("review_request",), "project_rules"),
+        (EvalInput.from_dict, input_payload(), (), "review_target"),
+        (
+            EvalInput.from_dict,
+            input_payload(),
+            ("review_target", "review_request"),
+            "project_rules",
+        ),
         (EvalSubmission.from_dict, submission_payload(), (), "usage"),
         (EvalSubmission.from_dict, submission_payload(), ("intent",), "uncertainties"),
         (EvalCase.from_dict, case_payload(), (), "clarification_script"),
@@ -296,10 +374,10 @@ def test_missing_declared_fields_are_never_defaulted(factory, payload, path, fie
 @pytest.mark.parametrize(
     ("factory", "payload", "path", "value"),
     [
-        (EvalInput.from_dict, input_payload(), ("schema_version",), "eval_input_v0"),
+        (EvalInput.from_dict, input_payload(), ("schema_version",), "eval_input_v3"),
         (EvalSubmission.from_dict, submission_payload(), ("status",), "running"),
         (EvalSubmission.from_dict, submission_payload(), ("intent", "status"), "unknown"),
-        (EvalCase.from_dict, case_payload(), ("schema_version",), "eval_case_v2"),
+        (EvalCase.from_dict, case_payload(), ("schema_version",), "eval_case_v3"),
         (EvalCase.from_dict, case_payload(), ("source", "origin"), "web"),
         (
             EvalCase.from_dict,
@@ -376,7 +454,9 @@ def test_digest_fields_require_full_lowercase_sha256_shape(digest: str) -> None:
 
 def test_existing_ci_hash_must_match_exact_utf8_text() -> None:
     payload = input_payload()
-    payload["review_request"]["existing_ci_evidence"][0]["content_hash"] = "0" * 64
+    payload["review_target"]["review_request"]["existing_ci_evidence"][0][
+        "content_hash"
+    ] = "0" * 64
     with pytest.raises(SchemaError):
         EvalInput.from_dict(payload)
 
@@ -393,7 +473,9 @@ def test_existing_ci_hash_must_match_exact_utf8_text() -> None:
 )
 def test_repository_source_path_url_matrix_is_strict(source, path, url) -> None:
     payload = input_payload()
-    payload["repository"].update(source=source, path=path, url=url)
+    payload["review_target"]["repository"].update(
+        source=source, path=path, url=url
+    )
     with pytest.raises(SchemaError):
         EvalInput.from_dict(payload)
 
@@ -412,7 +494,7 @@ def test_repository_source_path_url_matrix_is_strict(source, path, url) -> None:
 )
 def test_repository_paths_reject_escape_and_non_posix_forms(path: str) -> None:
     payload = input_payload()
-    payload["repository"]["path"] = path
+    payload["review_target"]["repository"]["path"] = path
     with pytest.raises(SchemaError):
         EvalInput.from_dict(payload)
 
@@ -429,7 +511,9 @@ def test_repository_paths_reject_escape_and_non_posix_forms(path: str) -> None:
 )
 def test_repository_revisions_are_distinct_same_length_full_object_ids(base, head) -> None:
     payload = input_payload()
-    payload["repository"].update(base_revision=base, head_revision=head)
+    payload["review_target"]["repository"].update(
+        base_revision=base, head_revision=head
+    )
     with pytest.raises(SchemaError):
         EvalInput.from_dict(payload)
 
@@ -459,8 +543,10 @@ def test_duplicate_claim_question_ci_answer_and_truth_ids_are_schema_errors() ->
         EvalSubmission.from_dict(submission)
 
     raw_input = input_payload()
-    raw_input["review_request"]["existing_ci_evidence"].append(
-        copy.deepcopy(raw_input["review_request"]["existing_ci_evidence"][0])
+    raw_input["review_target"]["review_request"]["existing_ci_evidence"].append(
+        copy.deepcopy(
+            raw_input["review_target"]["review_request"]["existing_ci_evidence"][0]
+        )
     )
     with pytest.raises(SchemaError, match="duplicate"):
         EvalInput.from_dict(raw_input)
@@ -559,7 +645,7 @@ def test_truth_locations_are_strict_even_though_submission_locations_are_scorabl
 def test_submission_locations_and_revisions_preserve_semantic_errors_but_reject_controls() -> None:
     submission = submission_payload()
     submission["evidence"] = [evidence_payload()]
-    submission["evidence"][0]["revision"] = "HEAD\x00evil"
+    submission["evidence"][0]["source"]["revision"] = "HEAD\x00evil"
     with pytest.raises(SchemaError):
         EvalSubmission.from_dict(submission)
 
@@ -573,13 +659,19 @@ def test_submission_locations_and_revisions_preserve_semantic_errors_but_reject_
 def test_command_evidence_preserves_platform_exit_codes_for_the_checker() -> None:
     submission = submission_payload()
     evidence = evidence_payload()
-    evidence["kind"] = "command_output"
-    evidence["exit_code"] = 0xC0000005
+    evidence["source"] = {
+        "kind": "command_output",
+        "target_materialization_id": MATERIALIZATION_ID,
+        "command": ["tool"],
+        "exit_code": 0xC0000005,
+        "stream": "combined",
+        "artifact_ref": "artifact-001",
+    }
     submission["evidence"] = [evidence]
 
     hydrated = EvalSubmission.from_dict(submission)
 
-    assert hydrated.evidence[0].exit_code == 0xC0000005
+    assert hydrated.evidence[0].source.exit_code == 0xC0000005
 
 
 def test_evidence_anchor_requires_nonempty_fact_and_strict_locations() -> None:
@@ -710,7 +802,7 @@ def test_case_input_projection_must_also_fit_the_eval_input_byte_limit() -> None
     case = case_payload()
     text = "x" * 32768
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    case["input"]["review_request"]["existing_ci_evidence"] = [
+    case["input"]["review_target"]["review_request"]["existing_ci_evidence"] = [
         {"source_id": "ci-%d" % index, "text": text, "content_hash": digest}
         for index in range(65)
     ]
@@ -749,7 +841,7 @@ def test_overlong_bounded_text_is_rejected(factory, payload, path) -> None:
 
 def test_empty_string_does_not_replace_null_for_nullable_leaf_fields() -> None:
     payload = input_payload()
-    payload["review_request"]["description"] = ""
+    payload["review_target"]["review_request"]["description"] = ""
     with pytest.raises(SchemaError):
         EvalInput.from_dict(payload)
 
