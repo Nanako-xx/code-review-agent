@@ -26,6 +26,7 @@ from .materialization import (
     _validate_materialization_request,
 )
 from .models import (
+    EvalInput,
     FrozenContextReviewTarget,
     ReviewTargetKind,
     TrialStatus,
@@ -312,6 +313,111 @@ class FrozenContextReplay:
         return data[start:end]
 
 
+def open_frozen_context_replay(
+    *,
+    bundle_root: Path,
+    eval_input: EvalInput,
+    suite_preparation_binding: Optional[PublicSuitePreparationBindingV2],
+    suite_preparation_binding_digest: Optional[str],
+) -> FrozenContextReplay:
+    """Open one exact verified local Frozen bundle record for evaluator replay.
+
+    This is shared by materialization and post-run evaluation so acquisition,
+    source-lineage, record, rendered-byte, and replay-digest trust cannot
+    diverge.  It only opens an existing explicit bundle root and never creates
+    an Agent workspace or downloads/renders content.
+    """
+
+    if type(eval_input) is not EvalInput:
+        raise TypeError("Frozen replay requires EvalInput")
+    target = eval_input.review_target
+    if not isinstance(target, FrozenContextReviewTarget):
+        raise MaterializationError("Frozen Target has the wrong tagged shape")
+    root = _secure_directory(
+        Path(bundle_root),
+        create=False,
+        context="Frozen bundle root",
+    )
+    try:
+        bundle = read_swe_prbench_frozen_bundle(
+            root,
+            expected_bundle_id=target.bundle_id,
+        )
+    except (PublicDatasetError, OSError) as exc:
+        raise MaterializationError("Frozen bundle trust validation failed") from exc
+    preparation = suite_preparation_binding
+    if (
+        preparation is None
+        or type(preparation) is not PublicSuitePreparationBindingV2
+        or preparation.repository_catalog_digest is not None
+        or preparation.frozen_bundle_trust_digest is None
+        or suite_preparation_binding_digest != preparation.digest()
+    ):
+        raise MaterializationError(
+            "Frozen Suite preparation trust is unavailable"
+        )
+    if (
+        preparation.frozen_bundle_trust_digest
+        != frozen_bundle_trust_digest(bundle, preparation)
+        or preparation.source_manifest_digest
+        != bundle.manifest.source_manifest_digest
+        or preparation.filter_manifest_digest
+        != bundle.manifest.filter_manifest_digest
+    ):
+        raise MaterializationError(
+            "Frozen bundle does not match external Suite trust"
+        )
+    matches = [
+        item
+        for item in bundle.manifest.records
+        if frozen_context_record_id(item) == target.record_id
+    ]
+    if len(matches) != 1:
+        raise MaterializationError("Frozen record identity is not unique")
+    binding = matches[0]
+    if binding.task_id != eval_input.task_id:
+        raise MaterializationError("Frozen record task does not match EvalInput")
+    source_binding = frozen_context_source_binding_digest(bundle, binding)
+    if source_binding != target.source_binding_digest:
+        raise MaterializationError("Frozen source binding drifted")
+    replay_digest = canonical_sha256(
+        {
+            "schema_version": FROZEN_CONTEXT_REPLAY_BINDING_VERSION,
+            "bundle_id": target.bundle_id,
+            "record_id": target.record_id,
+            "context_format": target.context_format,
+            "rendered_sha256": target.rendered_sha256,
+            "rendered_utf8_bytes": target.rendered_utf8_bytes,
+            "source_binding_digest": target.source_binding_digest,
+            "bundle_manifest_digest": bundle.manifest.digest(),
+            "record_digest": binding.record_digest,
+            "suite_preparation_binding_digest": (
+                suite_preparation_binding_digest
+            ),
+            "preparation_packet_digest": (
+                preparation.preparation_packet_digest
+            ),
+            "frozen_bundle_trust_digest": (
+                preparation.frozen_bundle_trust_digest
+            ),
+        }
+    )
+    replay = FrozenContextReplay(
+        bundle_id=target.bundle_id,
+        record_id=target.record_id,
+        context_ref=target.record_id,
+        context_format=target.context_format,
+        rendered_sha256=target.rendered_sha256,
+        rendered_utf8_bytes=target.rendered_utf8_bytes,
+        source_binding_digest=target.source_binding_digest,
+        replay_binding_digest=replay_digest,
+        _bundle_root=bundle.root,
+        _binding=binding,
+    )
+    replay.read_exact()
+    return replay
+
+
 @dataclass
 class _FrozenWorkspace:
     path: Path
@@ -579,84 +685,13 @@ class FrozenContextTargetMaterializer:
         target = request.eval_input.review_target
         if not isinstance(target, FrozenContextReviewTarget):
             raise MaterializationError("Frozen Target has the wrong tagged shape")
-        try:
-            bundle = read_swe_prbench_frozen_bundle(
-                self.bundle_root,
-                expected_bundle_id=target.bundle_id,
-            )
-        except (PublicDatasetError, OSError) as exc:
-            raise MaterializationError("Frozen bundle trust validation failed") from exc
-        preparation = request.suite_preparation_binding
-        if (
-            preparation is None
-            or preparation.repository_catalog_digest is not None
-            or preparation.frozen_bundle_trust_digest is None
-        ):
-            raise MaterializationError(
-                "Frozen Suite preparation trust is unavailable"
-            )
-        if (
-            preparation.frozen_bundle_trust_digest
-            != frozen_bundle_trust_digest(bundle, preparation)
-            or preparation.source_manifest_digest
-            != bundle.manifest.source_manifest_digest
-            or preparation.filter_manifest_digest
-            != bundle.manifest.filter_manifest_digest
-        ):
-            raise MaterializationError(
-                "Frozen bundle does not match external Suite trust"
-            )
-        matches = [
-            item
-            for item in bundle.manifest.records
-            if frozen_context_record_id(item) == target.record_id
-        ]
-        if len(matches) != 1:
-            raise MaterializationError("Frozen record identity is not unique")
-        binding = matches[0]
-        if binding.task_id != request.eval_input.task_id:
-            raise MaterializationError("Frozen record task does not match EvalInput")
-        source_binding = frozen_context_source_binding_digest(bundle, binding)
-        if source_binding != target.source_binding_digest:
-            raise MaterializationError("Frozen source binding drifted")
-        replay_digest = canonical_sha256(
-            {
-                "schema_version": FROZEN_CONTEXT_REPLAY_BINDING_VERSION,
-                "bundle_id": target.bundle_id,
-                "record_id": target.record_id,
-                "context_format": target.context_format,
-                "rendered_sha256": target.rendered_sha256,
-                "rendered_utf8_bytes": target.rendered_utf8_bytes,
-                "source_binding_digest": target.source_binding_digest,
-                "bundle_manifest_digest": bundle.manifest.digest(),
-                "record_digest": binding.record_digest,
-                "suite_preparation_binding_digest": (
-                    request.suite_preparation_binding_digest
-                ),
-                "preparation_packet_digest": (
-                    preparation.preparation_packet_digest
-                ),
-                "frozen_bundle_trust_digest": (
-                    preparation.frozen_bundle_trust_digest
-                ),
-            }
-        )
-        # ``record_id`` is already present in the Agent-visible EvalInput.
-        # Materialization identity supplies the bundle/attempt namespace, so
-        # using it as ``context_ref`` avoids a hidden identifier that a
-        # subprocess Agent could never reproduce in Frozen Evidence.
-        context_ref = target.record_id
-        replay = FrozenContextReplay(
-            bundle_id=target.bundle_id,
-            record_id=target.record_id,
-            context_ref=context_ref,
-            context_format=target.context_format,
-            rendered_sha256=target.rendered_sha256,
-            rendered_utf8_bytes=target.rendered_utf8_bytes,
-            source_binding_digest=target.source_binding_digest,
-            replay_binding_digest=replay_digest,
-            _bundle_root=bundle.root,
-            _binding=binding,
+        replay = open_frozen_context_replay(
+            bundle_root=self.bundle_root,
+            eval_input=request.eval_input,
+            suite_preparation_binding=request.suite_preparation_binding,
+            suite_preparation_binding_digest=(
+                request.suite_preparation_binding_digest
+            ),
         )
         content = replay.read_exact()
         workspace_id = stable_id(
@@ -696,7 +731,7 @@ class FrozenContextTargetMaterializer:
                 adapter_capabilities_digest=request.adapter_capabilities.digest(),
                 readable_relative_paths=(FROZEN_CONTEXT_TARGET_PATH,),
                 files=files,
-                replay_binding_digest=replay_digest,
+                replay_binding_digest=replay.replay_binding_digest,
             )
             lease = _FrozenMaterializationLease(
                 request=request,
@@ -740,4 +775,5 @@ __all__ = [
     "frozen_context_record_id",
     "frozen_context_source_binding_digest",
     "frozen_materialization_workspace",
+    "open_frozen_context_replay",
 ]

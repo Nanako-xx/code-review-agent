@@ -46,6 +46,7 @@ from .evidence_checker import (
     EvidenceItemIntegrityResult,
     EvidenceReasonCode,
 )
+from .frozen_context import FrozenContextReplay
 from .judge import (
     DEFAULT_JUDGE_RUBRICS,
     GLOBAL_JUDGE_SYSTEM_PROMPT,
@@ -58,6 +59,7 @@ from .judge import (
     FindingMatchRelation,
     JudgeContextKind,
     JudgeContextSource,
+    JudgeContextTrust,
     JudgeExecutionResult,
     JudgeExecutionSource,
     JudgeFailure,
@@ -92,10 +94,15 @@ from .models import (
     EvidenceSupport,
     EvalInput,
     EvalSubmission,
+    EvaluatorContextSource,
+    EvaluatorContextSourceKind,
+    EvaluatorContextTask,
     ExpectedFinding,
     FindingSeverity,
     KnownInvalidFinding,
     NovelFindingPolicy,
+    ReviewEvaluatorContext,
+    ReviewTargetKind,
     ReviewTruth,
     SchemaError,
     SubmissionEvidence,
@@ -111,13 +118,15 @@ from .models import (
     _json_tree,
     _strict_json_loads,
 )
-from .repository import PreparedRepositoryReplay
+from .repository import PreparedRepositoryReplay, repository_from_eval_input
 
 
 REVIEW_EVALUATION_SCHEMA_VERSION = "eval_review_evaluation_v1"
 REVIEW_EVALUATOR_REVISION = "review-evaluator-v1"
 REVIEW_MATCH_POLICY_VERSION = "review-finding-match-v1"
 REVIEW_LOCATION_POLICY_VERSION = "review-location-audit-v1"
+SWE_TRUTH_DIFF_HUNK_SOURCE_KIND = "swe_truth_diff_hunk_v1"
+SWE_TRUTH_DIFF_HUNK_SOURCE_ID_KIND = "swe-truth-diff-hunk-v1"
 
 # These are intentionally independent from the generic model limits.  A
 # Review artifact must reject an over-sized graph, not silently sample it.
@@ -497,6 +506,39 @@ def _merge_context_sources(
     return tuple(sorted(by_id.values(), key=lambda item: item.source_id))
 
 
+def _swe_truth_diff_hunk_source(
+    truth_id: str,
+    source: EvaluatorContextSource,
+) -> JudgeContextSource:
+    """Project one truth-bound SWE hunk into untrusted Judge data."""
+
+    _id(truth_id, "evaluator context truth_id")
+    if type(source) is not EvaluatorContextSource:
+        raise _error("evaluator context contains an invalid source")
+    if source.kind is not EvaluatorContextSourceKind.DIFF_HUNK:
+        raise _error("evaluator context source must be a diff hunk")
+    source_id = stable_id(
+        SWE_TRUTH_DIFF_HUNK_SOURCE_ID_KIND,
+        truth_id,
+        source.content_sha256,
+        source.provenance.digest(),
+    )
+    return JudgeContextSource.create(
+        source_id=source_id,
+        source_kind=SWE_TRUTH_DIFF_HUNK_SOURCE_KIND,
+        kind=JudgeContextKind.DIFF,
+        trust=JudgeContextTrust.UNTRUSTED_REPOSITORY_DATA,
+        content=source.content,
+        metadata={
+            "revision": None,
+            "path": None,
+            "side": None,
+            "from_line": None,
+            "to_line": None,
+        },
+    )
+
+
 @dataclass(frozen=True)
 class ReviewFindingContextEntry:
     finding_id: str
@@ -849,13 +891,15 @@ class ReviewCandidateRecord:
             if self.relation is not FindingMatchRelation.EQUIVALENT:
                 raise _error("only equivalent candidates may have an edge weight")
         if self.match_kind is FindingMatchKind.SEMANTIC:
-            decision_fields = (
-                self.score_ppm,
-                self.severity_assessment,
-                self.actionability,
-            )
             if self.relation is None:
-                if any(item is not None for item in decision_fields) or self.edge_weight is not None:
+                if any(
+                    item is not None
+                    for item in (
+                        self.score_ppm,
+                        self.severity_assessment,
+                        self.actionability,
+                    )
+                ) or self.edge_weight is not None:
                     raise _error("unresolved semantic candidate contains Judge decision fields")
                 if self.resolution not in {
                     FindingResolution.PENDING_JUDGE,
@@ -864,6 +908,12 @@ class ReviewCandidateRecord:
                 }:
                     raise _error("semantic candidate without a decision has invalid resolution")
             else:
+                decision_fields = (
+                    self.score_ppm,
+                    self.actionability,
+                )
+                if self.truth_kind is ReviewTruthKind.KNOWN_INVALID:
+                    decision_fields += (self.severity_assessment,)
                 if any(item is None for item in decision_fields):
                     raise _error("resolved semantic candidate lacks Judge decision fields")
                 if self.relation is FindingMatchRelation.UNKNOWN:
@@ -1728,6 +1778,13 @@ class ReviewEvaluationResult:
                 raise _error("location candidate references an unknown Finding/truth")
             truth = truth_map[item.truth_id]
             if (
+                item.truth_kind is ReviewTruthKind.EXPECTED
+                and not truth.metric_authority.location_scorable
+            ):
+                raise _error(
+                    "location candidate targets a location-unscorable expected truth"
+                )
+            if (
                 item.truth_location_index >= len(truth.locations)
                 or item.truth_location
                 != truth.locations[item.truth_location_index]
@@ -1749,6 +1806,14 @@ class ReviewEvaluationResult:
                 pairs.add(pair)
                 if item.truth_kind is not truth_kind or item.finding_id not in generated or item.truth_id not in truth_map:
                     raise _error("candidate references an unknown or wrong-kind Finding/truth")
+                if truth_kind is ReviewTruthKind.EXPECTED and item.relation is not None:
+                    severity_scorable = truth_map[
+                        item.truth_id
+                    ].metric_authority.severity_scorable
+                    if severity_scorable != (item.severity_assessment is not None):
+                        raise _error(
+                            "expected candidate severity assessment differs from MetricAuthority"
+                        )
                 locations = locations_by_pair.get(
                     (item.finding_id, item.truth_kind, item.truth_id), []
                 )
@@ -1833,6 +1898,7 @@ class ReviewEvaluationResult:
                 (finding_id, ReviewTruthKind.EXPECTED, truth_id, index)
                 for finding_id in generated
                 for truth_id, truth in expected.items()
+                if truth.metric_authority.location_scorable
                 for index, _location in enumerate(truth.locations)
             } | {
                 (finding_id, ReviewTruthKind.KNOWN_INVALID, truth_id, index)
@@ -1984,6 +2050,14 @@ class ReviewEvaluationResult:
                 )
             ):
                 raise _error("Finding outcome references an invalid duplicate Finding")
+            if outcome.matched_expected_truth_id is not None:
+                severity_scorable = expected[
+                    outcome.matched_expected_truth_id
+                ].metric_authority.severity_scorable
+                if severity_scorable != (outcome.severity_assessment is not None):
+                    raise _error(
+                        "matched outcome severity assessment differs from MetricAuthority"
+                    )
         for outcome in outcomes.values():
             if outcome.evidence_integrity is not evidence[outcome.finding_id].integrity:
                 raise _error("Finding outcome Evidence integrity disagrees with audit")
@@ -2515,8 +2589,9 @@ class ReviewEvaluator:
     """
 
     eval_input: EvalInput
-    replay: PreparedRepositoryReplay
+    replay: PreparedRepositoryReplay | FrozenContextReplay
     trial_id: str
+    target_materialization_id: str
     evaluator_execution: EvaluatorExecutionConfig
     rubrics: JudgeRubricCatalog = DEFAULT_JUDGE_RUBRICS
     location_matcher: Optional[LocationMatcher] = None
@@ -2524,15 +2599,25 @@ class ReviewEvaluator:
     command_attestations: Tuple[CommandOutputAttestation, ...] = ()
     context_bundle: ReviewContextBundle = ReviewContextBundle()
     evaluator_revision: str = REVIEW_EVALUATOR_REVISION
+    review_evaluator_context: ReviewEvaluatorContext = ReviewEvaluatorContext(
+        truth_contexts=()
+    )
 
     def __post_init__(self) -> None:
         if type(self.eval_input) is not EvalInput:
             raise _error("ReviewEvaluator requires canonical EvalInput")
-        if type(self.replay) is not PreparedRepositoryReplay:
-            raise _error("ReviewEvaluator requires verified PreparedRepositoryReplay")
         _id(self.trial_id, "ReviewEvaluator.trial_id")
+        _id(
+            self.target_materialization_id,
+            "ReviewEvaluator.target_materialization_id",
+        )
         if not isinstance(self.evaluator_execution, EvaluatorExecutionConfig):
             raise _error("ReviewEvaluator requires EvaluatorExecutionConfig")
+        self.evaluator_execution.validate_runtime_policy_support()
+        if type(self.review_evaluator_context) is not ReviewEvaluatorContext:
+            raise _error(
+                "review_evaluator_context must be the typed ReviewEvaluatorContext"
+            )
         if type(self.rubrics) is not JudgeRubricCatalog:
             raise _error("ReviewEvaluator requires a JudgeRubricCatalog")
         attestations = tuple(self.command_attestations)
@@ -2543,22 +2628,36 @@ class ReviewEvaluator:
             raise _error("context_bundle must be the scoped ReviewContextBundle")
         _id(self.evaluator_revision, "ReviewEvaluator.evaluator_revision")
 
-        repository = self.eval_input.repository
-        if (
-            self.replay.repository_descriptor_digest != repository.digest()
-            or self.replay.base_revision != repository.base_revision
-            or self.replay.head_revision != repository.head_revision
-        ):
-            raise _error("ReviewEvaluator replay is not bound to EvalInput")
-        expected_catalog = SidePathCatalog.from_replay(self.replay)
         matcher = self.location_matcher
-        if matcher is None:
-            matcher = LocationMatcher(expected_catalog)
-            object.__setattr__(self, "location_matcher", matcher)
-        elif type(matcher) is not LocationMatcher:
-            raise _error("location_matcher must be LocationMatcher")
-        elif matcher.side_paths.digest() != expected_catalog.digest():
-            raise _error("location_matcher is not bound to the supplied replay")
+        if self.eval_input.review_target.kind is ReviewTargetKind.REPOSITORY:
+            if type(self.replay) is not PreparedRepositoryReplay:
+                raise _error(
+                    "Repository ReviewEvaluator requires PreparedRepositoryReplay"
+                )
+            repository = repository_from_eval_input(self.eval_input)
+            if (
+                self.replay.repository_descriptor_digest != repository.digest()
+                or self.replay.base_revision != repository.base_revision
+                or self.replay.head_revision != repository.head_revision
+            ):
+                raise _error("ReviewEvaluator replay is not bound to EvalInput")
+            expected_catalog = SidePathCatalog.from_replay(self.replay)
+            if matcher is None:
+                matcher = LocationMatcher(expected_catalog)
+                object.__setattr__(self, "location_matcher", matcher)
+            elif type(matcher) is not LocationMatcher:
+                raise _error("location_matcher must be LocationMatcher")
+            elif matcher.side_paths.digest() != expected_catalog.digest():
+                raise _error("location_matcher is not bound to the supplied replay")
+        else:
+            if type(self.replay) is not FrozenContextReplay:
+                raise _error(
+                    "Frozen ReviewEvaluator requires FrozenContextReplay"
+                )
+            if matcher is not None:
+                raise _error(
+                    "Frozen ReviewEvaluator cannot use a Repository location matcher"
+                )
 
         checker = self.evidence_checker
         if checker is None:
@@ -2566,6 +2665,7 @@ class ReviewEvaluator:
                 self.eval_input,
                 self.replay,
                 self.trial_id,
+                self.target_materialization_id,
                 attestations,
             )
             object.__setattr__(self, "evidence_checker", checker)
@@ -2575,6 +2675,8 @@ class ReviewEvaluator:
             checker.eval_input != self.eval_input
             or checker.replay is not self.replay
             or checker.trial_id != self.trial_id
+            or checker.target_materialization_id
+            != self.target_materialization_id
             or checker.command_attestations != attestations
         ):
             raise _error("evidence_checker is not exactly bound to evaluator inputs")
@@ -2610,24 +2712,53 @@ class ReviewEvaluator:
 
     @property
     def deterministic_context_digest(self) -> str:
-        assert self.location_matcher is not None
         assert self.evidence_checker is not None
-        return canonical_sha256(
-            {
-                "schema_version": "eval_review_deterministic_context_v1",
-                "eval_input_digest": self.eval_input.digest(),
+        if type(self.replay) is PreparedRepositoryReplay:
+            assert self.location_matcher is not None
+            replay_binding = {
+                "kind": ReviewTargetKind.REPOSITORY.value,
                 "prepared_repository_id": self.replay.prepared_repository_id,
-                "repository_descriptor_digest": self.replay.repository_descriptor_digest,
+                "repository_descriptor_digest": (
+                    self.replay.repository_descriptor_digest
+                ),
                 "base_revision": self.replay.base_revision,
                 "head_revision": self.replay.head_revision,
-                "side_path_catalog_digest": self.location_matcher.side_paths.digest(),
+                "side_path_catalog_digest": (
+                    self.location_matcher.side_paths.digest()
+                ),
                 "location_policy": self.location_matcher.policy.to_dict(),
+            }
+        else:
+            assert type(self.replay) is FrozenContextReplay
+            replay_binding = {
+                "kind": ReviewTargetKind.FROZEN_CONTEXT.value,
+                "bundle_id": self.replay.bundle_id,
+                "record_id": self.replay.record_id,
+                "context_ref": self.replay.context_ref,
+                "context_format": self.replay.context_format,
+                "rendered_sha256": self.replay.rendered_sha256,
+                "rendered_utf8_bytes": self.replay.rendered_utf8_bytes,
+                "source_binding_digest": self.replay.source_binding_digest,
+                "replay_binding_digest": self.replay.replay_binding_digest,
+            }
+        return canonical_sha256(
+            {
+                "schema_version": "eval_review_deterministic_context_v2",
+                "eval_input_digest": self.eval_input.digest(),
+                "target_materialization_id": self.target_materialization_id,
+                "replay_binding": replay_binding,
                 "evidence_policy_version": EVIDENCE_INTEGRITY_POLICY_VERSION,
                 "trial_id": self.trial_id,
                 "command_attestation_digests": sorted(
                     item.digest() for item in self.command_attestations
                 ),
                 "context_bundle_digest": self.context_bundle.digest(),
+                "review_evaluator_context_digest": (
+                    self.review_evaluator_context.digest()
+                ),
+                "review_evaluator_context_policy_version": (
+                    self.evaluator_execution.review_evaluator_context_policy_version
+                ),
                 "judge_rubric_catalog_digest": self.rubrics.catalog_digest,
             }
         )
@@ -2645,6 +2776,15 @@ class ReviewEvaluator:
             raise _error("Review evaluation requires a Submission Review")
         if submission.task_id != self.eval_input.task_id:
             raise _error("Submission task_id differs from EvalInput")
+        if submission.eval_input_digest != self.eval_input.digest():
+            raise _error("Submission eval_input_digest differs from EvalInput")
+        if (
+            submission.target_materialization_id
+            != self.target_materialization_id
+        ):
+            raise _error(
+                "Submission target_materialization_id differs from ReviewEvaluator"
+            )
         if submission.trial_id != self.trial_id:
             raise _error("Submission trial_id differs from ReviewEvaluator")
         self._validate_truth_claim_conflicts(truth)
@@ -2681,6 +2821,12 @@ class ReviewEvaluator:
         finding_ids = {item.finding_id for item in findings}
         expected_ids = {item.truth_id for item in truth.expected_findings}
         invalid_ids = {item.truth_id for item in truth.known_invalid_findings}
+        review_truth_ids = expected_ids | invalid_ids
+        for entry in self.review_evaluator_context.truth_contexts:
+            if entry.truth_id not in review_truth_ids:
+                raise _error(
+                    "review evaluator context truth selector references an unknown truth Finding"
+                )
         for entry in self.context_bundle.finding_entries:
             if entry.finding_id not in finding_ids:
                 raise _error("context finding selector references an unknown Finding")
@@ -2690,6 +2836,32 @@ class ReviewEvaluator:
             valid_ids = expected_ids if entry.truth_kind is ReviewTruthKind.EXPECTED else invalid_ids
             if entry.truth_id not in valid_ids:
                 raise _error("context pair selector references an unknown truth Finding")
+
+    def _evaluator_context_sources(
+        self,
+        *,
+        truth_id: str,
+        task: EvaluatorContextTask,
+    ) -> Tuple[JudgeContextSource, ...]:
+        for entry in self.review_evaluator_context.truth_contexts:
+            if entry.truth_id != truth_id:
+                continue
+            if task not in entry.allowed_tasks:
+                return ()
+            sources = tuple(
+                sorted(
+                    (
+                        _swe_truth_diff_hunk_source(truth_id, source)
+                        for source in entry.sources
+                    ),
+                    key=lambda item: item.source_id,
+                )
+            )
+            return _merge_context_sources(
+                sources,
+                "truth-scoped evaluator context sources",
+            )
+        return ()
 
     @staticmethod
     def _validate_truth_claim_conflicts(truth: ReviewTruth) -> None:
@@ -2713,10 +2885,15 @@ class ReviewEvaluator:
         Tuple[LocationAuditRecord, ...],
         Mapping[Tuple[str, ReviewTruthKind, str], Tuple[LocationAuditRecord, ...]],
     ]:
+        location_scorable_expected = tuple(
+            item
+            for item in base.truth.expected_findings
+            if item.metric_authority.location_scorable
+        )
         truth_locations = sum(
             len(item.locations)
             for item in (
-                *base.truth.expected_findings,
+                *location_scorable_expected,
                 *base.truth.known_invalid_findings,
             )
         )
@@ -2729,13 +2906,18 @@ class ReviewEvaluator:
                 ReviewReasonCode.LOCATION_LIMIT_EXCEEDED,
                 ReviewEvaluationPhase.KNOWN_INVALID,
             )
-        assert self.location_matcher is not None
+        if self.location_matcher is None:
+            if truth_locations:
+                raise _error(
+                    "Frozen Review evaluation cannot perform Repository location matching"
+                )
+            return (), {}
         records: list[LocationAuditRecord] = []
         grouped: Dict[
             Tuple[str, ReviewTruthKind, str], list[LocationAuditRecord]
         ] = {}
         truth_groups = (
-            (ReviewTruthKind.EXPECTED, base.truth.expected_findings),
+            (ReviewTruthKind.EXPECTED, location_scorable_expected),
             (ReviewTruthKind.KNOWN_INVALID, base.truth.known_invalid_findings),
         )
         for finding in base.findings:
@@ -2798,14 +2980,26 @@ class ReviewEvaluator:
             base.review_truth_digest,
             base.deterministic_context_digest,
         )
+        context_sources = _merge_context_sources(
+            (
+                *self.context_bundle.resolve_pair(
+                    finding.finding_id,
+                    truth_kind,
+                    truth.truth_id,
+                ),
+                *self._evaluator_context_sources(
+                    truth_id=truth.truth_id,
+                    task=EvaluatorContextTask.FINDING_EQUIVALENCE,
+                ),
+            ),
+            "Finding-equivalence context",
+        )
         request = build_finding_equivalence_judge_input(
             request_id,
             finding,
             truth,
-            evidence=self._referenced_evidence(base, finding),
-            context_sources=self.context_bundle.resolve_pair(
-                finding.finding_id, truth_kind, truth.truth_id
-            ),
+            evidence=self._valid_evidence(base, finding),
+            context_sources=context_sources,
             rubrics=self.rubrics,
         )
         return ReviewJudgeRequestRecord(
@@ -2816,30 +3010,6 @@ class ReviewEvaluator:
             truth_id=truth.truth_id,
             request=request,
         )
-
-    def _referenced_evidence(
-        self,
-        base: _EvaluationBase,
-        finding: SubmissionFinding,
-    ) -> Tuple[SubmissionEvidence, ...]:
-        """Project existing referenced Evidence in Submission ref order.
-
-        Dangling IDs are omitted because they have no typed Evidence object;
-        duplicate refs remain visible to the integrity checker but are sent
-        only once to a Judge so its context-reference identity stays unique.
-        Integrity status is deliberately not consulted here.
-        """
-
-        seen: set[str] = set()
-        result: list[SubmissionEvidence] = []
-        for evidence_id in finding.evidence_refs:
-            if evidence_id in seen:
-                continue
-            seen.add(evidence_id)
-            evidence = base.evidence_by_id.get(evidence_id)
-            if evidence is not None:
-                result.append(evidence)
-        return tuple(result)
 
     def _valid_evidence(
         self, base: _EvaluationBase, finding: SubmissionFinding
@@ -2977,11 +3147,13 @@ class ReviewEvaluator:
         registry: _JudgeResultRegistry,
     ) -> Tuple[_PairState, Optional[ReviewJudgeRequestRecord]]:
         if finding.claim == truth.claim:
-            severity = (
-                _severity_assessment(finding.severity, truth.severity)
-                if type(truth) is ExpectedFinding
-                else None
-            )
+            severity = None
+            if (
+                type(truth) is ExpectedFinding
+                and truth.metric_authority.severity_scorable
+            ):
+                assert truth.severity is not None
+                severity = _severity_assessment(finding.severity, truth.severity)
             return (
                 _PairState(
                     finding=finding,
@@ -3065,6 +3237,12 @@ class ReviewEvaluator:
         decision = result.decision
         if type(decision) is not FindingEquivalenceJudgeDecision:
             raise _error("finding equivalence result has the wrong typed decision")
+        severity_assessment = decision.severity_assessment
+        if (
+            type(truth) is ExpectedFinding
+            and not truth.metric_authority.severity_scorable
+        ):
+            severity_assessment = None
         if decision.relation is FindingMatchRelation.UNKNOWN:
             resolution = FindingResolution.UNGRADED
             edge_weight = None
@@ -3092,7 +3270,7 @@ class ReviewEvaluator:
                 score_ppm=decision.score_ppm,
                 edge_weight=edge_weight,
                 resolution=resolution,
-                severity_assessment=decision.severity_assessment,
+                severity_assessment=severity_assessment,
                 actionability=decision.actionability,
                 reason_codes=reasons,
             ),

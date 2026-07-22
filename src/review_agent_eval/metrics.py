@@ -20,8 +20,9 @@ from enum import Enum
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from .assignment import ASSIGNMENT_POLICY_VERSION
-from .cases import CaseDimension, SuiteCase
+from .cases import CaseDimension, SuiteCase, WireContractV2
 from .config import (
+    DEFAULT_METRIC_AUTHORITY_POLICY_VERSION,
     EvalRunConfig,
     EvaluatorExecutionConfig,
     derive_evaluation_id,
@@ -44,12 +45,15 @@ from .models import (
     FailureCode,
     FindingSeverity,
     IssueJudgement,
+    MetricAuthority,
     NovelFindingPolicy,
+    ReviewTargetKind,
     SchemaError,
     SubmissionStatus,
     SubmissionUsage,
     TraceRef,
     TruthCompleteness,
+    UnsupportedProtocolVersionError,
     canonical_json,
     canonical_json_bytes,
     canonical_sha256,
@@ -67,6 +71,7 @@ from .review_evaluator import (
     ReviewEvaluationStatus,
     ReviewTruthKind,
     REVIEW_EVALUATOR_REVISION,
+    REVIEW_LOCATION_POLICY_VERSION,
 )
 
 
@@ -84,6 +89,7 @@ MAX_SCORE_BYTES = 256 * 1024 * 1024
 MAX_TRIAL_SCORES = 65_536
 MAX_CASE_SCORES = 16_384
 MAX_BREAKDOWN_ITEMS = 256
+MAX_AUTHORITY_COMBINATIONS = 16
 
 
 class MetricsError(ValueError):
@@ -942,6 +948,174 @@ class ReviewScoreBinding:
         }
 
 
+def _metric_authority_policy_snapshot(version: str) -> Dict[str, str]:
+    """Return the canonical semantics bound by an execution policy version."""
+
+    supported_version = _id(version, "metric authority policy.version")
+    if supported_version != DEFAULT_METRIC_AUTHORITY_POLICY_VERSION:
+        raise UnsupportedProtocolVersionError(
+            expected=DEFAULT_METRIC_AUTHORITY_POLICY_VERSION,
+            actual=supported_version,
+        )
+    return {
+        "version": supported_version,
+        "severity_eligibility": "required-and-severity-scorable",
+        "location_precision_eligibility": "all-expected-and-location-scorable",
+        "location_recall_eligibility": "required-and-location-scorable",
+    }
+
+
+def _metric_authority_policy_digest(version: str) -> str:
+    return canonical_sha256(_metric_authority_policy_snapshot(version))
+
+
+@dataclass(frozen=True)
+class MetricAuthorityProfile:
+    """Canonical set of authority combinations present in one EvalCase."""
+
+    authorities: Tuple[MetricAuthority, ...]
+
+    def __post_init__(self) -> None:
+        values = tuple(self.authorities)
+        if any(type(item) is not MetricAuthority for item in values):
+            raise _error("metric authority profile contains an invalid authority")
+        canonical = {
+            canonical_json(item.to_dict()): MetricAuthority.from_dict(item.to_dict())
+            for item in values
+        }
+        if len(canonical) > MAX_AUTHORITY_COMBINATIONS:
+            raise _error("metric authority profile exceeds its combination limit")
+        ordered = tuple(canonical[key] for key in sorted(canonical))
+        object.__setattr__(self, "authorities", ordered)
+        _canonical_payload(self.to_dict(), "metric authority profile")
+
+    @classmethod
+    def from_eval_case(cls, eval_case: EvalCase) -> "MetricAuthorityProfile":
+        if type(eval_case) is not EvalCase:
+            raise _error("metric authority profile requires an EvalCase")
+        return cls(
+            tuple(
+                item.metric_authority
+                for item in eval_case.review_truth.expected_findings
+            )
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "MetricAuthorityProfile":
+        payload = _strict_object(
+            value,
+            ("authorities",),
+            "metric authority profile",
+        )
+        return cls(
+            tuple(
+                MetricAuthority.from_dict(item)
+                for item in _array(
+                    payload["authorities"],
+                    "metric authority profile.authorities",
+                    MAX_AUTHORITY_COMBINATIONS,
+                )
+            )
+        )
+
+    @property
+    def digest(self) -> str:
+        return canonical_sha256(self.to_dict())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"authorities": [item.to_dict() for item in self.authorities]}
+
+
+@dataclass(frozen=True)
+class MetricAuthorityCoverage:
+    """Case-level eligible/excluded truth population for authority metrics."""
+
+    expected_truth_count: int
+    required_expected_truth_count: int
+    severity_eligible_required_truth_count: int
+    severity_excluded_required_truth_count: int
+    location_precision_eligible_truth_count: int
+    location_precision_excluded_truth_count: int
+    location_recall_eligible_required_truth_count: int
+    location_recall_excluded_required_truth_count: int
+
+    def __post_init__(self) -> None:
+        for name in self.__dataclass_fields__:
+            _integer(getattr(self, name), f"metric authority coverage.{name}")
+        if self.required_expected_truth_count > self.expected_truth_count:
+            raise _error("required authority truth count exceeds all expected truths")
+        if (
+            self.severity_eligible_required_truth_count
+            + self.severity_excluded_required_truth_count
+            != self.required_expected_truth_count
+        ):
+            raise _error("severity authority coverage does not cover required truths")
+        if (
+            self.location_precision_eligible_truth_count
+            + self.location_precision_excluded_truth_count
+            != self.expected_truth_count
+        ):
+            raise _error("location precision authority coverage does not cover truths")
+        if (
+            self.location_recall_eligible_required_truth_count
+            + self.location_recall_excluded_required_truth_count
+            != self.required_expected_truth_count
+        ):
+            raise _error("location recall authority coverage does not cover required truths")
+
+    @classmethod
+    def from_eval_case(cls, eval_case: EvalCase) -> "MetricAuthorityCoverage":
+        if type(eval_case) is not EvalCase:
+            raise _error("metric authority coverage requires an EvalCase")
+        expected = tuple(eval_case.review_truth.expected_findings)
+        required = tuple(item for item in expected if item.required)
+        severity_eligible = sum(
+            item.metric_authority.severity_scorable for item in required
+        )
+        precision_eligible = sum(
+            item.metric_authority.location_scorable for item in expected
+        )
+        recall_eligible = sum(
+            item.metric_authority.location_scorable for item in required
+        )
+        return cls(
+            expected_truth_count=len(expected),
+            required_expected_truth_count=len(required),
+            severity_eligible_required_truth_count=severity_eligible,
+            severity_excluded_required_truth_count=len(required) - severity_eligible,
+            location_precision_eligible_truth_count=precision_eligible,
+            location_precision_excluded_truth_count=len(expected) - precision_eligible,
+            location_recall_eligible_required_truth_count=recall_eligible,
+            location_recall_excluded_required_truth_count=(
+                len(required) - recall_eligible
+            ),
+        )
+
+    @classmethod
+    def aggregate(
+        cls,
+        values: Sequence["MetricAuthorityCoverage"],
+    ) -> "MetricAuthorityCoverage":
+        items = tuple(values)
+        if not items or any(type(item) is not cls for item in items):
+            raise _error("authority coverage aggregation requires typed Case coverage")
+        return cls(
+            **{
+                name: sum(getattr(item, name) for item in items)
+                for name in cls.__dataclass_fields__
+            }
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "MetricAuthorityCoverage":
+        field_names = tuple(cls.__dataclass_fields__)
+        payload = _strict_object(value, field_names, "metric authority coverage")
+        return cls(**{name: payload[name] for name in field_names})
+
+    def to_dict(self) -> Dict[str, int]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+
 @dataclass(frozen=True)
 class ScoreCompatibilityKey:
     run_id: str
@@ -953,8 +1127,17 @@ class ScoreCompatibilityKey:
     case_snapshot_digest: str
     trial_count: int
     protocol_id: str
+    target_kind: ReviewTargetKind
+    wire_contract: WireContractV2
+    wire_contract_digest: str
+    adapter_capabilities_digest: str
+    isolation_profile: str
     truth_completeness: TruthCompleteness
     novel_finding_policy: NovelFindingPolicy
+    metric_authority_profile: MetricAuthorityProfile
+    metric_authority_profile_digest: str
+    metric_authority_policy_version: str
+    metric_authority_policy_digest: str
     agent_config_digest: str
     clarification_matcher_config_digest: str
     evaluator_execution_digest: str
@@ -977,6 +1160,8 @@ class ScoreCompatibilityKey:
             "suite_version",
             "case_snapshot_id",
             "protocol_id",
+            "isolation_profile",
+            "metric_authority_policy_version",
             "intent_evaluator_revision",
             "review_evaluator_revision",
             "intent_policy_version",
@@ -991,12 +1176,37 @@ class ScoreCompatibilityKey:
         for name in (
             "manifest_digest",
             "case_snapshot_digest",
+            "wire_contract_digest",
+            "adapter_capabilities_digest",
+            "metric_authority_profile_digest",
+            "metric_authority_policy_digest",
             "agent_config_digest",
             "clarification_matcher_config_digest",
             "evaluator_execution_digest",
             "metrics_policy_digest",
         ):
             _digest(getattr(self, name), f"compatibility.{name}")
+        if type(self.target_kind) is not ReviewTargetKind:
+            raise _error("compatibility target kind is invalid")
+        if type(self.wire_contract) is not WireContractV2:
+            raise _error("compatibility wire contract snapshot is invalid")
+        if self.target_kind is not self.wire_contract.review_target_kind:
+            raise _error("compatibility target kind differs from wire contract")
+        if canonical_sha256(self.wire_contract.to_dict()) != self.wire_contract_digest:
+            raise _error("compatibility wire contract snapshot/digest differ")
+        if (
+            type(self.metric_authority_profile) is not MetricAuthorityProfile
+            or self.metric_authority_profile.digest
+            != self.metric_authority_profile_digest
+        ):
+            raise _error("compatibility authority profile snapshot/digest differ")
+        if (
+            _metric_authority_policy_digest(
+                self.metric_authority_policy_version
+            )
+            != self.metric_authority_policy_digest
+        ):
+            raise _error("compatibility authority policy version/digest differ")
         if (
             type(self.metrics_policy) is not MetricsPolicy
             or self.metrics_policy.digest != self.metrics_policy_digest
@@ -1018,8 +1228,17 @@ class ScoreCompatibilityKey:
             "case_snapshot_digest": self.case_snapshot_digest,
             "trial_count": self.trial_count,
             "protocol_id": self.protocol_id,
+            "target_kind": self.target_kind.value,
+            "wire_contract": self.wire_contract.to_dict(),
+            "wire_contract_digest": self.wire_contract_digest,
+            "adapter_capabilities_digest": self.adapter_capabilities_digest,
+            "isolation_profile": self.isolation_profile,
             "truth_completeness": self.truth_completeness.value,
             "novel_finding_policy": self.novel_finding_policy.value,
+            "metric_authority_profile": self.metric_authority_profile.to_dict(),
+            "metric_authority_profile_digest": self.metric_authority_profile_digest,
+            "metric_authority_policy_version": self.metric_authority_policy_version,
+            "metric_authority_policy_digest": self.metric_authority_policy_digest,
             "agent_config_digest": self.agent_config_digest,
             "clarification_matcher_config_digest": self.clarification_matcher_config_digest,
             "evaluator_execution_digest": self.evaluator_execution_digest,
@@ -1043,6 +1262,7 @@ class TrialScore:
     aggregator_revision: str
     evaluation_revision: str
     compatibility: ScoreCompatibilityKey
+    authority_coverage: MetricAuthorityCoverage
     task_id: str
     case_version: int
     trial_index: int
@@ -1071,6 +1291,8 @@ class TrialScore:
         _id(self.evaluation_revision, "Trial score.evaluation_revision")
         if type(self.compatibility) is not ScoreCompatibilityKey:
             raise _error("Trial score requires a compatibility key")
+        if type(self.authority_coverage) is not MetricAuthorityCoverage:
+            raise _error("Trial score authority coverage is invalid")
         _id(self.task_id, "Trial score.task_id")
         _integer(self.case_version, "Trial score.case_version", minimum=1)
         _integer(self.trial_index, "Trial score.trial_index", minimum=1)
@@ -1121,6 +1343,7 @@ class TrialScore:
             "aggregator_revision": self.aggregator_revision,
             "evaluation_revision": self.evaluation_revision,
             "compatibility": self.compatibility.to_dict(),
+            "authority_coverage": self.authority_coverage.to_dict(),
             "task_id": self.task_id,
             "case_version": self.case_version,
             "trial_index": self.trial_index,
@@ -1237,6 +1460,7 @@ class CaseScore:
     score_id: str
     aggregator_revision: str
     compatibility: ScoreCompatibilityKey
+    authority_coverage: MetricAuthorityCoverage
     task_id: str
     case_version: int
     canonical_case_digest: str
@@ -1264,6 +1488,8 @@ class CaseScore:
             raise _error("unsupported Case score schema/revision")
         if type(self.compatibility) is not ScoreCompatibilityKey:
             raise _error("Case score compatibility key is invalid")
+        if type(self.authority_coverage) is not MetricAuthorityCoverage:
+            raise _error("Case score authority coverage is invalid")
         _id(self.task_id, "Case score.task_id")
         _integer(self.case_version, "Case score.case_version", minimum=1)
         _digest(self.canonical_case_digest, "Case score.canonical_case_digest")
@@ -1322,6 +1548,7 @@ class CaseScore:
             "schema_version": self.schema_version,
             "aggregator_revision": self.aggregator_revision,
             "compatibility": self.compatibility.to_dict(),
+            "authority_coverage": self.authority_coverage.to_dict(),
             "task_id": self.task_id,
             "case_version": self.case_version,
             "canonical_case_digest": self.canonical_case_digest,
@@ -1391,6 +1618,7 @@ class AggregateScore:
     score_id: str
     aggregator_revision: str
     compatibility: ScoreCompatibilityKey
+    authority_coverage: MetricAuthorityCoverage
     group_dimensions: Tuple[CaseDimension, ...]
     case_count: int
     planned_trial_count: int
@@ -1416,6 +1644,8 @@ class AggregateScore:
             raise _error("unsupported Aggregate score schema/revision")
         if type(self.compatibility) is not ScoreCompatibilityKey:
             raise _error("Aggregate score compatibility key is invalid")
+        if type(self.authority_coverage) is not MetricAuthorityCoverage:
+            raise _error("Aggregate score authority coverage is invalid")
         for name in (
             "case_count",
             "planned_trial_count",
@@ -1471,6 +1701,7 @@ class AggregateScore:
             "schema_version": self.schema_version,
             "aggregator_revision": self.aggregator_revision,
             "compatibility": self.compatibility.to_dict(),
+            "authority_coverage": self.authority_coverage.to_dict(),
             "group_dimensions": [item.to_dict() for item in self.group_dimensions],
             "case_count": self.case_count,
             "planned_trial_count": self.planned_trial_count,
@@ -1707,40 +1938,88 @@ class TrialScorer:
     ) -> Tuple[MetricContribution, ...]:
         truth = eval_case.review_truth
         required_truths = tuple(item for item in truth.expected_findings if item.required)
-        weighted_denominator = sum(self.metrics_policy.severity_weights.weight_for(item.severity) for item in required_truths)
-        located_required_denominator = sum(bool(item.locations) for item in required_truths)
-        severe_required = sum(item.severity in {FindingSeverity.HIGH, FindingSeverity.CRITICAL} for item in required_truths)
+        severity_eligible_truths = tuple(
+            item
+            for item in required_truths
+            if item.metric_authority.severity_scorable
+        )
+        precision_location_eligible_truths = tuple(
+            item
+            for item in truth.expected_findings
+            if item.metric_authority.location_scorable
+        )
+        recall_location_eligible_truths = tuple(
+            item
+            for item in required_truths
+            if item.metric_authority.location_scorable
+        )
+        severity_eligible_ids = {
+            item.truth_id for item in severity_eligible_truths
+        }
+        precision_location_eligible_ids = {
+            item.truth_id for item in precision_location_eligible_truths
+        }
+        recall_location_eligible_ids = {
+            item.truth_id for item in recall_location_eligible_truths
+        }
+        weighted_denominator = sum(
+            self.metrics_policy.severity_weights.weight_for(item.severity)
+            for item in severity_eligible_truths
+        )
+        located_required_denominator = len(recall_location_eligible_truths)
+        severe_required = sum(
+            item.severity in {FindingSeverity.HIGH, FindingSeverity.CRITICAL}
+            for item in severity_eligible_truths
+        )
+        severity_metrics = {
+            CoreMetric.SEVERITY_WEIGHTED_RECALL,
+            CoreMetric.CRITICAL_HIGH_MISS_COUNT,
+        }
+
+        def excluded_for_authority(
+            metric: CoreMetric,
+            fallback: MetricSourceStatus,
+        ) -> MetricContribution:
+            if metric in severity_metrics and not severity_eligible_truths:
+                return self._excluded(metric, MetricSourceStatus.NOT_SCORABLE)
+            if (
+                metric is CoreMetric.LINE_PRECISION
+                and not precision_location_eligible_truths
+            ):
+                return self._excluded(metric, MetricSourceStatus.NOT_SCORABLE)
+            if (
+                metric is CoreMetric.LINE_RECALL
+                and not recall_location_eligible_truths
+            ):
+                return self._excluded(metric, MetricSourceStatus.NOT_SCORABLE)
+            return self._excluded(metric, fallback)
+
         if result is not None and result.status is ReviewEvaluationStatus.GRADED:
             metrics = result.metrics
             if not metrics.scorable:
                 raise _error("graded Review result has unscorable metric inputs")
             expected_by_id = {item.truth_id: item for item in result.expected_truth_findings}
-            matched_required_ids = {
+            matched_severity_ids = {
                 item.matched_expected_truth_id
                 for item in result.finding_outcomes
                 if item.matched_expected_truth_id is not None
-                and expected_by_id[item.matched_expected_truth_id].required
+                and item.matched_expected_truth_id in severity_eligible_ids
             }
             weighted_numerator = sum(
                 self.metrics_policy.severity_weights.weight_for(expected_by_id[item].severity)
-                for item in matched_required_ids
+                for item in matched_severity_ids
             )
             severe_misses = sum(
-                item.required
+                item.truth_id in severity_eligible_ids
                 and item.severity in {FindingSeverity.HIGH, FindingSeverity.CRITICAL}
                 and item.truth_id in result.unmatched_expected_truth_ids
                 for item in result.expected_truth_findings
             )
-            location_matches = {
-                (item.finding_id, item.truth_id): item.match.matched
-                for item in result.location_candidates
-            }
             located_assignment_count = 0
             located_assignment_denominator = 0
             located_required_numerator = 0
             for assignment in result.assignments:
-                target = expected_by_id[assignment.truth_id]
-                if not target.locations:
+                if assignment.truth_id not in precision_location_eligible_ids:
                     continue
                 located_assignment_denominator += 1
                 matched = any(
@@ -1752,7 +2031,7 @@ class TrialScorer:
                 )
                 if matched:
                     located_assignment_count += 1
-                    if target.required:
+                    if assignment.truth_id in recall_location_eligible_ids:
                         located_required_numerator += 1
             plausible = sum(item.issue_judgement is IssueJudgement.PLAUSIBLE for item in result.finding_outcomes)
             finding_count = metrics.generated_finding_count
@@ -1771,15 +2050,30 @@ class TrialScorer:
                 CoreMetric.EVIDENCE_SUPPORT_RATE: (metrics.evidence_supported_count, finding_count),
                 CoreMetric.PUBLISHABLE_FINDING_PRECISION: (metrics.strict_publishable_count, finding_count),
             }
-            return tuple(self._included(metric, numerator, denominator) for metric, (numerator, denominator) in values.items())
+            return tuple(
+                excluded_for_authority(metric, MetricSourceStatus.NOT_SCORABLE)
+                if (
+                    (metric in severity_metrics and not severity_eligible_truths)
+                    or (
+                        metric is CoreMetric.LINE_PRECISION
+                        and not precision_location_eligible_truths
+                    )
+                    or (
+                        metric is CoreMetric.LINE_RECALL
+                        and not recall_location_eligible_truths
+                    )
+                )
+                else self._included(metric, *values[metric])
+                for metric in _REVIEW_METRICS
+            )
         if result is not None:
             return tuple(
-                self._excluded(metric, MetricSourceStatus.UNGRADED)
+                excluded_for_authority(metric, MetricSourceStatus.UNGRADED)
                 for metric in _REVIEW_METRICS
             )
         if submission.review is not None:
             return tuple(
-                self._excluded(metric, MetricSourceStatus.MISSING)
+                excluded_for_authority(metric, MetricSourceStatus.MISSING)
                 for metric in _REVIEW_METRICS
             )
         failed = submission.status is not SubmissionStatus.COMPLETED
@@ -1792,14 +2086,34 @@ class TrialScorer:
             }
             contributions = []
             for metric in _REVIEW_METRICS:
-                if metric in missed_values:
+                if metric in severity_metrics and not severity_eligible_truths:
+                    contributions.append(
+                        self._excluded(metric, MetricSourceStatus.NOT_SCORABLE)
+                    )
+                elif (
+                    metric is CoreMetric.LINE_PRECISION
+                    and not precision_location_eligible_truths
+                ):
+                    contributions.append(
+                        self._excluded(metric, MetricSourceStatus.NOT_SCORABLE)
+                    )
+                elif (
+                    metric is CoreMetric.LINE_RECALL
+                    and not recall_location_eligible_truths
+                ):
+                    contributions.append(
+                        self._excluded(metric, MetricSourceStatus.NOT_SCORABLE)
+                    )
+                elif metric in missed_values:
                     numerator, denominator = missed_values[metric]
                     contributions.append(self._included(metric, numerator, denominator, MetricSourceStatus.FAILURE_AS_MISS))
                 else:
                     contributions.append(self._excluded(metric, MetricSourceStatus.FAILURE_EXCLUDED))
             return tuple(contributions)
         status = MetricSourceStatus.FAILURE_EXCLUDED if failed else MetricSourceStatus.UNGRADED
-        return tuple(self._excluded(metric, status) for metric in _REVIEW_METRICS)
+        return tuple(
+            excluded_for_authority(metric, status) for metric in _REVIEW_METRICS
+        )
 
     def _judge_contributions(
         self,
@@ -1836,6 +2150,7 @@ class TrialScorer:
     ) -> TrialScore:
         if type(run_config) is not EvalRunConfig or type(evaluator_execution) is not EvaluatorExecutionConfig:
             raise _error("Trial scoring requires canonical Run/Evaluator execution config")
+        evaluator_execution.validate_runtime_policy_support()
         if type(eval_case) is not EvalCase or type(submission) is not EvalSubmission:
             raise _error("Trial scoring requires canonical Case and Submission")
         suite_case = run_config.suite.case(eval_case.task_id)
@@ -1853,6 +2168,12 @@ class TrialScorer:
         ):
             raise _error("EvalCase differs from immutable Suite binding")
         execution_digest = evaluator_execution.digest()
+        location_policy_version = (
+            self.location_policy_version
+            if eval_case.eval_input().review_target.kind
+            is ReviewTargetKind.REPOSITORY
+            else REVIEW_LOCATION_POLICY_VERSION
+        )
         evaluation_id = derive_evaluation_id(run_config.run_id, execution_digest, evaluation_revision)
         validate_evaluation_id(evaluation_id, run_config.run_id, execution_digest, evaluation_revision)
         if intent_result is not None:
@@ -1881,7 +2202,7 @@ class TrialScorer:
                 or review_result.evaluator_execution_digest != execution_digest
                 or review_result.review_policy_version != self.review_policy_version
                 or review_result.assignment_policy_version != self.assignment_policy_version
-                or review_result.location_policy_version != self.location_policy_version
+                or review_result.location_policy_version != location_policy_version
                 or review_result.evidence_integrity_policy_version != self.evidence_policy_version
                 or review_result.evaluator_revision != self.review_evaluator_revision
             ):
@@ -1937,6 +2258,12 @@ class TrialScorer:
             *self._judge_contributions(intent_result, review_result),
         ]
         contributions = sorted(contributions, key=lambda item: item.metric.value)
+        authority_profile = MetricAuthorityProfile.from_eval_case(eval_case)
+        authority_coverage = MetricAuthorityCoverage.from_eval_case(eval_case)
+        wire_contract_digest = canonical_sha256(run_config.wire_contract.to_dict())
+        authority_policy_version = (
+            evaluator_execution.metric_authority_policy_version
+        )
         compatibility = ScoreCompatibilityKey(
             run_id=run_config.run_id,
             evaluation_id=evaluation_id,
@@ -1947,8 +2274,19 @@ class TrialScorer:
             case_snapshot_digest=run_config.suite.case_snapshot_digest,
             trial_count=run_config.trial_count,
             protocol_id=suite_case.protocol_id,
+            target_kind=run_config.wire_contract.review_target_kind,
+            wire_contract=run_config.wire_contract,
+            wire_contract_digest=wire_contract_digest,
+            adapter_capabilities_digest=run_config.adapter_capabilities_digest,
+            isolation_profile=run_config.adapter_capabilities.isolation_profile,
             truth_completeness=eval_case.review_truth.completeness,
             novel_finding_policy=eval_case.review_truth.novel_finding_policy,
+            metric_authority_profile=authority_profile,
+            metric_authority_profile_digest=authority_profile.digest,
+            metric_authority_policy_version=authority_policy_version,
+            metric_authority_policy_digest=_metric_authority_policy_digest(
+                authority_policy_version
+            ),
             agent_config_digest=run_config.agent_config_digest,
             clarification_matcher_config_digest=run_config.clarification_matcher_config_digest,
             evaluator_execution_digest=execution_digest,
@@ -1960,7 +2298,7 @@ class TrialScorer:
             intent_normalization_version=self.intent_normalization_version,
             review_policy_version=self.review_policy_version,
             assignment_policy_version=self.assignment_policy_version,
-            location_policy_version=self.location_policy_version,
+            location_policy_version=location_policy_version,
             evidence_policy_version=self.evidence_policy_version,
         )
         trace_ref = submission.trace_ref
@@ -1969,6 +2307,7 @@ class TrialScorer:
             "aggregator_revision": METRICS_AGGREGATOR_REVISION,
             "evaluation_revision": evaluation_revision,
             "compatibility": compatibility.to_dict(),
+            "authority_coverage": authority_coverage.to_dict(),
             "task_id": eval_case.task_id,
             "case_version": eval_case.case_version,
             "trial_index": trial_index,
@@ -1993,6 +2332,7 @@ class TrialScorer:
                 **identity,
                 "score_id": score_id,
                 "compatibility": compatibility,
+                "authority_coverage": authority_coverage,
                 "submission_status": submission.status,
                 "failure_code": None if submission.failure is None else submission.failure.code,
                 "intent_binding": intent_binding,
@@ -2179,6 +2519,9 @@ class MetricsAggregator:
             for item in values
         ):
             raise _error("Case aggregation sources refer to different Cases")
+        authority_coverage = first.authority_coverage
+        if any(item.authority_coverage != authority_coverage for item in values):
+            raise _error("one Case contains inconsistent authority coverage")
         planned = (
             first.compatibility.trial_count
             if planned_trial_count is None
@@ -2189,7 +2532,20 @@ class MetricsAggregator:
         if len(values) > planned:
             raise _error("terminal Trial scores exceed planned Trial count")
         metrics = self._aggregate_metrics(values)
-        refs = tuple(ScoreRef(item.score_id, item.digest(), item.task_id, item.trial_id) for item in values)
+        refs = tuple(
+            sorted(
+                (
+                    ScoreRef(
+                        item.score_id,
+                        item.digest(),
+                        item.task_id,
+                        item.trial_id,
+                    )
+                    for item in values
+                ),
+                key=lambda ref: ref.trial_id or "",
+            )
+        )
         failed_ids = tuple(sorted(item.trial_id for item in values if item.submission_status is not SubmissionStatus.COMPLETED))
         ungraded_ids = tuple(
             sorted(
@@ -2205,6 +2561,7 @@ class MetricsAggregator:
             "schema_version": CASE_SCORE_SCHEMA_VERSION,
             "aggregator_revision": METRICS_AGGREGATOR_REVISION,
             "compatibility": first.compatibility.to_dict(),
+            "authority_coverage": authority_coverage.to_dict(),
             "task_id": first.task_id,
             "case_version": first.case_version,
             "canonical_case_digest": first.canonical_case_digest,
@@ -2245,6 +2602,7 @@ class MetricsAggregator:
                 **identity,
                 "score_id": score_id,
                 "compatibility": first.compatibility,
+                "authority_coverage": authority_coverage,
                 "dimensions": first.dimensions,
                 "trial_scores": refs,
                 "metrics": metrics,
@@ -2293,6 +2651,24 @@ class MetricsAggregator:
             )
             if refs_by_trial_id[trial.trial_id] != expected_ref:
                 raise _error("Aggregate source Trial digest differs from Case score ref")
+        trials_by_task: Dict[str, list[TrialScore]] = {}
+        for trial in trials:
+            trials_by_task.setdefault(trial.task_id, []).append(trial)
+        for case in cases:
+            case_trials = tuple(trials_by_task.get(case.task_id, ()))
+            if (
+                not case_trials
+                or any(
+                    item.authority_coverage != case.authority_coverage
+                    for item in case_trials
+                )
+            ):
+                raise _error(
+                    "Aggregate Case authority coverage differs from source Trials"
+                )
+        authority_coverage = MetricAuthorityCoverage.aggregate(
+            tuple(item.authority_coverage for item in cases)
+        )
         metrics = self._aggregate_metrics(trials)
         refs = tuple(
             sorted(
@@ -2312,6 +2688,7 @@ class MetricsAggregator:
             "schema_version": AGGREGATE_SCORE_SCHEMA_VERSION,
             "aggregator_revision": METRICS_AGGREGATOR_REVISION,
             "compatibility": compatibility.to_dict(),
+            "authority_coverage": authority_coverage.to_dict(),
             "group_dimensions": [item.to_dict() for item in dimensions],
             "case_count": len(cases),
             "planned_trial_count": sum(item.planned_trial_count for item in cases),
@@ -2355,6 +2732,7 @@ class MetricsAggregator:
                 **identity,
                 "score_id": score_id,
                 "compatibility": compatibility,
+                "authority_coverage": authority_coverage,
                 "group_dimensions": dimensions,
                 "case_scores": refs,
                 "metrics": metrics,

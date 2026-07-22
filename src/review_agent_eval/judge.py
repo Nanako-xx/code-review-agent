@@ -41,15 +41,20 @@ from .intent_evaluator import (
 )
 from .judge_exports import JUDGE_PUBLIC_NAMES
 from .models import (
+    CommandOutputEvidenceSource,
     DiffSide,
     EvidenceAnchor,
     EvidenceKind,
     EvidenceStream,
+    ExternalRecordEvidenceSource,
     EvidenceSupport,
     ExpectedFinding,
     FindingSeverity,
+    FrozenContextEvidenceSource,
     IntentDimension,
     KnownInvalidFinding,
+    RepositoryDiffEvidenceSource,
+    RepositoryFileEvidenceSource,
     SchemaError,
     SubmissionEvidence,
     SubmissionFinding,
@@ -1331,6 +1336,54 @@ def repository_context(
 def _evidence_source(evidence: SubmissionEvidence) -> JudgeContextSource:
     if type(evidence) is not SubmissionEvidence:
         raise _error("Evidence context requires SubmissionEvidence")
+    source = evidence.source
+    if type(source) is RepositoryFileEvidenceSource:
+        revision = source.revision
+        path = source.path
+        from_line = source.from_line
+        to_line = source.to_line
+        command = None
+        exit_code = None
+        stream = None
+        source_ref = None
+    elif type(source) is RepositoryDiffEvidenceSource:
+        revision = "%s..%s" % (source.base_revision, source.head_revision)
+        path = source.path
+        from_line = None
+        to_line = None
+        command = None
+        exit_code = None
+        stream = None
+        source_ref = None
+    elif type(source) is FrozenContextEvidenceSource:
+        revision = ""
+        path = None
+        from_line = source.from_line
+        to_line = source.to_line
+        command = None
+        exit_code = None
+        stream = None
+        source_ref = source.context_ref
+    elif type(source) is CommandOutputEvidenceSource:
+        revision = ""
+        path = None
+        from_line = None
+        to_line = None
+        command = list(source.command)
+        exit_code = source.exit_code
+        stream = source.stream.value
+        source_ref = source.artifact_ref
+    elif type(source) is ExternalRecordEvidenceSource:
+        revision = ""
+        path = None
+        from_line = None
+        to_line = None
+        command = None
+        exit_code = None
+        stream = None
+        source_ref = source.source_ref
+    else:
+        raise _error("Evidence context source is not supported by Repository v2")
     return JudgeContextSource.create(
         source_id=evidence.evidence_id,
         source_kind="submission_evidence",
@@ -1338,17 +1391,15 @@ def _evidence_source(evidence: SubmissionEvidence) -> JudgeContextSource:
         trust=JudgeContextTrust.UNTRUSTED_REPOSITORY_DATA,
         content=evidence.excerpt,
         metadata={
-            "kind": evidence.kind.value,
-            "revision": evidence.revision,
-            "path": evidence.path,
-            "from_line": evidence.from_line,
-            "to_line": evidence.to_line,
-            "command": (
-                None if evidence.command is None else list(evidence.command)
-            ),
-            "exit_code": evidence.exit_code,
-            "stream": None if evidence.stream is None else evidence.stream.value,
-            "source_ref": evidence.source_ref,
+            "kind": source.kind.value,
+            "revision": revision,
+            "path": path,
+            "from_line": from_line,
+            "to_line": to_line,
+            "command": command,
+            "exit_code": exit_code,
+            "stream": stream,
+            "source_ref": source_ref,
             "content_hash": evidence.content_hash,
         },
         source_digest=canonical_sha256(evidence.to_dict()),
@@ -1471,7 +1522,7 @@ def _truth_finding_item(
 ) -> JudgeItem:
     if type(truth) is ExpectedFinding:
         metadata = {
-            "severity": truth.severity.value,
+            "severity": None if truth.severity is None else truth.severity.value,
             "category": truth.category,
             "locations": [item.to_dict() for item in truth.locations],
         }

@@ -13,16 +13,23 @@ import hashlib
 import json
 import math
 import re
+from array import array
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, ClassVar, Dict, Mapping, Optional, Tuple
 
+from .frozen_context import FrozenContextReplay
+from .materialization import MaterializationError
 from .models import (
+    CommandOutputEvidenceSource,
     EvalInput,
     EvidenceIntegrity,
     EvidenceKind,
     EvidenceStream,
+    ExternalRecordEvidenceSource,
+    FrozenContextEvidenceSource,
+    FrozenContextReviewTarget,
     MAX_CLAIM_CHARS,
     MAX_COMMAND_ARGUMENTS,
     MAX_COUNTER,
@@ -31,6 +38,10 @@ from .models import (
     MAX_EVIDENCE_REFS,
     MAX_FINDINGS,
     MAX_IDENTIFIER_CHARS,
+    RepositoryDiffEvidenceSource,
+    RepositoryFileEvidenceSource,
+    RepositoryReviewTarget,
+    ReviewTargetKind,
     SchemaError,
     SubmissionEvidence,
     SubmissionFinding,
@@ -43,6 +54,7 @@ from .repository import (
     RepositoryLimitError,
     RepositoryPolicyError,
     canonical_repository_path,
+    repository_from_eval_input,
 )
 
 
@@ -393,6 +405,9 @@ class EvidenceReasonCode(str, Enum):
     DANGLING_REF = "dangling_ref"
     DUPLICATE_REF = "duplicate_ref"
     KIND_FIELD_MISMATCH = "kind_field_mismatch"
+    TARGET_MATERIALIZATION_MISMATCH = "target_materialization_mismatch"
+    CONTEXT_REF_MISMATCH = "context_ref_mismatch"
+    REPLAY_BINDING_MISMATCH = "replay_binding_mismatch"
     REVISION_MISMATCH = "revision_mismatch"
     PATH_INVALID = "path_invalid"
     PATH_NOT_FOUND = "path_not_found"
@@ -638,7 +653,7 @@ class EvidenceItemIntegrityResult:
             raise TypeError("evidence binding must be a SubmissionEvidence")
         if self.evidence_id != evidence.evidence_id:
             raise _schema_error("item result is bound to a different Evidence ID")
-        if self.kind is not evidence.kind:
+        if self.kind is not evidence.source.kind:
             raise _schema_error("item result kind does not match Submission Evidence")
         if checker is not None:
             if type(checker) is not EvidenceIntegrityChecker:
@@ -931,8 +946,8 @@ class EvidenceIntegrityResult:
                 "finding result item_results do not match Submission Evidence"
             )
         for item_result in self.item_results:
-            source = evidence_by_id[item_result.evidence_id]
-            if item_result.kind is not source.kind:
+            evidence_item = evidence_by_id[item_result.evidence_id]
+            if item_result.kind is not evidence_item.source.kind:
                 raise _schema_error(
                     "finding item result kind does not match Submission Evidence"
                 )
@@ -1047,7 +1062,22 @@ class _CanonicalSource:
             raise ValueError("valid canonical source requires text and hash")
 
 
-_SourceCache = Dict[Tuple[Any, ...], _CanonicalSource]
+@dataclass(frozen=True)
+class _FrozenReplayRecord:
+    data: Optional[bytes]
+    line_starts: Optional[array]
+    reasons: Tuple[EvidenceReasonCode, ...]
+
+    def __post_init__(self) -> None:
+        if self.reasons:
+            if self.data is not None or self.line_starts is not None:
+                raise ValueError("invalid Frozen replay record cannot contain content")
+            return
+        if type(self.data) is not bytes or type(self.line_starts) is not array:
+            raise ValueError("valid Frozen replay record requires bytes and line index")
+
+
+_SourceCache = Dict[Tuple[Any, ...], Any]
 
 
 _OTHER_SPLITLINE_BOUNDARIES = frozenset(
@@ -1135,7 +1165,7 @@ def _item_result(
     diagnostics = _diagnostics(evidence.evidence_id, reasons)
     return EvidenceItemIntegrityResult(
         evidence_id=evidence.evidence_id,
-        kind=evidence.kind,
+        kind=evidence.source.kind,
         integrity=(
             EvidenceIntegrity.INVALID if diagnostics else EvidenceIntegrity.VALID
         ),
@@ -1161,8 +1191,9 @@ class EvidenceIntegrityChecker:
     POLICY_VERSION: ClassVar[str] = EVIDENCE_INTEGRITY_POLICY_VERSION
 
     eval_input: EvalInput
-    replay: PreparedRepositoryReplay
+    replay: PreparedRepositoryReplay | FrozenContextReplay
     trial_id: str
+    target_materialization_id: str
     command_attestations: Tuple[CommandOutputAttestation, ...] = ()
     _attestations_by_source: Mapping[str, Tuple[CommandOutputAttestation, ...]] = field(
         init=False, repr=False, compare=False
@@ -1174,9 +1205,11 @@ class EvidenceIntegrityChecker:
     def __post_init__(self) -> None:
         if type(self.eval_input) is not EvalInput:
             raise TypeError("eval_input must be the canonical EvalInput")
-        if type(self.replay) is not PreparedRepositoryReplay:
-            raise TypeError("replay must be a verified PreparedRepositoryReplay")
         _identifier(self.trial_id, "evidence checker.trial_id")
+        _identifier(
+            self.target_materialization_id,
+            "evidence checker.target_materialization_id",
+        )
         if type(self.command_attestations) is not tuple:
             raise TypeError("command_attestations must be an immutable tuple")
         if len(self.command_attestations) > MAX_COMMAND_OUTPUT_ATTESTATIONS:
@@ -1184,13 +1217,39 @@ class EvidenceIntegrityChecker:
         if any(type(item) is not CommandOutputAttestation for item in self.command_attestations):
             raise TypeError("command_attestations contains a non-attestation item")
 
-        repository = self.eval_input.repository
-        if (
-            self.replay.repository_descriptor_digest != repository.digest()
-            or self.replay.base_revision != repository.base_revision
-            or self.replay.head_revision != repository.head_revision
-        ):
-            raise ValueError("repository replay is not exactly bound to EvalInput")
+        target = self.eval_input.review_target
+        if target.kind is ReviewTargetKind.REPOSITORY:
+            if type(target) is not RepositoryReviewTarget:
+                raise TypeError("Repository target has a non-canonical target type")
+            if type(self.replay) is not PreparedRepositoryReplay:
+                raise TypeError(
+                    "Repository review target requires PreparedRepositoryReplay"
+                )
+            repository = repository_from_eval_input(self.eval_input)
+            if (
+                self.replay.repository_descriptor_digest != repository.digest()
+                or self.replay.base_revision != repository.base_revision
+                or self.replay.head_revision != repository.head_revision
+            ):
+                raise ValueError("repository replay is not exactly bound to EvalInput")
+        elif target.kind is ReviewTargetKind.FROZEN_CONTEXT:
+            if type(target) is not FrozenContextReviewTarget:
+                raise TypeError("Frozen target has a non-canonical target type")
+            if type(self.replay) is not FrozenContextReplay:
+                raise TypeError("Frozen review target requires FrozenContextReplay")
+            if (
+                self.replay.bundle_id != target.bundle_id
+                or self.replay.record_id != target.record_id
+                or self.replay.context_ref != target.record_id
+                or self.replay.context_format != target.context_format
+                or self.replay.rendered_sha256 != target.rendered_sha256
+                or self.replay.rendered_utf8_bytes != target.rendered_utf8_bytes
+                or self.replay.source_binding_digest
+                != target.source_binding_digest
+            ):
+                raise ValueError("frozen replay is not exactly bound to EvalInput")
+        else:
+            raise TypeError("EvidenceIntegrityChecker review target kind is invalid")
 
         grouped: Dict[str, list[CommandOutputAttestation]] = {}
         for attestation in self.command_attestations:
@@ -1211,10 +1270,14 @@ class EvidenceIntegrityChecker:
             )
             for source_ref, items in sorted(grouped.items())
         }
-        external_index = {
-            item.source_id: item
-            for item in self.eval_input.review_request.existing_ci_evidence
-        }
+        external_index = (
+            {
+                item.source_id: item
+                for item in target.review_request.existing_ci_evidence
+            }
+            if type(target) is RepositoryReviewTarget
+            else {}
+        )
         object.__setattr__(
             self, "_attestations_by_source", MappingProxyType(attestation_index)
         )
@@ -1234,66 +1297,193 @@ class EvidenceIntegrityChecker:
     ) -> EvidenceItemIntegrityResult:
         if type(evidence) is not SubmissionEvidence:
             raise TypeError("evidence must be a SubmissionEvidence")
-        if evidence.kind is EvidenceKind.REPOSITORY_FILE:
+        if (
+            evidence.source.target_materialization_id
+            != self.target_materialization_id
+        ):
+            return _item_result(
+                evidence,
+                (EvidenceReasonCode.TARGET_MATERIALIZATION_MISMATCH,),
+            )
+        target_kind = self.eval_input.review_target.kind
+        if target_kind is ReviewTargetKind.FROZEN_CONTEXT:
+            if evidence.source.kind is not EvidenceKind.FROZEN_CONTEXT:
+                return _item_result(
+                    evidence,
+                    (EvidenceReasonCode.REPLAY_BINDING_MISMATCH,),
+                )
+            return self._check_frozen_context(evidence, source_cache)
+        if evidence.source.kind is EvidenceKind.FROZEN_CONTEXT:
+            return _item_result(
+                evidence,
+                (EvidenceReasonCode.REPLAY_BINDING_MISMATCH,),
+            )
+        if evidence.source.kind is EvidenceKind.REPOSITORY_FILE:
             return self._check_repository_file(evidence, source_cache)
-        if evidence.kind is EvidenceKind.REPOSITORY_DIFF:
+        if evidence.source.kind is EvidenceKind.REPOSITORY_DIFF:
             return self._check_repository_diff(evidence, source_cache)
-        if evidence.kind is EvidenceKind.COMMAND_OUTPUT:
+        if evidence.source.kind is EvidenceKind.COMMAND_OUTPUT:
             return self._check_command_output(evidence)
-        if evidence.kind is EvidenceKind.EXTERNAL_RECORD:
+        if evidence.source.kind is EvidenceKind.EXTERNAL_RECORD:
             return self._check_external_record(evidence)
         raise AssertionError("unreachable EvidenceKind")
+
+    def _check_frozen_context(
+        self,
+        evidence: SubmissionEvidence,
+        source_cache: _SourceCache,
+    ) -> EvidenceItemIntegrityResult:
+        source = evidence.source
+        if type(source) is not FrozenContextEvidenceSource:
+            return _item_result(
+                evidence, (EvidenceReasonCode.KIND_FIELD_MISMATCH,)
+            )
+        if type(self.replay) is not FrozenContextReplay:
+            return _item_result(
+                evidence, (EvidenceReasonCode.REPLAY_BINDING_MISMATCH,)
+            )
+        if source.context_ref != self.replay.context_ref:
+            return _item_result(
+                evidence, (EvidenceReasonCode.CONTEXT_REF_MISMATCH,)
+            )
+        if source.from_line > source.to_line:
+            return _item_result(
+                evidence, (EvidenceReasonCode.LINE_RANGE_REVERSED,)
+            )
+
+        record_key = (
+            "frozen_record",
+            self.target_materialization_id,
+            source.context_ref,
+        )
+        record = source_cache.get(record_key)
+        if record is None:
+            record_reasons: Tuple[EvidenceReasonCode, ...] = ()
+            record_data: Optional[bytes] = None
+            line_starts: Optional[array] = None
+            try:
+                verified = self.replay.read_exact()
+            except MaterializationError:
+                record_reasons = (EvidenceReasonCode.REPLAY_BINDING_MISMATCH,)
+            else:
+                starts = array("I", (0,))
+                for index, value in enumerate(verified):
+                    if value != 0x0A or index + 1 >= len(verified):
+                        continue
+                    if len(starts) >= MAX_REPLAY_LINES:
+                        record_reasons = (
+                            EvidenceReasonCode.REPLAY_LINE_LIMIT_EXCEEDED,
+                        )
+                        break
+                    starts.append(index + 1)
+                if not record_reasons:
+                    record_data = verified
+                    line_starts = starts
+            record = _FrozenReplayRecord(
+                data=record_data,
+                line_starts=line_starts,
+                reasons=record_reasons,
+            )
+            source_cache[record_key] = record
+        if type(record) is not _FrozenReplayRecord:
+            raise AssertionError("Frozen replay cache key collision")
+        if record.reasons:
+            return _item_result(evidence, record.reasons)
+        assert record.data is not None
+        assert record.line_starts is not None
+        if source.to_line > len(record.line_starts):
+            return _item_result(
+                evidence, (EvidenceReasonCode.LINE_RANGE_OUT_OF_BOUNDS,)
+            )
+
+        source_key = (
+            EvidenceKind.FROZEN_CONTEXT.value,
+            source.context_ref,
+            source.from_line,
+            source.to_line,
+        )
+        canonical_source = source_cache.get(source_key)
+        if canonical_source is None:
+            source_reasons: Tuple[EvidenceReasonCode, ...] = ()
+            canonical_text: Optional[str] = None
+            canonical_hash: Optional[str] = None
+            start = record.line_starts[source.from_line - 1]
+            end = (
+                record.line_starts[source.to_line]
+                if source.to_line < len(record.line_starts)
+                else len(record.data)
+            )
+            raw = record.data[start:end]
+            if len(raw) > MAX_EVIDENCE_EXCERPT_BYTES:
+                source_reasons = (EvidenceReasonCode.EXCERPT_TOO_LARGE,)
+            else:
+                try:
+                    canonical_text = raw.decode("utf-8", "strict")
+                except UnicodeDecodeError:
+                    canonical_text = None
+                    source_reasons = (EvidenceReasonCode.CONTENT_NOT_UTF8,)
+                else:
+                    canonical_hash = hashlib.sha256(raw).hexdigest()
+            canonical_source = _CanonicalSource(
+                text=canonical_text,
+                content_hash=canonical_hash,
+                reasons=source_reasons,
+            )
+            source_cache[source_key] = canonical_source
+        if type(canonical_source) is not _CanonicalSource:
+            raise AssertionError("Frozen excerpt cache key collision")
+        if canonical_source.reasons:
+            return _item_result(evidence, canonical_source.reasons)
+        assert canonical_source.text is not None
+        assert canonical_source.content_hash is not None
+        return _item_result(
+            evidence,
+            _content_reasons(
+                evidence,
+                canonical_source.text,
+                canonical_source.content_hash,
+            ),
+        )
 
     def _check_repository_file(
         self,
         evidence: SubmissionEvidence,
         source_cache: _SourceCache,
     ) -> EvidenceItemIntegrityResult:
+        source = evidence.source
+        if type(source) is not RepositoryFileEvidenceSource:
+            return _item_result(evidence, (EvidenceReasonCode.KIND_FIELD_MISMATCH,))
         reasons = []
-        base = self.eval_input.repository.base_revision
-        head = self.eval_input.repository.head_revision
-        if evidence.revision not in (base, head):
+        repository = repository_from_eval_input(self.eval_input)
+        base = repository.base_revision
+        head = repository.head_revision
+        if source.revision not in (base, head):
             reasons.append(EvidenceReasonCode.REVISION_MISMATCH)
-        if (
-            evidence.path is None
-            or evidence.command is not None
-            or evidence.exit_code is not None
-            or evidence.stream is not None
-            or evidence.source_ref is not None
-        ):
-            reasons.append(EvidenceReasonCode.KIND_FIELD_MISMATCH)
-        if (evidence.from_line is None) != (evidence.to_line is None):
-            reasons.append(EvidenceReasonCode.LINE_RANGE_PARTIAL)
-        elif evidence.from_line is None:
-            reasons.append(EvidenceReasonCode.KIND_FIELD_MISMATCH)
-        elif evidence.from_line > evidence.to_line:
+        if source.from_line > source.to_line:
             reasons.append(EvidenceReasonCode.LINE_RANGE_REVERSED)
         if reasons:
             return _item_result(evidence, tuple(reasons))
 
-        assert evidence.path is not None
-        assert evidence.from_line is not None
-        assert evidence.to_line is not None
         try:
-            canonical_repository_path(evidence.path)
+            canonical_repository_path(source.path)
         except (RepositoryLimitError, RepositoryPolicyError):
             return _item_result(evidence, (EvidenceReasonCode.PATH_INVALID,))
         source_key = (
             EvidenceKind.REPOSITORY_FILE.value,
-            evidence.revision,
-            evidence.path,
-            evidence.from_line,
-            evidence.to_line,
+            source.revision,
+            source.path,
+            source.from_line,
+            source.to_line,
         )
-        source = source_cache.get(source_key)
-        if source is None:
+        canonical_source = source_cache.get(source_key)
+        if canonical_source is None:
             source_reasons: Tuple[EvidenceReasonCode, ...] = ()
             canonical_text: Optional[str] = None
             canonical_hash: Optional[str] = None
             try:
                 raw = self.replay.read_file(
-                    evidence.revision,
-                    evidence.path,
+                    source.revision,
+                    source.path,
                     max_bytes=MAX_GIT_BLOB_BYTES,
                 )
             except RepositoryLimitError:
@@ -1310,13 +1500,13 @@ class EvidenceIntegrityChecker:
                         source_reasons = (EvidenceReasonCode.CONTENT_NOT_UTF8,)
                     else:
                         canonical = _canonical_line_excerpt(
-                            text, evidence.from_line, evidence.to_line
+                            text, source.from_line, source.to_line
                         )
                         if canonical.too_many_lines:
                             source_reasons = (
                                 EvidenceReasonCode.REPLAY_LINE_LIMIT_EXCEEDED,
                             )
-                        elif evidence.to_line > canonical.line_count:
+                        elif source.to_line > canonical.line_count:
                             source_reasons = (
                                 EvidenceReasonCode.LINE_RANGE_OUT_OF_BOUNDS,
                             )
@@ -1330,22 +1520,22 @@ class EvidenceIntegrityChecker:
                             canonical_hash = hashlib.sha256(
                                 canonical_text.encode("utf-8")
                             ).hexdigest()
-            source = _CanonicalSource(
+            canonical_source = _CanonicalSource(
                 text=canonical_text,
                 content_hash=canonical_hash,
                 reasons=source_reasons,
             )
-            source_cache[source_key] = source
-        if source.reasons:
-            return _item_result(evidence, source.reasons)
-        assert source.text is not None
-        assert source.content_hash is not None
+            source_cache[source_key] = canonical_source
+        if canonical_source.reasons:
+            return _item_result(evidence, canonical_source.reasons)
+        assert canonical_source.text is not None
+        assert canonical_source.content_hash is not None
         return _item_result(
             evidence,
             _content_reasons(
                 evidence,
-                source.text,
-                source.content_hash,
+                canonical_source.text,
+                canonical_source.content_hash,
             ),
         )
 
@@ -1354,42 +1544,35 @@ class EvidenceIntegrityChecker:
         evidence: SubmissionEvidence,
         source_cache: _SourceCache,
     ) -> EvidenceItemIntegrityResult:
+        source = evidence.source
+        if type(source) is not RepositoryDiffEvidenceSource:
+            return _item_result(evidence, (EvidenceReasonCode.KIND_FIELD_MISMATCH,))
         reasons = []
-        repository = self.eval_input.repository
-        if evidence.revision != "%s..%s" % (
-            repository.base_revision,
-            repository.head_revision,
+        repository = repository_from_eval_input(self.eval_input)
+        if (
+            source.base_revision != repository.base_revision
+            or source.head_revision != repository.head_revision
         ):
             reasons.append(EvidenceReasonCode.REVISION_MISMATCH)
-        if (
-            evidence.path is None
-            or evidence.from_line is not None
-            or evidence.to_line is not None
-            or evidence.command is not None
-            or evidence.exit_code is not None
-            or evidence.stream is not None
-            or evidence.source_ref is not None
-        ):
-            reasons.append(EvidenceReasonCode.KIND_FIELD_MISMATCH)
         if reasons:
             return _item_result(evidence, tuple(reasons))
 
-        assert evidence.path is not None
         source_key = (
             EvidenceKind.REPOSITORY_DIFF.value,
-            evidence.revision,
-            evidence.path,
+            source.base_revision,
+            source.head_revision,
+            source.path,
         )
-        source = source_cache.get(source_key)
-        if source is None:
+        canonical_source = source_cache.get(source_key)
+        if canonical_source is None:
             source_reasons = ()
             canonical_text = None
             canonical_hash = None
             try:
                 exists = self.replay.contains_path(
-                    repository.base_revision, evidence.path
+                    repository.base_revision, source.path
                 ) or self.replay.contains_path(
-                    repository.head_revision, evidence.path
+                    repository.head_revision, source.path
                 )
             except (RepositoryLimitError, RepositoryPolicyError):
                 source_reasons = (EvidenceReasonCode.PATH_INVALID,)
@@ -1399,7 +1582,7 @@ class EvidenceIntegrityChecker:
                 else:
                     try:
                         raw = self.replay.diff(
-                            evidence.path,
+                            source.path,
                             max_bytes=MAX_EVIDENCE_EXCERPT_BYTES,
                         )
                     except RepositoryLimitError:
@@ -1416,52 +1599,33 @@ class EvidenceIntegrityChecker:
                             )
                         else:
                             canonical_hash = hashlib.sha256(raw).hexdigest()
-            source = _CanonicalSource(
+            canonical_source = _CanonicalSource(
                 text=canonical_text,
                 content_hash=canonical_hash,
                 reasons=source_reasons,
             )
-            source_cache[source_key] = source
-        if source.reasons:
-            return _item_result(evidence, source.reasons)
-        assert source.text is not None
-        assert source.content_hash is not None
+            source_cache[source_key] = canonical_source
+        if canonical_source.reasons:
+            return _item_result(evidence, canonical_source.reasons)
+        assert canonical_source.text is not None
+        assert canonical_source.content_hash is not None
         return _item_result(
             evidence,
             _content_reasons(
                 evidence,
-                source.text,
-                source.content_hash,
+                canonical_source.text,
+                canonical_source.content_hash,
             ),
         )
 
     def _check_command_output(
         self, evidence: SubmissionEvidence
     ) -> EvidenceItemIntegrityResult:
-        reasons = []
-        head = self.eval_input.repository.head_revision
-        if evidence.revision != head:
-            reasons.append(EvidenceReasonCode.REVISION_MISMATCH)
-        if (
-            evidence.path is not None
-            or evidence.from_line is not None
-            or evidence.to_line is not None
-            or evidence.command is None
-            or not evidence.command
-            or evidence.exit_code is None
-            or evidence.stream is None
-        ):
-            reasons.append(EvidenceReasonCode.KIND_FIELD_MISMATCH)
-        if evidence.source_ref is None:
-            reasons.append(EvidenceReasonCode.ATTESTATION_NOT_FOUND)
-        if reasons:
-            return _item_result(evidence, tuple(reasons))
-
-        assert evidence.command is not None
-        assert evidence.exit_code is not None
-        assert evidence.stream is not None
-        assert evidence.source_ref is not None
-        candidates = self._attestations_by_source.get(evidence.source_ref, ())
+        source = evidence.source
+        if type(source) is not CommandOutputEvidenceSource:
+            return _item_result(evidence, (EvidenceReasonCode.KIND_FIELD_MISMATCH,))
+        head = repository_from_eval_input(self.eval_input).head_revision
+        candidates = self._attestations_by_source.get(source.artifact_ref, ())
         if not candidates:
             return _item_result(
                 evidence, (EvidenceReasonCode.ATTESTATION_NOT_FOUND,)
@@ -1486,11 +1650,11 @@ class EvidenceIntegrityChecker:
             )
         attestation = bound[0]
         comparison_reasons = []
-        if evidence.command != attestation.argv:
+        if source.command != attestation.argv:
             comparison_reasons.append(EvidenceReasonCode.COMMAND_MISMATCH)
-        if evidence.exit_code != attestation.exit_code:
+        if source.exit_code != attestation.exit_code:
             comparison_reasons.append(EvidenceReasonCode.EXIT_CODE_MISMATCH)
-        if evidence.stream is not attestation.stream:
+        if source.stream is not attestation.stream:
             comparison_reasons.append(EvidenceReasonCode.STREAM_MISMATCH)
         try:
             canonical_text = attestation.output_bytes.decode("utf-8", "strict")
@@ -1505,25 +1669,10 @@ class EvidenceIntegrityChecker:
     def _check_external_record(
         self, evidence: SubmissionEvidence
     ) -> EvidenceItemIntegrityResult:
-        reasons = []
-        if evidence.revision != self.eval_input.repository.head_revision:
-            reasons.append(EvidenceReasonCode.REVISION_MISMATCH)
-        if (
-            evidence.path is not None
-            or evidence.from_line is not None
-            or evidence.to_line is not None
-            or evidence.command is not None
-            or evidence.exit_code is not None
-            or evidence.stream is not None
-        ):
-            reasons.append(EvidenceReasonCode.KIND_FIELD_MISMATCH)
-        if evidence.source_ref is None:
-            reasons.append(EvidenceReasonCode.EXTERNAL_RECORD_NOT_FOUND)
-        if reasons:
-            return _item_result(evidence, tuple(reasons))
-
-        assert evidence.source_ref is not None
-        source = self._external_by_source.get(evidence.source_ref)
+        evidence_source = evidence.source
+        if type(evidence_source) is not ExternalRecordEvidenceSource:
+            return _item_result(evidence, (EvidenceReasonCode.KIND_FIELD_MISMATCH,))
+        source = self._external_by_source.get(evidence_source.source_ref)
         if source is None:
             return _item_result(
                 evidence, (EvidenceReasonCode.EXTERNAL_RECORD_NOT_FOUND,)

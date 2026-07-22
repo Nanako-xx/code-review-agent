@@ -25,6 +25,7 @@ from .artifacts import (
     RunManifest,
     StageName,
     TrialManifest,
+    VerifiedTrialMaterialization,
 )
 from .cases import EvalCase
 from .datasets import CaseBank
@@ -46,7 +47,14 @@ from .judge import (
     intent_resolution_from_judge_result,
 )
 from .metrics import TrialScore, TrialScorer
-from .models import EvalSubmission, SchemaError, SubmissionStatus, TrialStatus
+from .models import (
+    EvalSubmission,
+    FailureCode,
+    ReviewTargetKind,
+    SchemaError,
+    SubmissionStatus,
+    TrialStatus,
+)
 from .report import (
     ReportBuilder,
     TrialEvaluationSource,
@@ -55,8 +63,16 @@ from .report import (
     render_run_markdown,
     render_trial_markdown,
 )
-from .repository import PreparedRepositoryReplay, RepositoryPreparer
+from .repository import (
+    RepositoryPreparer,
+)
 from .review_evaluator import ReviewEvaluationResult, ReviewEvaluator
+from .target_replay import (
+    RepositoryReplayResolver,
+    TargetReplay,
+    TargetReplayResolver,
+    validate_target_replay,
+)
 
 
 class EvaluationOrchestrationError(RuntimeError):
@@ -113,7 +129,7 @@ class TrialEvaluationBundle:
     evaluator_execution: EvaluatorExecutionConfig
     eval_case: EvalCase
     submission: EvalSubmission
-    intent_result: IntentEvaluationResult
+    intent_result: Optional[IntentEvaluationResult]
     review_result: Optional[ReviewEvaluationResult]
     trial_score: TrialScore
     judge_input: JudgeInputArtifact
@@ -132,7 +148,11 @@ class TrialEvaluationBundle:
             "evaluation_id": self.evaluation_id,
             "evaluation_revision": self.evaluation_revision,
             "submission_status": self.submission.status.value,
-            "intent_status": self.intent_result.status.value,
+            "intent_status": (
+                None
+                if self.intent_result is None
+                else self.intent_result.status.value
+            ),
             "review_status": (
                 None if self.review_result is None else self.review_result.status.value
             ),
@@ -185,6 +205,9 @@ class EvaluationOrchestrator:
         scorer: Optional[TrialScorer] = None,
         judge: Optional[SemanticJudge] = None,
         judge_factory: Optional[Callable[[], SemanticJudge]] = None,
+        target_replay_resolvers: Optional[
+            Mapping[ReviewTargetKind, TargetReplayResolver]
+        ] = None,
         max_judge_rounds: int = 8,
     ) -> None:
         if not isinstance(artifact_store, ArtifactStore):
@@ -213,6 +236,17 @@ class EvaluationOrchestrator:
         self.artifact_store = artifact_store
         self.case_bank = case_bank
         self.repository_preparer = repository_preparer
+        resolvers = dict(target_replay_resolvers or {})
+        if any(type(kind) is not ReviewTargetKind for kind in resolvers):
+            raise TypeError("target_replay_resolvers keys must be ReviewTargetKind")
+        if any(not callable(getattr(value, "resolve", None)) for value in resolvers.values()):
+            raise TypeError("target replay resolver must expose resolve(source)")
+        if repository_preparer is not None:
+            resolvers.setdefault(
+                ReviewTargetKind.REPOSITORY,
+                RepositoryReplayResolver(repository_preparer),
+            )
+        self.target_replay_resolvers = resolvers
         self.report_builder = report_builder or ReportBuilder()
         self.scorer = scorer or TrialScorer()
         self.judge = judge
@@ -244,22 +278,106 @@ class EvaluationOrchestrator:
 
     def _replay(
         self,
-        case: EvalCase,
-    ) -> PreparedRepositoryReplay:
-        preparer = self.repository_preparer
-        if preparer is None:
+        source: VerifiedTrialMaterialization,
+    ) -> TargetReplay:
+        kind = source.eval_input.review_target.kind
+        resolver = self.target_replay_resolvers.get(kind)
+        if resolver is None:
             raise EvaluationPreconditionError(
-                "evaluate requires a prepared repository cache"
+                "evaluate requires a replay resolver for the Review Target"
             )
-        # Task 12's cache-only method is preferred.  The fallback keeps the
-        # orchestrator compatible with older embedders, but never silently
-        # acquires a remote repository when the strict method is available.
-        require_cached = getattr(preparer, "require_cached", None)
-        if callable(require_cached):
-            prepared = require_cached(case.input.repository)
+        replay = resolver.resolve(source)
+        validate_target_replay(source, replay)
+        return replay
+
+    def _review_source(
+        self,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        case: EvalCase,
+    ) -> tuple[VerifiedTrialMaterialization, TargetReplay]:
+        source = self.artifact_store.load_trial_materialization(
+            run_id,
+            task_id,
+            trial_id,
+        )
+        if source.eval_input != case.eval_input():
+            raise EvaluationOrchestrationError(
+                "receipt-bound EvalInput differs from evaluator Case"
+            )
+        return source, self._replay(source)
+
+    @staticmethod
+    def _is_pre_materialization_failure(submission: EvalSubmission) -> bool:
+        return (
+            submission.status is SubmissionStatus.FAILED
+            and submission.review is None
+            and submission.failure is not None
+            and submission.failure.code
+            is FailureCode.HARNESS_MATERIALIZATION_ERROR
+        )
+
+    @staticmethod
+    def _validate_submission_binding(
+        submission: EvalSubmission,
+        case: EvalCase,
+        trial_id: str,
+        source: Optional[VerifiedTrialMaterialization],
+    ) -> None:
+        if submission.task_id != case.task_id:
+            raise EvaluationOrchestrationError(
+                "Submission task_id differs from evaluator Case"
+            )
+        if submission.trial_id != trial_id:
+            raise EvaluationOrchestrationError(
+                "Submission trial_id differs from requested Trial"
+            )
+        if submission.eval_input_digest != case.eval_input().digest():
+            raise EvaluationOrchestrationError(
+                "Submission eval_input_digest differs from evaluator Case"
+            )
+        if (
+            source is not None
+            and submission.target_materialization_id
+            != source.manifest.materialization_id
+        ):
+            raise EvaluationOrchestrationError(
+                "Submission target_materialization_id differs from committed PREPARE"
+            )
+
+    def _evaluation_source(
+        self,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        case: EvalCase,
+        submission: EvalSubmission,
+    ) -> tuple[
+        Optional[VerifiedTrialMaterialization],
+        Optional[TargetReplay],
+    ]:
+        """Resolve PREPARE replay, except for its canonical absence case."""
+
+        state = self.artifact_store.load_trial_state(run_id, task_id, trial_id)
+        source: Optional[VerifiedTrialMaterialization]
+        replay: Optional[TargetReplay]
+        if StageName.PREPARE in state.completed_stages:
+            source, replay = self._review_source(
+                run_id,
+                task_id,
+                trial_id,
+                case,
+            )
+        elif self._is_pre_materialization_failure(submission):
+            source, replay = None, None
         else:
-            prepared = preparer.prepare(case.input.repository)
-        return preparer.open_replay(prepared)
+            raise EvaluationPreconditionError(
+                "Trial without committed PREPARE is not a canonical "
+                "pre-materialization failure"
+            )
+        self._validate_submission_binding(submission, case, trial_id, source)
+        return source, replay
 
     @staticmethod
     def _receipt_payloads(
@@ -397,18 +515,25 @@ class EvaluationOrchestrator:
         run_config: EvalRunConfig,
         execution: EvaluatorExecutionConfig,
         trial_id: str,
-        replay: PreparedRepositoryReplay,
+        source: Optional[VerifiedTrialMaterialization],
+        replay: Optional[TargetReplay],
         attestations: Sequence[Any],
         judge: Any,
     ) -> tuple[Optional[ReviewEvaluationResult], tuple[BlindJudgeInput, ...], tuple[JudgeExecutionResult, ...]]:
         if submission.review is None:
             return None, (), ()
+        if source is None or replay is None:
+            raise EvaluationPreconditionError(
+                "Review evaluation requires a verified Target materialization"
+            )
         evaluator = ReviewEvaluator(
-            eval_input=case.eval_input(),
+            eval_input=source.eval_input,
             replay=replay,
             trial_id=trial_id,
+            target_materialization_id=source.manifest.materialization_id,
             evaluator_execution=execution,
             command_attestations=tuple(attestations),
+            review_evaluator_context=case.review_evaluator_context,
         )
         initial = evaluator.evaluate(submission, case.review_truth)
         requests = tuple(item.request for item in initial.judge_requests)
@@ -435,6 +560,7 @@ class EvaluationOrchestrator:
 
         if not isinstance(evaluator_execution, EvaluatorExecutionConfig):
             raise TypeError("evaluator_execution must be EvaluatorExecutionConfig")
+        evaluator_execution.validate_runtime_policy_support()
         if type(resume) is not bool:
             raise TypeError("resume must be a bool")
         evaluation_id = derive_evaluation_id(
@@ -461,22 +587,31 @@ class EvaluationOrchestrator:
         manifest = self.artifact_store.load_trial_manifest(run_id, task_id, trial_id)
         submission = self.artifact_store.load_existing_submission(run_id, task_id, trial_id)
         case = self._case(config, task_id)
-        if submission.trial_id != trial_id:
-            raise EvaluationOrchestrationError("Submission is bound to another Trial")
+        review_source, replay = self._evaluation_source(
+            run_id,
+            task_id,
+            trial_id,
+            case,
+            submission,
+        )
         receipts, attestations, trace_capture = self._execution_metadata(
             run_id, task_id, trial_id
         )
-        replay = self._replay(case)
         actual_judge = judge if judge is not None else self._new_judge()
-        intent_result, intent_requests, intent_results = self._evaluate_intent(
-            submission, case, receipts, actual_judge
-        )
+        intent_result: Optional[IntentEvaluationResult] = None
+        intent_requests: tuple[BlindJudgeInput, ...] = ()
+        intent_results: tuple[JudgeExecutionResult, ...] = ()
+        if submission.intent is not None:
+            intent_result, intent_requests, intent_results = self._evaluate_intent(
+                submission, case, receipts, actual_judge
+            )
         review_result, review_requests, review_results = self._evaluate_review(
             submission,
             case,
             config,
             evaluator_execution,
             trial_id,
+            review_source,
             replay,
             attestations,
             actual_judge,
@@ -579,6 +714,8 @@ class EvaluationOrchestrator:
             trial_id,
             evaluation_id,
         )
+        execution = stored.evaluator_execution
+        execution.validate_runtime_policy_support()
         config = self.artifact_store.load_run_config(run_id)
         manifest = self.artifact_store.load_trial_manifest(
             run_id, task_id, trial_id
@@ -587,21 +724,12 @@ class EvaluationOrchestrator:
             run_id, task_id, trial_id
         )
         case = self._case(config, task_id)
-        execution = stored.evaluator_execution
-        unbound_intent = IntentEvaluationResult._parse_unbound(
-            stored.intent_matches
-        )
-        semantic_decisions = tuple(
-            IntentSemanticJudgeDecision.from_dict(item)
-            for item in unbound_intent["judge_decisions"]
-        )
-        semantic_failures = tuple(
-            IntentSemanticJudgeFailure.from_dict(item)
-            for item in unbound_intent["judge_failures"]
-        )
-        semantic_ungraded = tuple(
-            IntentSemanticJudgeUngraded.from_dict(item)
-            for item in unbound_intent["judge_ungraded"]
+        review_source, replay = self._evaluation_source(
+            run_id,
+            task_id,
+            trial_id,
+            case,
+            submission,
         )
         judge_input = JudgeInputArtifact.from_dict(
             stored.judge_input,
@@ -610,34 +738,60 @@ class EvaluationOrchestrator:
         receipts, attestations, trace_capture = self._execution_metadata(
             run_id, task_id, trial_id
         )
-        intent_result = IntentEvaluationResult.from_dict(
-            stored.intent_matches,
-            evaluator=IntentEvaluator(),
-            submission_intent=submission.intent,
-            intent_truth=case.intent_truth,
-            clarification_script=case.clarification_script,
-            clarification_match_receipts=tuple(receipts),
-            semantic_decisions=semantic_decisions,
-            semantic_failures=semantic_failures,
-            semantic_ungraded=semantic_ungraded,
-        )
+        intent_result: Optional[IntentEvaluationResult] = None
+        if stored.intent_matches is not None:
+            unbound_intent = IntentEvaluationResult._parse_unbound(
+                stored.intent_matches
+            )
+            semantic_decisions = tuple(
+                IntentSemanticJudgeDecision.from_dict(item)
+                for item in unbound_intent["judge_decisions"]
+            )
+            semantic_failures = tuple(
+                IntentSemanticJudgeFailure.from_dict(item)
+                for item in unbound_intent["judge_failures"]
+            )
+            semantic_ungraded = tuple(
+                IntentSemanticJudgeUngraded.from_dict(item)
+                for item in unbound_intent["judge_ungraded"]
+            )
+            intent_result = IntentEvaluationResult.from_dict(
+                stored.intent_matches,
+                evaluator=IntentEvaluator(),
+                submission_intent=submission.intent,
+                intent_truth=case.intent_truth,
+                clarification_script=case.clarification_script,
+                clarification_match_receipts=tuple(receipts),
+                semantic_decisions=semantic_decisions,
+                semantic_failures=semantic_failures,
+                semantic_ungraded=semantic_ungraded,
+            )
         judge_output = JudgeOutputArtifact.from_dict(
             stored.judge_output,
             input_artifact=judge_input,
             evaluator_execution=execution,
             intent_evaluation=(
-                intent_result if intent_result.judge_requests else None
+                intent_result
+                if intent_result is not None and intent_result.judge_requests
+                else None
             ),
         )
         review_result = None
-        replay = self._replay(case)
         if stored.review_matches is not None:
+            if review_source is None or replay is None:
+                raise EvaluationPreconditionError(
+                    "persisted Review requires a committed PREPARE replay"
+                )
             reviewer = ReviewEvaluator(
-                eval_input=case.eval_input(),
+                eval_input=review_source.eval_input,
                 replay=replay,
                 trial_id=trial_id,
+                target_materialization_id=(
+                    review_source.manifest.materialization_id
+                ),
                 evaluator_execution=execution,
                 command_attestations=tuple(attestations),
+                review_evaluator_context=case.review_evaluator_context,
             )
             review_result = ReviewEvaluationResult.from_dict(
                 stored.review_matches,

@@ -47,10 +47,14 @@ from review_agent_eval.models import (
     IntentResult,
     KnownInvalidFinding,
     NovelFindingPolicy,
+    MetricAuthority,
+    MetricAuthoritySource,
     Repository,
+    RepositoryReviewTarget,
     RepositorySource,
     RequiredContextLevel,
     ReviewRequest,
+    ReviewTargetKind,
     ReviewTruth,
     SubmissionFinding,
     SubmissionIntent,
@@ -58,6 +62,7 @@ from review_agent_eval.models import (
     SubmissionStatus,
     SubmissionUsage,
     TruthCompleteness,
+    TruthLocation,
     canonical_sha256,
 )
 from review_agent_eval.repository import PreparedRepositoryReplay
@@ -72,6 +77,7 @@ from review_agent_eval.review_evaluator import (
 
 BASE_REVISION = "a" * 40
 HEAD_REVISION = "b" * 40
+TARGET_MATERIALIZATION_ID = "materialization-" + ("2" * 64)
 
 
 def _execution(
@@ -150,15 +156,18 @@ def _fixture() -> tuple[EvalInput, PreparedRepositoryReplay]:
     eval_input = EvalInput(
         schema_version=EVAL_INPUT_SCHEMA_VERSION,
         task_id="task-review-truth",
-        repository=repository,
-        review_request=ReviewRequest(
-            title="minimal review",
-            description=None,
-            user_intent=None,
-            review_focus=None,
-            linked_requirements=(),
-            project_rules=(),
-            existing_ci_evidence=(),
+        review_target=RepositoryReviewTarget(
+            kind=ReviewTargetKind.REPOSITORY,
+            repository=repository,
+            review_request=ReviewRequest(
+                title="minimal review",
+                description=None,
+                user_intent=None,
+                review_focus=None,
+                linked_requirements=(),
+                project_rules=(),
+                existing_ci_evidence=(),
+            ),
         ),
     )
     return eval_input, replay
@@ -185,7 +194,20 @@ def _expected(claim: str, truth_id: str = "truth-1") -> ExpectedFinding:
         severity=FindingSeverity.HIGH,
         category="correctness",
         required=True,
-        locations=(),
+        metric_authority=MetricAuthority(
+            severity_scorable=True,
+            severity_authority=MetricAuthoritySource.EXPERT_ANNOTATION,
+            location_scorable=True,
+            location_authority=MetricAuthoritySource.EXPERT_ANNOTATION,
+        ),
+        locations=(
+            TruthLocation(
+                path="src/app.py",
+                side=DiffSide.RIGHT,
+                from_line=1,
+                to_line=1,
+            ),
+        ),
         evidence_anchors=(),
         required_context_level=RequiredContextLevel.DIFF,
         rationale="minimal test truth",
@@ -198,6 +220,8 @@ def _submission(finding: SubmissionFinding) -> EvalSubmission:
         task_id="task-review-truth",
         agent_id="agent-under-test",
         trial_id="trial-review-truth",
+        eval_input_digest=_fixture()[0].digest(),
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         status=SubmissionStatus.COMPLETED,
         intent=SubmissionIntent(
             status=IntentResult.SUFFICIENT,
@@ -231,6 +255,7 @@ def _evaluator() -> ReviewEvaluator:
         eval_input=eval_input,
         replay=replay,
         trial_id="trial-review-truth",
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=_execution(),
     )
 
@@ -452,6 +477,7 @@ def test_custom_review_rubric_catalog_is_bound_to_execution_profile() -> None:
         eval_input=eval_input,
         replay=replay,
         trial_id="trial-review-truth",
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=_execution(rubrics),
         rubrics=rubrics,
     )
@@ -476,6 +502,7 @@ def test_custom_review_rubric_catalog_is_bound_to_execution_profile() -> None:
             eval_input=eval_input,
             replay=replay,
             trial_id="trial-review-truth",
+            target_materialization_id=TARGET_MATERIALIZATION_ID,
             evaluator_execution=_execution(),
             rubrics=rubrics,
         )
@@ -503,6 +530,7 @@ def test_custom_review_rubric_rejects_wrong_system_prompt_digest() -> None:
             eval_input=eval_input,
             replay=replay,
             trial_id="trial-review-truth",
+            target_materialization_id=TARGET_MATERIALIZATION_ID,
             evaluator_execution=forged_execution,
             rubrics=rubrics,
         )

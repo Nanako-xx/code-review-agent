@@ -1772,6 +1772,18 @@ class EvaluatorExecutionConfig(_JsonModel):
             "EvaluatorExecutionConfig",
         )
 
+    def validate_runtime_policy_support(self) -> None:
+        """Reject persisted policy identities this runtime cannot execute."""
+
+        _required_protocol_version(
+            self.review_evaluator_context_policy_version,
+            DEFAULT_REVIEW_EVALUATOR_CONTEXT_POLICY_VERSION,
+        )
+        _required_protocol_version(
+            self.metric_authority_policy_version,
+            DEFAULT_METRIC_AUTHORITY_POLICY_VERSION,
+        )
+
     @classmethod
     def create(
         cls,

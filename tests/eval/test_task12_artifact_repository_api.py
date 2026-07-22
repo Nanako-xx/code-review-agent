@@ -11,6 +11,7 @@ from review_agent_eval.artifacts import (
     ArtifactIntegrityError,
     ArtifactStateError,
     ArtifactStore,
+    VerifiedTrialMaterialization,
 )
 from review_agent_eval.config import (
     EvaluatorExecutionConfig,
@@ -46,6 +47,78 @@ def _evaluation_values(score: int = 1):
         "score": {"total": score},
         "report": "# Trial evaluation\n",
     }
+
+
+def test_public_trial_materialization_is_prepare_receipt_bound(
+    tmp_path: Path,
+) -> None:
+    store, config, _manifest, plan, trial = make_store(tmp_path)
+    complete_trial(store, config, plan)
+
+    verified = store.load_trial_materialization(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+    )
+
+    assert type(verified) is VerifiedTrialMaterialization
+    assert verified.eval_input.digest() == trial.eval_input_digest
+    assert verified.manifest.materialization_id == (
+        verified.prepare_receipt.materialization_id
+    )
+    assert verified.manifest.attempt == verified.active_attempt == 1
+    assert verified.trial_manifest == trial
+
+
+@pytest.mark.parametrize(
+    "artifact,field,value",
+    (
+        ("input.json", "task_id", "tampered-task"),
+        ("materialization_manifest.json", "replay_binding_digest", "0" * 64),
+        ("prepare.json", "prepared_source_id", "tampered-source"),
+        ("trial_manifest.json", "agent_config_digest", "0" * 64),
+    ),
+)
+def test_public_trial_materialization_rejects_control_plane_drift(
+    tmp_path: Path,
+    artifact: str,
+    field: str,
+    value: str,
+) -> None:
+    store, config, _manifest, plan, trial = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    trial_root = (
+        store.root
+        / config.run_id
+        / "cases"
+        / trial.case_path_id
+        / "trials"
+        / plan.trial_id
+    )
+    paths = {
+        "input.json": trial_root / "input.json",
+        "materialization_manifest.json": (
+            trial_root
+            / "materializations"
+            / "attempt-0001"
+            / "materialization_manifest.json"
+        ),
+        "prepare.json": (
+            trial_root / "receipts" / "attempt-0001" / "prepare.json"
+        ),
+        "trial_manifest.json": trial_root / "trial_manifest.json",
+    }
+    path = paths[artifact]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload[field] = value
+    path.write_bytes(canonical_json_bytes(payload))
+
+    with pytest.raises((ArtifactIntegrityError, UnsupportedProtocolVersionError)):
+        store.load_trial_materialization(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+        )
 
 
 def test_cache_only_mode_never_reacquires_and_opens_verified_replay(

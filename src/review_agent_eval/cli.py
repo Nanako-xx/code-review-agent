@@ -1434,6 +1434,7 @@ def _domain_error_category(exc: BaseException) -> tuple[str, int]:
         RepositorySecurityError,
     )
     from .runner import RunIncompatibilityError
+    from .target_replay import TargetReplayIntegrityError
 
     if isinstance(exc, (CliConflictError, ArtifactConflictError, EvaluationConflictError)):
         return "conflict", EXIT_CONFLICT
@@ -1444,6 +1445,7 @@ def _domain_error_category(exc: BaseException) -> tuple[str, int]:
             ArtifactIntegrityError,
             RepositoryIntegrityError,
             RepositorySecurityError,
+            TargetReplayIntegrityError,
         ),
     ):
         return "integrity", EXIT_INTEGRITY

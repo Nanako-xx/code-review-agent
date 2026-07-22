@@ -35,6 +35,7 @@ from review_agent_eval.frozen_context import (
     frozen_context_record_id,
     frozen_context_source_binding_digest,
     frozen_materialization_workspace,
+    open_frozen_context_replay,
 )
 from review_agent_eval.materialization import (
     MaterializationError,
@@ -220,6 +221,32 @@ def test_frozen_materializer_preserves_exact_rendered_bytes_and_relative_access(
         )
     assert materialized.closed
     assert not workspace.exists()
+
+
+def test_open_frozen_replay_reuses_verified_local_bundle_without_workspace(
+    tmp_path: Path,
+) -> None:
+    prepared = _prepared_bundle(tmp_path)
+    eval_input = _eval_input(prepared)
+    request = _request(eval_input, prepared)
+
+    replay = open_frozen_context_replay(
+        bundle_root=prepared.root,
+        eval_input=eval_input,
+        suite_preparation_binding=request.suite_preparation_binding,
+        suite_preparation_binding_digest=(
+            request.suite_preparation_binding_digest
+        ),
+    )
+
+    assert replay.bundle_id == eval_input.review_target.bundle_id
+    assert replay.source_binding_digest == (
+        eval_input.review_target.source_binding_digest
+    )
+    assert hashlib.sha256(replay.read_exact()).hexdigest() == (
+        eval_input.review_target.rendered_sha256
+    )
+    assert not (tmp_path / ".eval-workspaces").exists()
 
 
 @pytest.mark.parametrize(

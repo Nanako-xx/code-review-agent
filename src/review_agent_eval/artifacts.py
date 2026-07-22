@@ -36,6 +36,7 @@ from typing import (
 
 from .cases import (
     MAX_RUN_CASE_SNAPSHOT_BYTES,
+    PublicSuitePreparationBindingV2,
     RunCaseSnapshot,
     WireContractV2,
 )
@@ -2189,6 +2190,54 @@ class TrialState:
     completed_stages: Tuple[StageName, ...]
     terminal_receipt: Optional[StageReceipt]
 
+
+@dataclass(frozen=True)
+class VerifiedTrialMaterialization:
+    """Receipt-bound inputs for replaying one active Trial materialization.
+
+    This is the public trust boundary for evaluator composition roots.  The
+    path-bearing ArtifactStore internals stay private; consumers receive only
+    strictly hydrated canonical values whose Run, Trial, active attempt, and
+    committed PREPARE projections have already been cross-checked.
+    """
+
+    eval_input: EvalInput
+    manifest: TrialMaterializationManifest
+    trial_manifest: TrialManifest
+    prepare_receipt: StageReceipt
+    active_attempt: int
+    suite_preparation_binding: Optional[PublicSuitePreparationBindingV2]
+
+    def __post_init__(self) -> None:
+        if type(self.eval_input) is not EvalInput:
+            raise TypeError("verified materialization requires EvalInput")
+        if type(self.manifest) is not TrialMaterializationManifest:
+            raise TypeError(
+                "verified materialization requires TrialMaterializationManifest"
+            )
+        if type(self.trial_manifest) is not TrialManifest:
+            raise TypeError("verified materialization requires TrialManifest")
+        if type(self.prepare_receipt) is not StageReceipt:
+            raise TypeError("verified materialization requires StageReceipt")
+        if (
+            self.suite_preparation_binding is not None
+            and type(self.suite_preparation_binding)
+            is not PublicSuitePreparationBindingV2
+        ):
+            raise TypeError("verified materialization preparation binding is invalid")
+        if (
+            self.active_attempt != self.manifest.attempt
+            or self.prepare_receipt.stage is not StageName.PREPARE
+            or self.prepare_receipt.attempt != self.active_attempt
+            or self.prepare_receipt.materialization_id
+            != self.manifest.materialization_id
+            or self.eval_input.digest() != self.manifest.eval_input_digest
+            or self.trial_manifest.eval_input_digest
+            != self.manifest.eval_input_digest
+        ):
+            raise ArtifactIntegrityError(
+                "verified Trial materialization binding is inconsistent"
+            )
 
 @dataclass(frozen=True)
 class RunState:
@@ -4603,7 +4652,11 @@ class ArtifactStore:
         attempt: int,
         candidate: Optional[StageReceipt],
         budget: _ReadBudget,
-    ) -> Tuple[Optional[StageReceipt], Optional[TrialMaterializationManifest]]:
+    ) -> Tuple[
+        Optional[StageReceipt],
+        Optional[EvalInput],
+        Optional[TrialMaterializationManifest],
+    ]:
         """Resolve and fully verify the Prepare binding for one active attempt."""
 
         prepare_path = self._receipt_path(plan, StageName.PREPARE, attempt)
@@ -4634,18 +4687,18 @@ class ArtifactStore:
                 raise ArtifactIntegrityError(
                     "materialization exists without a committed prepare receipt"
                 )
-            return None, None
+            return None, None, None
         if prepare.stage is not StageName.PREPARE or prepare.attempt != attempt:
             raise ArtifactIntegrityError(
                 "terminal prepare receipt does not bind the active attempt"
             )
-        _eval_input, materialization = self._load_prepare_materialization(
+        eval_input, materialization = self._load_prepare_materialization(
             bundle,
             plan,
             prepare,
             budget=budget,
         )
-        return prepare, materialization
+        return prepare, eval_input, materialization
 
     def _terminal_target_binding(
         self,
@@ -4656,7 +4709,7 @@ class ArtifactStore:
         prepare: Optional[StageReceipt],
         budget: _ReadBudget,
     ) -> Tuple[str, bool]:
-        _prepare, materialization = self._verified_prepare_for_terminal(
+        _prepare, _eval_input, materialization = self._verified_prepare_for_terminal(
             bundle,
             plan,
             attempt=attempt,
@@ -5153,6 +5206,68 @@ class ArtifactStore:
             bundle, plan, budget=budget
         )
         return state
+
+    def load_trial_materialization(
+        self,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+    ) -> VerifiedTrialMaterialization:
+        """Load the active committed PREPARE projection through one trust root.
+
+        A pre-materialization terminal failure intentionally has no value at
+        this boundary and raises ``ArtifactStateError``.  Evaluator callers
+        must therefore request it only when a Review replay is required.
+        """
+
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        plan = self._load_trial_manifest(
+            bundle,
+            task_id,
+            trial_id,
+            budget=budget,
+        )
+        state, _submission = self._load_trial_state(
+            bundle,
+            plan,
+            budget=budget,
+        )
+        attempt = state.active_attempt
+        if attempt is None:
+            raise ArtifactStateError("Trial has no active materialization attempt")
+        receipt, eval_input, materialization = self._verified_prepare_for_terminal(
+            bundle,
+            plan,
+            attempt=attempt,
+            candidate=None,
+            budget=budget,
+        )
+        if receipt is None or eval_input is None or materialization is None:
+            raise ArtifactStateError(
+                "Trial active attempt has no committed PREPARE materialization"
+            )
+        snapshot_input = bundle.case_snapshot.eval_input(task_id)
+        preparation = bundle.case_snapshot.manifest.source.preparation_binding
+        preparation_digest = (
+            None if preparation is None else preparation.digest()
+        )
+        if (
+            eval_input != snapshot_input
+            or preparation_digest
+            != materialization.suite_preparation_binding_digest
+        ):
+            raise ArtifactIntegrityError(
+                "PREPARE input or Suite preparation differs from verified Run bundle"
+            )
+        return VerifiedTrialMaterialization(
+            eval_input=eval_input,
+            manifest=materialization,
+            trial_manifest=plan,
+            prepare_receipt=receipt,
+            active_attempt=attempt,
+            suite_preparation_binding=preparation,
+        )
 
     def load_run_state(self, run_id: str) -> RunState:
         budget = _ReadBudget(self.max_total_read_bytes)
@@ -7386,6 +7501,7 @@ __all__ = [
     "RunManifest",
     "StageReceipt",
     "TrialState",
+    "VerifiedTrialMaterialization",
     "RunState",
     "ResumePlan",
     "EvaluationNamespace",

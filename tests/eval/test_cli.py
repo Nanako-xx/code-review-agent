@@ -14,9 +14,11 @@ from review_agent_eval.cli import (
     EXIT_PRECONDITION,
     _canonical_digest,
     _build_parser,
+    _domain_error_category,
     main,
 )
 from review_agent_eval.repository import FixtureRepositoryBuilder
+from review_agent_eval.target_replay import TargetReplayIntegrityError
 
 from .test_agent_adapter import _AGENT_PROGRAM
 from .test_datasets import case_payload, write_suite
@@ -98,6 +100,12 @@ def _json_stdout(capsys: pytest.CaptureFixture[str]) -> dict:
 
 def _without_message(value: dict) -> dict:
     return {key: item for key, item in value.items() if key != "message"}
+
+
+def test_target_replay_integrity_error_has_stable_cli_category() -> None:
+    assert _domain_error_category(
+        TargetReplayIntegrityError("fixture replay drift")
+    ) == ("integrity", EXIT_INTEGRITY)
 
 
 def test_parser_exposes_only_the_four_task_12_commands() -> None:
