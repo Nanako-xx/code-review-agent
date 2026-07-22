@@ -343,6 +343,51 @@ def failed_submission(
     )
 
 
+TERMINAL_SUBMISSION_STATUSES = (
+    SubmissionStatus.COMPLETED,
+    SubmissionStatus.FAILED,
+    SubmissionStatus.BLOCKED,
+    SubmissionStatus.INVALID_OUTPUT,
+)
+
+
+def terminal_submission(
+    trial_id: str,
+    status: SubmissionStatus,
+    *,
+    target_materialization_id: str,
+    eval_input_digest: str | None = None,
+    failure_code: FailureCode | None = None,
+    include_trace: bool = False,
+) -> EvalSubmission:
+    if status is SubmissionStatus.COMPLETED:
+        payload = completed_submission(
+            trial_id,
+            target_materialization_id=target_materialization_id,
+        ).to_dict()
+    else:
+        payload = failed_submission(
+            trial_id,
+            "terminal failure",
+            target_materialization_id=target_materialization_id,
+        ).to_dict()
+        default_code = {
+            SubmissionStatus.FAILED: FailureCode.PROCESS_KILLED,
+            SubmissionStatus.BLOCKED: FailureCode.AGENT_BLOCKED,
+            SubmissionStatus.INVALID_OUTPUT: FailureCode.INVALID_JSON,
+        }[status]
+        payload["status"] = status.value
+        payload["failure"]["code"] = (failure_code or default_code).value
+    if eval_input_digest is not None:
+        payload["eval_input_digest"] = eval_input_digest
+    if include_trace:
+        payload["trace_ref"] = {
+            "type": "opaque_id",
+            "value": "trace-terminal-binding",
+        }
+    return EvalSubmission.from_dict(payload)
+
+
 def make_store(tmp_path: Path):
     store = ArtifactStore(tmp_path / ".eval-runs")
     snapshot = make_case_snapshot()
@@ -379,6 +424,68 @@ def write_required_runner_artifacts(
     for name, value in required_runner_artifacts(submission).items():
         refs.append(store._write_json(config.run_id, "%s/%s" % (base, name), value))
     return tuple(refs)
+
+
+def write_orphan_submission_artifacts(
+    store,
+    config,
+    plan,
+    submission: EvalSubmission,
+    *,
+    attempt: int,
+):
+    base = "cases/%s/trials/%s" % (plan.case_path_id, plan.trial_id)
+    store._write_json(
+        config.run_id,
+        base + "/submission.json",
+        submission,
+    )
+    write_required_runner_artifacts(
+        store,
+        config,
+        plan,
+        submission,
+        attempt=attempt,
+    )
+    return store._target(
+        config.run_id,
+        base + "/receipts/terminal.json",
+    )
+
+
+def trial_artifact_snapshot(store, config, plan):
+    root = (
+        store.root
+        / config.run_id
+        / "cases"
+        / plan.case_path_id
+        / "trials"
+        / plan.trial_id
+    )
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and ".locks" not in path.relative_to(root).parts
+    }
+
+
+def prepare_active_trial(store, config, plan):
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert running.active_attempt is not None
+    materialization = make_materialization(
+        config,
+        plan,
+        attempt=running.active_attempt,
+    )
+    store.write_prepare_stage(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        make_input(),
+        materialization,
+        attempt=running.active_attempt,
+    )
+    return running, materialization
 
 
 def complete_trial(store, config, plan):
@@ -810,6 +917,238 @@ def test_stale_attempt_cannot_commit_as_the_current_retry(tmp_path):
     assert store.load_trial_state(
         config.run_id, TASK_ID, plan.trial_id
     ).active_attempt == 2
+
+
+@pytest.mark.parametrize(
+    "status",
+    TERMINAL_SUBMISSION_STATUSES,
+    ids=lambda status: status.value,
+)
+def test_finalize_rejects_wrong_input_digest_without_terminal_mutation(
+    tmp_path, status
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = terminal_submission(
+        plan.trial_id,
+        status,
+        target_materialization_id=materialization.materialization_id,
+        eval_input_digest="0" * 64,
+        include_trace=True,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises((SchemaError, ArtifactIntegrityError, ArtifactStateError)):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+@pytest.mark.parametrize(
+    "status",
+    TERMINAL_SUBMISSION_STATUSES,
+    ids=lambda status: status.value,
+)
+def test_finalize_rejects_wrong_materialization_without_terminal_mutation(
+    tmp_path, status
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, _materialization = prepare_active_trial(store, config, plan)
+    submission = terminal_submission(
+        plan.trial_id,
+        status,
+        target_materialization_id="materialization-wrong",
+        include_trace=True,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises((SchemaError, ArtifactIntegrityError, ArtifactStateError)):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+@pytest.mark.parametrize(
+    "status",
+    TERMINAL_SUBMISSION_STATUSES,
+    ids=lambda status: status.value,
+)
+def test_finalize_without_prepare_rejects_ordinary_terminal_without_mutation(
+    tmp_path, status
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    submission = terminal_submission(
+        plan.trial_id,
+        status,
+        target_materialization_id="materialization-unbound",
+        include_trace=True,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises((SchemaError, ArtifactIntegrityError, ArtifactStateError)):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_without_prepare_accepts_only_canonical_harness_binding(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    expected_binding = artifact_module.derive_pre_materialization_failure_binding(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=running.active_attempt,
+        eval_input_digest=plan.eval_input_digest,
+        review_target_digest=make_input().review_target.digest(),
+    )
+    submission = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id=expected_binding,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    )
+
+    state = store.finalize_submission(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        submission,
+        attempt=running.active_attempt,
+        runner_artifacts=required_runner_artifacts(submission),
+    )
+
+    assert state.status is TrialStatus.FAILED
+    assert store.load_existing_submission(
+        config.run_id, TASK_ID, plan.trial_id
+    ) == submission
+
+
+def test_finalize_rejects_arbitrary_pre_materialization_binding_without_mutation(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    submission = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id="materialization-arbitrary",
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+        include_trace=True,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises((SchemaError, ArtifactIntegrityError, ArtifactStateError)):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_rejects_loose_materialization_without_prepare(tmp_path):
+    store, config, _, plan, trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    write_orphan_materialization(
+        store,
+        config,
+        plan,
+        trial,
+        attempt=running.active_attempt,
+    )
+    expected_binding = artifact_module.derive_pre_materialization_failure_binding(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=running.active_attempt,
+        eval_input_digest=plan.eval_input_digest,
+        review_target_digest=make_input().review_target.digest(),
+    )
+    submission = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id=expected_binding,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="without"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_rejects_drifted_pre_prepare_input_without_mutation(tmp_path):
+    store, config, _, plan, trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    drifted_payload = make_input().to_dict()
+    drifted_payload["review_target"]["repository"]["head_revision"] = "3" * 40
+    drifted_input = EvalInput.from_dict(drifted_payload)
+    input_path = (
+        "cases/%s/trials/%s/input.json" % (trial.case_path_id, plan.trial_id)
+    )
+    store._write_json(config.run_id, input_path, drifted_input)
+    expected_binding = artifact_module.derive_pre_materialization_failure_binding(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=running.active_attempt,
+        eval_input_digest=plan.eval_input_digest,
+        review_target_digest=make_input().review_target.digest(),
+    )
+    submission = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id=expected_binding,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="EvalInput"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
 
 
 @pytest.mark.parametrize(
@@ -1299,51 +1638,218 @@ def test_recovery_rejects_v1_orphans_before_committing_incomplete(
     assert not incomplete_path.exists()
 
 
-def test_recovery_revalidates_failed_submission_input_digest_before_commit(
-    tmp_path,
+@pytest.mark.parametrize(
+    "status",
+    TERMINAL_SUBMISSION_STATUSES,
+    ids=lambda status: status.value,
+)
+def test_recovery_revalidates_submission_input_digest_before_commit(
+    tmp_path, status
 ):
-    store, config, _manifest, plan, trial = make_store(tmp_path)
-    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
-    bad_payload = failed_submission(plan.trial_id, "bad digest").to_dict()
-    bad_payload["eval_input_digest"] = "0" * 64
-    bad_submission = EvalSubmission.from_dict(bad_payload)
-    base = "cases/%s/trials/%s" % (trial.case_path_id, plan.trial_id)
-    store._write_json(
-        config.run_id,
-        base + "/submission.json",
-        bad_submission,
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = terminal_submission(
+        plan.trial_id,
+        status,
+        target_materialization_id=materialization.materialization_id,
+        eval_input_digest="0" * 64,
     )
-    write_required_runner_artifacts(
+    terminal_path = write_orphan_submission_artifacts(
         store,
         config,
         plan,
-        bad_submission,
+        submission,
         attempt=running.active_attempt,
     )
-    terminal_path = store._target(
-        config.run_id,
-        base + "/receipts/terminal.json",
-    )
+    before = trial_artifact_snapshot(store, config, plan)
 
     with pytest.raises(ArtifactIntegrityError, match="EvalInput digest"):
         store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+
     assert not terminal_path.exists()
+    assert trial_artifact_snapshot(store, config, plan) == before
 
 
-def test_abandonment_atomically_commits_failed_process_killed_submission(tmp_path):
+@pytest.mark.parametrize(
+    "status",
+    TERMINAL_SUBMISSION_STATUSES,
+    ids=lambda status: status.value,
+)
+def test_recovery_rejects_wrong_materialization_before_terminal_commit(
+    tmp_path, status
+):
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
+    running, _materialization = prepare_active_trial(store, config, plan)
+    submission = terminal_submission(
+        plan.trial_id,
+        status,
+        target_materialization_id="materialization-wrong",
+    )
+    terminal_path = write_orphan_submission_artifacts(
+        store,
+        config,
+        plan,
+        submission,
+        attempt=running.active_attempt,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="materialization"):
+        store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+
+    assert not terminal_path.exists()
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+@pytest.mark.parametrize(
+    "status",
+    TERMINAL_SUBMISSION_STATUSES,
+    ids=lambda status: status.value,
+)
+def test_recovery_without_prepare_rejects_ordinary_terminal_without_mutation(
+    tmp_path, status
+):
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    submission = terminal_submission(
+        plan.trial_id,
+        status,
+        target_materialization_id="materialization-unbound",
+    )
+    terminal_path = write_orphan_submission_artifacts(
+        store,
+        config,
+        plan,
+        submission,
+        attempt=running.active_attempt,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="prepare"):
+        store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+
+    assert not terminal_path.exists()
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_recovery_without_prepare_requires_canonical_harness_binding(tmp_path):
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    arbitrary = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id="materialization-arbitrary",
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    )
+    terminal_path = write_orphan_submission_artifacts(
+        store,
+        config,
+        plan,
+        arbitrary,
+        attempt=running.active_attempt,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="pre-materialization"):
+        store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+
+    assert not terminal_path.exists()
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_recovery_adopts_canonical_pre_materialization_harness_failure(tmp_path):
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    expected_binding = artifact_module.derive_pre_materialization_failure_binding(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=running.active_attempt,
+        eval_input_digest=plan.eval_input_digest,
+        review_target_digest=make_input().review_target.digest(),
+    )
+    submission = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id=expected_binding,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    )
+    terminal_path = write_orphan_submission_artifacts(
+        store,
+        config,
+        plan,
+        submission,
+        attempt=running.active_attempt,
+    )
+
+    recovery = store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+
+    assert recovery.status is TrialStatus.FAILED
+    assert recovery.terminal is True
+    assert terminal_path.is_file()
+    assert store.load_existing_submission(
+        config.run_id, TASK_ID, plan.trial_id
+    ) == submission
+
+
+def test_abandonment_without_prepare_uses_canonical_harness_failure(tmp_path):
     store, config, _, plan, _ = make_store(tmp_path)
-    store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
     recovery = store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
     assert recovery.status is TrialStatus.INCOMPLETE
+    expected_binding = artifact_module.derive_pre_materialization_failure_binding(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=running.active_attempt,
+        eval_input_digest=plan.eval_input_digest,
+        review_target_digest=make_input().review_target.digest(),
+    )
 
     state = store.abandon_trial(config.run_id, TASK_ID, plan.trial_id)
     submission = store.load_existing_submission(config.run_id, TASK_ID, plan.trial_id)
     assert state.status is TrialStatus.FAILED
     assert submission.status is SubmissionStatus.FAILED
     assert submission.failure is not None
-    assert submission.failure.code is FailureCode.PROCESS_KILLED
+    assert submission.failure.code is FailureCode.HARNESS_MATERIALIZATION_ERROR
+    assert submission.target_materialization_id == expected_binding
     assert state.terminal_receipt is not None
-    assert state.terminal_receipt.failure_code is FailureCode.PROCESS_KILLED
+    assert state.terminal_receipt.failure_code is (
+        FailureCode.HARNESS_MATERIALIZATION_ERROR
+    )
+
+
+def test_abandonment_after_prepare_uses_committed_materialization_binding(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    _running, materialization = prepare_active_trial(store, config, plan)
+
+    state = store.abandon_trial(config.run_id, TASK_ID, plan.trial_id)
+    submission = store.load_existing_submission(
+        config.run_id, TASK_ID, plan.trial_id
+    )
+
+    assert state.status is TrialStatus.FAILED
+    assert submission.target_materialization_id == materialization.materialization_id
+    assert submission.failure is not None
+    assert submission.failure.code is FailureCode.PROCESS_KILLED
+
+
+def test_abandonment_rejects_harness_failure_after_prepare_without_mutation(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    prepare_active_trial(store, config, plan)
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(SchemaError, match="cannot follow"):
+        store.abandon_trial(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
 
 
 def test_load_existing_submission_is_strictly_read_only(tmp_path):

@@ -96,6 +96,9 @@ EVAL_STAGE_RECEIPT_SCHEMA_VERSION = "eval_stage_receipt_v2"
 EVAL_RUN_PREFLIGHT_SCHEMA_VERSION = "eval_capability_preflight_v2"
 EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION = "eval_preflight_candidate_v2"
 EVAL_TRIAL_MATERIALIZATION_SCHEMA_VERSION = "eval_trial_materialization_v2"
+PRE_MATERIALIZATION_FAILURE_BINDING_VERSION = (
+    "eval_pre_materialization_failure_binding_v2"
+)
 EVAL_RUN_EVALUATION_NAMESPACE_SCHEMA_VERSION = (
     "eval_run_evaluation_namespace_v2"
 )
@@ -1367,6 +1370,48 @@ def derive_receipt_id(
         attempt,
         evaluation_id,
         evaluation_revision,
+    )
+
+
+def derive_pre_materialization_failure_binding(
+    *,
+    run_id: str,
+    task_id: str,
+    trial_id: str,
+    attempt: int,
+    eval_input_digest: str,
+    review_target_digest: str,
+) -> str:
+    """Derive the sole target binding allowed before a Prepare commit."""
+
+    validate_run_id(run_id)
+    _identifier(task_id, "pre-materialization failure.task_id")
+    validate_trial_id_shape(trial_id)
+    normalized_attempt = _integer(
+        attempt,
+        "pre-materialization failure.attempt",
+        minimum=1,
+        maximum=MAX_TRIAL_ATTEMPTS,
+    )
+    _digest(
+        eval_input_digest,
+        "pre-materialization failure.eval_input_digest",
+    )
+    _digest(
+        review_target_digest,
+        "pre-materialization failure.review_target_digest",
+    )
+    return stable_id(
+        "pre-materialization-failure",
+        {
+            "schema_version": PRE_MATERIALIZATION_FAILURE_BINDING_VERSION,
+            "run_id": run_id,
+            "task_id": task_id,
+            "trial_id": trial_id,
+            "attempt": normalized_attempt,
+            "eval_input_digest": eval_input_digest,
+            "review_target_digest": review_target_digest,
+        },
     )
 
 
@@ -4286,6 +4331,195 @@ class ArtifactStore:
             )
         return eval_input, materialization
 
+    def _verified_prepare_for_terminal(
+        self,
+        bundle: _VerifiedRunBundle,
+        plan: TrialManifest,
+        *,
+        attempt: int,
+        candidate: Optional[StageReceipt],
+        budget: _ReadBudget,
+    ) -> Tuple[Optional[StageReceipt], Optional[TrialMaterializationManifest]]:
+        """Resolve and fully verify the Prepare binding for one active attempt."""
+
+        prepare_path = self._receipt_path(plan, StageName.PREPARE, attempt)
+        committed: Optional[StageReceipt] = None
+        if self._exists_regular(self._target(plan.run_id, prepare_path)):
+            committed = self._load_receipt(
+                plan.run_id,
+                prepare_path,
+                budget=budget,
+            )
+        if candidate is not None and not isinstance(candidate, StageReceipt):
+            raise ArtifactIntegrityError(
+                "terminal prepare candidate is not a StageReceipt"
+            )
+        if committed is not None and candidate is not None and committed != candidate:
+            raise ArtifactIntegrityError(
+                "terminal prepare candidate differs from committed receipt"
+            )
+        prepare = committed if committed is not None else candidate
+        if prepare is None:
+            materialization_path = self._materialization_manifest_path(
+                plan,
+                attempt,
+            )
+            if self._exists_regular(
+                self._target(plan.run_id, materialization_path)
+            ):
+                raise ArtifactIntegrityError(
+                    "materialization exists without a committed prepare receipt"
+                )
+            return None, None
+        if prepare.stage is not StageName.PREPARE or prepare.attempt != attempt:
+            raise ArtifactIntegrityError(
+                "terminal prepare receipt does not bind the active attempt"
+            )
+        _eval_input, materialization = self._load_prepare_materialization(
+            bundle,
+            plan,
+            prepare,
+            budget=budget,
+        )
+        return prepare, materialization
+
+    def _terminal_target_binding(
+        self,
+        bundle: _VerifiedRunBundle,
+        plan: TrialManifest,
+        *,
+        attempt: int,
+        prepare: Optional[StageReceipt],
+        budget: _ReadBudget,
+    ) -> Tuple[str, bool]:
+        _prepare, materialization = self._verified_prepare_for_terminal(
+            bundle,
+            plan,
+            attempt=attempt,
+            candidate=prepare,
+            budget=budget,
+        )
+        if materialization is not None:
+            return materialization.materialization_id, True
+        eval_input = bundle.case_snapshot.eval_input(plan.task_id)
+        if eval_input.digest() != plan.eval_input_digest:
+            raise ArtifactIntegrityError(
+                "Case Snapshot EvalInput differs from immutable Trial plan"
+            )
+        return (
+            derive_pre_materialization_failure_binding(
+                run_id=plan.run_id,
+                task_id=plan.task_id,
+                trial_id=plan.trial_id,
+                attempt=attempt,
+                eval_input_digest=plan.eval_input_digest,
+                review_target_digest=eval_input.review_target.digest(),
+            ),
+            False,
+        )
+
+    def _verify_existing_terminal_input(
+        self,
+        bundle: _VerifiedRunBundle,
+        plan: TrialManifest,
+        *,
+        budget: _ReadBudget,
+    ) -> None:
+        input_path = "cases/%s/trials/%s/input.json" % (
+            plan.case_path_id,
+            plan.trial_id,
+        )
+        target = self._target(plan.run_id, input_path)
+        if not self._exists_regular(target):
+            return
+        payload = self._read_json(
+            target,
+            budget=budget,
+            maximum=MAX_EVAL_INPUT_BYTES,
+        )
+        try:
+            eval_input = EvalInput.from_dict(payload)
+        except UnsupportedProtocolVersionError:
+            raise
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "terminal EvalInput failed strict hydration"
+            ) from exc
+        if (
+            eval_input.task_id != plan.task_id
+            or eval_input.digest() != plan.eval_input_digest
+            or eval_input.review_target.kind is not plan.target_kind
+        ):
+            raise ArtifactIntegrityError(
+                "terminal EvalInput differs from immutable Trial plan"
+            )
+
+    def _validate_terminal_submission_binding(
+        self,
+        bundle: _VerifiedRunBundle,
+        plan: TrialManifest,
+        submission: EvalSubmission,
+        *,
+        attempt: int,
+        prepare: Optional[StageReceipt],
+        budget: _ReadBudget,
+        error_type: type[Exception] = ArtifactIntegrityError,
+    ) -> None:
+        """Enforce one terminal binding matrix before publication or adoption."""
+
+        def reject(message: str) -> None:
+            raise error_type(message)
+
+        if (
+            submission.task_id != plan.task_id
+            or submission.trial_id != plan.trial_id
+            or submission.agent_id != bundle.config.agent.agent_id
+        ):
+            reject("Submission identity does not match immutable Run/Trial plan")
+        if submission.eval_input_digest != plan.eval_input_digest:
+            reject("Submission EvalInput digest differs from immutable Trial plan")
+
+        target_binding, has_prepare = self._terminal_target_binding(
+            bundle,
+            plan,
+            attempt=attempt,
+            prepare=prepare,
+            budget=budget,
+        )
+        if not has_prepare:
+            self._verify_existing_terminal_input(
+                bundle,
+                plan,
+                budget=budget,
+            )
+        failure_code = (
+            None if submission.failure is None else submission.failure.code
+        )
+        if has_prepare:
+            if failure_code is FailureCode.HARNESS_MATERIALIZATION_ERROR:
+                reject(
+                    "harness materialization failure cannot follow a committed Prepare"
+                )
+            if submission.target_materialization_id != target_binding:
+                reject(
+                    "Submission target differs from active materialization binding"
+                )
+            return
+
+        if (
+            submission.status is not SubmissionStatus.FAILED
+            or failure_code is not FailureCode.HARNESS_MATERIALIZATION_ERROR
+            or submission.intent is not None
+            or submission.review is not None
+        ):
+            reject(
+                "terminal Submission requires a committed prepare receipt"
+            )
+        if submission.target_materialization_id != target_binding:
+            reject(
+                "Submission pre-materialization failure binding is not canonical"
+            )
+
     def _load_terminal_submission(
         self,
         bundle: _VerifiedRunBundle,
@@ -4354,33 +4588,24 @@ class ArtifactStore:
             None if submission.failure is None else submission.failure.code
         )
         if (
-            submission.task_id != plan.task_id
-            or submission.trial_id != plan.trial_id
-            or submission.agent_id != bundle.config.agent.agent_id
-            or submission.status.value != receipt.terminal_status.value
+            submission.status.value != receipt.terminal_status.value
             or expected_failure is not receipt.failure_code
         ):
             raise ArtifactIntegrityError(
-                "Submission does not match its terminal receipt or verified Run"
+                "Submission does not match its terminal receipt"
             )
-        if submission.eval_input_digest != plan.eval_input_digest:
+        if receipt.attempt is None:
             raise ArtifactIntegrityError(
-                "Submission EvalInput digest differs from immutable Trial plan"
+                "terminal receipt has no active attempt binding"
             )
-        if submission.status is SubmissionStatus.COMPLETED:
-            if prepare is None:
-                raise ArtifactIntegrityError(
-                    "completed Submission has no prepare receipt binding"
-                )
-            if (
-                prepare.attempt != receipt.attempt
-                or submission.eval_input_digest != prepare.eval_input_digest
-                or submission.target_materialization_id
-                != prepare.materialization_id
-            ):
-                raise ArtifactIntegrityError(
-                    "Submission differs from active materialization binding"
-                )
+        self._validate_terminal_submission_binding(
+            bundle,
+            plan,
+            submission,
+            attempt=receipt.attempt,
+            prepare=prepare,
+            budget=budget,
+        )
         return submission
 
     def _recoverable_runner_artifacts(
@@ -5038,20 +5263,16 @@ class ArtifactStore:
                 raise ArtifactConflictError(
                     "stale Trial attempt cannot commit a terminal Submission"
                 )
-            if (
-                submission.task_id != task_id
-                or submission.trial_id != trial_id
-                or submission.agent_id != bundle.config.agent.agent_id
-            ):
-                raise SchemaError("Submission identity does not match Run/Trial")
+            self._validate_terminal_submission_binding(
+                bundle,
+                plan,
+                submission,
+                attempt=attempt,
+                prepare=None,
+                budget=_ReadBudget(self.max_total_read_bytes),
+                error_type=SchemaError,
+            )
             terminal_status = self._submission_status(submission)
-            if (
-                terminal_status is TrialStatus.COMPLETED
-                and StageName.PREPARE not in state.completed_stages
-            ):
-                raise ArtifactStateError(
-                    "completed Submission requires committed prepare stage"
-                )
             base = "cases/%s/trials/%s" % (plan.case_path_id, trial_id)
             planned_control: List[Tuple[str, Any, bytes, ArtifactRef]] = []
             planned_mandatory: List[Tuple[str, Any, bytes, ArtifactRef]] = []
@@ -5258,26 +5479,48 @@ class ArtifactStore:
         if failure_status is not SubmissionStatus.FAILED:
             raise SchemaError("abandonment requires a stable failed failure code")
         validate_safe_text(message, "abandonment failure message")
-        config = self.load_run_config(run_id)
-        state = self.load_trial_state(run_id, task_id, trial_id)
+        bundle = self._load_verified_run_bundle(
+            run_id,
+            budget=_ReadBudget(self.max_total_read_bytes),
+        )
+        plan = self._load_trial_manifest(
+            bundle,
+            task_id,
+            trial_id,
+            budget=_ReadBudget(self.max_total_read_bytes),
+        )
+        state, _existing_submission = self._load_trial_state(
+            bundle,
+            plan,
+            budget=_ReadBudget(self.max_total_read_bytes),
+        )
         if state.active_attempt is None:
             raise ArtifactStateError(
                 "abandonment requires a started Trial attempt"
             )
-        case_binding = config.suite.case(task_id)
+        target_binding, has_prepare = self._terminal_target_binding(
+            bundle,
+            plan,
+            attempt=state.active_attempt,
+            prepare=None,
+            budget=_ReadBudget(self.max_total_read_bytes),
+        )
+        if has_prepare and failure_code is FailureCode.HARNESS_MATERIALIZATION_ERROR:
+            raise SchemaError(
+                "harness materialization failure cannot follow a committed Prepare"
+            )
+        effective_failure_code = (
+            failure_code
+            if has_prepare
+            else FailureCode.HARNESS_MATERIALIZATION_ERROR
+        )
         submission = EvalSubmission(
             schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
             task_id=task_id,
-            agent_id=config.agent.agent_id,
+            agent_id=bundle.config.agent.agent_id,
             trial_id=trial_id,
-            eval_input_digest=case_binding.eval_input_digest,
-            target_materialization_id=stable_id(
-                "unmaterialized-target",
-                run_id,
-                task_id,
-                trial_id,
-                state.active_attempt,
-            ),
+            eval_input_digest=plan.eval_input_digest,
+            target_materialization_id=target_binding,
             status=SubmissionStatus.FAILED,
             intent=None,
             review=None,
@@ -5293,7 +5536,7 @@ class ArtifactStore:
             ),
             trace_ref=None,
             failure=SubmissionFailure(
-                code=failure_code,
+                code=effective_failure_code,
                 message=message,
                 retryable=False,
             ),
@@ -5308,7 +5551,7 @@ class ArtifactStore:
             "clarification_match_receipts.json": {
                 "schema_version": "eval_clarification_match_receipts_v1",
                 "trial_id": trial_id,
-                "matcher_digest": config.clarification_matcher.digest(),
+                "matcher_digest": bundle.config.clarification_matcher.digest(),
                 "receipts": [],
             },
             "terminal_summary.json": {
@@ -5318,7 +5561,7 @@ class ArtifactStore:
                 "trial_id": trial_id,
                 "attempt": state.active_attempt,
                 "status": submission.status.value,
-                "failure_code": failure_code.value,
+                "failure_code": effective_failure_code.value,
                 "elapsed_seconds": None,
                 "stdout": {
                     "bytes": 0,
@@ -5908,33 +6151,14 @@ class ArtifactStore:
                     raise ArtifactIntegrityError(
                         "orphan Submission has no started Trial attempt"
                     )
-                if (
-                    submission.task_id != task_id
-                    or submission.trial_id != trial_id
-                    or submission.agent_id != bundle.config.agent.agent_id
-                ):
-                    raise ArtifactIntegrityError("orphan Submission has wrong identity")
-                if (
-                    self._submission_status(submission) is TrialStatus.COMPLETED
-                    and not prepare_committed
-                ):
-                    raise ArtifactIntegrityError(
-                        "orphan completed Submission lacks committed prepare stage"
-                    )
-                if (
-                    self._submission_status(submission)
-                    is TrialStatus.COMPLETED
-                    and (
-                        prepare_receipt is None
-                        or submission.eval_input_digest
-                        != prepare_receipt.eval_input_digest
-                        or submission.target_materialization_id
-                        != prepare_receipt.materialization_id
-                    )
-                ):
-                    raise ArtifactIntegrityError(
-                        "orphan Submission differs from active materialization"
-                    )
+                self._validate_terminal_submission_binding(
+                    bundle,
+                    plan,
+                    submission,
+                    attempt=state.active_attempt,
+                    prepare=prepare_receipt,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                )
                 runner_refs = self._recoverable_runner_artifacts(
                     run_id,
                     plan,
@@ -6726,6 +6950,7 @@ __all__ = [
     "EVAL_RUN_PREFLIGHT_SCHEMA_VERSION",
     "EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION",
     "EVAL_TRIAL_MATERIALIZATION_SCHEMA_VERSION",
+    "PRE_MATERIALIZATION_FAILURE_BINDING_VERSION",
     "EVAL_RUN_EVALUATION_NAMESPACE_SCHEMA_VERSION",
     "MAX_RUN_MANIFEST_BYTES",
     "MAX_TRIAL_MANIFEST_BYTES",
@@ -6763,6 +6988,7 @@ __all__ = [
     "RunEvaluationNamespace",
     "RunEvaluationBundle",
     "derive_receipt_id",
+    "derive_pre_materialization_failure_binding",
     "ArtifactStore",
     "load_existing_submission",
 ]
