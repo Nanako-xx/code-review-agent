@@ -30,6 +30,7 @@ from review_agent_eval.models import (  # noqa: E402
     canonical_json,
     canonical_sha256,
 )
+from review_agent_eval.cases import is_windows_reserved_path_component  # noqa: E402
 from review_agent_eval import repository as repository_models  # noqa: E402
 
 
@@ -109,10 +110,6 @@ _OBVIOUS_MACHINE_SUBSTRINGS = (
 _OBVIOUS_MACHINE_TOKENS = frozenset(
     {"agent", "assistant", "bot", "gpt", "llm", "model", "subagent"}
 )
-_WINDOWS_RESERVED_STEMS = frozenset(
-    str(item).casefold()
-    for item in getattr(repository_models, "_WINDOWS_RESERVED", frozenset())
-)
 # NTFS can resolve a DOS 8.3 short name such as ``REPOSI~1`` to a protected
 # long-name directory. Reject the bounded shape on every platform, including
 # punctuation-bearing prefixes such as ``CORE-P~1`` and ``CORE_P~1``.
@@ -140,11 +137,6 @@ class VerifiedResponse:
 
 def _absolute(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
-
-
-def _is_windows_reserved_component(component: str) -> bool:
-    stem = unicodedata.normalize("NFKC", component).split(".", 1)[0]
-    return stem.casefold() in _WINDOWS_RESERVED_STEMS
 
 
 def _is_dos_83_alias_component(component: str) -> bool:
@@ -320,7 +312,7 @@ def _safe_relative_parts(value: str, context: str) -> tuple[str, ...]:
         raise HumanReviewError(f"{context} contains an unsafe path component")
     if any(part.endswith((".", " ")) for part in parts):
         raise HumanReviewError(f"{context} contains a Windows trailing dot or space")
-    if any(_is_windows_reserved_component(part) for part in parts):
+    if any(is_windows_reserved_path_component(part) for part in parts):
         raise HumanReviewError(f"{context} contains a Windows reserved device name")
     if any(_is_dos_83_alias_component(part) for part in parts):
         raise HumanReviewError(f"{context} contains a possible Windows 8.3 short-name alias")

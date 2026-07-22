@@ -756,6 +756,11 @@ def test_symlink_git_entries_are_rejected_before_checkout(tmp_path: Path) -> Non
     "names",
     [
         (b"CON",),
+        (b"COM1 .txt",),
+        (b"COM2 .json",),
+        (b"NUL .json",),
+        (b"AUX .x",),
+        (b"LPT9 .data",),
         (b"trailing.",),
         (b"trailing ",),
         (b"stream:ads",),
@@ -776,6 +781,21 @@ def test_nonportable_or_colliding_git_tree_paths_fail_closed(
     with _preparer(tmp_path, suite) as preparer:
         with pytest.raises(RepositoryPolicyError, match="path|portable|collision|UTF"):
             preparer.prepare(_local_descriptor("imports/malicious.git", base, head))
+
+
+def test_fixture_builder_accepts_windows_reserved_near_miss_and_unicode_names(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / "suite" / "repositories" / "near-miss"
+    (fixture / "base").mkdir(parents=True)
+    (fixture / "head").mkdir()
+    for side in ("base", "head"):
+        (fixture / side / "COM10 .txt").write_bytes(b"payload")
+        (fixture / side / "普通话.txt").write_bytes(b"payload")
+
+    built = FixtureRepositoryBuilder().build(fixture, tmp_path / "near-miss.git")
+
+    assert built.head_revision
 
 
 def test_remote_requires_prepare_authorization_and_secret_free_url(

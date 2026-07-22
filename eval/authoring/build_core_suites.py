@@ -26,6 +26,7 @@ from review_agent_eval.cases import (  # noqa: E402
     REPOSITORY_MATERIALIZER_PROTOCOL,
     SUITE_MANIFEST_SCHEMA_VERSION,
     SuiteManifest,
+    is_windows_reserved_path_component,
 )
 from review_agent_eval.models import (  # noqa: E402
     EVAL_CASE_SCHEMA_VERSION,
@@ -41,7 +42,6 @@ from review_agent_eval.repository import FixtureRepositoryBuilder  # noqa: E402
 from core_human_review import (  # noqa: E402
     ANNOTATION_PROTOCOL_VERSION,
     _is_dos_83_alias_component,
-    _is_windows_reserved_component,
     annotation_protocol_binding,
     fixture_manifest_from_mappings,
     load_source_bound_ledger_record,
@@ -1500,7 +1500,7 @@ def _safe_relative_parts(relative: str, *, context: str) -> tuple[str, ...]:
         raise ValueError(
             "%s contains a Windows trailing dot or space component" % context
         )
-    if any(_is_windows_reserved_component(part) for part in raw_parts):
+    if any(is_windows_reserved_path_component(part) for part in raw_parts):
         raise ValueError(
             "%s contains a Windows reserved device name component" % context
         )

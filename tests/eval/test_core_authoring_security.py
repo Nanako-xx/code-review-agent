@@ -273,6 +273,11 @@ WIN32_RESERVED_COMPONENTS = (
     "prn.txt",
     "Aux",
     "nul.json",
+    "COM1 .txt",
+    "COM2 .json",
+    "NUL .json",
+    "AUX .x",
+    "LPT9 .data",
     *("COM%d.py" % value for value in range(1, 10)),
     *("lpt%d.data" % value for value in range(1, 10)),
 )
@@ -879,6 +884,20 @@ def test_write_rejects_nfkc_windows_reserved_device_component(
         authoring_module.write_outputs(eval_root, plan)
 
     assert writes == []
+
+
+def test_authoring_path_policy_accepts_windows_reserved_near_miss_and_unicode(
+    authoring_module: ModuleType,
+) -> None:
+    for relative in (
+        "cases/core/core-py-001/COM10 .txt/case.json",
+        "cases/core/core-py-001/普通话/case.json",
+    ):
+        parts = authoring_module._safe_relative_parts(
+            relative,
+            context="normal path",
+        )
+        assert parts[-2] == relative.split("/")[-2]
 
 
 @pytest.mark.parametrize(

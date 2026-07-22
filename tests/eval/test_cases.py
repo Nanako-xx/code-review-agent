@@ -23,6 +23,7 @@ from review_agent_eval.cases import (
     SuiteKind,
     SuiteManifest,
     SuiteSource,
+    is_windows_reserved_path_component,
     validate_case_for_manifest,
 )
 from review_agent_eval.models import (
@@ -444,6 +445,11 @@ def test_manifest_collision_keys_use_unicode_normalization_before_casefold() -> 
         r"cases\escape.json",
         "cases//case.json",
         "cases/CON.json",
+        "cases/COM1 .txt",
+        "cases/COM2 .json",
+        "cases/NUL .json",
+        "cases/AUX .x",
+        "cases/LPT9 .data",
         "cases/COM¹.json",
         "cases/LPT³.txt",
         "cases/case.json.",
@@ -455,6 +461,39 @@ def test_manifest_rejects_unsafe_and_non_portable_case_paths(path: str) -> None:
     raw["cases"][0]["path"] = path
     with pytest.raises(SchemaError, match="path|unsafe|relative|portable"):
         SuiteManifest.from_dict(raw)
+
+
+@pytest.mark.parametrize(
+    ("component", "expected"),
+    (
+        ("COM1 .txt", True),
+        ("COM2 .json", True),
+        ("NUL .json", True),
+        ("AUX .x", True),
+        ("LPT9 .data", True),
+        ("COM\N{SUPERSCRIPT ONE}", True),
+        ("COM\N{SUPERSCRIPT TWO}", True),
+        ("COM\N{SUPERSCRIPT THREE}", True),
+        ("LPT\N{SUPERSCRIPT ONE}", True),
+        ("LPT\N{SUPERSCRIPT TWO}", True),
+        ("LPT\N{SUPERSCRIPT THREE}", True),
+        ("CLOCK$ .txt", True),
+        ("COM10 .txt", False),
+        ("普通话.txt", False),
+    ),
+)
+def test_windows_reserved_path_component_policy_handles_ignored_stem_suffixes(
+    component: str,
+    expected: bool,
+) -> None:
+    assert is_windows_reserved_path_component(component) is expected
+
+
+def test_manifest_accepts_windows_reserved_near_miss_and_unicode_case_paths() -> None:
+    case = EvalCase.from_dict(case_payload())
+    for path in ("cases/COM10 .txt", "cases/普通话.txt"):
+        manifest = manifest_for_case(case, path=path)
+        assert manifest.cases[0].path == path
 
 
 def test_case_dimensions_are_strict_generic_grouping_metadata() -> None:

@@ -50,7 +50,11 @@ from typing import (
 from urllib.parse import urlsplit
 
 from .artifacts import TrialManifest
-from .cases import SuiteCase, SuiteSource
+from .cases import (
+    SuiteCase,
+    SuiteSource,
+    is_windows_reserved_path_component,
+)
 from .models import (
     EvalInput,
     MAX_COUNTER,
@@ -124,16 +128,6 @@ _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _GIT_OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _HEX_RE = re.compile(r"^[0-9a-f]+$")
 _WINDOWS_FORBIDDEN = frozenset('<>:"\\|?*')
-_WINDOWS_RESERVED = frozenset(
-    {
-        "CON",
-        "PRN",
-        "AUX",
-        "NUL",
-        *("COM%d" % value for value in range(1, 10)),
-        *("LPT%d" % value for value in range(1, 10)),
-    }
-)
 _VCS_METADATA = frozenset({".git", ".hg", ".svn", ".gitmodules"})
 _LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1\n"
 _LFS_ATTRIBUTE_RE = re.compile(
@@ -1951,7 +1945,7 @@ def _validate_component(name: str, context: str) -> bytes:
         raise RepositoryPolicyError("%s path has a Windows trailing dot or space" % context)
     if any(character in _WINDOWS_FORBIDDEN for character in name):
         raise RepositoryPolicyError("%s path contains Windows ADS/forbidden syntax" % context)
-    if name.split(".", 1)[0].upper() in _WINDOWS_RESERVED:
+    if is_windows_reserved_path_component(name):
         raise RepositoryPolicyError("%s path uses a Windows device name" % context)
     folded = unicodedata.normalize("NFC", name).casefold()
     if folded in _VCS_METADATA or folded == ".lfsconfig":

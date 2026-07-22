@@ -106,6 +106,13 @@ _LOCAL_CASE_ORIGINS = frozenset(
 )
 
 
+def is_windows_reserved_path_component(value: str) -> bool:
+    """Return whether a path component resolves to a Windows device alias."""
+    normalized = unicodedata.normalize("NFKC", value)
+    stem = normalized.split(".", 1)[0].rstrip(" .").casefold()
+    return stem in _WINDOWS_RESERVED_NAMES
+
+
 def _portable_key(value: str) -> str:
     normalized = unicodedata.normalize("NFC", value)
     return unicodedata.normalize("NFC", normalized.casefold())
@@ -132,10 +139,7 @@ def _portable_case_path(value: Any, context: str) -> str:
             raise SchemaError(
                 "%s contains a character that is unsafe on Windows" % context
             )
-        stem = unicodedata.normalize(
-            "NFKC", component.split(".", 1)[0]
-        ).casefold()
-        if stem in _WINDOWS_RESERVED_NAMES:
+        if is_windows_reserved_path_component(component):
             raise SchemaError(
                 "%s contains a reserved portable path component" % context
             )

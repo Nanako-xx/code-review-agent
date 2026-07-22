@@ -392,7 +392,16 @@ def test_export_rejects_injected_short_alias_before_any_output_mutation(
 
 @pytest.mark.parametrize(
     "component",
-    ("COM\N{SUPERSCRIPT ONE}", "COM\N{SUPERSCRIPT TWO}.txt", "LPT\N{SUPERSCRIPT THREE}"),
+    (
+        "COM\N{SUPERSCRIPT ONE}",
+        "COM\N{SUPERSCRIPT TWO}.txt",
+        "LPT\N{SUPERSCRIPT THREE}",
+        "COM1 .txt",
+        "COM2 .json",
+        "NUL .json",
+        "AUX .x",
+        "LPT9 .data",
+    ),
 )
 def test_human_review_shared_path_policy_rejects_nfkc_device_names(
     component: str,
@@ -402,6 +411,14 @@ def test_human_review_shared_path_policy_rejects_nfkc_device_names(
             "repository/base/%s/input.py" % component,
             "fixture path",
         )
+
+
+def test_human_review_path_policy_accepts_windows_reserved_near_miss_and_unicode() -> None:
+    for component in ("COM10 .txt", "普通话"):
+        assert human_review_module._safe_relative_parts(
+            "repository/base/%s/input.py" % component,
+            "fixture path",
+        )[-2] == component
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows GetShortPathNameW capability")
