@@ -37,7 +37,10 @@ from review_agent_eval.models import (  # noqa: E402
     canonical_sha256,
     stable_id,
 )
-from review_agent_eval.repository import FixtureRepositoryBuilder  # noqa: E402
+from review_agent_eval.repository import (  # noqa: E402
+    _WINDOWS_RESERVED as _REPOSITORY_WINDOWS_RESERVED,
+    FixtureRepositoryBuilder,
+)
 from core_human_review import (  # noqa: E402
     ANNOTATION_PROTOCOL_VERSION,
     annotation_protocol_binding,
@@ -90,7 +93,6 @@ REPOSITORY_WIRE_CONTRACT = {
 # signs each frozen blind-review packet.  A model/sub-agent review must never
 # be recorded as the external human audit gate.
 HUMAN_REVIEW_STATUS = "requires_independent_re_review"
-
 
 @dataclass(frozen=True)
 class CoreCaseSpec:
@@ -1478,6 +1480,17 @@ def _safe_relative_parts(relative: str, *, context: str) -> tuple[str, ...]:
         raise ValueError("%s contains an empty or dot path component" % context)
     if any(":" in part for part in raw_parts):
         raise ValueError("%s contains a Windows drive or stream component" % context)
+    if any(part.endswith((".", " ")) for part in raw_parts):
+        raise ValueError(
+            "%s contains a Windows trailing dot or space component" % context
+        )
+    if any(
+        part.split(".", 1)[0].upper() in _REPOSITORY_WINDOWS_RESERVED
+        for part in raw_parts
+    ):
+        raise ValueError(
+            "%s contains a Windows reserved device name component" % context
+        )
     pure = PurePosixPath(relative)
     if pure.is_absolute() or tuple(pure.parts) != tuple(raw_parts):
         raise ValueError("%s is not a canonical relative POSIX path" % context)

@@ -261,6 +261,21 @@ NFC_FIXTURE_PATH = (
 NFD_ALIAS_FIXTURE_PATH = (
     "cases/core/core-py-test/REPOSITORY/base/src/cafe\u0301.py"
 )
+WIN32_TRAILING_WRITABLE_PATHS = (
+    "cases/core/core-py-test/Repository./base/src/input.py",
+    "cases/core/core-py-test/repository /base/src/input.py",
+    "cases/core/core-py-test/RePoSiToRy./base/src/input.py",
+    "cases/core/core-py-test/R\u00c9POSITORY./base/src/input.py",
+    "cases/core/core-py-test/RE\u0301POSITORY /base/src/input.py",
+)
+WIN32_RESERVED_COMPONENTS = (
+    "CON",
+    "prn.txt",
+    "Aux",
+    "nul.json",
+    *("COM%d.py" % value for value in range(1, 10)),
+    *("lpt%d.data" % value for value in range(1, 10)),
+)
 
 
 def test_authoring_module_exposes_only_the_core_v2_projection(
@@ -691,6 +706,157 @@ def test_existing_inventory_reports_and_rejects_portable_aliases(
     with pytest.raises(RuntimeError, match="unexpected portable alias"):
         authoring_module.write_outputs(eval_root, plan)
     assert writes == []
+
+
+@pytest.mark.parametrize("relative", WIN32_TRAILING_WRITABLE_PATHS)
+def test_write_rejects_win32_trailing_dot_or_space_before_writer_call(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={relative: b"attacker replacement"},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, target, _data: writes.append(target),
+    )
+
+    with pytest.raises(ValueError, match="Windows trailing dot or space"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "cases/core/core-py-test/repository./base/src/input.py",
+        "cases/core/core-py-test/repository/base /src/input.py",
+        "cases/core/core-py-test/repository/base/src/cafe\u0301.py ",
+    ),
+)
+def test_check_only_fixture_rejects_win32_trailing_dot_or_space(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    plan = _build_plan(
+        authoring_module,
+        check_only_fixtures={relative: b"fixture"},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, target, _data: writes.append(target),
+    )
+
+    with pytest.raises(ValueError, match="Windows trailing dot or space"):
+        authoring_module.check_outputs(eval_root, plan)
+    with pytest.raises(ValueError, match="Windows trailing dot or space"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+
+
+@pytest.mark.parametrize("component", WIN32_RESERVED_COMPONENTS)
+def test_write_rejects_windows_reserved_device_component_before_writer_call(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    relative = "cases/core/core-py-test/%s/case.json" % component
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={relative: b"attacker replacement"},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, target, _data: writes.append(target),
+    )
+
+    with pytest.raises(ValueError, match="Windows reserved device name"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "cases/core/core-py-test/repository/base/src/CON.py",
+        "cases/core/core-py-test/repository/base/AUX/input.py",
+    ),
+)
+def test_check_only_reserved_device_rejects_before_writer_call(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    plan = _build_plan(
+        authoring_module,
+        check_only_fixtures={relative: b"fixture"},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, target, _data: writes.append(target),
+    )
+
+    with pytest.raises(ValueError, match="Windows reserved device name"):
+        authoring_module.check_outputs(eval_root, plan)
+    with pytest.raises(ValueError, match="Windows reserved device name"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "cases/core/core-py-test/Repository./base/src/input.py",
+        "cases/core/core-py-test/CON/case.json",
+    ),
+)
+def test_existing_inventory_rejects_nonportable_win32_component(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    (eval_root / "cases" / "core").mkdir(parents=True)
+
+    def nonportable_inventory(_root: Path, _eval_root: Path) -> Iterator[str]:
+        yield relative
+
+    monkeypatch.setattr(
+        authoring_module,
+        "_walk_generated_files",
+        nonportable_inventory,
+    )
+
+    with pytest.raises(ValueError, match="Windows"):
+        authoring_module._existing_generated_files(eval_root)
 
 
 def test_check_reports_drifted_and_missing_check_only_fixtures(
