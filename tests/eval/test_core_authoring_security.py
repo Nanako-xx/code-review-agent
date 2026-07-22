@@ -252,6 +252,15 @@ FIXTURE_HEAD_PATH = (
     "cases/core/core-py-test/repository/head/src/input.py"
 )
 DERIVED_CASE_PATH = "cases/core/core-py-test/case.json"
+CASE_ALIAS_FIXTURE_PATH = (
+    "cases/core/core-py-test/Repository/base/src/input.py"
+)
+NFC_FIXTURE_PATH = (
+    "cases/core/core-py-test/repository/base/src/caf\u00e9.py"
+)
+NFD_ALIAS_FIXTURE_PATH = (
+    "cases/core/core-py-test/REPOSITORY/base/src/cafe\u0301.py"
+)
 
 
 def test_authoring_module_exposes_only_the_core_v2_projection(
@@ -445,8 +454,243 @@ def test_write_never_targets_check_only_repository_fixture_paths(
     authoring_module.write_outputs(eval_root, plan)
 
     assert writes == [DERIVED_CASE_PATH]
-    assert not any("/repository/base/" in item for item in writes)
-    assert not any("/repository/head/" in item for item in writes)
+    portable_writes = [
+        authoring_module._portable_path_identity(
+            authoring_module._safe_relative_parts(
+                item,
+                context="test writer path",
+            )
+        )
+        for item in writes
+    ]
+    assert not any("/repository/base/" in item for item in portable_writes)
+    assert not any("/repository/head/" in item for item in portable_writes)
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    (
+        (CASE_ALIAS_FIXTURE_PATH, FIXTURE_BASE_PATH),
+        (NFD_ALIAS_FIXTURE_PATH, NFC_FIXTURE_PATH),
+    ),
+)
+def test_portable_path_identity_normalizes_case_and_unicode_equivalents(
+    authoring_module: ModuleType,
+    left: str,
+    right: str,
+) -> None:
+    left_parts = authoring_module._safe_relative_parts(
+        left,
+        context="left test path",
+    )
+    right_parts = authoring_module._safe_relative_parts(
+        right,
+        context="right test path",
+    )
+
+    assert authoring_module._portable_path_identity(left_parts) == (
+        authoring_module._portable_path_identity(right_parts)
+    )
+
+
+@pytest.mark.parametrize(
+    ("writable_alias", "fixture_path"),
+    (
+        (CASE_ALIAS_FIXTURE_PATH, FIXTURE_BASE_PATH),
+        (NFD_ALIAS_FIXTURE_PATH, NFC_FIXTURE_PATH),
+    ),
+)
+def test_write_rejects_portable_cross_set_alias_before_writer_call(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writable_alias: str,
+    fixture_path: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    fixture_bytes = b"immutable fixture"
+    fixture = _write_test_file(eval_root, fixture_path, fixture_bytes)
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={writable_alias: b"attacker replacement"},
+        check_only_fixtures={fixture_path: fixture_bytes},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+
+    with pytest.raises(ValueError, match="ownership sets overlap portably"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+    assert fixture.read_bytes() == fixture_bytes
+
+
+@pytest.mark.parametrize(
+    "writable_alias",
+    (
+        CASE_ALIAS_FIXTURE_PATH,
+        FIXTURE_BASE_PATH.replace("/repository/", "/REPOSITORY/"),
+    ),
+)
+def test_write_rejects_repository_case_alias_without_fixture_overlap(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writable_alias: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={writable_alias: b"attacker replacement"},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+
+    with pytest.raises(ValueError, match="cannot target a Repository fixture path"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+
+
+@pytest.mark.parametrize(
+    ("writable_outputs", "check_only_fixtures", "label"),
+    (
+        (
+            {
+                DERIVED_CASE_PATH: b"first",
+                "cases/core/core-py-test/CASE.json": b"second",
+            },
+            {},
+            "writable output",
+        ),
+        (
+            {},
+            {
+                FIXTURE_BASE_PATH: b"first",
+                "cases/core/core-py-test/repository/base/src/INPUT.py": b"second",
+            },
+            "check-only fixture",
+        ),
+    ),
+)
+def test_build_plan_rejects_portable_collision_within_each_ownership_set(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writable_outputs: dict[str, bytes],
+    check_only_fixtures: dict[str, bytes],
+    label: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs=writable_outputs,
+        check_only_fixtures=check_only_fixtures,
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+
+    with pytest.raises(ValueError, match=label + " paths collide portably"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    (
+        (
+            DERIVED_CASE_PATH,
+            "cases/core/core-py-test/CASE.json",
+        ),
+        (
+            "cases/core/core-py-test/caf\u00e9.json",
+            "cases/core/core-py-test/cafe\u0301.json",
+        ),
+    ),
+)
+def test_existing_inventory_rejects_portable_collisions_without_set_collapse(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first: str,
+    second: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    (eval_root / "cases" / "core").mkdir(parents=True)
+
+    def colliding_inventory(_root: Path, _eval_root: Path) -> Iterator[str]:
+        yield first
+        yield second
+
+    monkeypatch.setattr(
+        authoring_module,
+        "_walk_generated_files",
+        colliding_inventory,
+    )
+
+    with pytest.raises(RuntimeError, match="existing Core files collide portably"):
+        authoring_module._existing_generated_files(eval_root)
+
+
+@pytest.mark.parametrize(
+    ("expected", "existing_alias"),
+    (
+        (
+            DERIVED_CASE_PATH,
+            "cases/core/core-py-test/CASE.json",
+        ),
+        (
+            "cases/core/core-py-test/caf\u00e9.json",
+            "cases/core/core-py-test/cafe\u0301.json",
+        ),
+    ),
+)
+def test_existing_inventory_reports_and_rejects_portable_aliases(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected: str,
+    existing_alias: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    payload = b"derived"
+    _write_test_file(eval_root, existing_alias, payload)
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={expected: payload},
+    )
+    alias_error = (
+        "unexpected portable alias: %s (expected %s)"
+        % (existing_alias, expected)
+    )
+
+    assert alias_error in authoring_module.check_outputs(eval_root, plan)
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+    with pytest.raises(RuntimeError, match="unexpected portable alias"):
+        authoring_module.write_outputs(eval_root, plan)
+    assert writes == []
 
 
 def test_check_reports_drifted_and_missing_check_only_fixtures(

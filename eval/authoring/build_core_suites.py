@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 import stat
 import sys
 import tempfile
+import unicodedata
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
@@ -128,6 +129,13 @@ class CoreBuildPlan:
             "check_only_fixtures",
             MappingProxyType(dict(self.check_only_fixtures)),
         )
+
+
+@dataclass(frozen=True)
+class _ValidatedBuildPlanOwnership:
+    writable_by_portable_key: Mapping[str, str]
+    fixtures_by_portable_key: Mapping[str, str]
+    known_by_portable_key: Mapping[str, str]
 
 
 def _claim(
@@ -2639,14 +2647,24 @@ def _walk_generated_files(root: Path, eval_root: Path) -> Iterable[str]:
             yield path.relative_to(eval_root).as_posix()
 
 
-def _existing_generated_files(eval_root: Path) -> set[str]:
+def _portable_path_identity(parts: tuple[str, ...]) -> str:
+    return "/".join(
+        unicodedata.normalize(
+            "NFC",
+            unicodedata.normalize("NFC", part).casefold(),
+        )
+        for part in parts
+    )
+
+
+def _existing_generated_files(eval_root: Path) -> dict[str, str]:
     eval_root = _assert_safe_root(eval_root, context="Eval authoring root")
     roots = (
         ("cases", "core"),
         ("suites", "core-regression"),
         ("suites", "core-capability"),
     )
-    result: set[str] = set()
+    result: dict[str, str] = {}
     for parts in roots:
         root = _safe_directory(
             eval_root,
@@ -2656,11 +2674,24 @@ def _existing_generated_files(eval_root: Path) -> set[str]:
         )
         if not os.path.lexists(root):
             continue
-        result.update(_walk_generated_files(root, eval_root))
+        for relative in _walk_generated_files(root, eval_root):
+            relative_parts = _safe_relative_parts(
+                relative,
+                context="existing Core file path",
+            )
+            portable_key = _portable_path_identity(relative_parts)
+            previous = result.get(portable_key)
+            if previous is not None and previous != relative:
+                raise RuntimeError(
+                    "existing Core files collide portably: %s and %s"
+                    % (previous, relative)
+                )
+            result[portable_key] = relative
     return result
 
 
-def _is_repository_path(parts: tuple[str, ...]) -> bool:
+def _is_repository_path(portable_key: str) -> bool:
+    parts = tuple(portable_key.split("/"))
     return (
         len(parts) >= 4
         and parts[:2] == ("cases", "core")
@@ -2668,45 +2699,75 @@ def _is_repository_path(parts: tuple[str, ...]) -> bool:
     )
 
 
-def _is_repository_fixture_path(parts: tuple[str, ...]) -> bool:
+def _is_repository_fixture_path(portable_key: str) -> bool:
+    parts = tuple(portable_key.split("/"))
     return (
         len(parts) >= 6
-        and _is_repository_path(parts)
+        and _is_repository_path(portable_key)
         and parts[4] in {"base", "head"}
     )
 
 
-def _validated_plan_paths(plan: CoreBuildPlan) -> tuple[set[str], set[str]]:
+def _portable_output_paths(
+    outputs: Mapping[str, bytes],
+    *,
+    label: str,
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for relative, data in outputs.items():
+        parts = _safe_relative_parts(relative, context=label + " path")
+        if type(data) is not bytes:
+            raise TypeError(label + " values must be bytes")
+        portable_key = _portable_path_identity(parts)
+        previous = result.get(portable_key)
+        if previous is not None:
+            raise ValueError(
+                "%s paths collide portably: %s and %s"
+                % (label, previous, relative)
+            )
+        result[portable_key] = relative
+    return result
+
+
+def _validated_plan_paths(plan: CoreBuildPlan) -> _ValidatedBuildPlanOwnership:
     if type(plan) is not CoreBuildPlan:
         raise TypeError("Core authoring requires a CoreBuildPlan")
-    writable_paths: set[str] = set()
-    fixture_paths: set[str] = set()
-    for relative, data in plan.writable_outputs.items():
-        parts = _safe_relative_parts(relative, context="writable output path")
-        if type(data) is not bytes:
-            raise TypeError("writable output values must be bytes")
-        if _is_repository_path(parts):
+    writable_paths = _portable_output_paths(
+        plan.writable_outputs,
+        label="writable output",
+    )
+    fixture_paths = _portable_output_paths(
+        plan.check_only_fixtures,
+        label="check-only fixture",
+    )
+    overlap = set(writable_paths) & set(fixture_paths)
+    if overlap:
+        aliases = [
+            "%s and %s" % (writable_paths[key], fixture_paths[key])
+            for key in sorted(overlap)
+        ]
+        raise ValueError(
+            "build-plan ownership sets overlap portably: " + ", ".join(aliases)
+        )
+    for portable_key, relative in writable_paths.items():
+        if _is_repository_path(portable_key):
             raise ValueError(
                 "writable output cannot target a Repository fixture path: %s"
                 % relative
             )
-        writable_paths.add(relative)
-    for relative, data in plan.check_only_fixtures.items():
-        parts = _safe_relative_parts(relative, context="check-only fixture path")
-        if type(data) is not bytes:
-            raise TypeError("check-only fixture values must be bytes")
-        if not _is_repository_fixture_path(parts):
+    for portable_key, relative in fixture_paths.items():
+        if not _is_repository_fixture_path(portable_key):
             raise ValueError(
                 "check-only fixture must be under repository/base or repository/head: %s"
                 % relative
             )
-        fixture_paths.add(relative)
-    overlap = writable_paths & fixture_paths
-    if overlap:
-        raise ValueError(
-            "build-plan ownership sets overlap: " + ", ".join(sorted(overlap))
-        )
-    return writable_paths, fixture_paths
+    known_paths = dict(writable_paths)
+    known_paths.update(fixture_paths)
+    return _ValidatedBuildPlanOwnership(
+        writable_by_portable_key=MappingProxyType(writable_paths),
+        fixtures_by_portable_key=MappingProxyType(fixture_paths),
+        known_by_portable_key=MappingProxyType(known_paths),
+    )
 
 
 def _check_expected_files(
@@ -2737,8 +2798,28 @@ def _check_expected_files(
     return errors
 
 
+def _inventory_errors(
+    existing_by_portable_key: Mapping[str, str],
+    known_by_portable_key: Mapping[str, str],
+) -> list[str]:
+    errors: list[str] = []
+    for portable_key, relative in sorted(
+        existing_by_portable_key.items(),
+        key=lambda item: item[1],
+    ):
+        expected = known_by_portable_key.get(portable_key)
+        if expected is None:
+            errors.append("unexpected: " + relative)
+        elif relative != expected:
+            errors.append(
+                "unexpected portable alias: %s (expected %s)"
+                % (relative, expected)
+            )
+    return errors
+
+
 def check_outputs(eval_root: Path, plan: CoreBuildPlan) -> list[str]:
-    writable_paths, fixture_paths = _validated_plan_paths(plan)
+    ownership = _validated_plan_paths(plan)
     errors = _check_expected_files(
         eval_root,
         plan.writable_outputs,
@@ -2751,14 +2832,17 @@ def check_outputs(eval_root: Path, plan: CoreBuildPlan) -> list[str]:
             label="check-only fixture",
         )
     )
-    known_paths = writable_paths | fixture_paths
-    for relative in sorted(_existing_generated_files(eval_root) - known_paths):
-        errors.append("unexpected: " + relative)
+    errors.extend(
+        _inventory_errors(
+            _existing_generated_files(eval_root),
+            ownership.known_by_portable_key,
+        )
+    )
     return errors
 
 
 def write_outputs(eval_root: Path, plan: CoreBuildPlan) -> None:
-    writable_paths, fixture_paths = _validated_plan_paths(plan)
+    ownership = _validated_plan_paths(plan)
     fixture_errors = _check_expected_files(
         eval_root,
         plan.check_only_fixtures,
@@ -2768,12 +2852,14 @@ def write_outputs(eval_root: Path, plan: CoreBuildPlan) -> None:
         raise RuntimeError(
             "check-only fixture validation failed: " + "; ".join(fixture_errors)
         )
-    known_paths = writable_paths | fixture_paths
-    unexpected = _existing_generated_files(eval_root) - known_paths
-    if unexpected:
+    inventory_errors = _inventory_errors(
+        _existing_generated_files(eval_root),
+        ownership.known_by_portable_key,
+    )
+    if inventory_errors:
         raise RuntimeError(
-            "refusing to delete unexpected generated files: "
-            + ", ".join(sorted(unexpected))
+            "refusing to write with unexpected generated files: "
+            + "; ".join(inventory_errors)
         )
     for relative, data in sorted(plan.writable_outputs.items()):
         _write_bytes_safely(eval_root, relative, data)
