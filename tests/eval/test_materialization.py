@@ -152,6 +152,7 @@ def _make_request(
         suite_case=suite_case,
         attempt=1,
         wire_contract=wire,
+        suite_preparation_binding=None,
         suite_preparation_binding_digest=None,
         adapter_capabilities=capabilities,
     )

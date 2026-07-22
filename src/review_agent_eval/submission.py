@@ -23,6 +23,7 @@ from .models import (
     SubmissionStatus,
     SubmissionUsage,
     TraceRef,
+    TraceType,
     _strict_json_loads,
     submission_status_for_failure,
 )
@@ -112,6 +113,16 @@ def validate_submission_binding(
     if not isinstance(submission, EvalSubmission):
         raise TypeError("submission must be EvalSubmission")
     if (
+        submission.failure is not None
+        and submission.failure.code
+        is FailureCode.HARNESS_MATERIALIZATION_ERROR
+    ):
+        raise AgentAdapterError(
+            FailureCode.SCHEMA_MISMATCH,
+            "Agent output may not claim a Harness-owned failure code",
+            retryable=False,
+        )
+    if (
         submission.task_id != eval_input.task_id
         or submission.task_id != config.task_id
     ):
@@ -147,19 +158,72 @@ def validate_submission_binding(
             "Agent output trial identity does not match the invocation",
             retryable=False,
         )
-    if clarification_transcript is not None:
-        expected = tuple(clarification_transcript)
-        actual: Tuple[SubmissionClarificationExchange, ...] = (
-            ()
-            if submission.intent is None
-            else submission.intent.clarification_questions
+    if any(
+        item.source.kind not in config.adapter_capabilities.evidence_kinds
+        for item in submission.evidence
+    ):
+        raise AgentAdapterError(
+            FailureCode.SCHEMA_MISMATCH,
+            "Agent output evidence kind was not declared by its Adapter",
+            retryable=False,
         )
+
+    trace_protocol = config.adapter_capabilities.trace_protocol
+    if trace_protocol == "local-trace-v2":
+        if (
+            submission.trace_ref is not None
+            and submission.trace_ref.type is not TraceType.LOCAL_PATH
+        ):
+            raise AgentAdapterError(
+                FailureCode.SCHEMA_MISMATCH,
+                "Agent output trace does not match its declared protocol",
+                retryable=False,
+            )
+    elif trace_protocol == "none-v2":
+        if submission.trace_ref is not None:
+            raise AgentAdapterError(
+                FailureCode.SCHEMA_MISMATCH,
+                "Agent output trace is forbidden by its declared protocol",
+                retryable=False,
+            )
+    else:
+        raise AgentAdapterError(
+            FailureCode.SCHEMA_MISMATCH,
+            "Agent output trace protocol is unsupported",
+            retryable=False,
+        )
+
+    expected = (
+        ()
+        if clarification_transcript is None
+        else tuple(clarification_transcript)
+    )
+    actual: Tuple[SubmissionClarificationExchange, ...] = (
+        ()
+        if submission.intent is None
+        else submission.intent.clarification_questions
+    )
+    clarification_protocol = config.adapter_capabilities.clarification_protocol
+    if clarification_protocol == "none-v2":
+        if actual or expected:
+            raise AgentAdapterError(
+                FailureCode.SCHEMA_MISMATCH,
+                "Agent output clarification is forbidden by its declared protocol",
+                retryable=False,
+            )
+    elif clarification_protocol == "canonical-clarification-v2":
         if actual != expected:
             raise AgentAdapterError(
                 FailureCode.SCHEMA_MISMATCH,
                 "Agent output clarification transcript does not match the channel",
                 retryable=False,
             )
+    else:
+        raise AgentAdapterError(
+            FailureCode.SCHEMA_MISMATCH,
+            "Agent output clarification protocol is unsupported",
+            retryable=False,
+        )
     return submission
 
 

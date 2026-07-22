@@ -12,6 +12,7 @@ from review_agent_eval.adapters.agent_factory import (
     AgentAdapterConfigError,
     CURRENT_AGENT_ADAPTER_KIND,
     SUBPROCESS_JSON_ADAPTER_KIND,
+    adapter_capabilities_from_snapshot,
     build_agent_adapter_factory,
 )
 from review_agent_eval.adapters.current_agent import CurrentAgentAdapter
@@ -22,7 +23,10 @@ from review_agent_eval.adapters.model_adapter import (
     build_judge_model_adapter_factory,
     build_model_adapter_factory_from_config,
 )
-from review_agent_eval.adapters.subprocess_agent import SubprocessAgentAdapter
+from review_agent_eval.adapters.subprocess_agent import (
+    SubprocessAgentAdapter,
+    subprocess_adapter_capabilities,
+)
 from review_agent_eval.config import AgentConfigSnapshot, JudgeExecutionBudgets
 
 
@@ -63,6 +67,7 @@ def _agent_snapshot(
                 "{workspace}",
             ],
             "environment_allowlist": [],
+            "capabilities": subprocess_adapter_capabilities().to_dict(),
         }
     return AgentConfigSnapshot(
         agent_id="agent-boundary",
@@ -197,14 +202,50 @@ def test_eval_model_config_rejects_credential_bearing_endpoint(bad_url: str) -> 
 
 def test_agent_factory_returns_fresh_adapters_for_supported_snapshot_kinds() -> None:
     current_snapshot = _agent_snapshot(CURRENT_AGENT_ADAPTER_KIND)
+    assert adapter_capabilities_from_snapshot(current_snapshot).adapter_id == (
+        CURRENT_AGENT_ADAPTER_KIND
+    )
     current_factory = build_agent_adapter_factory(current_snapshot)
     assert isinstance(current_factory(), CurrentAgentAdapter)
     assert current_factory() is not current_factory()
 
     subprocess_snapshot = _agent_snapshot(SUBPROCESS_JSON_ADAPTER_KIND)
+    assert adapter_capabilities_from_snapshot(subprocess_snapshot) == (
+        subprocess_adapter_capabilities()
+    )
     subprocess_factory = build_agent_adapter_factory(subprocess_snapshot)
     assert isinstance(subprocess_factory(), SubprocessAgentAdapter)
     assert subprocess_factory() is not subprocess_factory()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("adapter_id", "other-subprocess-adapter"),
+        ("adapter_version", "3"),
+        ("subprocess_wire_version", "subprocess-json-v3"),
+        ("input_schema_version", "eval_input_v3"),
+        ("submission_schema_version", "eval_submission_v3"),
+    ],
+)
+def test_agent_factory_rejects_subprocess_capability_identity_drift(
+    field: str,
+    value: str,
+) -> None:
+    capabilities = subprocess_adapter_capabilities().to_dict()
+    capabilities[field] = value
+    snapshot = _agent_snapshot(
+        SUBPROCESS_JSON_ADAPTER_KIND,
+        adapter_override={
+            "kind": SUBPROCESS_JSON_ADAPTER_KIND,
+            "command": [str(Path(sys.executable).resolve())],
+            "environment_allowlist": [],
+            "capabilities": capabilities,
+        },
+    )
+
+    with pytest.raises(AgentAdapterConfigError, match="capabilities"):
+        build_agent_adapter_factory(snapshot)
 
 
 @pytest.mark.parametrize(

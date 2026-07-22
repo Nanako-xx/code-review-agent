@@ -14,12 +14,19 @@ from dataclasses import dataclass
 import re
 from typing import Any, Callable, Protocol
 
-from ..config import AgentConfigSnapshot
+from ..config import AdapterCapabilitiesV2, AgentConfigSnapshot
+from ..models import EVAL_INPUT_SCHEMA_VERSION, EVAL_SUBMISSION_SCHEMA_VERSION
 from .base import AgentUnderTestAdapter
 
 
-CURRENT_AGENT_ADAPTER_KIND = "current-agent-cli-v1"
-SUBPROCESS_JSON_ADAPTER_KIND = "subprocess-json-v1"
+CURRENT_AGENT_ADAPTER_KIND = "current-agent-cli-v2"
+CURRENT_AGENT_ADAPTER_VERSION = "2"
+SUBPROCESS_JSON_ADAPTER_KIND = "subprocess-json-v2"
+SUBPROCESS_JSON_ADAPTER_VERSION = "2"
+SUBPROCESS_WIRE_VERSION = "subprocess-json-v2"
+SUBPROCESS_CLARIFICATION_PROTOCOL = "none-v2"
+SUBPROCESS_TRACE_PROTOCOL = "local-trace-v2"
+SUBPROCESS_ISOLATION_PROFILE = "target-workspace-v2"
 
 _CURRENT_FIELDS = frozenset(
     {
@@ -30,7 +37,9 @@ _CURRENT_FIELDS = frozenset(
         "memory_mode",
     }
 )
-_SUBPROCESS_FIELDS = frozenset({"kind", "command", "environment_allowlist"})
+_SUBPROCESS_FIELDS = frozenset(
+    {"kind", "command", "environment_allowlist", "capabilities"}
+)
 _ENVIRONMENT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _PLACEHOLDER_RE = re.compile(r"\{(agent_id|task_id|trial_id|workspace)\}")
 _MAX_ARGUMENTS = 256
@@ -40,6 +49,8 @@ _JUDGE_OPTION_RE = re.compile(
     r"^--(?:eval-)?(?:judge|evaluator)(?:-|$)",
     re.IGNORECASE,
 )
+
+
 class AgentAdapterConfigError(ValueError):
     """The frozen Agent snapshot cannot be used by a supported adapter."""
 
@@ -125,6 +136,22 @@ def build_agent_adapter_from_snapshot(
 build_agent_adapter = build_agent_adapter_from_snapshot
 
 
+def adapter_capabilities_from_snapshot(
+    snapshot: AgentConfigSnapshot,
+) -> AdapterCapabilitiesV2:
+    """Return the capability declaration frozen into an Agent snapshot."""
+
+    kind = _validate_snapshot(snapshot)
+    if kind == CURRENT_AGENT_ADAPTER_KIND:
+        from .current_agent import current_agent_capabilities
+
+        return current_agent_capabilities()
+    raw = snapshot.parameters["adapter"]
+    if not isinstance(raw, Mapping):
+        raise AgentAdapterConfigError("agent.parameters.adapter is required")
+    return _validate_subprocess_capabilities(raw["capabilities"])
+
+
 def _validate_snapshot(snapshot: AgentConfigSnapshot) -> str:
     if type(snapshot) is not AgentConfigSnapshot:
         raise TypeError("snapshot must be an AgentConfigSnapshot")
@@ -146,7 +173,7 @@ def _validate_snapshot(snapshot: AgentConfigSnapshot) -> str:
     else:
         raise AgentAdapterConfigError("unsupported Agent adapter kind")
     if set(raw) != expected:
-        raise AgentAdapterConfigError("Agent adapter fields do not match its v1 schema")
+        raise AgentAdapterConfigError("Agent adapter fields do not match its v2 schema")
 
     _validate_command(raw["command"], kind=kind)
     _validate_environment_allowlist(raw["environment_allowlist"])
@@ -161,7 +188,47 @@ def _validate_snapshot(snapshot: AgentConfigSnapshot) -> str:
         _validate_current_model_identity(snapshot, review_arguments)
         if raw["memory_mode"] not in {"off", "read", "read-write"}:
             raise AgentAdapterConfigError("current Agent memory_mode is invalid")
+    else:
+        _validate_subprocess_capabilities(raw["capabilities"])
     return kind
+
+
+def _validate_subprocess_capabilities(value: Any) -> AdapterCapabilitiesV2:
+    try:
+        capabilities = AdapterCapabilitiesV2.from_dict(
+            _plain_json_value(value)
+        )
+    except (TypeError, ValueError) as exc:
+        raise AgentAdapterConfigError(
+            "subprocess Agent capabilities are invalid"
+        ) from exc
+    if (
+        capabilities.adapter_id != SUBPROCESS_JSON_ADAPTER_KIND
+        or capabilities.adapter_version != SUBPROCESS_JSON_ADAPTER_VERSION
+        or capabilities.subprocess_wire_version != SUBPROCESS_WIRE_VERSION
+        or capabilities.input_schema_version != EVAL_INPUT_SCHEMA_VERSION
+        or capabilities.submission_schema_version
+        != EVAL_SUBMISSION_SCHEMA_VERSION
+        or capabilities.clarification_protocol
+        != SUBPROCESS_CLARIFICATION_PROTOCOL
+        or capabilities.trace_protocol != SUBPROCESS_TRACE_PROTOCOL
+        or capabilities.isolation_profile != SUBPROCESS_ISOLATION_PROFILE
+    ):
+        raise AgentAdapterConfigError(
+            "subprocess Agent capabilities do not match subprocess-json-v2"
+        )
+    return capabilities
+
+
+def _plain_json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _plain_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_plain_json_value(item) for item in value]
+    return value
 
 
 def _is_judge_namespace_key(value: Any) -> bool:
@@ -303,8 +370,12 @@ __all__ = [
     "AgentAdapterConfigError",
     "AgentAdapterFactory",
     "CURRENT_AGENT_ADAPTER_KIND",
+    "CURRENT_AGENT_ADAPTER_VERSION",
     "SUBPROCESS_JSON_ADAPTER_KIND",
+    "SUBPROCESS_JSON_ADAPTER_VERSION",
+    "SUBPROCESS_WIRE_VERSION",
     "SnapshotAgentAdapterFactory",
+    "adapter_capabilities_from_snapshot",
     "build_agent_adapter",
     "build_agent_adapter_factory",
     "build_agent_adapter_from_snapshot",

@@ -4759,14 +4759,33 @@ class ArtifactStore:
         failure_code = (
             None if submission.failure is None else submission.failure.code
         )
+        if failure_code is FailureCode.HARNESS_MATERIALIZATION_ERROR and (
+            submission.failure is None
+            or submission.failure.retryable
+            or submission.trace_ref is not None
+            or submission.usage.input_tokens is not None
+            or submission.usage.output_tokens is not None
+            or submission.usage.total_tokens is not None
+            or submission.usage.tool_calls is not None
+            or submission.usage.cost_amount is not None
+            or submission.usage.cost_currency is not None
+        ):
+            reject(
+                "Harness-owned materialization failure contains Agent-owned metadata"
+            )
         if has_prepare:
-            if failure_code is FailureCode.HARNESS_MATERIALIZATION_ERROR:
-                reject(
-                    "harness materialization failure cannot follow a committed Prepare"
-                )
             if submission.target_materialization_id != target_binding:
                 reject(
                     "Submission target differs from active materialization binding"
+                )
+            if failure_code is FailureCode.HARNESS_MATERIALIZATION_ERROR and (
+                submission.status is not SubmissionStatus.FAILED
+                or submission.intent is not None
+                or submission.review is not None
+                or submission.evidence
+            ):
+                reject(
+                    "post-Prepare materialization failure contains Agent output"
                 )
             return
 
@@ -4775,6 +4794,7 @@ class ArtifactStore:
             or failure_code is not FailureCode.HARNESS_MATERIALIZATION_ERROR
             or submission.intent is not None
             or submission.review is not None
+            or submission.evidence
         ):
             reject(
                 "terminal Submission requires a committed prepare receipt"
@@ -5879,10 +5899,6 @@ class ArtifactStore:
             prepare=None,
             budget=_ReadBudget(self.max_total_read_bytes),
         )
-        if has_prepare and failure_code is FailureCode.HARNESS_MATERIALIZATION_ERROR:
-            raise SchemaError(
-                "harness materialization failure cannot follow a committed Prepare"
-            )
         effective_failure_code = (
             failure_code
             if has_prepare

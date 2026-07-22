@@ -1260,6 +1260,58 @@ def test_finalize_without_prepare_accepts_only_canonical_harness_binding(tmp_pat
     ) == submission
 
 
+def test_pre_materialization_harness_failure_rejects_evidence_without_mutation(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    eval_input = make_input()
+    expected_binding = artifact_module.derive_pre_materialization_failure_binding(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=running.active_attempt,
+        eval_input_digest=plan.eval_input_digest,
+        review_target_digest=eval_input.review_target.digest(),
+    )
+    payload = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id=expected_binding,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    ).to_dict()
+    excerpt = "Agent-supplied evidence"
+    payload["evidence"] = [
+        {
+            "evidence_id": "evidence-forged-harness",
+            "source": {
+                "kind": "repository_file",
+                "target_materialization_id": expected_binding,
+                "revision": eval_input.review_target.repository.head_revision,
+                "path": "app.py",
+                "from_line": 1,
+                "to_line": 1,
+            },
+            "content_hash": hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+            "excerpt": excerpt,
+        }
+    ]
+    submission = EvalSubmission.from_dict(payload)
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(SchemaError, match="requires a committed prepare receipt"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
 def test_finalize_rejects_arbitrary_pre_materialization_binding_without_mutation(
     tmp_path,
 ):
@@ -2272,19 +2324,64 @@ def test_abandonment_after_prepare_uses_committed_materialization_binding(tmp_pa
     assert submission.failure.code is FailureCode.PROCESS_KILLED
 
 
-def test_abandonment_rejects_harness_failure_after_prepare_without_mutation(
+def test_abandonment_allows_harness_failure_after_prepare_with_bound_identity(
     tmp_path,
 ):
     store, config, _, plan, _ = make_store(tmp_path)
-    prepare_active_trial(store, config, plan)
+    _running, materialization = prepare_active_trial(store, config, plan)
+
+    state = store.abandon_trial(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    )
+    submission = store.load_existing_submission(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+    )
+
+    assert state.status is TrialStatus.FAILED
+    assert submission.target_materialization_id == materialization.materialization_id
+    assert submission.failure is not None
+    assert submission.failure.code is FailureCode.HARNESS_MATERIALIZATION_ERROR
+
+
+def test_harness_materialization_failure_rejects_agent_owned_metadata(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    payload = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id=materialization.materialization_id,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+        include_trace=True,
+    ).to_dict()
+    payload["failure"]["retryable"] = True
+    payload["usage"].update(
+        {
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "total_tokens": 3,
+            "tool_calls": 1,
+            "cost_amount": 1,
+            "cost_currency": "USD",
+        }
+    )
+    submission = EvalSubmission.from_dict(payload)
     before = trial_artifact_snapshot(store, config, plan)
 
-    with pytest.raises(SchemaError, match="cannot follow"):
-        store.abandon_trial(
+    with pytest.raises(SchemaError, match="Agent-owned metadata"):
+        store.finalize_submission(
             config.run_id,
             TASK_ID,
             plan.trial_id,
-            failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
         )
 
     assert trial_artifact_snapshot(store, config, plan) == before

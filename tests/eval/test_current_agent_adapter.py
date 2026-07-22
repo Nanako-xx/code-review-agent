@@ -24,22 +24,35 @@ from review_agent.run_state import RunPhase
 from review_agent.session_store import SessionStore
 from review_agent_eval.adapters.base import (
     AdapterIncompatibilityReason,
+    AgentAdapterError,
     AgentAdapterIncompatibleError,
     AgentRunConfig,
     AgentUnderTestAdapter,
 )
 from review_agent_eval.adapters.current_agent import CurrentAgentAdapter
+from review_agent_eval.adapters.current_agent import (
+    CURRENT_AGENT_ADAPTER_KIND,
+    CURRENT_AGENT_ADAPTER_VERSION,
+    current_agent_capabilities,
+)
 from review_agent_eval.adapters.subprocess_agent import BoundedProcessResult
+from review_agent_eval.artifacts import TargetAccess
+from review_agent_eval.cases import REPOSITORY_MATERIALIZER_PROTOCOL, WireContractV2
 from review_agent_eval.clarification import canonical_material_claim_matcher_snapshot
 from review_agent_eval.config import AgentConfigSnapshot, ResourceBudgets, derive_trial_id
 from review_agent_eval.models import (
     ClarificationAction,
+    EVAL_CASE_SCHEMA_VERSION,
+    EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
     EvalInput,
     ExistingCIEvidence,
     FailureCode,
     IntentDimension,
     Repository,
+    RepositoryReviewTarget,
     RepositorySource,
+    ReviewTargetKind,
     ReviewRequest,
     SubmissionClarificationExchange,
     SubmissionStatus,
@@ -58,23 +71,32 @@ def _eval_input(
     return EvalInput(
         schema_version=EvalInput.SCHEMA_VERSION,
         task_id="task-current-adapter",
-        repository=Repository(
-            source=RepositorySource.FIXTURE,
-            path="repositories/current-adapter",
-            url=None,
-            base_revision=base,
-            head_revision=head,
-        ),
-        review_request=ReviewRequest(
-            title="Review the current Agent adapter",
-            description="Check the changed behavior without inventing evidence.",
-            user_intent="Keep the function behavior deterministic.",
-            review_focus="correctness",
-            linked_requirements=("REQ-CURRENT-1",),
-            project_rules=("Cite only inspected repository content.",),
-            existing_ci_evidence=existing_ci,
+        review_target=RepositoryReviewTarget(
+            kind=ReviewTargetKind.REPOSITORY,
+            repository=Repository(
+                source=RepositorySource.FIXTURE,
+                path="repositories/current-adapter",
+                url=None,
+                base_revision=base,
+                head_revision=head,
+            ),
+            review_request=ReviewRequest(
+                title="Review the current Agent adapter",
+                description="Check the changed behavior without inventing evidence.",
+                user_intent="Keep the function behavior deterministic.",
+                review_focus="correctness",
+                linked_requirements=("REQ-CURRENT-1",),
+                project_rules=("Cite only inspected repository content.",),
+                existing_ci_evidence=existing_ci,
+            ),
         ),
     )
+
+
+def _repository_target(eval_input: EvalInput) -> RepositoryReviewTarget:
+    target = eval_input.review_target
+    assert isinstance(target, RepositoryReviewTarget)
+    return target
 
 
 def _existing_ci(source_id: str, text: str) -> ExistingCIEvidence:
@@ -141,7 +163,7 @@ def _config(
     adapter: object
     if adapter_override is ...:
         adapter = {
-            "kind": "current-agent-cli-v1",
+            "kind": CURRENT_AGENT_ADAPTER_KIND,
             "command": list(
                 command
                 or (
@@ -170,10 +192,21 @@ def _config(
     run_id = stable_id("run", "current-adapter-tests", agent.digest())
     trial_id = derive_trial_id(run_id, eval_input.task_id, 1)
     matcher = canonical_material_claim_matcher_snapshot()
+    capabilities = current_agent_capabilities()
+    wire = WireContractV2(
+        case_schema_version=EVAL_CASE_SCHEMA_VERSION,
+        input_schema_version=EVAL_INPUT_SCHEMA_VERSION,
+        submission_schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
+        review_target_kind=ReviewTargetKind.REPOSITORY,
+        materializer_protocol=REPOSITORY_MATERIALIZER_PROTOCOL,
+    )
     return AgentRunConfig._from_verified_binding(
         run_id=run_id,
         task_id=eval_input.task_id,
         eval_input_digest=eval_input.digest(),
+        wire_contract=wire,
+        adapter_capabilities=capabilities,
+        adapter_capabilities_digest=capabilities.digest(),
         clarification_matcher=matcher,
         clarification_matcher_config_digest=matcher.digest(),
         trial_index=1,
@@ -188,6 +221,31 @@ def _config(
             max_execution_artifact_total_bytes=256 * 1024 * 1024,
             max_parallel_trials=1,
         ),
+    )
+
+
+def _run_current(
+    adapter: CurrentAgentAdapter,
+    eval_input: EvalInput,
+    workspace: Path,
+    config: AgentRunConfig,
+    channel: Any,
+):
+    materialization_id = stable_id(
+        "materialization",
+        config.trial_id,
+        config.eval_input_digest,
+    )
+    return adapter.run(
+        eval_input,
+        workspace,
+        config,
+        channel,
+        target_access=TargetAccess(
+            target_materialization_id=materialization_id,
+            readable_relative_paths=("target/repository",),
+        ),
+        target_materialization_id=materialization_id,
     )
 
 
@@ -262,10 +320,12 @@ def test_current_adapter_runs_formal_cli_and_uses_verified_session_artifacts(
     monkeypatch.setenv("PYTHONPATH", str(source_root))
     channel = _SkipChannel()
 
-    submission = CurrentAgentAdapter().run(
+    config = _config(eval_input, environment_allowlist=("PATH", "PYTHONPATH"))
+    submission = _run_current(
+        CurrentAgentAdapter(),
         eval_input,
         git_repo,
-        _config(eval_input, environment_allowlist=("PATH", "PYTHONPATH")),
+        config,
         channel,
     )
 
@@ -291,7 +351,7 @@ def test_current_adapter_runs_formal_cli_and_uses_verified_session_artifacts(
     request = json.loads((run_dir / "request.json").read_text(encoding="utf-8"))
     assert request["existing_ci_evidence"] == [
         _ci_cli_payload(item)
-        for item in eval_input.review_request.existing_ci_evidence
+        for item in _repository_target(eval_input).review_request.existing_ci_evidence
     ]
 
     original_brief = (run_dir / "review_brief.json").read_bytes()
@@ -317,29 +377,33 @@ def test_current_adapter_maps_awaiting_session_to_blocked_submission(
     eval_input = EvalInput(
         schema_version=eval_input.schema_version,
         task_id=eval_input.task_id,
-        repository=eval_input.repository,
-        review_request=ReviewRequest(
-            title=None,
-            description=None,
-            user_intent=None,
-            review_focus=None,
-            linked_requirements=(),
-            project_rules=(),
-            existing_ci_evidence=(),
+        review_target=replace(
+            _repository_target(eval_input),
+            review_request=ReviewRequest(
+                title=None,
+                description=None,
+                user_intent=None,
+                review_focus=None,
+                linked_requirements=(),
+                project_rules=(),
+                existing_ci_evidence=(),
+            ),
         ),
     )
     source_root = Path(__file__).resolve().parents[2] / "src"
     monkeypatch.setenv("PYTHONPATH", str(source_root))
     channel = _DeferChannel()
 
-    submission = CurrentAgentAdapter().run(
+    config = _config(
+        eval_input,
+        review_arguments=(),
+        environment_allowlist=("PATH", "PYTHONPATH"),
+    )
+    submission = _run_current(
+        CurrentAgentAdapter(),
         eval_input,
         git_repo,
-        _config(
-            eval_input,
-            review_arguments=(),
-            environment_allowlist=("PATH", "PYTHONPATH"),
-        ),
+        config,
         channel,
     )
 
@@ -377,11 +441,11 @@ def test_existing_ci_is_preflight_compatible() -> None:
 def test_current_adapter_exposes_stable_preflight_identity() -> None:
     adapter = CurrentAgentAdapter()
 
-    assert adapter.ADAPTER_KIND == "current-agent-cli-v1"
-    assert adapter.ADAPTER_VERSION == "1"
+    assert adapter.ADAPTER_KIND == CURRENT_AGENT_ADAPTER_KIND
+    assert adapter.ADAPTER_VERSION == CURRENT_AGENT_ADAPTER_VERSION
     assert runner_module._adapter_identity(adapter) == (
-        "current-agent-cli-v1",
-        "1",
+        CURRENT_AGENT_ADAPTER_KIND,
+        CURRENT_AGENT_ADAPTER_VERSION,
     )
 
 
@@ -429,18 +493,21 @@ def test_current_adapter_rejects_input_substitution_before_launch(
 ) -> None:
     original = _eval_input("a" * 40, "b" * 40)
     config = _config(original)
+    original_target = _repository_target(original)
     substituted = EvalInput(
         schema_version=original.schema_version,
         task_id=("task-substituted" if replace_task_id else original.task_id),
-        repository=original.repository,
-        review_request=ReviewRequest(
-            title=original.review_request.title,
-            description="Input content was substituted after Trial binding.",
-            user_intent=original.review_request.user_intent,
-            review_focus=original.review_request.review_focus,
-            linked_requirements=original.review_request.linked_requirements,
-            project_rules=original.review_request.project_rules,
-            existing_ci_evidence=original.review_request.existing_ci_evidence,
+        review_target=replace(
+            original_target,
+            review_request=ReviewRequest(
+                title=original_target.review_request.title,
+                description="Input content was substituted after Trial binding.",
+                user_intent=original_target.review_request.user_intent,
+                review_focus=original_target.review_request.review_focus,
+                linked_requirements=original_target.review_request.linked_requirements,
+                project_rules=original_target.review_request.project_rules,
+                existing_ci_evidence=original_target.review_request.existing_ci_evidence,
+            ),
         ),
     )
     calls = []
@@ -449,19 +516,17 @@ def test_current_adapter_rejects_input_substitution_before_launch(
         calls.append((args, kwargs))
         raise AssertionError("substituted input reached the product process")
 
-    submission = CurrentAgentAdapter(process_runner=forbidden_process).run(
-        substituted,
-        tmp_path,
-        config,
-        _SkipChannel(),
-    )
+    with pytest.raises(AgentAdapterError) as raised:
+        _run_current(
+            CurrentAgentAdapter(process_runner=forbidden_process),
+            substituted,
+            tmp_path,
+            config,
+            _SkipChannel(),
+        )
 
     assert not calls
-    assert submission.status is SubmissionStatus.FAILED
-    assert submission.failure is not None
-    assert submission.failure.code is FailureCode.ADAPTER_ERROR
-    assert submission.task_id == config.task_id
-    assert submission.trial_id == config.trial_id
+    assert raised.value.code is FailureCode.SCHEMA_MISMATCH
 
 
 @pytest.mark.parametrize(
@@ -477,49 +542,49 @@ def test_current_adapter_rejects_input_substitution_before_launch(
             "memory_mode": "off",
         },
         {
-            "kind": "current-agent-cli-v1",
+            "kind": CURRENT_AGENT_ADAPTER_KIND,
             "command": ["relative-entry"],
             "review_arguments": [],
             "environment_allowlist": [],
             "memory_mode": "off",
         },
         {
-            "kind": "current-agent-cli-v1",
+            "kind": CURRENT_AGENT_ADAPTER_KIND,
             "command": [str(Path(sys.executable).resolve())],
             "review_arguments": None,
             "environment_allowlist": [],
             "memory_mode": "off",
         },
         {
-            "kind": "current-agent-cli-v1",
+            "kind": CURRENT_AGENT_ADAPTER_KIND,
             "command": [str(Path(sys.executable).resolve())],
             "review_arguments": ["--repo=C:/forged"],
             "environment_allowlist": [],
             "memory_mode": "off",
         },
         {
-            "kind": "current-agent-cli-v1",
+            "kind": CURRENT_AGENT_ADAPTER_KIND,
             "command": [str(Path(sys.executable).resolve())],
             "review_arguments": ["--ci-evidence=forged"],
             "environment_allowlist": [],
             "memory_mode": "off",
         },
         {
-            "kind": "current-agent-cli-v1",
+            "kind": CURRENT_AGENT_ADAPTER_KIND,
             "command": [str(Path(sys.executable).resolve())],
             "review_arguments": ["--ci-evidence-f=forged.json"],
             "environment_allowlist": [],
             "memory_mode": "off",
         },
         {
-            "kind": "current-agent-cli-v1",
+            "kind": CURRENT_AGENT_ADAPTER_KIND,
             "command": [str(Path(sys.executable).resolve())],
             "review_arguments": [],
             "environment_allowlist": ["Path", "PATH"],
             "memory_mode": "off",
         },
         {
-            "kind": "current-agent-cli-v1",
+            "kind": CURRENT_AGENT_ADAPTER_KIND,
             "command": [str(Path(sys.executable).resolve())],
             "review_arguments": [],
             "environment_allowlist": [],
@@ -538,10 +603,12 @@ def test_current_adapter_configuration_is_strict_and_fails_before_launch(
         calls.append((args, kwargs))
         raise AssertionError("invalid current adapter config reached launch")
 
-    submission = CurrentAgentAdapter(process_runner=forbidden_process).run(
+    config = _config(eval_input, adapter_override=adapter)
+    submission = _run_current(
+        CurrentAgentAdapter(process_runner=forbidden_process),
         eval_input,
         tmp_path,
-        _config(eval_input, adapter_override=adapter),
+        config,
         _SkipChannel(),
     )
     assert not calls
@@ -578,14 +645,16 @@ def test_cli_arguments_are_snapshot_bound_and_eval_fields_are_not_reclassified(
             output_bytes=17,
         )
 
-    submission = CurrentAgentAdapter(process_runner=capture).run(
+    config = _config(
+        eval_input,
+        command=(str(Path(sys.executable).resolve()), "product-entry.py"),
+        review_arguments=("--reviewer-provider=fake",),
+    )
+    submission = _run_current(
+        CurrentAgentAdapter(process_runner=capture),
         eval_input,
         tmp_path,
-        _config(
-            eval_input,
-            command=(str(Path(sys.executable).resolve()), "product-entry.py"),
-            review_arguments=("--reviewer-provider=fake",),
-        ),
+        config,
         _SkipChannel(),
     )
 
@@ -600,8 +669,9 @@ def test_cli_arguments_are_snapshot_bound_and_eval_fields_are_not_reclassified(
         "review",
         "--reviewer-provider=fake",
     ]
-    assert "--intent=" + eval_input.review_request.user_intent in argv
-    assert "--focus=" + eval_input.review_request.review_focus in argv
+    request = _repository_target(eval_input).review_request
+    assert "--intent=" + request.user_intent in argv
+    assert "--focus=" + request.review_focus in argv
     assert "--requirement=REQ-CURRENT-1" in argv
     assert "--project-rule=Cite only inspected repository content." in argv
     assert not any(item.startswith("--ci-evidence=") for item in argv)
@@ -612,7 +682,7 @@ def test_cli_arguments_are_snapshot_bound_and_eval_fields_are_not_reclassified(
         "--ci-evidence-file=.review-agent/eval-input/"
         "existing-ci-evidence."
         + hashlib.sha256(
-            _ci_bundle_bytes(*eval_input.review_request.existing_ci_evidence)
+            _ci_bundle_bytes(*request.existing_ci_evidence)
         ).hexdigest()
         + ".v1.json"
     ]
@@ -621,14 +691,14 @@ def test_cli_arguments_are_snapshot_bound_and_eval_fields_are_not_reclassified(
         *ci_file_arguments[0].split("=", 1)[1].split("/")
     )
     assert bundle_path.read_bytes() == _ci_bundle_bytes(
-        *eval_input.review_request.existing_ci_evidence
+        *request.existing_ci_evidence
     )
     assert command_module._load_ci_evidence_bundle(
         tmp_path.resolve(),
         ci_file_arguments[0].split("=", 1)[1],
     ) == tuple(
         _ci_cli_payload(item)
-        for item in eval_input.review_request.existing_ci_evidence
+        for item in request.existing_ci_evidence
     )
 
     parsed = command_module._build_parser().parse_args(argv[2:])
@@ -672,7 +742,8 @@ def test_empty_ci_evidence_adds_no_cli_argument(tmp_path: Path) -> None:
             output_bytes=0,
         )
 
-    CurrentAgentAdapter(process_runner=capture).run(
+    _run_current(
+        CurrentAgentAdapter(process_runner=capture),
         eval_input,
         tmp_path,
         config,
@@ -707,13 +778,15 @@ def test_large_ci_payload_with_nul_and_unicode_stays_out_of_argv(
             output_bytes=0,
         )
 
-    CurrentAgentAdapter(process_runner=capture).run(
+    config = _config(
+        eval_input,
+        command=(str(Path(sys.executable).resolve()), "product-entry.py"),
+    )
+    _run_current(
+        CurrentAgentAdapter(process_runner=capture),
         eval_input,
         tmp_path,
-        _config(
-            eval_input,
-            command=(str(Path(sys.executable).resolve()), "product-entry.py"),
-        ),
+        config,
         _SkipChannel(),
     )
 
@@ -745,10 +818,12 @@ def test_ci_bundle_publication_is_create_only_and_fails_before_launch(
         calls.append((argv, kwargs))
         raise AssertionError("preexisting control input reached process launch")
 
-    submission = CurrentAgentAdapter(process_runner=forbidden).run(
+    config = _config(eval_input)
+    submission = _run_current(
+        CurrentAgentAdapter(process_runner=forbidden),
         eval_input,
         tmp_path,
-        _config(eval_input),
+        config,
         _SkipChannel(),
     )
 
@@ -774,10 +849,12 @@ def test_ci_bundle_rejects_symlinked_control_root(tmp_path: Path) -> None:
         calls.append((argv, kwargs))
         raise AssertionError("symlinked control root reached process launch")
 
-    submission = CurrentAgentAdapter(process_runner=forbidden).run(
+    config = _config(eval_input)
+    submission = _run_current(
+        CurrentAgentAdapter(process_runner=forbidden),
         eval_input,
         tmp_path,
-        _config(eval_input),
+        config,
         _SkipChannel(),
     )
 
@@ -1057,10 +1134,12 @@ def test_invalid_completed_artifact_state_is_invalid_output(
         raise current_module._CurrentArtifactError("tampered Session")
 
     monkeypatch.setattr(current_module, "_load_session", reject_session)
-    submission = CurrentAgentAdapter(process_runner=create_run).run(
+    config = _config(eval_input)
+    submission = _run_current(
+        CurrentAgentAdapter(process_runner=create_run),
         eval_input,
         tmp_path,
-        _config(eval_input),
+        config,
         _SkipChannel(),
     )
 
@@ -1312,6 +1391,7 @@ def test_evidence_conversion_uses_only_referenced_replayable_observations(
     brief = _brief(findings=[brief_finding])
     findings = current_module._findings_from_brief(brief)
     eval_input = _eval_input(base, head)
+    materialization_id = stable_id("materialization", "evidence-conversion")
 
     evidence = current_module._evidence_from_observations(
         run_dir=run_dir,
@@ -1319,11 +1399,13 @@ def test_evidence_conversion_uses_only_referenced_replayable_observations(
         findings=findings,
         observations=observations,
         eval_input=eval_input,
+        target_materialization_id=materialization_id,
     )
 
     assert [item.evidence_id for item in evidence] == ["O-read"]
-    assert evidence[0].revision == head
-    assert evidence[0].path == "feature.py"
+    assert evidence[0].source.revision == head
+    assert evidence[0].source.path == "feature.py"
+    assert evidence[0].source.target_materialization_id == materialization_id
     assert findings[0].evidence_refs == ("O-read", "O-search", "O-missing")
 
 
@@ -1380,6 +1462,9 @@ def test_command_output_requires_runner_attestation_before_becoming_evidence(
         findings=findings,
         observations={"O-gate": observation},
         eval_input=_eval_input(base, head),
+        target_materialization_id=stable_id(
+            "materialization", "command-attestation-test"
+        ),
     )
 
     assert evidence == ()

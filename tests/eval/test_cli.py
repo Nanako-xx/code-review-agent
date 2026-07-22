@@ -47,9 +47,13 @@ def _write_cli_suite(tmp_path: Path) -> tuple[dict[str, Path], Path]:
         tmp_path / "authored.git",
     )
     payload = case_payload()
-    payload["input"]["repository"]["base_revision"] = built.base_revision
-    payload["input"]["repository"]["head_revision"] = built.head_revision
-    payload["input"]["review_request"]["user_intent"] = (
+    payload["input"]["review_target"]["repository"][
+        "base_revision"
+    ] = built.base_revision
+    payload["input"]["review_target"]["repository"][
+        "head_revision"
+    ] = built.head_revision
+    payload["input"]["review_target"]["review_request"]["user_intent"] = (
         "Review the requested change"
     )
     payload["clarification_script"] = {"max_rounds": 1, "answers": []}
@@ -131,6 +135,39 @@ def test_prepare_dry_run_is_write_free_and_emits_stable_json(
     assert not roots["runs"].exists()
     assert not roots["data"].exists()
     assert not roots["workspaces"].exists()
+
+
+def test_prepare_and_run_agent_use_the_v2_subprocess_protocol_without_evaluation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    roots, program = _write_cli_suite(tmp_path)
+    common = _root_arguments(roots)
+    command = [
+        str(Path(sys.executable).resolve()),
+        str(program),
+        "success",
+        "{agent_id}",
+        "{task_id}",
+        "{trial_id}",
+    ]
+    prepare_args = [
+        "prepare",
+        *common,
+        "--agent-adapter",
+        "subprocess",
+        "--json",
+    ]
+    for item in command:
+        prepare_args.extend(("--agent-command", item))
+
+    assert main(prepare_args) == EXIT_OK
+    run_id = _json_stdout(capsys)["run_id"]
+
+    assert main(["run-agent", run_id, *common, "--json"]) == EXIT_OK
+    result = _json_stdout(capsys)
+    assert result["run_status"] == "completed"
+    assert result["trials"][0]["submission_status"] == "completed"
 
 
 def test_full_prepare_run_evaluate_inspect_flow_keeps_stages_separate(

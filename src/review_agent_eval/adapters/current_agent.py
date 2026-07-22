@@ -36,7 +36,10 @@ from review_agent.session_store import SessionStore
 
 from ..clarification import ClarificationChannel, ClarificationProtocolError
 from ..config import ClarificationMatcherSnapshot
+from ..config import AdapterCapabilitiesV2
+from ..artifacts import TargetAccess
 from ..models import (
+    EVAL_INPUT_SCHEMA_VERSION,
     EVAL_SUBMISSION_SCHEMA_VERSION,
     MAX_EVAL_INPUT_BYTES,
     ClarificationAction,
@@ -48,6 +51,10 @@ from ..models import (
     IntentClaimSource,
     IntentDimension,
     IntentResult,
+    ReviewTargetKind,
+    RepositoryDiffEvidenceSource,
+    RepositoryFileEvidenceSource,
+    RepositoryReviewTarget,
     SubmissionClarificationExchange,
     SubmissionEvidence,
     SubmissionFinding,
@@ -60,6 +67,7 @@ from ..models import (
     canonical_json_bytes,
     stable_id,
 )
+from ..repository import repository_from_eval_input
 from ..submission import (
     empty_usage,
     failure_submission,
@@ -80,7 +88,33 @@ from .subprocess_agent import (
 )
 
 
-CURRENT_AGENT_ADAPTER_KIND = "current-agent-cli-v1"
+CURRENT_AGENT_ADAPTER_KIND = "current-agent-cli-v2"
+CURRENT_AGENT_ADAPTER_VERSION = "2"
+
+
+def current_agent_capabilities() -> AdapterCapabilitiesV2:
+    """Return the fixed capability declaration for the product CLI adapter."""
+
+    return AdapterCapabilitiesV2.from_dict(
+        {
+            "schema_version": "eval_adapter_capabilities_v2",
+            "adapter_id": CURRENT_AGENT_ADAPTER_KIND,
+            "adapter_version": CURRENT_AGENT_ADAPTER_VERSION,
+            "input_schema_version": EVAL_INPUT_SCHEMA_VERSION,
+            "submission_schema_version": EVAL_SUBMISSION_SCHEMA_VERSION,
+            "target_kinds": [ReviewTargetKind.REPOSITORY.value],
+            "evidence_kinds": [
+                EvidenceKind.REPOSITORY_FILE.value,
+                EvidenceKind.REPOSITORY_DIFF.value,
+                EvidenceKind.COMMAND_OUTPUT.value,
+                EvidenceKind.EXTERNAL_RECORD.value,
+            ],
+            "clarification_protocol": "canonical-clarification-v2",
+            "trace_protocol": "local-trace-v2",
+            "subprocess_wire_version": None,
+            "isolation_profile": "repository-worktree-v2",
+        }
+    )
 
 _ADAPTER_FIELDS = frozenset(
     {
@@ -315,7 +349,7 @@ def _load_session(
 ) -> Tuple[SessionStore, SessionManifest]:
     store = SessionStore(run_dir)
     manifest = store.load()
-    repository = eval_input.repository
+    repository = repository_from_eval_input(eval_input)
     try:
         Path(manifest.repository.git_common_dir).resolve().relative_to(
             workspace.resolve()
@@ -643,7 +677,10 @@ def _read_created_ci_bundle(path: Path) -> bytes:
 
 
 def _write_ci_evidence_bundle(workspace: Path, eval_input: EvalInput) -> Optional[str]:
-    evidence = eval_input.review_request.existing_ci_evidence
+    target = eval_input.review_target
+    if not isinstance(target, RepositoryReviewTarget):
+        raise _CurrentAdapterError("current Agent requires a Repository Target")
+    evidence = target.review_request.existing_ci_evidence
     if not evidence:
         return None
     payload = {
@@ -757,8 +794,11 @@ def _initial_argv(
     memory_root: Path,
     ci_evidence_file: Optional[str] = None,
 ) -> List[str]:
-    request = eval_input.review_request
-    repository = eval_input.repository
+    target = eval_input.review_target
+    if not isinstance(target, RepositoryReviewTarget):
+        raise _CurrentAdapterError("current Agent requires a Repository Target")
+    request = target.review_request
+    repository = repository_from_eval_input(eval_input)
     argv = [
         *adapter.command,
         "review",
@@ -800,8 +840,8 @@ def _resume_argv(
 class CurrentAgentAdapter:
     """Invoke and convert the current product through its public CLI/artifacts."""
 
-    ADAPTER_KIND = "current-agent-cli-v1"
-    ADAPTER_VERSION = "1"
+    ADAPTER_KIND = CURRENT_AGENT_ADAPTER_KIND
+    ADAPTER_VERSION = CURRENT_AGENT_ADAPTER_VERSION
 
     def __init__(
         self,
@@ -819,6 +859,17 @@ class CurrentAgentAdapter:
             config, AgentRunConfig
         ):
             raise TypeError("adapter compatibility requires canonical input/config")
+        if (
+            eval_input.review_target.kind is not ReviewTargetKind.REPOSITORY
+            or eval_input.review_target.kind is not config.target_kind
+        ):
+            raise AgentAdapterIncompatibleError(
+                AdapterIncompatibilityReason.TARGET_KIND
+            )
+        if config.adapter_capabilities != current_agent_capabilities():
+            raise AgentAdapterIncompatibleError(
+                AdapterIncompatibilityReason.CAPABILITY_MISMATCH
+            )
         return AdapterCompatibility(unsupported=frozenset())
 
     def run(
@@ -828,21 +879,31 @@ class CurrentAgentAdapter:
         config: AgentRunConfig,
         clarification_channel: ClarificationChannel,
         *,
+        target_access: TargetAccess,
         target_materialization_id: str,
         cancel_event: Optional[threading.Event] = None,
     ) -> EvalSubmission:
+        if (
+            not isinstance(eval_input, EvalInput)
+            or not isinstance(config, AgentRunConfig)
+            or eval_input.task_id != config.task_id
+            or eval_input.digest() != config.eval_input_digest
+        ):
+            raise AgentAdapterError(
+                FailureCode.SCHEMA_MISMATCH,
+                "current Agent invocation does not match its Trial binding",
+                retryable=False,
+            )
         started = time.monotonic()
         transcript: List[SubmissionClarificationExchange] = []
         run_dir: Optional[Path] = None
         try:
-            if not isinstance(eval_input, EvalInput) or not isinstance(
-                config, AgentRunConfig
-            ) or eval_input.task_id != config.task_id or (
-                eval_input.digest() != config.eval_input_digest
-            ):
-                raise _CurrentAdapterError("current Agent invocation binding is invalid")
             if not isinstance(workspace, Path):
                 raise _CurrentAdapterError("current Agent workspace is invalid")
+            if not isinstance(target_access, TargetAccess):
+                raise _CurrentAdapterError("current Agent TargetAccess is invalid")
+            if target_access.target_materialization_id != target_materialization_id:
+                raise _CurrentAdapterError("current Agent TargetAccess identity drifted")
             resolved_workspace = workspace.resolve(strict=True)
             if not resolved_workspace.is_dir():
                 raise _CurrentAdapterError("current Agent workspace is not a directory")
@@ -920,9 +981,9 @@ class CurrentAgentAdapter:
             )
 
             revision = (
-                eval_input.repository.base_revision
+                repository_from_eval_input(eval_input).base_revision
                 + ".."
-                + eval_input.repository.head_revision
+                + repository_from_eval_input(eval_input).head_revision
             )
             while manifest.status is RunStatus.AWAITING_USER:
                 claims, questions, uncertainties = _load_intent_discovery(
@@ -1184,10 +1245,11 @@ class CurrentAgentAdapter:
         elapsed: float,
         trace_ref: TraceRef,
     ) -> EvalSubmission:
+        repository = repository_from_eval_input(eval_input)
         revision = (
-            eval_input.repository.base_revision
+            repository.base_revision
             + ".."
-            + eval_input.repository.head_revision
+            + repository.head_revision
         )
         brief_payload = _load_registered_json(
             run_dir=run_dir,
@@ -1201,8 +1263,8 @@ class CurrentAgentAdapter:
         brief = review_brief_from_dict(brief_payload)
         if (
             brief.review_id != manifest.review_id
-            or brief.base_revision != eval_input.repository.base_revision
-            or brief.head_revision != eval_input.repository.head_revision
+            or brief.base_revision != repository.base_revision
+            or brief.head_revision != repository.head_revision
         ):
             raise _CurrentArtifactError("review brief identity is invalid")
         intent = _intent_from_brief(brief, transcript)
@@ -1221,6 +1283,7 @@ class CurrentAgentAdapter:
             findings=findings,
             observations=observations,
             eval_input=eval_input,
+            target_materialization_id=target_materialization_id,
         )
         return EvalSubmission(
             schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
@@ -1403,12 +1466,13 @@ def _load_final_observations(
         config.budgets.max_execution_artifact_total_bytes,
         512 * 1024 * 1024,
     )
+    repository = repository_from_eval_input(eval_input)
     loaded = ObservationStore.load(
         run_dir,
         {
             revision,
-            "base@" + eval_input.repository.base_revision,
-            "head@" + eval_input.repository.head_revision,
+            "base@" + repository.base_revision,
+            "head@" + repository.head_revision,
         },
         max_log_bytes=file_budget,
         max_raw_artifact_bytes=file_budget,
@@ -1442,12 +1506,14 @@ def _evidence_from_observations(
     findings: Sequence[SubmissionFinding],
     observations: Mapping[str, Observation],
     eval_input: EvalInput,
+    target_materialization_id: str,
 ) -> Tuple[SubmissionEvidence, ...]:
     referenced = {
         reference for finding in findings for reference in finding.evidence_refs
     }
-    base = eval_input.repository.base_revision
-    head = eval_input.repository.head_revision
+    repository = repository_from_eval_input(eval_input)
+    base = repository.base_revision
+    head = repository.head_revision
     diff_revision = base + ".." + head
     result = []
     for evidence_id in sorted(referenced):
@@ -1465,15 +1531,14 @@ def _evidence_from_observations(
             result.append(
                 SubmissionEvidence(
                     evidence_id=evidence_id,
-                    kind=EvidenceKind.REPOSITORY_FILE,
-                    revision=observation.revision.split("@", 1)[1],
-                    path=observation.path,
-                    from_line=observation.line_start,
-                    to_line=observation.line_end,
-                    command=None,
-                    exit_code=None,
-                    stream=None,
-                    source_ref=None,
+                    source=RepositoryFileEvidenceSource(
+                        kind=EvidenceKind.REPOSITORY_FILE,
+                        target_materialization_id=target_materialization_id,
+                        revision=observation.revision.split("@", 1)[1],
+                        path=observation.path,
+                        from_line=observation.line_start,
+                        to_line=observation.line_end,
+                    ),
                     content_hash=observation.content_hash,
                     excerpt=raw,
                 )
@@ -1488,15 +1553,13 @@ def _evidence_from_observations(
             result.append(
                 SubmissionEvidence(
                     evidence_id=evidence_id,
-                    kind=EvidenceKind.REPOSITORY_DIFF,
-                    revision=diff_revision,
-                    path=observation.path,
-                    from_line=None,
-                    to_line=None,
-                    command=None,
-                    exit_code=None,
-                    stream=None,
-                    source_ref=None,
+                    source=RepositoryDiffEvidenceSource(
+                        kind=EvidenceKind.REPOSITORY_DIFF,
+                        target_materialization_id=target_materialization_id,
+                        base_revision=base,
+                        head_revision=head,
+                        path=observation.path,
+                    ),
                     content_hash=observation.content_hash,
                     excerpt=raw,
                 )
@@ -1508,4 +1571,9 @@ def _evidence_from_observations(
     return tuple(result)
 
 
-__all__ = ["CURRENT_AGENT_ADAPTER_KIND", "CurrentAgentAdapter"]
+__all__ = [
+    "CURRENT_AGENT_ADAPTER_KIND",
+    "CURRENT_AGENT_ADAPTER_VERSION",
+    "CurrentAgentAdapter",
+    "current_agent_capabilities",
+]

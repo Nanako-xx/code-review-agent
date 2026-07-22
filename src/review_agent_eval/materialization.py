@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Generic, Optional, Protocol, Tuple, TypeVar
 
 from .artifacts import (
@@ -19,7 +20,11 @@ from .artifacts import (
     TrialMaterializationManifest,
     TargetAccess,
 )
-from .cases import SuiteCase, WireContractV2
+from .cases import (
+    PublicSuitePreparationBindingV2,
+    SuiteCase,
+    WireContractV2,
+)
 from .config import AdapterCapabilitiesV2
 from .models import (
     canonical_sha256,
@@ -52,6 +57,10 @@ class _MaterializationLease(Protocol):
     def closed(self) -> bool:
         ...
 
+    @property
+    def work_root(self) -> Path:
+        ...
+
     def validate(self) -> None:
         ...
 
@@ -68,6 +77,7 @@ class MaterializationRequest:
     suite_case: SuiteCase
     attempt: int
     wire_contract: WireContractV2
+    suite_preparation_binding: Optional[PublicSuitePreparationBindingV2]
     suite_preparation_binding_digest: Optional[str]
     adapter_capabilities: AdapterCapabilitiesV2
 
@@ -82,6 +92,13 @@ class MaterializationRequest:
             raise SchemaError("materialization request attempt must be positive")
         if not isinstance(self.wire_contract, WireContractV2):
             raise TypeError("materialization request requires WireContractV2")
+        if self.suite_preparation_binding is not None and not isinstance(
+            self.suite_preparation_binding,
+            PublicSuitePreparationBindingV2,
+        ):
+            raise TypeError(
+                "materialization request preparation binding is invalid"
+            )
         if self.suite_preparation_binding_digest is not None:
             if (
                 type(self.suite_preparation_binding_digest) is not str
@@ -94,6 +111,15 @@ class MaterializationRequest:
                 raise SchemaError(
                     "materialization request preparation digest is invalid"
                 )
+        expected_preparation_digest = (
+            None
+            if self.suite_preparation_binding is None
+            else self.suite_preparation_binding.digest()
+        )
+        if self.suite_preparation_binding_digest != expected_preparation_digest:
+            raise SchemaError(
+                "materialization request preparation binding digest drifted"
+            )
         if not isinstance(self.adapter_capabilities, AdapterCapabilitiesV2):
             raise TypeError(
                 "materialization request requires AdapterCapabilitiesV2"
@@ -120,6 +146,10 @@ class PreparedTargetMaterialization(Generic[ReplayT]):
     @property
     def closed(self) -> bool:
         return self._lease.closed
+
+    @property
+    def work_root(self) -> Path:
+        return self._lease.work_root
 
     def validate(self) -> None:
         """Revalidate the immutable Target before handing it to an Agent."""
@@ -173,6 +203,10 @@ class _RepositoryMaterializationLease:
     def closed(self) -> bool:
         return self.workspace.closed
 
+    @property
+    def work_root(self) -> Path:
+        return self.workspace.path
+
     def validate(self) -> None:
         _validate_repository_request(self.request)
         try:
@@ -194,14 +228,21 @@ class _RepositoryMaterializationLease:
             raise MaterializationError(
                 "prepared Repository does not match EvalInput Target"
             )
-        current_replay = self.preparer.open_replay(self.prepared_repository)
+        try:
+            current_replay = self.preparer.open_replay(self.prepared_repository)
+            current_files = _repository_file_bindings(
+                self.workspace,
+                current_replay,
+                repository.head_revision,
+            )
+        except MaterializationError:
+            raise
+        except RepositoryPreparationError as exc:
+            raise MaterializationError(
+                "Repository replay validation failed"
+            ) from exc
         if _replay_identity(current_replay) != _replay_identity(self.replay):
             raise MaterializationError("Repository replay identity drifted")
-        current_files = _repository_file_bindings(
-            self.workspace,
-            current_replay,
-            repository.head_revision,
-        )
         if current_files != self.manifest.files:
             raise MaterializationError(
                 "Agent-visible Repository Target drifted after materialization"
@@ -224,14 +265,29 @@ def _validate_repository_request(request: MaterializationRequest) -> None:
         raise MaterializationError(
             "RepositoryTargetMaterializer received a non-Repository Target"
         )
+    _validate_materialization_request(request, ReviewTargetKind.REPOSITORY)
     if not isinstance(request.eval_input.review_target, RepositoryReviewTarget):
         raise MaterializationError("Repository Target has the wrong tagged shape")
-    if request.wire_contract.review_target_kind is not ReviewTargetKind.REPOSITORY:
-        raise MaterializationError("wire contract Target kind is not Repository")
+
+
+def _validate_materialization_request(
+    request: MaterializationRequest,
+    expected_kind: ReviewTargetKind,
+) -> None:
+    if not isinstance(request, MaterializationRequest):
+        raise TypeError("materialization validation requires MaterializationRequest")
+    if not isinstance(expected_kind, ReviewTargetKind):
+        raise TypeError("expected materialization kind must be ReviewTargetKind")
+    if request.eval_input.review_target.kind is not expected_kind:
+        raise MaterializationError(
+            "Target materializer received the wrong review Target kind"
+        )
+    if request.wire_contract.review_target_kind is not expected_kind:
+        raise MaterializationError("wire contract Target kind drifted")
     if request.trial_manifest.wire_contract != request.wire_contract:
         raise MaterializationError("Trial wire contract does not match request")
-    if request.trial_manifest.target_kind is not ReviewTargetKind.REPOSITORY:
-        raise MaterializationError("Trial Target kind is not Repository")
+    if request.trial_manifest.target_kind is not expected_kind:
+        raise MaterializationError("Trial Target kind drifted")
     if request.trial_manifest.task_id != request.eval_input.task_id:
         raise MaterializationError("Trial task does not match EvalInput")
     if request.trial_manifest.eval_input_digest != request.eval_input.digest():
@@ -249,8 +305,8 @@ def _validate_repository_request(request: MaterializationRequest) -> None:
         request.adapter_capabilities.digest()
     ):
         raise MaterializationError("Adapter capability digest drifted")
-    if ReviewTargetKind.REPOSITORY not in request.adapter_capabilities.target_kinds:
-        raise MaterializationError("Adapter does not support Repository Target")
+    if expected_kind not in request.adapter_capabilities.target_kinds:
+        raise MaterializationError("Adapter does not support review Target kind")
     if request.suite_preparation_binding_digest != (
         request.trial_manifest.suite_preparation_binding_digest
     ):

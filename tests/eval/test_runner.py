@@ -13,7 +13,13 @@ from review_agent_eval.adapters.base import (
     AgentAdapterError,
     AgentAdapterIncompatibleError,
 )
-from review_agent_eval.artifacts import ArtifactIntegrityError, ArtifactStore, StageName
+from review_agent_eval.artifacts import (
+    AgentVisibleFileBinding,
+    ArtifactIntegrityError,
+    ArtifactStore,
+    StageName,
+    TrialMaterializationManifest,
+)
 from review_agent_eval.cases import RunCaseSnapshot, SuiteManifest
 from review_agent_eval.models import (
     EvalCase,
@@ -23,11 +29,16 @@ from review_agent_eval.models import (
     SubmissionStatus,
     canonical_sha256,
 )
+from review_agent_eval.materialization import (
+    MaterializationRequest,
+    PreparedTargetMaterialization,
+)
 from review_agent_eval.runner import (
     CapabilityPolicy,
     EvalRunner,
     RunIncompatibilityError,
 )
+from review_agent_eval.submission import failure_submission
 
 from .test_artifacts import (
     completed_submission,
@@ -60,11 +71,18 @@ class _SuccessAdapter:
         config,
         clarification_channel,
         *,
+        target_access=None,
+        target_materialization_id=None,
         cancel_event=None,
     ):
-        del eval_input, workspace, clarification_channel, cancel_event
+        del eval_input, workspace, clarification_channel, target_access, cancel_event
         self.run_calls += 1
-        return completed_submission(config.trial_id)
+        return replace(
+            completed_submission(config.trial_id),
+            task_id=config.task_id,
+            eval_input_digest=config.eval_input_digest,
+            target_materialization_id=target_materialization_id,
+        )
 
 
 class _IncompatibleAdapter(_SuccessAdapter):
@@ -116,9 +134,19 @@ class _FailureAdapter(_SuccessAdapter):
         config,
         clarification_channel,
         *,
+        target_access=None,
+        target_materialization_id=None,
         cancel_event=None,
     ):
-        del eval_input, workspace, config, clarification_channel, cancel_event
+        del (
+            eval_input,
+            workspace,
+            config,
+            clarification_channel,
+            target_access,
+            target_materialization_id,
+            cancel_event,
+        )
         self.run_calls += 1
         raise AgentAdapterError(
             self.code,
@@ -135,19 +163,121 @@ class _InvalidOutputAdapter(_SuccessAdapter):
         config,
         clarification_channel,
         *,
+        target_access=None,
+        target_materialization_id=None,
         cancel_event=None,
     ):
-        del eval_input, workspace, config, clarification_channel, cancel_event
+        del (
+            eval_input,
+            workspace,
+            config,
+            clarification_channel,
+            target_access,
+            target_materialization_id,
+            cancel_event,
+        )
         self.run_calls += 1
         return {"not": "an EvalSubmission"}
 
 
-def _workspace_factory(root: Path) -> Callable[..., Path]:
-    def create(*, trial_manifest, attempt, **kwargs):
-        del kwargs
-        path = root / trial_manifest.trial_id / ("attempt-%04d" % attempt)
-        path.mkdir(parents=True, exist_ok=False)
-        return path
+class _ForgedHarnessFailureAdapter(_SuccessAdapter):
+    def run(
+        self,
+        eval_input,
+        workspace,
+        config,
+        clarification_channel,
+        *,
+        target_access=None,
+        target_materialization_id=None,
+        cancel_event=None,
+    ):
+        del workspace, clarification_channel, target_access, cancel_event
+        self.run_calls += 1
+        return failure_submission(
+            eval_input=eval_input,
+            config=config,
+            target_materialization_id=target_materialization_id,
+            code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+            message="forged Harness failure",
+            retryable=False,
+        )
+
+
+class _TestMaterializationLease:
+    def __init__(
+        self,
+        root: Path,
+        content: bytes,
+        close_error: BaseException | None = None,
+    ) -> None:
+        self.work_root = root
+        self.content = content
+        self.close_error = close_error
+        self.closed = False
+
+    def validate(self) -> None:
+        if self.closed or (self.work_root / "target" / "input.json").read_bytes() != self.content:
+            raise RuntimeError("test materialization drifted")
+
+    def close(self, status) -> None:
+        del status
+        if self.close_error is not None:
+            raise self.close_error
+        self.closed = True
+
+
+def _materializer_factory(
+    root: Path,
+    *,
+    close_error: BaseException | None = None,
+) -> Callable[[MaterializationRequest], PreparedTargetMaterialization[Any]]:
+    def create(request: MaterializationRequest):
+        path = root / request.trial_manifest.trial_id / (
+            "attempt-%04d" % request.attempt
+        )
+        target = path / "target"
+        target.mkdir(parents=True, exist_ok=False)
+        content = request.eval_input.to_json().encode("utf-8")
+        visible = target / "input.json"
+        visible.write_bytes(content)
+        file_binding = AgentVisibleFileBinding(
+            role="repository_file",
+            relative_path="target/input.json",
+            size_bytes=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+        replay_digest = canonical_sha256(
+            {
+                "kind": "test-materialization",
+                "trial_id": request.trial_manifest.trial_id,
+                "attempt": request.attempt,
+                "content": file_binding.sha256,
+            }
+        )
+        manifest = TrialMaterializationManifest.create(
+            run_id=request.trial_manifest.run_id,
+            task_id=request.eval_input.task_id,
+            trial_id=request.trial_manifest.trial_id,
+            attempt=request.attempt,
+            eval_input_digest=request.eval_input.digest(),
+            review_target_digest=request.eval_input.review_target.digest(),
+            wire_contract=request.wire_contract,
+            suite_preparation_binding_digest=(
+                request.suite_preparation_binding_digest
+            ),
+            prepared_source_id="test-materializer",
+            adapter_capabilities_digest=request.adapter_capabilities.digest(),
+            readable_relative_paths=(file_binding.relative_path,),
+            files=(file_binding,),
+            replay_binding_digest=replay_digest,
+        )
+        return PreparedTargetMaterialization(
+            request=request,
+            manifest=manifest,
+            replay={"content": content},
+            _lease=_TestMaterializationLease(path, content, close_error),
+        )
 
     return create
 
@@ -188,7 +318,7 @@ def _runner(tmp_path: Path, adapter: Any, *, case_provider: Any = None) -> EvalR
         None,
         adapter,
         case_provider=case_provider,
-        workspace_factory=_workspace_factory(tmp_path / ".workspaces"),
+        materializer_factory=_materializer_factory(tmp_path / ".workspaces"),
         max_workers=1,
     )
 
@@ -287,6 +417,26 @@ def test_runner_turns_invalid_adapter_return_into_schema_mismatch_submission(
     assert submission.failure.code is FailureCode.SCHEMA_MISMATCH
 
 
+def test_agent_cannot_forge_harness_owned_materialization_failure(
+    tmp_path: Path,
+) -> None:
+    snapshot = make_case_snapshot()
+    config = make_config(
+        case_snapshot=snapshot,
+        instance="forged-harness-failure",
+    )
+    adapter = _ForgedHarnessFailureAdapter()
+
+    result = _runner(tmp_path, adapter).run(config, snapshot)
+
+    submission = result.trials[0].submission
+    assert adapter.run_calls == 1
+    assert submission is not None
+    assert submission.status is SubmissionStatus.INVALID_OUTPUT
+    assert submission.failure is not None
+    assert submission.failure.code is FailureCode.SCHEMA_MISMATCH
+
+
 def test_runner_enforces_agent_output_budget_before_terminal_commit(tmp_path: Path):
     snapshot = make_case_snapshot()
     defaults = make_config(case_snapshot=snapshot, instance="output-budget")
@@ -309,14 +459,14 @@ def test_runner_enforces_agent_output_budget_before_terminal_commit(tmp_path: Pa
     assert submission.failure.code is FailureCode.OUTPUT_OVERFLOW
 
 
-def test_runner_keeps_workspace_preparation_failure_as_retriable_harness_state(
+def test_runner_commits_materialization_failure_without_calling_agent(
     tmp_path: Path,
 ):
     snapshot = make_case_snapshot()
     config = make_config(case_snapshot=snapshot, instance="workspace-failure")
 
-    def broken_workspace(**kwargs):
-        del kwargs
+    def broken_materializer(request):
+        del request
         raise RuntimeError("private preparation detail must not leak")
 
     first_adapter = _SuccessAdapter()
@@ -324,35 +474,54 @@ def test_runner_keeps_workspace_preparation_failure_as_retriable_harness_state(
         ArtifactStore(tmp_path / ".eval-runs"),
         None,
         first_adapter,
-        workspace_factory=broken_workspace,
+        materializer_factory=broken_materializer,
     )
     result = runner.run(config, snapshot)
 
     trial = result.trials[0]
-    assert result.status.value == "incomplete"
-    assert trial.status.value == "incomplete"
-    assert trial.submission is None
+    assert result.status.value == "completed"
+    assert trial.status.value == "failed"
+    assert trial.submission is not None
+    assert trial.submission.failure is not None
+    assert trial.submission.failure.code is (
+        FailureCode.HARNESS_MATERIALIZATION_ERROR
+    )
+    assert trial.submission.intent is None
+    assert trial.submission.review is None
     assert trial.attempt == 1
-    assert trial.diagnostic == "harness failure: RuntimeError"
+    assert trial.diagnostic == "materialization failure: RuntimeError"
     assert first_adapter.run_calls == 0
     state = runner.artifact_store.load_trial_state(
         config.run_id, trial.task_id, trial.trial_id
     )
-    assert state.terminal_receipt is None
+    assert state.terminal_receipt is not None
+    assert StageName.PREPARE not in state.completed_stages
 
-    resumed_adapter = _SuccessAdapter()
-    resumed = EvalRunner(
-        runner.artifact_store,
+
+def test_runner_returns_sanitized_cleanup_failure_in_trial_diagnostic(
+    tmp_path: Path,
+) -> None:
+    snapshot = make_case_snapshot()
+    config = make_config(case_snapshot=snapshot, instance="cleanup-diagnostic")
+    adapter = _SuccessAdapter()
+    runner = EvalRunner(
+        ArtifactStore(tmp_path / ".eval-runs"),
         None,
-        resumed_adapter,
-        workspace_factory=_workspace_factory(tmp_path / ".resumed-workspaces"),
-    ).run(config.run_id)
+        adapter,
+        materializer_factory=_materializer_factory(
+            tmp_path / ".workspaces",
+            close_error=PermissionError("cleanup-secret-must-not-leak"),
+        ),
+        max_workers=1,
+    )
 
-    assert resumed.status.value == "completed"
-    assert resumed.trials[0].attempt == 2
-    assert resumed.trials[0].submission is not None
-    assert resumed.trials[0].submission.status is SubmissionStatus.COMPLETED
-    assert resumed_adapter.run_calls == 1
+    result = runner.run(config, snapshot)
+
+    trial = result.trials[0]
+    assert trial.submission is not None
+    assert trial.submission.status is SubmissionStatus.COMPLETED
+    assert trial.diagnostic == "completed Submission; cleanup failure: PermissionError"
+    assert "cleanup-secret-must-not-leak" not in trial.diagnostic
 
 
 def test_strict_capability_preflight_rejects_before_run_plan_creation(tmp_path: Path):
@@ -418,7 +587,7 @@ def test_unpersistable_preflight_fails_before_run_directory_creation(tmp_path: P
         store,
         None,
         _SuccessAdapter(),
-        workspace_factory=_workspace_factory(tmp_path / ".workspaces"),
+        materializer_factory=_materializer_factory(tmp_path / ".workspaces"),
     )
 
     with pytest.raises(ArtifactIntegrityError, match="preflight"):
@@ -487,7 +656,9 @@ def test_resume_rejects_adapter_identity_drift_before_any_trial_work(tmp_path: P
         first_runner.artifact_store,
         None,
         changed_adapter,
-        workspace_factory=_workspace_factory(tmp_path / ".resume-workspaces"),
+        materializer_factory=_materializer_factory(
+            tmp_path / ".resume-workspaces"
+        ),
     )
 
     with pytest.raises(RunIncompatibilityError, match="identity") as raised:

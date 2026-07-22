@@ -27,7 +27,6 @@ import stat
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -35,7 +34,6 @@ from typing import (
     Any,
     Callable,
     Dict,
-    Iterator,
     List,
     Mapping,
     Optional,
@@ -61,6 +59,8 @@ from .artifacts import (
     StageName,
     TrialManifest,
     TrialState,
+    TargetAccess,
+    derive_pre_materialization_failure_binding,
 )
 from .cases import RunCaseSnapshot
 from .clarification import (
@@ -77,6 +77,7 @@ from .models import (
     EvalInput,
     EvalSubmission,
     FailureCode,
+    ReviewTargetKind,
     SchemaError,
     SubmissionStatus,
     TraceType,
@@ -84,10 +85,16 @@ from .models import (
     canonical_json_bytes,
     canonical_sha256,
 )
+from .materialization import (
+    MaterializationError,
+    MaterializationRequest,
+    PreparedTargetMaterialization,
+    RepositoryTargetMaterializer,
+    TargetMaterializer,
+)
 from .repository import (
-    PreparedRepository,
+    RepositoryMode,
     RepositoryPreparer,
-    TrialWorkspace,
     WorkspaceManifest,
 )
 from .submission import (
@@ -599,6 +606,7 @@ def _invoke_adapter(
     adapter: AgentUnderTestAdapter,
     eval_input: EvalInput,
     workspace: Path,
+    target_access: TargetAccess,
     config: AgentRunConfig,
     clarification_channel: ClarificationChannel,
     cancel_event: Any,
@@ -611,6 +619,7 @@ def _invoke_adapter(
             workspace,
             config,
             clarification_channel,
+            target_access=target_access,
             target_materialization_id=target_materialization_id,
             cancel_event=cancel_event,
         )
@@ -619,7 +628,20 @@ def _invoke_adapter(
         workspace,
         config,
         clarification_channel,
+        target_access=target_access,
         target_materialization_id=target_materialization_id,
+    )
+
+
+def _adapter_supports_target_access(adapter: Any) -> bool:
+    try:
+        parameters = inspect.signature(adapter.run).parameters.values()
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return any(
+        parameter.name == "target_access"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
     )
 
 
@@ -634,6 +656,9 @@ def _failure_message(code: FailureCode) -> str:
         FailureCode.CLARIFICATION_REQUIRED: "Agent requires clarification",
         FailureCode.AGENT_BLOCKED: "Agent reported a blocked execution",
         FailureCode.ADAPTER_ERROR: "Agent Adapter failed at its execution boundary",
+        FailureCode.HARNESS_MATERIALIZATION_ERROR: (
+            "Harness could not materialize the immutable review Target"
+        ),
         FailureCode.UNKNOWN: "Agent ended without a canonical terminal result",
     }[code]
 
@@ -786,6 +811,13 @@ def _clarification_artifact(
 
 def _workspace_manifest_value(handle: Any) -> Optional[Dict[str, Any]]:
     manifest = getattr(handle, "manifest", None)
+    if not isinstance(manifest, WorkspaceManifest):
+        workspace = getattr(handle, "workspace", None)
+        manifest = getattr(workspace, "manifest", None)
+    if not isinstance(manifest, WorkspaceManifest):
+        lease = getattr(handle, "_lease", None)
+        workspace = getattr(lease, "workspace", None)
+        manifest = getattr(workspace, "manifest", None)
     if not isinstance(manifest, WorkspaceManifest):
         return None
     return manifest.to_dict()
@@ -1579,26 +1611,6 @@ def _capture_trace_summary(
         }
 
 
-@contextmanager
-def _workspace_scope(handle: Any) -> Iterator[Tuple[Path, Any]]:
-    """Normalize the real TrialWorkspace and small test doubles."""
-
-    if isinstance(handle, TrialWorkspace):
-        with handle as entered:
-            yield entered.path, entered
-        return
-    if hasattr(handle, "__enter__") and hasattr(handle, "__exit__"):
-        entered = handle.__enter__()
-        try:
-            path = getattr(entered, "path", entered)
-            yield Path(path), entered
-        finally:
-            handle.__exit__(None, None, None)
-        return
-    path = getattr(handle, "path", handle)
-    yield Path(path), handle
-
-
 class EvalRunner:
     """Execute canonical Agent Trials and commit exactly one terminal result."""
 
@@ -1611,7 +1623,15 @@ class EvalRunner:
         *,
         matcher_factory: Any = None,
         capability_policy: CapabilityPolicy = CapabilityPolicy.STRICT,
-        workspace_factory: Optional[Callable[..., Any]] = None,
+        target_materializers: Optional[
+            Mapping[ReviewTargetKind, TargetMaterializer]
+        ] = None,
+        materializer_factory: Optional[
+            Callable[
+                [MaterializationRequest],
+                PreparedTargetMaterialization[Any],
+            ]
+        ] = None,
         adapter_factory: Optional[Callable[[], AgentUnderTestAdapter]] = None,
         max_workers: Optional[int] = None,
         retry_incomplete: bool = True,
@@ -1622,15 +1642,32 @@ class EvalRunner:
             raise TypeError("adapter must implement AgentUnderTestAdapter")
         if not _adapter_supports_cancellation(adapter):
             raise TypeError("adapter.run must accept the cancel_event keyword")
-        if repository_preparer is not None and not isinstance(
-            repository_preparer, RepositoryPreparer
-        ):
-            # A small structural fake is useful in unit tests; real production
-            # instances still get the stronger type above at method boundaries.
-            if not hasattr(repository_preparer, "prepare") or not hasattr(
-                repository_preparer, "trial_workspace"
-            ):
-                raise TypeError("repository_preparer has no preparation interface")
+        if not _adapter_supports_target_access(adapter):
+            raise TypeError("adapter.run must accept the target_access keyword")
+        if repository_preparer is not None:
+            if not isinstance(repository_preparer, RepositoryPreparer):
+                raise TypeError("repository_preparer must be RepositoryPreparer")
+            if repository_preparer.repository_mode is not RepositoryMode.CACHE_ONLY:
+                raise TypeError(
+                    "EvalRunner requires a CACHE_ONLY RepositoryPreparer"
+                )
+        if materializer_factory is not None and not callable(materializer_factory):
+            raise TypeError("materializer_factory must be callable or None")
+        materializers: Dict[ReviewTargetKind, TargetMaterializer] = {}
+        if target_materializers is not None:
+            if not isinstance(target_materializers, Mapping):
+                raise TypeError("target_materializers must be a mapping")
+            for kind, value in target_materializers.items():
+                if not isinstance(kind, ReviewTargetKind) or not hasattr(
+                    value, "materialize"
+                ):
+                    raise TypeError("target_materializers contains an invalid entry")
+                materializers[kind] = value
+        if repository_preparer is not None:
+            materializers.setdefault(
+                ReviewTargetKind.REPOSITORY,
+                RepositoryTargetMaterializer(repository_preparer),
+            )
         if not isinstance(capability_policy, CapabilityPolicy):
             raise TypeError("capability_policy must be a CapabilityPolicy")
         if max_workers is not None and (type(max_workers) is not int or max_workers < 1):
@@ -1643,7 +1680,8 @@ class EvalRunner:
         self.case_provider = case_provider
         self.matcher_factory = matcher_factory or BuiltinMaterialClaimMatcherFactory()
         self.capability_policy = capability_policy
-        self.workspace_factory = workspace_factory
+        self.target_materializers = materializers
+        self.materializer_factory = materializer_factory
         self.adapter_factory = adapter_factory
         self.max_workers = max_workers
         self.retry_incomplete = retry_incomplete
@@ -1797,9 +1835,10 @@ class EvalRunner:
                 clarification_matcher=config.clarification_matcher,
                 evaluator=config.evaluator,
                 suite=filtered_suite,
+                adapter_capabilities=config.adapter_capabilities,
                 trial_count=config.trial_count,
-                    resource_budgets=config.resource_budgets,
-                )
+                resource_budgets=config.resource_budgets,
+            )
             source_preflight = preflight
             final_preflight = self.preflight(
                 config,
@@ -2027,24 +2066,6 @@ class EvalRunner:
         if cancel_event is not None and not hasattr(cancel_event, "is_set"):
             raise TypeError("cancel_event must provide is_set()")
         effective_cancel = _CombinedCancelEvent(self._cancel_event, cancel_event)
-        prepared: Dict[str, PreparedRepository] = {}
-        preparation_errors: Dict[str, BaseException] = {}
-        descriptors: Dict[str, Any] = {}
-        for entry in snapshot.cases:
-            key = entry.input.repository.digest()
-            descriptors[key] = entry.input.repository
-        if self.repository_preparer is not None:
-            for key, descriptor in descriptors.items():
-                try:
-                    value = self.repository_preparer.prepare(descriptor)
-                    if not isinstance(value, PreparedRepository):
-                        raise TypeError("repository preparer returned an invalid handle")
-                    prepared[key] = value
-                except BaseException as exc:
-                    preparation_errors[key] = exc
-        elif self.workspace_factory is None:
-            error = RunnerError("no RepositoryPreparer or workspace_factory is configured")
-            preparation_errors.update({key: error for key in descriptors})
 
         plans = tuple(manifest.trials)
         worker_count = max_workers if max_workers is not None else self.max_workers
@@ -2067,8 +2088,6 @@ class EvalRunner:
                 snapshot,
                 plan,
                 preflight,
-                prepared,
-                preparation_errors,
                 resume=resume,
                 cancel_event=effective_cancel,
             )
@@ -2138,36 +2157,32 @@ class EvalRunner:
             raise _AdapterFactoryError(
                 "adapter_factory returned a non-cancellable Adapter"
             )
+        if not _adapter_supports_target_access(value):
+            raise _AdapterFactoryError(
+                "adapter_factory returned an Adapter without TargetAccess"
+            )
         if _adapter_identity(value) != expected_identity:
             raise _AdapterIdentityMismatch(ADAPTER_IDENTITY_MISMATCH)
         return value
 
-    def _make_workspace(
+    def _materialize_target(
         self,
-        *,
-        prepared: Optional[PreparedRepository],
-        trial_manifest: TrialManifest,
-        suite_case: Any,
-        eval_input: EvalInput,
-        attempt: int,
-    ) -> Any:
-        if self.workspace_factory is not None:
-            return self.workspace_factory(
-                prepared_repository=prepared,
-                trial_manifest=trial_manifest,
-                suite_case=suite_case,
-                eval_input=eval_input,
-                attempt=attempt,
+        request: MaterializationRequest,
+    ) -> PreparedTargetMaterialization[Any]:
+        if self.materializer_factory is not None:
+            value = self.materializer_factory(request)
+        else:
+            materializer = self.target_materializers.get(
+                request.eval_input.review_target.kind
             )
-        if self.repository_preparer is None or prepared is None:
-            raise RunnerError("isolated workspace cannot be prepared")
-        return self.repository_preparer.trial_workspace(
-            prepared,
-            trial_manifest=trial_manifest,
-            suite_case=suite_case,
-            eval_input=eval_input,
-            attempt=attempt,
-        )
+            if materializer is None:
+                raise RunnerError("no materializer is configured for Target kind")
+            value = materializer.materialize(request)
+        if not isinstance(value, PreparedTargetMaterialization):
+            raise RunnerError("Target materializer returned an invalid lease")
+        if value.request != request:
+            raise RunnerError("Target materialization request binding drifted")
+        return value
 
     def _execute_trial(
         self,
@@ -2175,8 +2190,6 @@ class EvalRunner:
         snapshot: RunCaseSnapshot,
         plan: Any,
         preflight: CapabilityPreflight,
-        prepared: Mapping[str, PreparedRepository],
-        preparation_errors: Mapping[str, BaseException],
         *,
         resume: bool,
         cancel_event: Any,
@@ -2252,9 +2265,7 @@ class EvalRunner:
         if binding.trial_id != trial_manifest.trial_id:
             raise RunnerError("AgentRunConfig trial binding drifted")
 
-        repository_key = eval_input.repository.digest()
-        preparation_error = preparation_errors.get(repository_key)
-        workspace_handle: Any = None
+        materialized: Optional[PreparedTargetMaterialization[Any]] = None
         workspace_path: Optional[Path] = None
         workspace_binding_id: Optional[str] = None
         started = time.monotonic()
@@ -2268,173 +2279,239 @@ class EvalRunner:
         incompatibility: Optional[str] = None
         diagnostic = ""
         terminal_status: Optional[TrialStatus] = None
+        adapter: AgentUnderTestAdapter = self.adapter
 
         try:
-            if preparation_error is not None:
-                raise RunnerError("repository preparation failed")
-            workspace_handle = self._make_workspace(
-                prepared=prepared.get(repository_key),
+            request = MaterializationRequest(
+                eval_input=eval_input,
                 trial_manifest=trial_manifest,
                 suite_case=suite_case,
-                eval_input=eval_input,
                 attempt=attempt,
+                wire_contract=config.wire_contract,
+                suite_preparation_binding=(
+                    snapshot.manifest.source.preparation_binding
+                ),
+                suite_preparation_binding_digest=(
+                    config.suite_preparation_binding_digest
+                ),
+                adapter_capabilities=config.adapter_capabilities,
             )
-            with _workspace_scope(workspace_handle) as (workspace, entered):
-                workspace_binding_id = getattr(
-                    getattr(entered, "manifest", None), "workspace_binding_id", None
+            try:
+                materialized = self._materialize_target(request)
+            except Exception as exc:
+                workspace_binding_id = derive_pre_materialization_failure_binding(
+                    run_id=config.run_id,
+                    task_id=plan.task_id,
+                    trial_id=plan.trial_id,
+                    attempt=attempt,
+                    eval_input_digest=eval_input.digest(),
+                    review_target_digest=eval_input.review_target.digest(),
                 )
-                if type(workspace_binding_id) is not str or not workspace_binding_id:
-                    raise RunnerError(
-                        "workspace did not expose a canonical target materialization ID"
-                    )
-                if not isinstance(workspace, Path):
-                    raise RunnerError("workspace handle did not provide a Path")
-                workspace = workspace.resolve(strict=True)
-                workspace_path = workspace
-                current_state = self.artifact_store.load_trial_state(
-                    config.run_id, plan.task_id, plan.trial_id
+                submission = self._failure_submission(
+                    eval_input,
+                    binding,
+                    FailureCode.HARNESS_MATERIALIZATION_ERROR,
+                    target_materialization_id=workspace_binding_id,
+                    elapsed=time.monotonic() - started,
+                    retryable=False,
                 )
-                if StageName.PREPARE not in current_state.completed_stages:
-                    self.artifact_store.write_prepare_stage(
-                        config.run_id,
-                        plan.task_id,
-                        plan.trial_id,
-                        eval_input,
-                        attempt=attempt,
-                    )
-                if cancel_event.is_set():
+                terminal_status = TrialStatus.FAILED
+                diagnostic = "materialization failure: " + _safe_diag_text(
+                    exc.__class__.__name__
+                )
+                self._commit_submission(
+                    config,
+                    trial_manifest,
+                    submission,
+                    attempt=attempt,
+                    controller=controller,
+                    preflight=preflight,
+                    workspace_handle=None,
+                    workspace_path=None,
+                    adapter=self.adapter,
+                    elapsed=time.monotonic() - started,
+                )
+            else:
+                workspace_binding_id = materialized.materialization_id
+                self.artifact_store.write_prepare_stage(
+                    config.run_id,
+                    plan.task_id,
+                    plan.trial_id,
+                    eval_input,
+                    materialized.manifest,
+                    attempt=attempt,
+                )
+                try:
+                    workspace = materialized.work_root.resolve(strict=True)
+                    if not workspace.is_dir():
+                        raise MaterializationError(
+                            "materialization work root is not a directory"
+                        )
+                    materialized.validate()
+                except Exception as exc:
                     submission = self._failure_submission(
                         eval_input,
                         binding,
-                        FailureCode.PROCESS_KILLED,
+                        FailureCode.HARNESS_MATERIALIZATION_ERROR,
                         target_materialization_id=workspace_binding_id,
                         elapsed=time.monotonic() - started,
                         retryable=False,
                     )
+                    terminal_status = TrialStatus.FAILED
+                    diagnostic = "materialization failure: " + _safe_diag_text(
+                        exc.__class__.__name__
+                    )
                 else:
-                    try:
-                        adapter = self._new_adapter(
-                            (preflight.adapter_id, preflight.adapter_version)
-                        )
-                        candidate = _invoke_adapter(
-                            adapter,
-                            eval_input,
-                            workspace,
-                            binding,
-                            controller.channel,
-                            cancel_event,
-                            target_materialization_id=workspace_binding_id,
-                        )
-                        if cancel_event.is_set():
-                            submission = self._failure_submission(
-                                eval_input,
-                                binding,
-                                FailureCode.PROCESS_KILLED,
-                                target_materialization_id=workspace_binding_id,
-                                elapsed=time.monotonic() - started,
-                                retryable=False,
-                            )
-                        elif not isinstance(candidate, EvalSubmission):
-                            raise AgentAdapterError(
-                                FailureCode.SCHEMA_MISMATCH,
-                                "Adapter did not return EvalSubmission",
-                                retryable=False,
-                            )
-                        else:
-                            if len(canonical_json_bytes(candidate)) > binding.max_output_bytes:
-                                raise AgentAdapterError(
-                                    FailureCode.OUTPUT_OVERFLOW,
-                                    "Adapter Submission exceeds the configured output limit",
-                                    retryable=False,
-                                )
-                            candidate = validate_submission_binding(
-                                candidate,
-                                eval_input=eval_input,
-                                config=binding,
-                                target_materialization_id=workspace_binding_id,
-                                clarification_transcript=controller.transcript,
-                            )
-                            candidate = validate_submission_trace(
-                                candidate,
-                                workspace=workspace,
-                                max_trace_bytes=binding.max_trace_bytes,
-                            )
-                            submission = candidate
-                    except _AdapterIdentityMismatch:
-                        incompatibility = ADAPTER_IDENTITY_MISMATCH
-                        self.artifact_store.mark_trial_incomplete(
-                            config.run_id,
-                            plan.task_id,
-                            plan.trial_id,
-                            attempt=attempt,
-                        )
-                        terminal_status = TrialStatus.INCOMPLETE
-                        diagnostic = "Adapter identity drifted after preflight"
-                    except AgentAdapterIncompatibleError as exc:
-                        incompatibility = exc.reason.value
-                        self.artifact_store.mark_trial_incomplete(
-                            config.run_id,
-                            plan.task_id,
-                            plan.trial_id,
-                            attempt=attempt,
-                        )
-                        terminal_status = TrialStatus.INCOMPLETE
-                        diagnostic = "dynamic capability incompatibility"
-                    except RunnerError:
-                        # Script/matcher/factory failures belong to the
-                        # Harness boundary and are handled by the outer
-                        # incomplete path, never scored as Agent output.
-                        raise
-                    except AgentAdapterError as exc:
+                    workspace_path = workspace
+                    if cancel_event.is_set():
                         submission = self._failure_submission(
                             eval_input,
                             binding,
-                            exc.code,
-                            target_materialization_id=workspace_binding_id,
-                            elapsed=time.monotonic() - started,
-                            retryable=exc.retryable,
-                        )
-                    except ClarificationProtocolError:
-                        submission = self._failure_submission(
-                            eval_input,
-                            binding,
-                            FailureCode.ADAPTER_ERROR,
+                            FailureCode.PROCESS_KILLED,
                             target_materialization_id=workspace_binding_id,
                             elapsed=time.monotonic() - started,
                             retryable=False,
                         )
-                    except BaseException as exc:
-                        submission = self._failure_submission(
-                            eval_input,
-                            binding,
-                            _exception_failure_code(exc),
-                            target_materialization_id=workspace_binding_id,
-                            elapsed=time.monotonic() - started,
-                            retryable=_exception_failure_code(exc)
-                            in {FailureCode.TIMEOUT, FailureCode.PROCESS_KILLED},
-                        )
-                    if submission is not None:
-                        terminal_status = _terminal_status_for_submission(submission)
-                        diagnostic = (
-                            "completed Submission"
-                            if submission.status is SubmissionStatus.COMPLETED
-                            else _failure_message(submission.failure.code)
-                            if submission.failure is not None
-                            else "terminal Submission"
-                        )
-                if (
-                    entered is not None
-                    and hasattr(entered, "record_terminal_status")
-                    and terminal_status is not None
-                ):
-                    entered.record_terminal_status(terminal_status)
-                elif (
-                    entered is not None
-                    and hasattr(entered, "record_terminal_status")
-                    and incompatibility is not None
-                ):
-                    entered.record_terminal_status(TrialStatus.INCOMPLETE)
-
+                    else:
+                        adapter_invocation_started = False
+                        try:
+                            adapter = self._new_adapter(
+                                (preflight.adapter_id, preflight.adapter_version)
+                            )
+                            try:
+                                materialized.validate()
+                            except Exception as exc:
+                                raise MaterializationError(
+                                    "Target materialization drifted before Agent execution"
+                                ) from exc
+                            adapter_invocation_started = True
+                            candidate = _invoke_adapter(
+                                adapter,
+                                eval_input,
+                                workspace,
+                                materialized.target_access,
+                                binding,
+                                controller.channel,
+                                cancel_event,
+                                target_materialization_id=workspace_binding_id,
+                            )
+                            try:
+                                materialized.validate()
+                            except Exception as exc:
+                                raise MaterializationError(
+                                    "Target materialization drifted during Agent execution"
+                                ) from exc
+                            if cancel_event.is_set():
+                                submission = self._failure_submission(
+                                    eval_input,
+                                    binding,
+                                    FailureCode.PROCESS_KILLED,
+                                    target_materialization_id=workspace_binding_id,
+                                    elapsed=time.monotonic() - started,
+                                    retryable=False,
+                                )
+                            elif not isinstance(candidate, EvalSubmission):
+                                raise AgentAdapterError(
+                                    FailureCode.SCHEMA_MISMATCH,
+                                    "Adapter did not return EvalSubmission",
+                                    retryable=False,
+                                )
+                            else:
+                                if len(canonical_json_bytes(candidate)) > binding.max_output_bytes:
+                                    raise AgentAdapterError(
+                                        FailureCode.OUTPUT_OVERFLOW,
+                                        "Adapter Submission exceeds the configured output limit",
+                                        retryable=False,
+                                    )
+                                candidate = validate_submission_binding(
+                                    candidate,
+                                    eval_input=eval_input,
+                                    config=binding,
+                                    target_materialization_id=workspace_binding_id,
+                                    clarification_transcript=controller.transcript,
+                                )
+                                candidate = validate_submission_trace(
+                                    candidate,
+                                    workspace=workspace,
+                                    max_trace_bytes=binding.max_trace_bytes,
+                                )
+                                submission = candidate
+                        except _AdapterIdentityMismatch:
+                            incompatibility = ADAPTER_IDENTITY_MISMATCH
+                            self.artifact_store.mark_trial_incomplete(
+                                config.run_id,
+                                plan.task_id,
+                                plan.trial_id,
+                                attempt=attempt,
+                            )
+                            terminal_status = TrialStatus.INCOMPLETE
+                            diagnostic = "Adapter identity drifted after preflight"
+                        except AgentAdapterIncompatibleError as exc:
+                            incompatibility = exc.reason.value
+                            self.artifact_store.mark_trial_incomplete(
+                                config.run_id,
+                                plan.task_id,
+                                plan.trial_id,
+                                attempt=attempt,
+                            )
+                            terminal_status = TrialStatus.INCOMPLETE
+                            diagnostic = "dynamic capability incompatibility"
+                        except MaterializationError:
+                            code = (
+                                FailureCode.ADAPTER_ERROR
+                                if adapter_invocation_started
+                                else FailureCode.HARNESS_MATERIALIZATION_ERROR
+                            )
+                            submission = self._failure_submission(
+                                eval_input,
+                                binding,
+                                code,
+                                target_materialization_id=workspace_binding_id,
+                                elapsed=time.monotonic() - started,
+                                retryable=False,
+                            )
+                        except RunnerError:
+                            # Script/matcher/factory failures belong to the
+                            # Harness boundary and are handled by the outer
+                            # incomplete path, never scored as Agent output.
+                            raise
+                        except AgentAdapterError as exc:
+                            submission = self._failure_submission(
+                                eval_input,
+                                binding,
+                                exc.code,
+                                target_materialization_id=workspace_binding_id,
+                                elapsed=time.monotonic() - started,
+                                retryable=exc.retryable,
+                            )
+                        except ClarificationProtocolError:
+                            submission = self._failure_submission(
+                                eval_input,
+                                binding,
+                                FailureCode.ADAPTER_ERROR,
+                                target_materialization_id=workspace_binding_id,
+                                elapsed=time.monotonic() - started,
+                                retryable=False,
+                            )
+                        except BaseException as exc:
+                            submission = self._failure_submission(
+                                eval_input,
+                                binding,
+                                _exception_failure_code(exc),
+                                target_materialization_id=workspace_binding_id,
+                                elapsed=time.monotonic() - started,
+                                retryable=_exception_failure_code(exc)
+                                in {FailureCode.TIMEOUT, FailureCode.PROCESS_KILLED},
+                            )
+                        if submission is not None:
+                            terminal_status = _terminal_status_for_submission(submission)
+                            diagnostic = (
+                                "completed Submission"
+                                if submission.status is SubmissionStatus.COMPLETED
+                                else _failure_message(submission.failure.code)
+                                if submission.failure is not None
+                                else "terminal Submission"
+                            )
                 if submission is not None:
                     self._commit_submission(
                         config,
@@ -2443,9 +2520,9 @@ class EvalRunner:
                         attempt=attempt,
                         controller=controller,
                         preflight=preflight,
-                        workspace_handle=entered or workspace_handle,
+                        workspace_handle=materialized,
                         workspace_path=workspace_path,
-                        adapter=(adapter if "adapter" in locals() else self.adapter),
+                        adapter=adapter,
                         elapsed=time.monotonic() - started,
                     )
         except AgentAdapterIncompatibleError as exc:
@@ -2484,6 +2561,28 @@ class EvalRunner:
             else:
                 terminal_status = latest.status
             submission = None
+        finally:
+            if materialized is not None:
+                try:
+                    if materialized.closed:
+                        close_status = None
+                    else:
+                        close_status = terminal_status or (
+                            TrialStatus.INCOMPLETE
+                            if incompatibility is not None
+                            else TrialStatus.FAILED
+                        )
+                    if close_status is not None:
+                        materialized.close(close_status)
+                except BaseException as exc:
+                    cleanup_diagnostic = "cleanup failure: " + _safe_diag_text(
+                        exc.__class__.__name__
+                    )
+                    diagnostic = _safe_diag_text(
+                        cleanup_diagnostic
+                        if not diagnostic
+                        else diagnostic + "; " + cleanup_diagnostic
+                    )
 
         if incompatibility is not None:
             state = self.artifact_store.load_trial_state(

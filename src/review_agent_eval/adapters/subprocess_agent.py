@@ -13,10 +13,21 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, BinaryIO, Dict, List, Optional, Tuple
+from typing import Any, BinaryIO, Dict, Iterable, List, Optional, Tuple
 
+from ..artifacts import TargetAccess
 from ..clarification import ClarificationChannel
-from ..models import EvalInput, EvalSubmission, FailureCode
+from ..config import AdapterCapabilitiesV2
+from ..models import (
+    EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
+    EvalInput,
+    EvalSubmission,
+    EvidenceKind,
+    FailureCode,
+    ReviewTargetKind,
+    canonical_json_bytes,
+)
 from ..repository import _WindowsProcessJob, _resume_windows_process
 from ..submission import (
     empty_usage,
@@ -24,12 +35,26 @@ from ..submission import (
     parse_submission_output,
     validate_submission_trace,
 )
-from .base import AdapterCompatibility, AgentAdapterError, AgentRunConfig
+from .base import (
+    AdapterCompatibility,
+    AdapterIncompatibilityReason,
+    AgentAdapterError,
+    AgentAdapterIncompatibleError,
+    AgentRunConfig,
+)
 
 
-SUBPROCESS_JSON_ADAPTER_KIND = "subprocess-json-v1"
+SUBPROCESS_JSON_ADAPTER_KIND = "subprocess-json-v2"
+SUBPROCESS_JSON_ADAPTER_VERSION = "2"
+SUBPROCESS_INVOCATION_SCHEMA_VERSION = "eval_subprocess_invocation_v2"
+SUBPROCESS_WIRE_VERSION = "subprocess-json-v2"
+SUBPROCESS_CLARIFICATION_PROTOCOL = "none-v2"
+SUBPROCESS_TRACE_PROTOCOL = "local-trace-v2"
+SUBPROCESS_ISOLATION_PROFILE = "target-workspace-v2"
 
-_ADAPTER_FIELDS = frozenset({"kind", "command", "environment_allowlist"})
+_ADAPTER_FIELDS = frozenset(
+    {"kind", "command", "environment_allowlist", "capabilities"}
+)
 _ENVIRONMENT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _PLACEHOLDER_RE = re.compile(r"\{(agent_id|task_id|trial_id|workspace)\}")
 _FIXED_RUNTIME_ENVIRONMENT_KEYS = (
@@ -62,6 +87,38 @@ _WINDOWS_KILLED_EXIT_CODES = frozenset(
 )
 
 
+def subprocess_adapter_capabilities(
+    *,
+    target_kinds: Iterable[ReviewTargetKind] = tuple(ReviewTargetKind),
+    evidence_kinds: Iterable[EvidenceKind] = tuple(EvidenceKind),
+) -> AdapterCapabilitiesV2:
+    """Build the explicit capability declaration for subprocess-json-v2."""
+
+    return AdapterCapabilitiesV2.from_dict(
+        {
+            "schema_version": "eval_adapter_capabilities_v2",
+            "adapter_id": SUBPROCESS_JSON_ADAPTER_KIND,
+            "adapter_version": SUBPROCESS_JSON_ADAPTER_VERSION,
+            "input_schema_version": EVAL_INPUT_SCHEMA_VERSION,
+            "submission_schema_version": EVAL_SUBMISSION_SCHEMA_VERSION,
+            "target_kinds": [item.value for item in target_kinds],
+            "evidence_kinds": [item.value for item in evidence_kinds],
+            "clarification_protocol": SUBPROCESS_CLARIFICATION_PROTOCOL,
+            "trace_protocol": SUBPROCESS_TRACE_PROTOCOL,
+            "subprocess_wire_version": SUBPROCESS_WIRE_VERSION,
+            "isolation_profile": SUBPROCESS_ISOLATION_PROFILE,
+        }
+    )
+
+
+def _plain_json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_json_value(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_plain_json_value(item) for item in value]
+    return value
+
+
 class _AdapterConfigurationError(ValueError):
     """The frozen Agent snapshot does not contain the supported adapter shape."""
 
@@ -70,6 +127,7 @@ class _AdapterConfigurationError(ValueError):
 class _SubprocessConfiguration:
     command: Tuple[str, ...]
     environment_allowlist: Tuple[str, ...]
+    capabilities: AdapterCapabilitiesV2
     agent_snapshot_digest: str
 
 
@@ -341,7 +399,7 @@ def _adapter_configuration(config: AgentRunConfig) -> _SubprocessConfiguration:
     if not isinstance(raw, Mapping):
         raise _AdapterConfigurationError("missing adapter object")
     if set(raw) != _ADAPTER_FIELDS:
-        raise _AdapterConfigurationError("adapter object fields do not match v1")
+        raise _AdapterConfigurationError("adapter object fields do not match v2")
     if raw["kind"] != SUBPROCESS_JSON_ADAPTER_KIND:
         raise _AdapterConfigurationError("unsupported adapter kind")
 
@@ -388,6 +446,30 @@ def _adapter_configuration(config: AgentRunConfig) -> _SubprocessConfiguration:
         seen.add(folded)
         environment.append(key)
 
+    try:
+        capabilities = AdapterCapabilitiesV2.from_dict(
+            _plain_json_value(raw["capabilities"])
+        )
+    except (TypeError, ValueError) as exc:
+        raise _AdapterConfigurationError(
+            "adapter capabilities are invalid"
+        ) from exc
+    if (
+        capabilities.adapter_id != SUBPROCESS_JSON_ADAPTER_KIND
+        or capabilities.adapter_version != SUBPROCESS_JSON_ADAPTER_VERSION
+        or capabilities.subprocess_wire_version != SUBPROCESS_WIRE_VERSION
+        or capabilities.input_schema_version != EVAL_INPUT_SCHEMA_VERSION
+        or capabilities.submission_schema_version
+        != EVAL_SUBMISSION_SCHEMA_VERSION
+        or capabilities.clarification_protocol
+        != SUBPROCESS_CLARIFICATION_PROTOCOL
+        or capabilities.trace_protocol != SUBPROCESS_TRACE_PROTOCOL
+        or capabilities.isolation_profile != SUBPROCESS_ISOLATION_PROFILE
+    ):
+        raise _AdapterConfigurationError(
+            "adapter capabilities do not identify subprocess-json-v2"
+        )
+
     # AgentConfigSnapshot is recursively frozen.  Rechecking the digest keeps
     # launch configuration coupled to the exact snapshot parsed above.
     if snapshot.digest() != snapshot_digest:
@@ -395,6 +477,7 @@ def _adapter_configuration(config: AgentRunConfig) -> _SubprocessConfiguration:
     return _SubprocessConfiguration(
         command=tuple(command),
         environment_allowlist=tuple(environment),
+        capabilities=capabilities,
         agent_snapshot_digest=snapshot_digest,
     )
 
@@ -882,8 +965,41 @@ def _failed_submission(
     )
 
 
+def _subprocess_invocation(
+    *,
+    eval_input: EvalInput,
+    config: AgentRunConfig,
+    target_access: TargetAccess,
+    target_materialization_id: str,
+) -> Dict[str, Any]:
+    if target_access.target_materialization_id != target_materialization_id:
+        raise _AdapterConfigurationError(
+            "TargetAccess does not match materialization identity"
+        )
+    return {
+        "schema_version": SUBPROCESS_INVOCATION_SCHEMA_VERSION,
+        "eval_input": eval_input.to_dict(),
+        "trial_binding": {
+            "run_id": config.run_id,
+            "task_id": config.task_id,
+            "trial_id": config.trial_id,
+            "trial_index": config.trial_index,
+            "eval_input_digest": config.eval_input_digest,
+            "wire_contract": config.wire_contract.to_dict(),
+            "adapter_capabilities_digest": (
+                config.adapter_capabilities_digest
+            ),
+        },
+        "target_access": target_access.to_dict(),
+        "materialization_id": target_materialization_id,
+    }
+
+
 class SubprocessAgentAdapter:
-    """Run a snapshot-bound ``subprocess-json-v1`` Agent exactly once."""
+    """Run a snapshot-bound ``subprocess-json-v2`` Agent exactly once."""
+
+    ADAPTER_KIND = SUBPROCESS_JSON_ADAPTER_KIND
+    ADAPTER_VERSION = SUBPROCESS_JSON_ADAPTER_VERSION
 
     @staticmethod
     def compatibility(
@@ -894,6 +1010,19 @@ class SubprocessAgentAdapter:
             config, AgentRunConfig
         ):
             raise TypeError("adapter compatibility requires canonical input/config")
+        adapter = _adapter_configuration(config)
+        if adapter.capabilities != config.adapter_capabilities:
+            raise AgentAdapterIncompatibleError(
+                AdapterIncompatibilityReason.CAPABILITY_MISMATCH
+            )
+        if (
+            eval_input.review_target.kind is not config.target_kind
+            or eval_input.review_target.kind
+            not in adapter.capabilities.target_kinds
+        ):
+            raise AgentAdapterIncompatibleError(
+                AdapterIncompatibilityReason.TARGET_KIND
+            )
         return AdapterCompatibility()
 
     def run(
@@ -903,29 +1032,42 @@ class SubprocessAgentAdapter:
         config: AgentRunConfig,
         clarification_channel: ClarificationChannel,
         *,
+        target_access: TargetAccess,
         target_materialization_id: str,
         cancel_event: Optional[threading.Event] = None,
     ) -> EvalSubmission:
-        del clarification_channel  # Generic v1 is one-shot and has no channel wire.
+        del clarification_channel  # Generic v2 is one-shot and has no channel wire.
         started = time.monotonic()
 
+        if (
+            not isinstance(eval_input, EvalInput)
+            or not isinstance(config, AgentRunConfig)
+            or eval_input.task_id != config.task_id
+            or eval_input.digest() != config.eval_input_digest
+        ):
+            raise AgentAdapterError(
+                FailureCode.SCHEMA_MISMATCH,
+                "Adapter invocation input does not match its Trial binding",
+                retryable=False,
+            )
+
         try:
-            if not isinstance(eval_input, EvalInput):
-                raise _AdapterConfigurationError("eval_input type is invalid")
-            if not isinstance(config, AgentRunConfig):
-                raise _AdapterConfigurationError("run config type is invalid")
-            if eval_input.task_id != config.task_id:
-                raise _AdapterConfigurationError("input task does not match run config")
-            if eval_input.digest() != config.eval_input_digest:
-                raise _AdapterConfigurationError(
-                    "input content does not match run config"
-                )
+            if not isinstance(target_access, TargetAccess):
+                raise _AdapterConfigurationError("TargetAccess type is invalid")
             if not isinstance(workspace, Path):
                 raise _AdapterConfigurationError("workspace type is invalid")
             resolved_workspace = workspace.resolve(strict=True)
             if not resolved_workspace.is_dir():
                 raise _AdapterConfigurationError("workspace is not a directory")
             adapter = _adapter_configuration(config)
+            if adapter.capabilities != config.adapter_capabilities:
+                raise AgentAdapterIncompatibleError(
+                    AdapterIncompatibilityReason.CAPABILITY_MISMATCH
+                )
+            if not self.compatibility(eval_input, config).compatible:
+                raise AgentAdapterIncompatibleError(
+                    AdapterIncompatibilityReason.TARGET_KIND
+                )
             argv = _expand_command(
                 adapter,
                 config=config,
@@ -934,7 +1076,16 @@ class SubprocessAgentAdapter:
             environment = build_subprocess_environment(
                 adapter.environment_allowlist
             )
-            stdin_bytes = eval_input.to_json().encode("utf-8")
+            stdin_bytes = canonical_json_bytes(
+                _subprocess_invocation(
+                    eval_input=eval_input,
+                    config=config,
+                    target_access=target_access,
+                    target_materialization_id=target_materialization_id,
+                )
+            )
+        except AgentAdapterIncompatibleError:
+            raise
         except _AdapterConfigurationError:
             return _failed_submission(
                 eval_input=eval_input,
@@ -1064,8 +1215,12 @@ class SubprocessAgentAdapter:
 __all__ = [
     "BoundedProcessResult",
     "SUBPROCESS_JSON_ADAPTER_KIND",
+    "SUBPROCESS_JSON_ADAPTER_VERSION",
+    "SUBPROCESS_INVOCATION_SCHEMA_VERSION",
+    "SUBPROCESS_WIRE_VERSION",
     "SubprocessAgentAdapter",
     "build_subprocess_environment",
     "returncode_was_killed",
     "run_bounded_process",
+    "subprocess_adapter_capabilities",
 ]

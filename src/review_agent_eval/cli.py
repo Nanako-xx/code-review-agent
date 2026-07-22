@@ -379,7 +379,13 @@ def _default_evaluator_config(
 
 
 def _default_agent_snapshot(args: argparse.Namespace):
+    from .adapters.current_agent import CURRENT_AGENT_ADAPTER_KIND
+    from .adapters.subprocess_agent import (
+        SUBPROCESS_JSON_ADAPTER_KIND,
+        subprocess_adapter_capabilities,
+    )
     from .config import AgentConfigSnapshot
+    from .models import ReviewTargetKind
 
     command = list(args.agent_command)
     if not command:
@@ -395,7 +401,7 @@ def _default_agent_snapshot(args: argparse.Namespace):
         if args.agent_base_url:
             review_arguments.append("--reviewer-base-url=" + args.agent_base_url)
         adapter = {
-            "kind": "current-agent-cli-v1",
+            "kind": CURRENT_AGENT_ADAPTER_KIND,
             "command": command,
             "review_arguments": review_arguments,
             "environment_allowlist": [args.agent_api_key_env]
@@ -405,9 +411,12 @@ def _default_agent_snapshot(args: argparse.Namespace):
         }
     else:
         adapter = {
-            "kind": "subprocess-json-v1",
+            "kind": SUBPROCESS_JSON_ADAPTER_KIND,
             "command": command,
             "environment_allowlist": [],
+            "capabilities": subprocess_adapter_capabilities(
+                target_kinds=(ReviewTargetKind.REPOSITORY,),
+            ).to_dict(),
         }
     parameters = {"adapter": adapter}
     return AgentConfigSnapshot(
@@ -482,6 +491,7 @@ def _budgets(args: argparse.Namespace):
 
 
 def _load_run_config_for_prepare(args: argparse.Namespace, bank: Any):
+    from .adapters.agent_factory import adapter_capabilities_from_snapshot
     from .config import EvalRunConfig, SuiteRunConfig
 
     snapshot = bank.snapshot()
@@ -492,12 +502,15 @@ def _load_run_config_for_prepare(args: argparse.Namespace, bank: Any):
         if config.suite != suite:
             raise CliIntegrityError("Run config does not match the verified Suite snapshot")
         return config, snapshot
+    agent = _load_agent_snapshot(args)
+    capabilities = adapter_capabilities_from_snapshot(agent)
     config = EvalRunConfig.create(
         run_instance_key=args.run_instance_key,
-        agent=_load_agent_snapshot(args),
+        agent=agent,
         clarification_matcher=_load_matcher(args),
         evaluator=_load_evaluator_config(args),
         suite=suite,
+        adapter_capabilities=capabilities,
         trial_count=_positive_int(args.trial_count, name="trial_count", maximum=10_000),
         resource_budgets=_budgets(args),
     )
@@ -869,6 +882,8 @@ def _judge_for(args: argparse.Namespace, execution: Any):
 
 
 def _handle_prepare(args: argparse.Namespace) -> int:
+    from .repository import repository_from_eval_input
+
     roots = _roots(args)
     suite_root, runs_root, _data_root, _workspace_root = roots
     if args.overwrite:
@@ -912,7 +927,9 @@ def _handle_prepare(args: argparse.Namespace) -> int:
             # a missing-cache failure to run-agent/evaluate.
             with _repository_preparer(args, roots, cache_only=False) as preparer:
                 for case_entry in snapshot.cases:
-                    preparer.prepare(case_entry.input.repository)
+                    preparer.prepare(
+                        repository_from_eval_input(case_entry.input)
+                    )
             _emit(args, "prepare", "ok", message="existing immutable Run reused", run_id=config.run_id, resumed=True)
             return EXIT_OK
     adapter_factory, adapter = _agent_adapter(config)
@@ -922,17 +939,17 @@ def _handle_prepare(args: argparse.Namespace) -> int:
     with _repository_preparer(args, roots, cache_only=False) as preparer:
         # Preparation is the only stage allowed to acquire repository data.
         for case_entry in snapshot.cases:
-            preparer.prepare(case_entry.input.repository)
-        runner = EvalRunner(
-            store,
-            preparer,
-            adapter,
-            case_provider=bank,
-            adapter_factory=adapter_factory,
-            capability_policy=policy,
-            max_workers=config.resource_budgets.max_parallel_trials,
-        )
-        setup = runner.create_run(config, snapshot, policy=policy)
+            preparer.prepare(repository_from_eval_input(case_entry.input))
+    runner = EvalRunner(
+        store,
+        None,
+        adapter,
+        case_provider=bank,
+        adapter_factory=adapter_factory,
+        capability_policy=policy,
+        max_workers=config.resource_budgets.max_parallel_trials,
+    )
+    setup = runner.create_run(config, snapshot, policy=policy)
     _emit(
         args,
         "prepare",
