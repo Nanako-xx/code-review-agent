@@ -209,10 +209,49 @@ def _invoke(
     if operation == "scan":
         return module._existing_generated_files(eval_root)
     if operation == "check":
-        return module.check_outputs(eval_root, {relative: expected})
+        return module.check_outputs(
+            eval_root,
+            _build_plan(module, writable_outputs={relative: expected}),
+        )
     if operation == "write":
-        return module.write_outputs(eval_root, {relative: b"attacker replacement"})
+        return module.write_outputs(
+            eval_root,
+            _build_plan(
+                module,
+                writable_outputs={relative: b"attacker replacement"},
+            ),
+        )
     raise AssertionError("unknown operation: %s" % operation)
+
+
+def _build_plan(
+    module: ModuleType,
+    *,
+    writable_outputs: dict[str, bytes] | None = None,
+    check_only_fixtures: dict[str, bytes] | None = None,
+) -> object:
+    return module.CoreBuildPlan(
+        writable_outputs={} if writable_outputs is None else writable_outputs,
+        check_only_fixtures=(
+            {} if check_only_fixtures is None else check_only_fixtures
+        ),
+    )
+
+
+def _write_test_file(eval_root: Path, relative: str, data: bytes) -> Path:
+    target = eval_root.joinpath(*relative.split("/"))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    return target
+
+
+FIXTURE_BASE_PATH = (
+    "cases/core/core-py-test/repository/base/src/input.py"
+)
+FIXTURE_HEAD_PATH = (
+    "cases/core/core-py-test/repository/head/src/input.py"
+)
+DERIVED_CASE_PATH = "cases/core/core-py-test/case.json"
 
 
 def test_authoring_module_exposes_only_the_core_v2_projection(
@@ -232,6 +271,239 @@ def test_authoring_module_exposes_only_the_core_v2_projection(
     )
 
 
+def test_write_rejects_drifted_fixture_before_any_derived_output_mutation(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    drifted = b"locally modified immutable fixture"
+    fixture = _write_test_file(eval_root, FIXTURE_BASE_PATH, drifted)
+    original_derived = b"existing derived output"
+    derived = _write_test_file(eval_root, DERIVED_CASE_PATH, original_derived)
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={DERIVED_CASE_PATH: b"replacement derived output"},
+        check_only_fixtures={FIXTURE_BASE_PATH: b"expected fixture"},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+
+    with pytest.raises(RuntimeError, match="check-only fixture validation failed"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+    assert fixture.read_bytes() == drifted
+    assert derived.read_bytes() == original_derived
+
+
+def test_write_rejects_missing_fixture_without_creating_or_mutating_anything(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    original_derived = b"existing derived output"
+    derived = _write_test_file(eval_root, DERIVED_CASE_PATH, original_derived)
+    missing = eval_root.joinpath(*FIXTURE_BASE_PATH.split("/"))
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={DERIVED_CASE_PATH: b"replacement derived output"},
+        check_only_fixtures={FIXTURE_BASE_PATH: b"expected fixture"},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+
+    with pytest.raises(RuntimeError, match="check-only fixture validation failed"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+    assert not os.path.lexists(missing)
+    assert derived.read_bytes() == original_derived
+
+
+def test_write_rejects_symlinked_fixture_without_replacing_it(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    fixture = eval_root.joinpath(*FIXTURE_BASE_PATH.split("/"))
+    fixture.parent.mkdir(parents=True)
+    outside = tmp_path / "outside-fixture.py"
+    sentinel = b"outside fixture target"
+    outside.write_bytes(sentinel)
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={DERIVED_CASE_PATH: b"derived"},
+        check_only_fixtures={FIXTURE_BASE_PATH: sentinel},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+
+    with _file_symlink_or_skip(fixture, outside):
+        with pytest.raises(RuntimeError, match="check-only fixture"):
+            authoring_module.write_outputs(eval_root, plan)
+        assert writes == []
+        assert fixture.is_symlink()
+        assert outside.read_bytes() == sentinel
+
+
+def test_write_rejects_reparse_marked_fixture_without_replacing_it(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    sentinel = b"reparse-marked fixture"
+    fixture = _write_test_file(eval_root, FIXTURE_BASE_PATH, sentinel)
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={DERIVED_CASE_PATH: b"derived"},
+        check_only_fixtures={FIXTURE_BASE_PATH: sentinel},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+    _mark_as_reparse_point(monkeypatch, authoring_module, fixture)
+
+    with pytest.raises(RuntimeError, match="check-only fixture"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+    assert fixture.read_bytes() == sentinel
+
+
+def test_write_rejects_non_regular_fixture_without_replacing_it(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    fixture = eval_root.joinpath(*FIXTURE_BASE_PATH.split("/"))
+    fixture.mkdir(parents=True)
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={DERIVED_CASE_PATH: b"derived"},
+        check_only_fixtures={FIXTURE_BASE_PATH: b"expected fixture"},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+
+    with pytest.raises(RuntimeError, match="check-only fixture"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+    assert fixture.is_dir()
+
+
+def test_write_never_targets_check_only_repository_fixture_paths(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    fixture_bytes = b"immutable fixture"
+    _write_test_file(eval_root, FIXTURE_BASE_PATH, fixture_bytes)
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={DERIVED_CASE_PATH: b"derived"},
+        check_only_fixtures={FIXTURE_BASE_PATH: fixture_bytes},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+
+    authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == [DERIVED_CASE_PATH]
+    assert not any("/repository/base/" in item for item in writes)
+    assert not any("/repository/head/" in item for item in writes)
+
+
+def test_check_reports_drifted_and_missing_check_only_fixtures(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    _write_test_file(eval_root, FIXTURE_BASE_PATH, b"drifted fixture")
+    _write_test_file(eval_root, DERIVED_CASE_PATH, b"derived")
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={DERIVED_CASE_PATH: b"derived"},
+        check_only_fixtures={
+            FIXTURE_BASE_PATH: b"expected base fixture",
+            FIXTURE_HEAD_PATH: b"expected head fixture",
+        },
+    )
+
+    assert authoring_module.check_outputs(eval_root, plan) == [
+        "drifted check-only fixture: " + FIXTURE_BASE_PATH,
+        "missing check-only fixture: " + FIXTURE_HEAD_PATH,
+    ]
+
+
+def test_inventory_accepts_known_fixtures_and_rejects_unexpected_derived_files(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    fixture_bytes = b"immutable fixture"
+    _write_test_file(eval_root, FIXTURE_BASE_PATH, fixture_bytes)
+    _write_test_file(eval_root, DERIVED_CASE_PATH, b"derived")
+    unexpected = "cases/core/unexpected-derived.json"
+    _write_test_file(eval_root, unexpected, b"stale")
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={DERIVED_CASE_PATH: b"derived"},
+        check_only_fixtures={FIXTURE_BASE_PATH: fixture_bytes},
+    )
+
+    assert authoring_module.check_outputs(eval_root, plan) == [
+        "unexpected: " + unexpected
+    ]
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, relative, _data: writes.append(relative),
+    )
+    with pytest.raises(RuntimeError, match="unexpected generated files"):
+        authoring_module.write_outputs(eval_root, plan)
+    assert writes == []
+
+
 @pytest.mark.parametrize("relative", UNSAFE_OUTPUT_PATHS)
 def test_check_outputs_rejects_noncanonical_or_escaping_output_paths(
     authoring_module: ModuleType,
@@ -242,7 +514,13 @@ def test_check_outputs_rejects_noncanonical_or_escaping_output_paths(
     eval_root.mkdir()
 
     with pytest.raises(ValueError):
-        authoring_module.check_outputs(eval_root, {relative: b"expected"})
+        authoring_module.check_outputs(
+            eval_root,
+            _build_plan(
+                authoring_module,
+                writable_outputs={relative: b"expected"},
+            ),
+        )
 
 
 @pytest.mark.parametrize("relative", UNSAFE_OUTPUT_PATHS)
@@ -258,7 +536,13 @@ def test_write_outputs_rejects_noncanonical_or_escaping_output_paths_without_mut
 
     _assert_rejected(
         ValueError,
-        lambda: authoring_module.write_outputs(eval_root, {relative: b"payload"}),
+        lambda: authoring_module.write_outputs(
+            eval_root,
+            _build_plan(
+                authoring_module,
+                writable_outputs={relative: b"payload"},
+            ),
+        ),
     )
 
 

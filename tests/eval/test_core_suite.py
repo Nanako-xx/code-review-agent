@@ -1039,8 +1039,32 @@ def test_core_authoring_outputs_are_reproducible(tmp_path: Path) -> None:
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
-        outputs = module.build_outputs(tmp_path)
-        assert module.check_outputs(EVAL_ROOT, outputs) == []
+        plan = module.build_plan(tmp_path)
+        assert len(plan.writable_outputs) == 52
+        assert len(plan.check_only_fixtures) == 54
+        assert set(plan.writable_outputs).isdisjoint(plan.check_only_fixtures)
+        assert not any(
+            "/repository/base/" in relative
+            or "/repository/head/" in relative
+            for relative in plan.writable_outputs
+        )
+        assert all(
+            "/repository/base/" in relative
+            or "/repository/head/" in relative
+            for relative in plan.check_only_fixtures
+        )
+        assert module._summary(plan) == {
+            "schema_version": "core_suite_authoring_summary_v2",
+            "case_count": 18,
+            "golden_count": 12,
+            "suite_count": 2,
+            "regression_count": 10,
+            "capability_count": 8,
+            "writable_generated_file_count": 52,
+            "checked_fixture_file_count": 54,
+            "human_review_status": "requires_independent_re_review",
+        }
+        assert module.check_outputs(EVAL_ROOT, plan) == []
     finally:
         sys.modules.pop(module_name, None)
 
