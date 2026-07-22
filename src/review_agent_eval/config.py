@@ -2015,6 +2015,7 @@ class EvalRunConfig(_JsonModel):
             raise SchemaError(
                 "run_config.target_kinds must contain the suite wire target kind"
             )
+        object.__setattr__(self, "target_kinds", targets)
         if self.wire_contract.review_target_kind not in self.adapter_capabilities.target_kinds:
             raise SchemaError("adapter capabilities do not support the suite target kind")
         if (

@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import stat
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -46,6 +47,7 @@ from review_agent_eval.models import (
     FailureCode,
     SchemaError,
     SubmissionStatus,
+    TraceType,
     TrialStatus,
     UnsupportedProtocolVersionError,
     canonical_json_bytes,
@@ -388,6 +390,22 @@ def terminal_submission(
     return EvalSubmission.from_dict(payload)
 
 
+def local_trace_submission(
+    trial_id: str,
+    *,
+    target_materialization_id: str,
+) -> EvalSubmission:
+    payload = completed_submission(
+        trial_id,
+        target_materialization_id=target_materialization_id,
+    ).to_dict()
+    payload["trace_ref"] = {
+        "type": "local_path",
+        "value": "traces/attempt.jsonl",
+    }
+    return EvalSubmission.from_dict(payload)
+
+
 def make_store(tmp_path: Path):
     store = ArtifactStore(tmp_path / ".eval-runs")
     snapshot = make_case_snapshot()
@@ -401,10 +419,16 @@ def make_store(tmp_path: Path):
 def required_runner_artifacts(submission: EvalSubmission):
     """Minimal control-plane artifacts required by a terminal Agent receipt."""
 
-    return {
+    artifacts = {
         "clarification_match_receipts.json": {"receipts": []},
         "terminal_summary.json": {"status": submission.status.value},
     }
+    if (
+        submission.trace_ref is not None
+        and submission.trace_ref.type is TraceType.LOCAL_PATH
+    ):
+        artifacts["trace_capture.json"] = {"events": []}
+    return artifacts
 
 
 def write_required_runner_artifacts(
@@ -983,6 +1007,196 @@ def test_finalize_rejects_wrong_materialization_without_terminal_mutation(
 
 
 @pytest.mark.parametrize(
+    "missing_name",
+    (
+        "clarification_match_receipts.json",
+        "terminal_summary.json",
+    ),
+)
+def test_finalize_missing_control_artifact_rejects_before_any_publication(
+    tmp_path, missing_name
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = completed_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    runner_artifacts = required_runner_artifacts(submission)
+    runner_artifacts.pop(missing_name)
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="required Runner"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=runner_artifacts,
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_does_not_adopt_unpassed_orphan_required_runner_artifact(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = completed_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    artifacts = required_runner_artifacts(submission)
+    orphan_name = "terminal_summary.json"
+    orphan_value = artifacts.pop(orphan_name)
+    runner_base = "cases/%s/trials/%s/runner/attempt-%04d" % (
+        plan.case_path_id,
+        plan.trial_id,
+        running.active_attempt,
+    )
+    store._write_json(
+        config.run_id,
+        "%s/%s" % (runner_base, orphan_name),
+        orphan_value,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="required Runner"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=artifacts,
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_local_trace_requires_capture_before_any_publication(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = local_trace_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    artifacts = required_runner_artifacts(submission)
+    artifacts.pop("trace_capture.json")
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="required Runner"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=artifacts,
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_rejects_malformed_mandatory_trace_without_mutation(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = local_trace_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    artifacts = required_runner_artifacts(submission)
+    artifacts["trace_capture.json"] = {"raw_reasoning": "hidden"}
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(SchemaError):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=artifacts,
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_preflights_mandatory_trace_file_budget_without_mutation(
+    tmp_path,
+):
+    constrained = ResourceBudgets(
+        agent_timeout_seconds=900,
+        evaluator_timeout_seconds=300,
+        max_agent_output_bytes=64,
+        max_trace_bytes=64,
+        max_execution_artifact_file_bytes=64,
+        max_execution_artifact_total_bytes=512,
+        max_parallel_trials=1,
+    )
+    store = ArtifactStore(tmp_path / ".eval-runs")
+    snapshot = make_case_snapshot()
+    config = make_config(
+        case_snapshot=snapshot,
+        resource_budgets=constrained,
+    )
+    manifest = store.create_run(config, snapshot)
+    plan = manifest.trials[0]
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = local_trace_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    artifacts = required_runner_artifacts(submission)
+    artifacts["trace_capture.json"] = {"events": ["x" * 128]}
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="required trace"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=artifacts,
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_preflights_trace_ref_create_only_conflict_without_mutation(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = local_trace_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    base = "cases/%s/trials/%s" % (plan.case_path_id, plan.trial_id)
+    store._write_json(
+        config.run_id,
+        "%s/trace_ref.json" % base,
+        submission.trace_ref,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactConflictError, match="trace_ref"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+@pytest.mark.parametrize(
     "status",
     TERMINAL_SUBMISSION_STATUSES,
     ids=lambda status: status.value,
@@ -1270,6 +1484,146 @@ def test_materialization_create_bounds_input_iterables(
             replay_binding_digest=baseline.replay_binding_digest,
         )
     assert consumed == [0, 1, 2]
+
+
+def test_materialization_create_size_gate_precedes_sort_and_identity(
+    tmp_path, monkeypatch
+):
+    _store, config, _manifest, plan, _trial = make_store(tmp_path)
+    baseline = make_materialization(config, plan, attempt=1)
+    monkeypatch.setattr(
+        artifact_module,
+        "MAX_TRIAL_MATERIALIZATION_BYTES",
+        len(canonical_json_bytes(baseline)) - 1,
+    )
+
+    def forbidden_identity(cls, **_kwargs):
+        raise AssertionError("identity derivation ran before the size gate")
+
+    monkeypatch.setattr(
+        TrialMaterializationManifest,
+        "derive_materialization_id",
+        classmethod(forbidden_identity),
+    )
+
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        TrialMaterializationManifest.create(
+            run_id=baseline.run_id,
+            task_id=baseline.task_id,
+            trial_id=baseline.trial_id,
+            attempt=baseline.attempt,
+            eval_input_digest=baseline.eval_input_digest,
+            review_target_digest=baseline.review_target_digest,
+            wire_contract=baseline.wire_contract,
+            suite_preparation_binding_digest=(
+                baseline.suite_preparation_binding_digest
+            ),
+            prepared_source_id=baseline.prepared_source_id,
+            adapter_capabilities_digest=(
+                baseline.adapter_capabilities_digest
+            ),
+            readable_relative_paths=(
+                baseline.target_access.readable_relative_paths
+            ),
+            files=baseline.files,
+            replay_binding_digest=baseline.replay_binding_digest,
+        )
+
+
+def test_bounded_canonical_size_preflight_matches_exact_json_bytes():
+    payload = {
+        "unicode": ["café", "line\nfeed", "quote\"slash\\"],
+        "scalars": {"bool": True, "float": 1.25, "none": None},
+    }
+    exact_size = len(canonical_json_bytes(payload))
+
+    artifact_module._check_bounded_canonical_payload_size(
+        payload,
+        exact_size,
+        "test payload",
+    )
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        artifact_module._check_bounded_canonical_payload_size(
+            payload,
+            exact_size - 1,
+            "test payload",
+        )
+
+
+def test_materialization_direct_size_gate_precedes_file_sort(
+    tmp_path, monkeypatch
+):
+    _store, config, _manifest, plan, _trial = make_store(tmp_path)
+    baseline = make_materialization(config, plan, attempt=1)
+    monkeypatch.setattr(
+        artifact_module,
+        "MAX_TRIAL_MATERIALIZATION_BYTES",
+        len(canonical_json_bytes(baseline)) - 1,
+    )
+
+    def forbidden_sort(*_args, **_kwargs):
+        raise AssertionError("sorting ran before the size gate")
+
+    monkeypatch.setattr(
+        artifact_module,
+        "sorted",
+        forbidden_sort,
+        raising=False,
+    )
+
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        TrialMaterializationManifest(**vars(baseline))
+
+
+def test_materialization_from_dict_size_gate_precedes_nested_hydration(
+    tmp_path, monkeypatch
+):
+    _store, config, _manifest, plan, _trial = make_store(tmp_path)
+    baseline = make_materialization(config, plan, attempt=1)
+    payload = baseline.to_dict()
+    monkeypatch.setattr(
+        artifact_module,
+        "MAX_TRIAL_MATERIALIZATION_BYTES",
+        len(canonical_json_bytes(payload)) - 1,
+    )
+
+    def forbidden_target_access(cls, _value):
+        raise AssertionError("nested hydration ran before the size gate")
+
+    monkeypatch.setattr(
+        artifact_module.TargetAccess,
+        "from_dict",
+        classmethod(forbidden_target_access),
+    )
+
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        TrialMaterializationManifest.from_dict(payload)
+
+
+def test_materialization_path_coverage_uses_indexed_component_walk():
+    count = 20_000
+    readable = tuple(
+        "target/repository/roots/%05d" % index for index in range(count)
+    )
+    files = tuple("%s/file.py" % path for path in readable)
+
+    artifact_module._validate_materialization_path_coverage(files, readable)
+
+
+def test_materialization_path_coverage_rejects_unauthorized_file():
+    with pytest.raises(SchemaError, match="outside TargetAccess"):
+        artifact_module._validate_materialization_path_coverage(
+            ("target/private/secret.py",),
+            ("target/public",),
+        )
+
+
+def test_materialization_path_coverage_rejects_uncovered_readable_path():
+    with pytest.raises(SchemaError, match="no Agent-visible file binding"):
+        artifact_module._validate_materialization_path_coverage(
+            ("target/public/app.py",),
+            ("target/public", "target/empty"),
+        )
 
 
 @pytest.mark.parametrize("unbounded_field", ("artifacts", "agent_visible_files"))
@@ -1588,6 +1942,90 @@ def test_resume_only_commits_missing_legal_receipts_and_never_rewrites_submissio
     terminal_path = submission_path.parent / "receipts" / "terminal.json"
     assert terminal_path.is_file()
     assert store.load_existing_submission(config.run_id, TASK_ID, plan.trial_id) == submission
+
+
+def test_recovery_checks_cumulative_execution_budget_under_lock_before_mutation(
+    tmp_path, monkeypatch
+):
+    constrained = ResourceBudgets(
+        agent_timeout_seconds=900,
+        evaluator_timeout_seconds=300,
+        max_agent_output_bytes=64,
+        max_trace_bytes=64,
+        max_execution_artifact_file_bytes=256,
+        max_execution_artifact_total_bytes=300,
+        max_parallel_trials=1,
+    )
+    store = ArtifactStore(tmp_path / ".eval-runs")
+    snapshot = make_case_snapshot()
+    config = make_config(
+        case_snapshot=snapshot,
+        resource_budgets=constrained,
+    )
+    manifest = store.create_run(config, snapshot)
+    plan = manifest.trials[0]
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = completed_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    terminal_path = write_orphan_submission_artifacts(
+        store,
+        config,
+        plan,
+        submission,
+        attempt=running.active_attempt,
+    )
+    runner_base = "cases/%s/trials/%s/runner/attempt-%04d" % (
+        plan.case_path_id,
+        plan.trial_id,
+        running.active_attempt,
+    )
+    for name in ("workspace_manifest.json", "command_attestations.json"):
+        ref = store._write_json(
+            config.run_id,
+            "%s/%s" % (runner_base, name),
+            {"payload": "x" * 180},
+        )
+        assert ref.size_bytes <= constrained.max_execution_artifact_file_bytes
+    assert store._execution_artifact_total_bytes(config.run_id) > (
+        constrained.max_execution_artifact_total_bytes
+    )
+
+    real_lock = store._lock
+    real_total = store._execution_artifact_total_bytes
+    budget_lock_held = False
+    total_checked_under_lock = False
+
+    @contextmanager
+    def tracked_lock(path):
+        nonlocal budget_lock_held
+        with real_lock(path):
+            is_budget_lock = path.name == "execution-budget.lock"
+            if is_budget_lock:
+                budget_lock_held = True
+            try:
+                yield
+            finally:
+                if is_budget_lock:
+                    budget_lock_held = False
+
+    def checked_total(run_id):
+        nonlocal total_checked_under_lock
+        assert budget_lock_held
+        total_checked_under_lock = True
+        return real_total(run_id)
+
+    monkeypatch.setattr(store, "_lock", tracked_lock)
+    monkeypatch.setattr(store, "_execution_artifact_total_bytes", checked_total)
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="cumulative"):
+        store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+
+    assert total_checked_under_lock is True
+    assert not terminal_path.exists()
+    assert trial_artifact_snapshot(store, config, plan) == before
 
 
 @pytest.mark.parametrize("orphan_kind", ("input", "materialization", "submission"))

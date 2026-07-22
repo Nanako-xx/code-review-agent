@@ -335,6 +335,30 @@ def test_run_config_binds_wire_preparation_and_adapter_capabilities(
         EvalRunConfig.from_dict(payload)
 
 
+def test_run_config_direct_construction_freezes_target_kinds_alias(
+    case_snapshot: RunCaseSnapshot,
+) -> None:
+    baseline = run_config(case_snapshot)
+    caller_targets = [ReviewTargetKind.REPOSITORY]
+    config = EvalRunConfig(
+        **{
+            **vars(baseline),
+            "target_kinds": caller_targets,
+        }
+    )
+    encoded = config.to_json()
+    digest = config.digest()
+    run_id = config.run_id
+
+    caller_targets.clear()
+
+    assert config.target_kinds == (ReviewTargetKind.REPOSITORY,)
+    assert type(config.target_kinds) is tuple
+    assert config.to_json() == encoded
+    assert config.digest() == digest
+    assert config.run_id == run_id
+
+
 def test_suite_run_config_reuses_verified_snapshot_protocol_and_round_trips(
     case_snapshot: RunCaseSnapshot,
 ) -> None:
