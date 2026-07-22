@@ -96,6 +96,8 @@ _WINDOWS_RESERVED_NAMES = frozenset(
         "aux",
         "nul",
         "clock$",
+        "conin$",
+        "conout$",
         *("com%d" % index for index in range(1, 10)),
         *("lpt%d" % index for index in range(1, 10)),
     }

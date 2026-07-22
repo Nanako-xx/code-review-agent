@@ -278,6 +278,12 @@ WIN32_RESERVED_COMPONENTS = (
     "NUL .json",
     "AUX .x",
     "LPT9 .data",
+    "CONIN$",
+    "conout$",
+    "ConIn$.txt",
+    "CONOUT$.log",
+    "CONIN$ .txt",
+    "cOnOuT$ .log",
     *("COM%d.py" % value for value in range(1, 10)),
     *("lpt%d.data" % value for value in range(1, 10)),
 )
@@ -891,6 +897,8 @@ def test_authoring_path_policy_accepts_windows_reserved_near_miss_and_unicode(
 ) -> None:
     for relative in (
         "cases/core/core-py-001/COM10 .txt/case.json",
+        "cases/core/core-py-001/CONINX$.txt/case.json",
+        "cases/core/core-py-001/CONOUTER$.log/case.json",
         "cases/core/core-py-001/普通话/case.json",
     ):
         parts = authoring_module._safe_relative_parts(

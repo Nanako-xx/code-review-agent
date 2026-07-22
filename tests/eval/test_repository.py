@@ -761,6 +761,12 @@ def test_symlink_git_entries_are_rejected_before_checkout(tmp_path: Path) -> Non
         (b"NUL .json",),
         (b"AUX .x",),
         (b"LPT9 .data",),
+        (b"CONIN$",),
+        (b"conout$",),
+        (b"ConIn$.txt",),
+        (b"CONOUT$.log",),
+        (b"CONIN$ .txt",),
+        (b"cOnOuT$ .log",),
         (b"trailing.",),
         (b"trailing ",),
         (b"stream:ads",),
@@ -791,6 +797,8 @@ def test_fixture_builder_accepts_windows_reserved_near_miss_and_unicode_names(
     (fixture / "head").mkdir()
     for side in ("base", "head"):
         (fixture / side / "COM10 .txt").write_bytes(b"payload")
+        (fixture / side / "CONINX$.txt").write_bytes(b"payload")
+        (fixture / side / "CONOUTER$.log").write_bytes(b"payload")
         (fixture / side / "普通话.txt").write_bytes(b"payload")
 
     built = FixtureRepositoryBuilder().build(fixture, tmp_path / "near-miss.git")

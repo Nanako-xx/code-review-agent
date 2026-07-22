@@ -450,6 +450,8 @@ def test_manifest_collision_keys_use_unicode_normalization_before_casefold() -> 
         "cases/NUL .json",
         "cases/AUX .x",
         "cases/LPT9 .data",
+        "cases/CONIN$.json",
+        "cases/cOnOuT$ .log",
         "cases/COM¹.json",
         "cases/LPT³.txt",
         "cases/case.json.",
@@ -478,7 +480,15 @@ def test_manifest_rejects_unsafe_and_non_portable_case_paths(path: str) -> None:
         ("LPT\N{SUPERSCRIPT TWO}", True),
         ("LPT\N{SUPERSCRIPT THREE}", True),
         ("CLOCK$ .txt", True),
+        ("CONIN$", True),
+        ("conout$", True),
+        ("ConIn$.txt", True),
+        ("CONOUT$.log", True),
+        ("CONIN$ .txt", True),
+        ("cOnOuT$ .log", True),
         ("COM10 .txt", False),
+        ("CONINX$.txt", False),
+        ("CONOUTER$.log", False),
         ("普通话.txt", False),
     ),
 )
@@ -491,7 +501,12 @@ def test_windows_reserved_path_component_policy_handles_ignored_stem_suffixes(
 
 def test_manifest_accepts_windows_reserved_near_miss_and_unicode_case_paths() -> None:
     case = EvalCase.from_dict(case_payload())
-    for path in ("cases/COM10 .txt", "cases/普通话.txt"):
+    for path in (
+        "cases/COM10 .txt",
+        "cases/CONINX$.txt",
+        "cases/CONOUTER$.log",
+        "cases/普通话.txt",
+    ):
         manifest = manifest_for_case(case, path=path)
         assert manifest.cases[0].path == path
 

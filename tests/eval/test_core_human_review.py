@@ -401,6 +401,12 @@ def test_export_rejects_injected_short_alias_before_any_output_mutation(
         "NUL .json",
         "AUX .x",
         "LPT9 .data",
+        "CONIN$",
+        "conout$",
+        "ConIn$.txt",
+        "CONOUT$.log",
+        "CONIN$ .txt",
+        "cOnOuT$ .log",
     ),
 )
 def test_human_review_shared_path_policy_rejects_nfkc_device_names(
@@ -414,7 +420,7 @@ def test_human_review_shared_path_policy_rejects_nfkc_device_names(
 
 
 def test_human_review_path_policy_accepts_windows_reserved_near_miss_and_unicode() -> None:
-    for component in ("COM10 .txt", "普通话"):
+    for component in ("COM10 .txt", "CONINX$.txt", "CONOUTER$.log", "普通话"):
         assert human_review_module._safe_relative_parts(
             "repository/base/%s/input.py" % component,
             "fixture path",
