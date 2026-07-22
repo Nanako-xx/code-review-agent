@@ -37,7 +37,11 @@ from core_human_review import (  # noqa: E402
     verify_completed_response,
     verify_current_case_approval,
 )
-from review_agent_eval.models import EvalCase, canonical_json  # noqa: E402
+from review_agent_eval.models import (  # noqa: E402
+    EvalCase,
+    RepositoryReviewTarget,
+    canonical_json,
+)
 
 
 TASK_ID = "core-py-001"
@@ -77,6 +81,12 @@ def _case(task_id: str = TASK_ID) -> EvalCase:
 
 def _annotation() -> dict:
     return _read_json(EVAL_ROOT / "cases" / "core" / TASK_ID / "annotation.json")
+
+
+def _repository_target(case: EvalCase) -> RepositoryReviewTarget:
+    target = case.input.review_target
+    assert type(target) is RepositoryReviewTarget
+    return target
 
 
 def _batch(tmp_path: Path, task_ids: tuple[str, ...] = (TASK_ID,)) -> Path:
@@ -202,7 +212,9 @@ def _adjudication(verified, path: Path) -> dict:
 
 def _fixture_manifest() -> dict:
     case = _case()
-    root = EVAL_ROOT / case.input.repository.path
+    repository_path = _repository_target(case).repository.path
+    assert repository_path is not None
+    root = EVAL_ROOT / repository_path
 
     def files(side: str) -> dict[str, str]:
         return {
@@ -235,6 +247,17 @@ def test_exported_packet_is_blind_source_bound_and_replayable(tmp_path: Path) ->
     assert not any("golden" in path.parts for path in packet_root.rglob("*"))
 
     packet = _read_json(packet_root / "packet.json")
+    assert packet["eval_input"]["schema_version"] == "eval_input_v2"
+    assert set(packet["eval_input"]) == {
+        "schema_version",
+        "task_id",
+        "review_target",
+    }
+    assert set(packet["eval_input"]["review_target"]) == {
+        "kind",
+        "repository",
+        "review_request",
+    }
     expected = make_packet(
         case,
         _annotation()["repository_binding"],
@@ -242,6 +265,26 @@ def test_exported_packet_is_blind_source_bound_and_replayable(tmp_path: Path) ->
         annotation_protocol_binding(EVAL_ROOT),
     )
     assert packet == expected
+
+
+def test_packet_verifier_rejects_a_self_consistent_legacy_eval_input(
+    tmp_path: Path,
+) -> None:
+    batch = _batch(tmp_path)
+    packet_path = batch / "cases" / TASK_ID / "packet.json"
+    packet = _read_json(packet_path)
+    target = packet["eval_input"].pop("review_target")
+    packet["eval_input"]["schema_version"] = "eval_input_v1"
+    packet["eval_input"]["repository"] = target["repository"]
+    packet["eval_input"]["review_request"] = target["review_request"]
+    core = {key: value for key, value in packet.items() if key != "packet_digest"}
+    packet["packet_digest"] = hashlib.sha256(
+        canonical_json(core).encode("utf-8")
+    ).hexdigest()
+    packet_path.write_text(canonical_json(packet), encoding="utf-8")
+
+    with pytest.raises(HumanReviewError, match="sole v2 projection"):
+        verify_blind_review_batch(EVAL_ROOT, batch)
 
 
 def test_export_rejects_traversal_overwrite_and_repository_output(tmp_path: Path) -> None:
@@ -564,7 +607,7 @@ def test_ledger_rejects_overwrite_tampering_and_stale_case_digest(tmp_path: Path
     (clean_ledger / "records" / f"{TASK_ID}.json").write_text(
         canonical_json(record), encoding="utf-8"
     )
-    with pytest.raises(HumanReviewError, match="stale"):
+    with pytest.raises(HumanReviewError, match="requires independent re-review"):
         load_source_bound_ledger_record(
             clean_ledger,
             _case(),

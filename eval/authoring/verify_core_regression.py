@@ -23,11 +23,21 @@ from core_human_review import (  # noqa: E402
 )
 from review_agent_eval.adapters.current_agent import CurrentAgentAdapter  # noqa: E402
 from review_agent_eval.artifacts import ArtifactStore  # noqa: E402
-from review_agent_eval.cases import CaseSplit  # noqa: E402
+from review_agent_eval.cases import (  # noqa: E402
+    REPOSITORY_MATERIALIZER_PROTOCOL,
+    CaseSplit,
+    SuiteKind,
+)
 from review_agent_eval.config import SuiteRunConfig  # noqa: E402
 from review_agent_eval.datasets import CaseBank  # noqa: E402
 from review_agent_eval.intent_evaluator import IntentEvaluationStatus  # noqa: E402
-from review_agent_eval.models import SubmissionStatus  # noqa: E402
+from review_agent_eval.models import (  # noqa: E402
+    EVAL_CASE_SCHEMA_VERSION,
+    EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
+    ReviewTargetKind,
+    SubmissionStatus,
+)
 from review_agent_eval.orchestrator import EvaluationOrchestrator  # noqa: E402
 from review_agent_eval.repository import RepositoryPreparer  # noqa: E402
 from review_agent_eval.review_evaluator import ReviewEvaluationStatus  # noqa: E402
@@ -37,7 +47,7 @@ from review_agent_eval.runner import (  # noqa: E402
 )
 
 
-PROMOTION_RUN_INSTANCE_KEY = "core-regression-promotion-v1"
+PROMOTION_RUN_INSTANCE_KEY = "core-regression-promotion-v2"
 PROMOTION_PROTOCOL_ID = "native_repository"
 MINIMUM_PROMOTION_TRIALS = 3
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
@@ -49,6 +59,19 @@ class CoreRegressionPromotionError(RuntimeError):
 
 def _fail(message: str) -> None:
     raise CoreRegressionPromotionError(message)
+
+
+def _is_non_real_model_identity(value: Any) -> bool:
+    if type(value) is not str or not value.strip():
+        return True
+    tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", value.casefold())
+        if token
+    }
+    return bool(
+        tokens & {"none", "fake", "fixture", "mock", "scripted", "test", "unknown"}
+    )
 
 
 def _promotion_locator(value: Any) -> dict[str, str]:
@@ -87,10 +110,25 @@ def _assert_current_agent(config: Any, preflight: CapabilityPreflight) -> None:
         _fail("promotion Agent commit must be a full immutable Git object ID")
     if agent.agent_version.casefold() in {"working-tree", "unknown"}:
         _fail("promotion Agent version must identify a release baseline")
-    if agent.provider.casefold() in {"none", "fake"}:
+    if _is_non_real_model_identity(agent.provider):
         _fail("promotion Run must use a real model provider")
-    if agent.model.casefold() in {"none", "fake", "unknown"}:
+    if _is_non_real_model_identity(agent.model):
         _fail("promotion Run must bind a real model")
+
+
+def _assert_v2_repository_suite(handle: Any) -> None:
+    manifest = handle.manifest
+    contract = manifest.wire_contract
+    if (
+        manifest.source.kind is not SuiteKind.CORE
+        or manifest.source.preparation_binding is not None
+        or contract.case_schema_version != EVAL_CASE_SCHEMA_VERSION
+        or contract.input_schema_version != EVAL_INPUT_SCHEMA_VERSION
+        or contract.submission_schema_version != EVAL_SUBMISSION_SCHEMA_VERSION
+        or contract.review_target_kind is not ReviewTargetKind.REPOSITORY
+        or contract.materializer_protocol != REPOSITORY_MATERIALIZER_PROTOCOL
+    ):
+        _fail("promotion Case does not belong to the sole Core v2 Repository contract")
 
 
 def _assert_preflight(config: Any, manifest: Any, raw: Any) -> None:
@@ -210,6 +248,7 @@ def verify_case_promotion(
         ) from exc
     locator = _promotion_locator(dict(promotion_evidence))
     handle = case_bank.handle(task_id)
+    _assert_v2_repository_suite(handle)
     if handle.split is not CaseSplit.REGRESSION:
         _fail("only a current Regression manifest Case may use promotion evidence")
     case = handle.load()

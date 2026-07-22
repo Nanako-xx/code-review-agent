@@ -6,37 +6,42 @@ from functools import lru_cache
 import hashlib
 import importlib.util
 import json
-import os
 import re
-import shutil
 from pathlib import Path
 import sys
 import unicodedata
 
 from review_agent_eval.cases import (
+    REPOSITORY_MATERIALIZER_PROTOCOL,
     CaseSplit,
     SuiteCase,
     SuiteKind,
     SuiteManifest,
 )
 from review_agent_eval.datasets import CaseBank
-from review_agent_eval.artifacts import ArtifactStore
 from review_agent_eval.models import (
+    EVAL_CASE_SCHEMA_VERSION,
+    EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
     CaseOrigin,
     ClarificationAction,
     ClarificationPolicy,
     DiffSide,
     EvalCase,
+    EvalSubmission,
     FindingSeverity,
     IntentAuthority,
+    MetricAuthoritySource,
     NovelFindingPolicy,
     RequiredContextLevel,
+    RepositoryReviewTarget,
+    ReviewTargetKind,
     TruthLocation,
     TruthCompleteness,
     canonical_json,
     canonical_sha256,
 )
-from review_agent_eval.repository import FixtureRepositoryBuilder, RepositoryPreparer
+from review_agent_eval.repository import FixtureRepositoryBuilder
 
 AUTHORING_MODULE_ROOT = Path(__file__).resolve().parents[2] / "eval" / "authoring"
 if str(AUTHORING_MODULE_ROOT) not in sys.path:
@@ -59,13 +64,14 @@ MANIFEST_PATHS = {
 }
 ANNOTATION_GUIDELINES = EVAL_ROOT / "annotation-guidelines.md"
 CORE_PROTOCOL_ID = "native_repository"
-ANNOTATION_CHECKLIST_VERSION = "core-annotation-v1"
+ANNOTATION_CHECKLIST_VERSION = "core-annotation-v2"
 AUTHORING_SCRIPT = EVAL_ROOT / "authoring" / "build_core_suites.py"
 PROMOTION_VERIFIER = EVAL_ROOT / "authoring" / "verify_core_regression.py"
 GOLDEN_INDEX = EVAL_ROOT / "cases" / "core" / "golden-index.json"
-GOLDEN_INDEX_SCHEMA_VERSION = "core_golden_index_v1"
-GOLDEN_ENTRY_SCHEMA_VERSION = "core_golden_entry_v1"
-SUITE_SOURCE_PACKET_SCHEMA_VERSION = "core_suite_source_v2"
+GOLDEN_INDEX_SCHEMA_VERSION = "core_golden_index_v2"
+GOLDEN_ENTRY_SCHEMA_VERSION = "core_golden_entry_v2"
+SUITE_SOURCE_PACKET_SCHEMA_VERSION = "core_suite_source_v3"
+CORE_SOURCE_VERSION = "core-2026-07-21-v3"
 
 REQUIRED_INTENT_SCENARIOS = {
     "explicit_intent",
@@ -156,6 +162,12 @@ def _coverage(case: EvalCase) -> set[str]:
     return set(raw)
 
 
+def _repository_target(case: EvalCase) -> RepositoryReviewTarget:
+    target = case.input.review_target
+    assert type(target) is RepositoryReviewTarget
+    return target
+
+
 def _normalized(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
@@ -175,7 +187,7 @@ def _snapshot(root: Path) -> dict[str, bytes]:
 
 
 def _location_file(case: EvalCase, location: TruthLocation) -> Path:
-    repository_path = case.input.repository.path
+    repository_path = _repository_target(case).repository.path
     assert repository_path is not None
     fixture = EVAL_ROOT / repository_path
     if location.side is DiffSide.LEFT:
@@ -258,18 +270,29 @@ def test_task13_declares_two_canonical_core_manifests_and_a_guideline() -> None:
     assert len(banks) == 2
     for bank in banks:
         assert type(bank.manifest) is SuiteManifest
+        assert bank.manifest.schema_version == "suite_manifest_v2"
         assert bank.manifest.source.kind is SuiteKind.CORE
+        assert bank.manifest.source.preparation_binding is None
+        contract = bank.manifest.wire_contract
+        assert contract.case_schema_version == EVAL_CASE_SCHEMA_VERSION
+        assert contract.input_schema_version == EVAL_INPUT_SCHEMA_VERSION
+        assert contract.submission_schema_version == EVAL_SUBMISSION_SCHEMA_VERSION
+        assert contract.review_target_kind is ReviewTargetKind.REPOSITORY
+        assert contract.materializer_protocol == REPOSITORY_MATERIALIZER_PROTOCOL
         raw = (EVAL_ROOT / MANIFEST_PATHS[bank.suite_id]).read_bytes()
         assert raw == bank.manifest.to_json().encode("utf-8"), (
             "%s must be canonical UTF-8 JSON" % bank.suite_id
         )
+        assert bank.manifest.digest() == canonical_sha256(bank.manifest.to_dict())
+        assert hashlib.sha256(raw + b"\n").hexdigest() != bank.manifest.digest()
 
 
 def test_core_suites_share_the_final_case_schema_and_have_18_unique_cases() -> None:
     banks = _banks()
     regression = next(bank for bank in banks if bank.suite_id == "core-regression")
     capability = next(bank for bank in banks if bank.suite_id == "core-capability")
-    assert regression.handles and capability.handles
+    assert len(regression.handles) == 10
+    assert len(capability.handles) == 8
     assert all(handle.split is CaseSplit.REGRESSION for handle in regression)
     assert all(handle.split is CaseSplit.CAPABILITY for handle in capability)
 
@@ -277,7 +300,7 @@ def test_core_suites_share_the_final_case_schema_and_have_18_unique_cases() -> N
     task_ids = [case.task_id for _bank, _entry, case in loaded]
     case_paths = [entry.path for _bank, entry, _case in loaded]
     digests = [entry.canonical_case_digest for _bank, entry, _case in loaded]
-    assert len(task_ids) >= 18
+    assert len(task_ids) == 18
     assert len(task_ids) == len(set(task_ids))
     assert len(case_paths) == len(set(case_paths))
     assert len(digests) == len(set(digests))
@@ -290,23 +313,37 @@ def test_core_suites_share_the_final_case_schema_and_have_18_unique_cases() -> N
         assert case.source.suite == bank.suite_id
         assert case.source.origin is CaseOrigin.HAND_AUTHORED
         assert case.source.source_id == case.task_id + "-source"
+        assert case.schema_version == EVAL_CASE_SCHEMA_VERSION
+        assert case.case_version == 3
+        assert case.review_evaluator_context.truth_contexts == ()
         assert entry.path == "cases/core/%s/case.json" % case.task_id
-        assert case.input.repository.path == (
+        target = _repository_target(case)
+        assert target.kind is ReviewTargetKind.REPOSITORY
+        assert target.repository.path == (
             "cases/core/%s/repository" % case.task_id
         )
+        assert set(case.input.to_dict()) == {"review_target"}
+        assert set(case.eval_input().to_dict()) == {
+            "schema_version",
+            "task_id",
+            "review_target",
+        }
         raw = (EVAL_ROOT / entry.path).read_bytes()
         assert raw == case.to_json().encode("utf-8"), (
-            "%s must be canonical EvalCase v1 JSON" % case.task_id
+            "%s must be canonical EvalCase v2 JSON" % case.task_id
         )
+        assert entry.raw_file_size_bytes == len(raw)
+        assert entry.raw_file_sha256 == hashlib.sha256(raw).hexdigest()
+        assert entry.canonical_case_digest == case.digest()
         assert entry.eval_input_digest == case.eval_input().digest()
         assert entry.truth_completeness is case.review_truth.completeness
 
 
-def test_core_v2_private_identifiers_are_global_opaque_sequences() -> None:
+def test_core_v3_private_identifiers_are_global_opaque_sequences() -> None:
     loaded = _loaded_cases()
-    assert {case.case_version for _bank, _entry, case in loaded} == {2}
+    assert {case.case_version for _bank, _entry, case in loaded} == {3}
     assert {case.source.source_version for _bank, _entry, case in loaded} == {
-        "core-2026-07-19-v2"
+        CORE_SOURCE_VERSION
     }
 
     intent_ids = [
@@ -351,11 +388,30 @@ def test_golden_index_binds_exact_bytes_into_each_suite_source_hash() -> None:
     index = json.loads(raw_index.decode("utf-8"))
     assert type(index) is dict
     assert raw_index == canonical_json(index).encode("utf-8")
-    assert set(index) == {"entries", "schema_version", "source_version"}
+    assert set(index) == {
+        "entries",
+        "run_binding",
+        "schema_version",
+        "source_version",
+    }
     assert index["schema_version"] == GOLDEN_INDEX_SCHEMA_VERSION
-    assert index["source_version"] == "core-2026-07-19-v2"
+    assert index["source_version"] == CORE_SOURCE_VERSION
+    run_binding = index["run_binding"]
+    assert set(run_binding) == {
+        "schema_version",
+        "run_instance_key",
+        "run_id",
+        "attempt",
+        "scenario_order",
+    }
+    assert run_binding["schema_version"] == "core_golden_run_binding_v2"
+    assert run_binding["run_instance_key"] == "core-golden-authoring-v2"
+    assert re.fullmatch(r"run-[0-9a-f]{64}", run_binding["run_id"])
+    assert run_binding["attempt"] == 1
+    assert len(run_binding["scenario_order"]) == 12
+    assert len(set(run_binding["scenario_order"])) == 12
     entries = index["entries"]
-    assert type(entries) is list and entries
+    assert type(entries) is list and len(entries) == 12
     assert entries == sorted(entries, key=lambda item: item["path"])
 
     cases = {case.task_id: case for _bank, _entry, case in _loaded_cases()}
@@ -365,12 +421,16 @@ def test_golden_index_binds_exact_bytes_into_each_suite_source_hash() -> None:
         assert type(entry) is dict
         assert set(entry) == {
             "entry_digest",
+            "canonical_submission_digest",
+            "eval_input_digest",
             "path",
             "raw_file_sha256",
             "raw_file_size_bytes",
             "scenario",
             "suite_id",
             "task_id",
+            "target_materialization_id",
+            "trial_id",
         }
         path = entry["path"]
         task_id = entry["task_id"]
@@ -382,8 +442,16 @@ def test_golden_index_binds_exact_bytes_into_each_suite_source_hash() -> None:
         assert task_id in cases
         assert entry["suite_id"] == cases[task_id].source.suite
         golden_bytes = _required_file(EVAL_ROOT / path).read_bytes()
+        submission = EvalSubmission.from_json(golden_bytes)
         assert entry["raw_file_size_bytes"] == len(golden_bytes)
         assert entry["raw_file_sha256"] == hashlib.sha256(golden_bytes).hexdigest()
+        assert entry["canonical_submission_digest"] == submission.digest()
+        assert entry["eval_input_digest"] == submission.eval_input_digest
+        assert entry["trial_id"] == submission.trial_id
+        assert entry["target_materialization_id"] == (
+            submission.target_materialization_id
+        )
+        assert submission.eval_input_digest == cases[task_id].eval_input().digest()
         core = {
             name: entry[name]
             for name in (
@@ -393,6 +461,10 @@ def test_golden_index_binds_exact_bytes_into_each_suite_source_hash() -> None:
                 "scenario",
                 "raw_file_size_bytes",
                 "raw_file_sha256",
+                "canonical_submission_digest",
+                "eval_input_digest",
+                "trial_id",
+                "target_materialization_id",
             )
         }
         assert entry["entry_digest"] == canonical_sha256(
@@ -456,7 +528,7 @@ def test_annotation_ledgers_bind_cases_repositories_and_suite_taxonomy() -> None
             "task_id",
             "truth_summary",
         }
-        assert annotation["schema_version"] == "core_annotation_record_v1"
+        assert annotation["schema_version"] == "core_annotation_record_v2"
         assert annotation["task_id"] == case.task_id
         assert annotation["case_version"] == case.case_version
         assert annotation["suite_id"] == case.source.suite
@@ -494,6 +566,7 @@ def test_annotation_ledgers_bind_cases_repositories_and_suite_taxonomy() -> None
             "adjudication_digest",
             "adjudicator_id",
             "annotation_protocol_version",
+            "approval_identity_status",
             "author_id",
             "base_revision",
             "base_tree",
@@ -508,30 +581,38 @@ def test_annotation_ledgers_bind_cases_repositories_and_suite_taxonomy() -> None
             "head_tree",
             "independent_annotation_digest",
             "leakage_review_completed",
+            "prior_approval_carried_forward",
             "review_batch_id",
             "reviewer_id",
             "schema_version",
             "status",
             "task_id",
         }
-        assert human_review["schema_version"] == "core_human_review_record_v1"
+        assert human_review["schema_version"] == "core_human_review_record_v2"
         assert human_review["status"] in {
-            "pending_human_review",
+            "requires_independent_re_review",
             "approved",
             "rejected",
         }
+        assert human_review["approval_identity_status"] in {
+            "requires_re_review",
+            "current_source_bound",
+        }
+        assert human_review["prior_approval_carried_forward"] is False
         assert human_review["task_id"] == case.task_id
         assert human_review["case_version"] == case.case_version
         assert human_review["canonical_case_digest"] == entry.canonical_case_digest
         assert human_review["eval_input_digest"] == entry.eval_input_digest
-        assert human_review["base_revision"] == case.input.repository.base_revision
-        assert human_review["head_revision"] == case.input.repository.head_revision
+        repository = _repository_target(case).repository
+        assert human_review["base_revision"] == repository.base_revision
+        assert human_review["head_revision"] == repository.head_revision
         assert human_review["base_tree"] == annotation["repository_binding"]["base_tree"]
         assert human_review["head_tree"] == annotation["repository_binding"]["head_tree"]
         assert human_review["annotation_protocol_version"] == (
             ANNOTATION_CHECKLIST_VERSION
         )
-        fixture_root = EVAL_ROOT / case.input.repository.path
+        assert repository.path is not None
+        fixture_root = EVAL_ROOT / repository.path
         fixture_manifest = fixture_manifest_from_mappings(
             {
                 path: raw.decode("utf-8")
@@ -561,14 +642,16 @@ def test_annotation_ledgers_bind_cases_repositories_and_suite_taxonomy() -> None
         assert type(disagreements["items"]) is list
         assert disagreements["status"] in {
             "pending_blind_review",
+            "requires_independent_re_review",
             "none",
             "resolved",
             "unresolved",
         }
-        if human_review["status"] == "pending_human_review":
+        if human_review["status"] == "requires_independent_re_review":
             assert not any(checklist[name] for name in HUMAN_CHECKLIST_ITEMS)
             assert human_review["final_decision"] is None
-            assert disagreements["status"] == "pending_blind_review"
+            assert disagreements["status"] == "requires_independent_re_review"
+            assert human_review["approval_identity_status"] == "requires_re_review"
 
         coverage = _coverage(case)
         intent_scenarios.update(coverage & REQUIRED_INTENT_SCENARIOS)
@@ -578,109 +661,41 @@ def test_annotation_ledgers_bind_cases_repositories_and_suite_taxonomy() -> None
     assert REQUIRED_REVIEW_SCENARIOS <= review_scenarios
 
 
-def test_every_core_case_has_an_approved_human_review_record() -> None:
+def test_independent_human_re_review_gate_is_explicitly_unmet() -> None:
     pending = []
     for _bank, _entry, case in _loaded_cases():
         try:
-            source_bound_record = verify_current_case_approval(
-                EVAL_ROOT, case.task_id
-            )
-        except HumanReviewError:
+            verify_current_case_approval(EVAL_ROOT, case.task_id)
+        except HumanReviewError as exc:
             pending.append(case.task_id)
-            continue
+            assert "no evaluator-private human approval" in str(exc)
+        else:  # pragma: no cover - checked-in external evidence is intentionally absent
+            raise AssertionError("Task 3 must not fabricate or carry forward approval")
         annotation = _annotation(case)
-        human_review = annotation["human_review"]
-        checklist = annotation["checklist"]
-        assert type(human_review) is dict and type(checklist) is dict
-        assert source_bound_record["record_digest"]
-        assert human_review["status"] == "approved"
-        assert checklist["human_review_completed"]
-        reviewer = human_review["reviewer_id"]
-        author = human_review["author_id"]
-        assert type(reviewer) is str and reviewer.strip()
-        assert type(author) is str and author.strip() and author != reviewer
-        assert not any(
-            marker in reviewer.casefold()
-            for marker in ("agent", "bot", "gpt", "llm", "claude", "codex")
+        assert annotation["human_review"]["status"] == (
+            "requires_independent_re_review"
         )
-        assert type(human_review["blind_review_started_at"]) is str
-        assert type(human_review["blind_review_completed_at"]) is str
-        assert type(human_review["review_batch_id"]) is str
-        assert human_review["final_decision"] == "accepted"
-        assert human_review["leakage_review_completed"] is True
-        assert re.fullmatch(
-            r"[0-9a-f]{64}", human_review["independent_annotation_digest"]
+        assert annotation["human_review"]["approval_identity_status"] == (
+            "requires_re_review"
         )
-        assert all(checklist[name] for name in HUMAN_CHECKLIST_ITEMS)
-        disagreements = annotation["disagreements"]
-        assert disagreements["status"] in {"none", "resolved"}
-        if disagreements["status"] == "resolved":
-            assert type(disagreements["adjudicator_id"]) is str
-            assert re.fullmatch(
-                r"[0-9a-f]{64}", disagreements["adjudication_digest"]
-            )
-    assert not pending, "human review is still pending for: %s" % ", ".join(pending)
+        assert annotation["human_review"]["prior_approval_carried_forward"] is False
+        assert not annotation["checklist"]["human_review_completed"]
+    assert pending == sorted(case.task_id for _bank, _entry, case in _loaded_cases())
 
 
-def test_regression_cases_have_three_trial_current_agent_baseline_evidence() -> None:
+def test_real_three_trial_current_agent_baseline_gate_is_explicitly_unmet() -> None:
     pending = []
-    confirmed = []
     for bank, entry, case in _loaded_cases():
         if entry.split is not CaseSplit.REGRESSION:
             continue
         assert bank.suite_id == "core-regression"
         assignment = _annotation(case)["suite_assignment"]
         assert type(assignment) is dict
-        if assignment["status"] != "regression_baseline_confirmed":
-            pending.append(case.task_id)
-            continue
-        evidence = assignment["promotion_evidence"]
-        assert type(evidence) is dict
-        assert set(evidence) == {"evaluation_id", "run_id", "summary_id"}
-        assert all(type(value) is str and value for value in evidence.values())
-        confirmed.append((bank, case, evidence))
-    assert not pending, "regression baseline is still pending for: %s" % ", ".join(
-        pending
-    )
+        assert assignment["status"] == "pending_current_agent_baseline"
+        assert assignment["promotion_evidence"] is None
+        pending.append(case.task_id)
+    assert pending == ["core-py-%03d" % index for index in range(1, 11)]
     _required_file(PROMOTION_VERIFIER)
-    module_name = "_review_agent_core_regression_promotion"
-    spec = importlib.util.spec_from_file_location(module_name, PROMOTION_VERIFIER)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    runs_root = Path(
-        os.environ.get("CORE_REGRESSION_RUNS_ROOT", REPOSITORY_ROOT / ".eval-runs")
-    )
-    data_root = Path(
-        os.environ.get("CORE_REGRESSION_DATA_ROOT", REPOSITORY_ROOT / ".eval-data")
-    )
-    workspace_root = Path(
-        os.environ.get(
-            "CORE_REGRESSION_WORKSPACE_ROOT",
-            REPOSITORY_ROOT / ".eval-workspaces",
-        )
-    )
-    git = shutil.which("git")
-    assert git is not None
-    try:
-        spec.loader.exec_module(module)
-        store = ArtifactStore(runs_root, create_root=False)
-        with RepositoryPreparer(
-            suite_root=EVAL_ROOT,
-            data_root=data_root,
-            workspace_root=workspace_root,
-            git_executable=Path(git).absolute(),
-        ) as preparer:
-            for bank, case, evidence in confirmed:
-                module.verify_case_promotion(
-                    case_bank=bank,
-                    artifact_store=store,
-                    repository_preparer=preparer,
-                    task_id=case.task_id,
-                    promotion_evidence=evidence,
-                )
-    finally:
-        sys.modules.pop(module_name, None)
 
 
 def test_intent_truth_covers_authority_scorability_and_clarification_contracts() -> None:
@@ -710,13 +725,13 @@ def test_intent_truth_covers_authority_scorability_and_clarification_contracts()
 
     assert any(
         case.intent_truth.authority is IntentAuthority.EXPLICIT_AUTHOR_METADATA
-        and case.input.review_request.user_intent is not None
+        and _repository_target(case).review_request.user_intent is not None
         for case in by_scenario["explicit_intent"]
     )
     assert any(
         case.intent_truth.authority
         in {IntentAuthority.EXPERT_RECONSTRUCTED, IntentAuthority.SYNTHETIC}
-        and case.input.review_request.user_intent is None
+        and _repository_target(case).review_request.user_intent is None
         and case.intent_truth.expected_claims
         and _annotation(case)["intent_expectation"]["initial_source"] == "inferred"
         for case in by_scenario["inferred_intent"]
@@ -770,6 +785,20 @@ def test_review_truth_is_atomic_audited_and_covers_core_review_risks() -> None:
         NovelFindingPolicy.VERIFY,
     }
     assert {finding.severity for finding in expected} == set(FindingSeverity)
+    assert all(
+        finding.metric_authority.severity_scorable
+        and finding.metric_authority.severity_authority
+        is MetricAuthoritySource.EXPERT_ANNOTATION
+        and finding.metric_authority.location_scorable
+        and finding.metric_authority.location_authority
+        is MetricAuthoritySource.EXPERT_ANNOTATION
+        for finding in expected
+    )
+    assert all(finding.locations for finding in expected)
+    assert all(
+        case.review_evaluator_context.truth_contexts == ()
+        for _bank, _entry, case in loaded
+    )
     assert {finding.required_context_level for finding in expected} == set(
         RequiredContextLevel
     )
@@ -847,7 +876,7 @@ def test_review_truth_is_atomic_audited_and_covers_core_review_risks() -> None:
 
 def test_every_expected_finding_points_to_at_least_one_changed_line() -> None:
     for _bank, _entry, case in _loaded_cases():
-        repository_path = case.input.repository.path
+        repository_path = _repository_target(case).repository.path
         assert repository_path is not None
         fixture = EVAL_ROOT / repository_path
         changed_by_path: dict[str, tuple[set[int], set[int]]] = {}
@@ -899,7 +928,8 @@ def test_fixture_trees_are_small_python_and_bound_to_immutable_digests(
     repository_bindings = []
     source_digests = []
     for _bank, _entry, case in _loaded_cases():
-        repository = case.input.repository
+        target = _repository_target(case)
+        repository = target.repository
         assert repository.path is not None
         fixture = EVAL_ROOT / repository.path
         assert fixture.is_dir()
@@ -936,12 +966,13 @@ def test_fixture_trees_are_small_python_and_bound_to_immutable_digests(
         }
         expected_source_hash = canonical_sha256(
             {
-                "schema_version": "core_case_provenance_v1",
+                "schema_version": "core_case_provenance_v2",
                 "task_id": case.task_id,
                 "case_version": case.case_version,
                 "source_version": case.source.source_version,
                 "annotation_protocol_version": ANNOTATION_CHECKLIST_VERSION,
-                "review_request": case.input.review_request.to_dict(),
+                "review_target_kind": "repository",
+                "review_request": target.review_request.to_dict(),
                 "fixture_source_digest": built.source_digest,
                 "base_tree": built.base_tree,
                 "head_tree": built.head_tree,
@@ -980,7 +1011,7 @@ def test_truth_never_leaks_into_agent_view_or_repository_fixtures() -> None:
                 "private annotation leaked into EvalInput for %s" % case.task_id
             )
 
-        repository_path = case.input.repository.path
+        repository_path = _repository_target(case).repository.path
         assert repository_path is not None
         fixture = EVAL_ROOT / repository_path
         for side in ("base", "head"):
@@ -1025,11 +1056,15 @@ def test_annotation_guidelines_define_the_human_audit_contract() -> None:
         "severity": "severity",
         "truth completeness": "truthcompleteness",
         "evidence anchor": "evidenceanchor",
+        "metric authority": "metric_authority",
+        "review evaluator context": "review_evaluator_context",
+        "materialization binding": "target_materialization_id",
         "non-unique investigation path": "唯一调查路径",
         "known invalid": "knowninvalidfinding",
         "disagreement": "disagreement",
         "human review record": "人工审阅记录",
         "case version": "case_version",
+        "external gates": "core-regression-promotion-v2",
     }
     for concept, token in required_tokens.items():
         assert token in folded, "annotation guidelines omit %s" % concept

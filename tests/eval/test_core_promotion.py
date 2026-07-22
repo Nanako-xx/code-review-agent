@@ -11,6 +11,7 @@ import pytest
 from review_agent_eval.intent_evaluator import IntentEvaluationStatus
 from review_agent_eval.models import SubmissionStatus
 from review_agent_eval.review_evaluator import ReviewEvaluationStatus
+from tests.eval.test_core_suite import _banks
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -56,6 +57,65 @@ def test_promotion_locator_rejects_redundant_or_incomplete_claims(
         match="promotion evidence",
     ):
         promotion_module._promotion_locator(value)
+
+
+def test_promotion_identity_and_suite_contract_are_v2_only(
+    promotion_module: ModuleType,
+) -> None:
+    assert promotion_module.PROMOTION_RUN_INSTANCE_KEY == (
+        "core-regression-promotion-v2"
+    )
+    regression = next(
+        bank for bank in _banks() if bank.suite_id == "core-regression"
+    )
+    for handle in regression:
+        promotion_module._assert_v2_repository_suite(handle)
+
+    contract = regression.manifest.wire_contract
+    stale_handle = SimpleNamespace(
+        manifest=SimpleNamespace(
+            source=regression.manifest.source,
+            wire_contract=SimpleNamespace(
+                case_schema_version=contract.case_schema_version,
+                input_schema_version=contract.input_schema_version,
+                submission_schema_version=contract.submission_schema_version,
+                review_target_kind=contract.review_target_kind,
+                materializer_protocol="repository-materializer-v1",
+            ),
+        )
+    )
+    with pytest.raises(
+        promotion_module.CoreRegressionPromotionError,
+        match="sole Core v2 Repository contract",
+    ):
+        promotion_module._assert_v2_repository_suite(stale_handle)
+
+
+@pytest.mark.parametrize("marker", ("fake", "fixture", "mock", "scripted", "test"))
+def test_scripted_or_fake_model_identity_cannot_satisfy_promotion(
+    promotion_module: ModuleType,
+    marker: str,
+) -> None:
+    adapter = promotion_module.CurrentAgentAdapter
+    agent = SimpleNamespace(
+        parameters={"adapter": {"kind": adapter.ADAPTER_KIND}},
+        agent_id="current-agent",
+        commit="a" * 40,
+        agent_version="release-v2",
+        provider=marker + "-provider",
+        model="real-looking-model",
+    )
+    config = SimpleNamespace(agent=agent)
+    preflight = SimpleNamespace(
+        adapter_id=adapter.ADAPTER_KIND,
+        adapter_version=adapter.ADAPTER_VERSION,
+        agent_id=agent.agent_id,
+    )
+    with pytest.raises(
+        promotion_module.CoreRegressionPromotionError,
+        match="real model provider",
+    ):
+        promotion_module._assert_current_agent(config, preflight)
 
 
 def _passing_trial() -> tuple[SimpleNamespace, SimpleNamespace]:

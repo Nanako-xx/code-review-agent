@@ -1,8 +1,8 @@
 # Core Code Review Eval 标注协议
 
-**协议版本：** `core-annotation-v1`
+**协议版本：** `core-annotation-v2`
 
-**适用对象：** `eval_case_v1`、`suite_manifest_v1` 中的 Core Capability / Core Regression Case
+**适用对象：** `eval_case_v2`、`suite_manifest_v2` 中的 Core Capability / Core Regression Case
 
 **规范词：** “必须”“不得”“应”“可以”均为操作要求；示例使用 YAML 便于阅读，实际 Case 和 Manifest 必须写成 canonical UTF-8 JSON。
 
@@ -66,7 +66,7 @@ Core Case 只有同时满足以下条件才可进入 Suite：
 `base/` 和 `head/` 都是完整仓库快照，不是 patch。标注流程必须：
 
 1. 用 `FixtureRepositoryBuilder` 构建确定性仓库；
-2. 把返回的完整 `base_revision`、`head_revision` 写入 `input.repository`；
+2. 把返回的完整 `base_revision`、`head_revision` 写入 `input.review_target.repository`；`input` 不得保留 legacy `repository` / `review_request` sibling；
 3. 保存并复核 builder 返回的 base/head tree digest；
 4. 修改任一 fixture byte 后重新构建，禁止沿用旧 revision、tree digest 或 manifest hash；
 5. 不手写 Git object ID 或 tree digest。
@@ -322,9 +322,11 @@ Clean Case 的 `expected_findings=[]`，但它仍是完整 Case，不得跳过�
 
 若两个审阅者相差两级或对 `high/critical` 有分歧，必须由第三名 adjudicator 裁决。严重度不得取平均值。
 
+Core v2 的每个 `ExpectedFinding.metric_authority` 固定为：`severity_scorable=true`、`severity_authority=expert_annotation`、`location_scorable=true`、`location_authority=expert_annotation`。这表示 severity 与 location 都必须由本协议要求的独立专家复核；不能因为字段有值就自动获得 metric authority。所有 Core Finding 都必须至少有一个完整、稳定、可重放的 truth location。`review_evaluator_context.truth_contexts` 当前固定为空；不得把额外答案、diff hint 或 Judge-only 文本塞入该字段绕过 blind evaluation。
+
 ### 4.8 Category
 
-Core v1 使用以下固定 category 文本：
+Core v2 使用以下固定 category 文本：
 
 - `security`：主要影响 confidentiality、integrity、authentication、authorization、injection、secret 或 trust boundary；
 - `regression`：主要问题是 head 破坏 base 中受支持且应保持的行为或兼容性；
@@ -423,14 +425,15 @@ Case 不保存唯一标准 Evidence。`evidence_anchors` 只描述完整 claim �
 - `invalid`：所有 ref 可解析，但至少一个 item 的 revision/path/field/attestation/hash/excerpt 不合法；
 - `missing`：Finding 没有 ref，或存在 dangling ref。
 
-四种 Evidence kind 的 exact 规则：
+五种 Evidence `source` tagged union 的 exact 规则。每个 source 都必须包含与 Submission 根完全相同的 `target_materialization_id`，不得保留 v1 flat/null placeholder 字段：
 
-- `repository_file`：revision 必须是 exact base 或 head；path 和完整 line range 必填；excerpt 是该范围的 canonical UTF-8/LF 文本，hash 对 exact excerpt；
-- `repository_diff`：revision 必须是 exact `base..head`；path 必填；line、command、stream、source ref 等不适用字段为 null；excerpt/hash 对该 path 的完整 canonical diff；
-- `command_output`：revision 必须是 exact head；必须有完整 argv、exit code、stream 和当前 Trial 的 Harness/Adapter attestation；截断或自报输出无效；
-- `external_record`：revision 必须是 exact head；`source_ref` 必须命中 Agent 可见的 `existing_ci_evidence`，excerpt/hash 必须与该记录一致。
+- `repository_file`：source exact keys 为 `kind/target_materialization_id/revision/path/from_line/to_line`；revision 必须是 exact base 或 head；excerpt 是该范围的 canonical UTF-8/LF 文本，hash 对 exact excerpt；
+- `repository_diff`：source exact keys 为 `kind/target_materialization_id/base_revision/head_revision/path`；excerpt/hash 对该 path 的完整 canonical diff；
+- `frozen_context`：source exact keys 为 `kind/target_materialization_id/context_ref/from_line/to_line`；Core Repository Suite 不得使用此分支；
+- `command_output`：source exact keys 为 `kind/target_materialization_id/command/exit_code/stream/artifact_ref`；必须命中当前 Materialization 的 Harness/Adapter attestation；截断或自报输出无效；
+- `external_record`：source exact keys 为 `kind/target_materialization_id/source_ref`；`source_ref` 必须命中 Agent 可见的 `existing_ci_evidence`，excerpt/hash 必须与该记录一致。
 
-不要手工猜 hash。Golden Submission 中的 valid Evidence 必须由固定 replay 生成；bad-Evidence golden 则只改变被测试的一个维度（例如 wrong line 或 hash），避免同时制造多个无法归因的错误。
+不要手工猜 hash 或 Materialization ID。Core Golden 使用 `golden-index.json` 记录的固定 run、scenario-to-trial、attempt=1 与 Repository replay binding，经 `review_agent_eval.identity_v2` 稳定派生；它只用于 deterministic protocol fixture，不是真实 Agent baseline。Golden Submission 中的 valid Evidence 必须由固定 replay 生成；bad-Evidence golden 则只改变被测试的一个维度（例如 wrong line 或 hash），避免同时制造多个无法归因的错误。
 
 ### 6.3 Evidence support
 
@@ -506,7 +509,7 @@ pending 记录必须诚实：人工 atomicity、severity/category/context、trut
 - `verify-response` 严格拒绝 unknown key、重复 JSON key、stale digest、时间倒置、缺失 attestation/checklist、明显机器身份和不能由 `IntentTruth` / `ReviewTruth` hydration 的 truth；
 - `import` 只有在 Author receipt 完整、Author A != Reviewer B、外部审计引用存在时才原子写 ledger；有 material disagreement 时还必须有独立 Adjudicator C 的完整逐项 resolution。
 
-Reviewer B 的 `core_independent_human_response_v2` 必须包含稳定身份、开始/结束 UTC 时间、blind/no-output/human/independent attestations、独立 `IntentTruth`、结构化 `clarification_decision`、完整 `ReviewTruth` 和全部 human checklist。`clarification_decision` 包含 `policy`、`max_rounds`、`answers`、`rationale`、`exchanges`：`answers` 必须通过 canonical `ClarificationScript` / `ClarificationAnswer` hydration；Reviewer 使用自己生成的 opaque `answer_id`，不要求与 Author ID 相同；每条 exchange 必须用该 `answer_id` 一对一绑定 Reviewer answer，且 `answered_at` 位于盲审起止时间内。`required` 必须至少有一条 answer 且每条 answer 恰有一条 exchange；`not_required` 的 answers/exchanges 必须都为空。`ReviewTruth` 的 canonical 模型覆盖 Finding 原子 claim、severity、category、required、locations、Evidence anchors、required context、completeness、novel policy 和 rationale。
+Reviewer B 的 `core_independent_human_response_v3` 必须包含稳定身份、开始/结束 UTC 时间、blind/no-output/human/independent attestations、独立 `IntentTruth`、结构化 `clarification_decision`、完整 v2 `ReviewTruth` 和全部 human checklist。`clarification_decision` 包含 `policy`、`max_rounds`、`answers`、`rationale`、`exchanges`：`answers` 必须通过 canonical `ClarificationScript` / `ClarificationAnswer` hydration；Reviewer 使用自己生成的 opaque `answer_id`，不要求与 Author ID 相同；每条 exchange 必须用该 `answer_id` 一对一绑定 Reviewer answer，且 `answered_at` 位于盲审起止时间内。`required` 必须至少有一条 answer 且每条 answer 恰有一条 exchange；`not_required` 的 answers/exchanges 必须都为空。`ReviewTruth` 的 canonical 模型覆盖 Finding 原子 claim、severity、metric authority、category、required、locations、Evidence anchors、required context、completeness、novel policy 和 rationale。
 
 揭盲 comparison 是严格逐字段 comparison。Clarification 比较忽略 Author/Reviewer 各自 opaque `answer_id`，但必须比较 `policy`、`max_rounds`，以及每个 answer 的 `dimension`、`material_claim`、`action`、`response`、`corrected_values`；其余 truth 的措辞、truth ID、列表结构、location、anchor 或 rationale 不同都会产生 material difference。机器不得把差异自动归为“语义等价”。无 difference 时 Author 可以签署接受/拒绝；有 difference 时 Adjudicator C 必须对每个 `difference_id` 写唯一 resolution 和理由。若 Reviewer/merged truth 胜出，当前 Case 必须拒绝并按第 10 节重做；只有所有 difference 都裁定当前 Author truth 成立时，当前 Case binding 才能被接受。
 
@@ -579,7 +582,7 @@ Reviewer B 的 `core_independent_human_response_v2` 必须包含稳定身份、�
 - **Capability**：真值已完全审计，但当前产品尚未稳定完成，用来指明能力缺口；
 - **Regression**：发布基线应稳定完成，用来阻止已获得能力退化。
 
-两者使用同一个 `EvalCase v1` schema、同一原子化标准和同一 grader。不得为同一任务维护“宽松 Capability truth”和“严格 Regression truth”。
+两者使用同一个 `EvalCase v2` schema、同一原子化标准和同一 grader。不得为同一任务维护“宽松 Capability truth”和“严格 Regression truth”。
 
 仓库中出现 Case 文件或 Capability/Regression manifest 只表示候选数据已被物化，不表示已经准入。只要完整 Task 13 门禁仍因缺少 source-bound 真人审批、未解决 disagreement 或 Regression 三次真实 baseline 而失败，这些 pending Case/manifest 就不得作为 release gate、发布质量承诺或已批准 Suite 使用。不得通过单独运行排除外部门禁的 pytest 子集，把工程验证通过误写成 Suite 准入通过。
 
@@ -596,11 +599,11 @@ Case 只有满足以下条件才可从 Capability 提升到 Regression：
 - clean Case 无 fabricated/known-invalid 输出；
 - 人工抽查确认通过不是由泄漏、过拟合措辞或 Judge 偏差造成。
 
-Task 15 的正式 repeated-trial/gate 实现完成前，可以生成审计记录，但不得声称已由自动 Regression Gate 完成 promotion。
+生成器、schema、hash、Golden 和本地 replay 全部验证通过，只能证明制品与协议有效，不能证明真实 promotion gate 已满足。独立 Reviewer B 批准与真实 current-Agent 模型 baseline 都是外部门禁；AI、fake、mock、scripted 或 fixture 数据不得替代。
 
 Task 13 不新增平行的 `regression_promotion_receipt` schema。`annotation.json.suite_assignment.promotion_evidence` 只允许保存 `run_id`、`evaluation_id`、`summary_id` 三个 locator；`trial_count`、`passed` 或手填 digest 不是证据。晋级验证必须从 locator 打开原始 `.eval-runs`，通过 `ArtifactStore` 和 `EvaluationOrchestrator.load_run_evaluation` 对 Run Config、Case Snapshot、Run/Trial Manifest、terminal Submission、clarification receipt、Judge input/output、Intent/Review evaluation、TrialScore 和 Run summary 做 source-bound replay。
 
-晋级 Run 还必须满足：固定的 promotion run-instance key；`trial_count >= 3`；完整、未过滤的 strict preflight；`current-agent-cli-v1` adapter；非 `unknown` commit 和非 `working-tree` Agent version；目标 Suite/Case/EvalInput digest 与当前 manifest 完全一致；所选 evaluator execution 等于 Run 初始 evaluator execution。必须使用目标 Case 在该 Run 中的全部 Trial，不能只挑成功的三次。上述本地 artifact 绑定能防止只改 annotation 过门禁，但不能提供密码学签名；可信 CI 签名属于 Task 15。
+晋级 Run 还必须满足：固定的 `core-regression-promotion-v2` run-instance key；`trial_count >= 3`；完整、未过滤的 strict preflight；支持 Repository `WireContractV2` 的 current-Agent adapter；非 `unknown` commit 和非 `working-tree` Agent version；真实 provider/model；目标 Suite/Case/EvalInput/Materialization digest 与当前 manifest 完全一致；所选 evaluator execution 等于 Run 初始 evaluator execution。必须使用目标 Case 在该 Run 中的全部 Trial，不能只挑成功的三次。上述本地 artifact 绑定能防止只改 annotation 过门禁，但不能提供密码学签名。
 
 ### 10.3 迁移规则
 
@@ -608,6 +611,7 @@ Task 13 不新增平行的 `regression_promotion_receipt` schema。`annotation.j
 - Capability 和 Regression 在同一 Suite snapshot 中不得同时包含同一 task；
 - 当前 `CaseSource.suite` 必须等于目标 `SuiteManifest.suite_id`，因此迁移必须修改该字段，而不是把同一 Case 文件同时挂到两个 manifest；
 - 迁移会改变 canonical Case identity，必须递增 `case_version`；
+- Case/Input/packet digest 改变后，旧 Reviewer/Author approval identity 必须标记 `requires_re_review`；只能重新执行独立盲审，禁止把旧批准内容静默投影到新 Case；
 - 从原 Suite 删除、向目标 Suite 增加，并同时递增两个受影响的 `suite_version`；
 - 更新与目标 Suite 一致的 `source_version`，重算 raw file SHA、canonical Case digest、EvalInput digest 和 manifest/source hash；
 - 不复制一份只改目录名的 Case；共享逻辑 task 只有一个当前版本；
@@ -887,7 +891,7 @@ evidence_anchors:
 - Accepted `critical`：未认证网络请求可任意接管所有管理员账户，默认部署无 mitigation。
 - Rejected `critical`：只有测试环境中的 debug message 拼写错误；不能因修复简单或 Case 想测 high/critical miss 而抬高严重度。
 
-## 13. 当前 v1 schema 的表达边界
+## 13. 当前 v2 schema 的表达边界
 
 以下是标注时必须知道的现状，不得通过给 canonical JSON 添加未知 key 绕过：
 

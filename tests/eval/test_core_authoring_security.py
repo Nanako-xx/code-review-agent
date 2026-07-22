@@ -215,6 +215,23 @@ def _invoke(
     raise AssertionError("unknown operation: %s" % operation)
 
 
+def test_authoring_module_exposes_only_the_core_v2_projection(
+    authoring_module: ModuleType,
+) -> None:
+    assert authoring_module.CORE_SOURCE_VERSION == "core-2026-07-21-v3"
+    assert authoring_module.CASE_VERSION == 3
+    assert authoring_module.REPOSITORY_WIRE_CONTRACT == {
+        "case_schema_version": "eval_case_v2",
+        "input_schema_version": "eval_input_v2",
+        "submission_schema_version": "eval_submission_v2",
+        "review_target_kind": "repository",
+        "materializer_protocol": "repository-materializer-v2",
+    }
+    assert authoring_module.HUMAN_REVIEW_STATUS == (
+        "requires_independent_re_review"
+    )
+
+
 @pytest.mark.parametrize("relative", UNSAFE_OUTPUT_PATHS)
 def test_check_outputs_rejects_noncanonical_or_escaping_output_paths(
     authoring_module: ModuleType,

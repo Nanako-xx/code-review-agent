@@ -3,16 +3,16 @@
   "authoring": {
     "author_id": null,
     "kind": "ai_assisted",
-    "source_version": "core-2026-07-19-v2",
-    "status": "draft_pending_human_author",
+    "source_version": "core-2026-07-21-v3",
+    "status": "draft_requires_independent_re_review",
     "truth_frozen_at": null
   },
   "case_binding": {
-    "canonical_case_digest": "86bea18435024014793535a6db8f6e3c56a4a962f8ba6c54d0ce14602239c2ce",
-    "case_source_content_hash": "46c645b44697084767cf018c394a2b6d9d93c60a199531e06802bff5ac5bb30d",
-    "eval_input_digest": "c2941d145e0e707e973db78e4d66861c2c17fbe630788974f16dbf1f11975872"
+    "canonical_case_digest": "a7d73113479e55fef6ff21ffad1de8969c3909507df7249ea9fbec415430ddc9",
+    "case_source_content_hash": "aa5e634b39d430409046bf33cfac787fc7acc051ba6173c3c1aecb71d52cf50d",
+    "eval_input_digest": "8825cca8016b83cd90e6ddd3e00227e650611997060a85de36a9fb4baea713e3"
   },
-  "case_version": 2,
+  "case_version": 3,
   "checklist": {
     "agent_input_contains_no_truth": true,
     "atomic_findings_reviewed": false,
@@ -35,30 +35,32 @@
     "adjudication_digest": null,
     "adjudicator_id": null,
     "items": [],
-    "status": "pending_blind_review"
+    "status": "requires_independent_re_review"
   },
   "human_review": {
     "adjudication_digest": null,
     "adjudicator_id": null,
-    "annotation_protocol_version": "core-annotation-v1",
+    "annotation_protocol_version": "core-annotation-v2",
+    "approval_identity_status": "requires_re_review",
     "author_id": null,
     "base_revision": "3e7d89e99e402d3be534e39310ab663010792cd1",
     "base_tree": "face23803bfa7cf1ab0af8624ef9a55ef16c93d0",
     "blind_review_completed_at": null,
-    "blind_review_packet_digest": "cc1cb70f01708d7c81dc4285728480c214d950cbeb6708efeeb7b47335d78a67",
+    "blind_review_packet_digest": "6ecbfca11da66e03114d90381b7cd86c51a081e0b9cfbdd25f7b3aa6a499f6e3",
     "blind_review_started_at": null,
-    "canonical_case_digest": "86bea18435024014793535a6db8f6e3c56a4a962f8ba6c54d0ce14602239c2ce",
-    "case_version": 2,
-    "eval_input_digest": "c2941d145e0e707e973db78e4d66861c2c17fbe630788974f16dbf1f11975872",
+    "canonical_case_digest": "a7d73113479e55fef6ff21ffad1de8969c3909507df7249ea9fbec415430ddc9",
+    "case_version": 3,
+    "eval_input_digest": "8825cca8016b83cd90e6ddd3e00227e650611997060a85de36a9fb4baea713e3",
     "final_decision": null,
     "head_revision": "07db72c851343ea84e9db452d0fa73a8f6c0ef11",
     "head_tree": "31674aed72ee44f8756cec8b1ee2beacfe4cda1e",
     "independent_annotation_digest": null,
     "leakage_review_completed": false,
+    "prior_approval_carried_forward": false,
     "review_batch_id": null,
     "reviewer_id": null,
-    "schema_version": "core_human_review_record_v1",
-    "status": "pending_human_review",
+    "schema_version": "core_human_review_record_v2",
+    "status": "requires_independent_re_review",
     "task_id": "core-py-001"
   },
   "intent_expectation": {
@@ -69,9 +71,9 @@
     "initial_status": "sufficient"
   },
   "provenance_binding": {
-    "annotation_protocol_version": "core-annotation-v1",
-    "content_hash": "46c645b44697084767cf018c394a2b6d9d93c60a199531e06802bff5ac5bb30d",
-    "schema_version": "core_case_provenance_v1"
+    "annotation_protocol_version": "core-annotation-v2",
+    "content_hash": "aa5e634b39d430409046bf33cfac787fc7acc051ba6173c3c1aecb71d52cf50d",
+    "schema_version": "core_case_provenance_v2"
   },
   "repository_binding": {
     "base_revision": "3e7d89e99e402d3be534e39310ab663010792cd1",
@@ -80,7 +82,7 @@
     "head_tree": "31674aed72ee44f8756cec8b1ee2beacfe4cda1e",
     "source_digest": "71f893eccda3d8e1bdd10ecc67043282339137fe19116cbd9ffc0d6f1a6721e8"
   },
-  "schema_version": "core_annotation_record_v1",
+  "schema_version": "core_annotation_record_v2",
   "suite_assignment": {
     "promotion_evidence": null,
     "split": "regression",

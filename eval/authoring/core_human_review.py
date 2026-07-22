@@ -22,7 +22,9 @@ if str(SRC_ROOT) not in sys.path:
 from review_agent_eval.models import (  # noqa: E402
     ClarificationScript,
     EvalCase,
+    EvalInput,
     IntentTruth,
+    RepositoryReviewTarget,
     ReviewTruth,
     canonical_json,
     canonical_sha256,
@@ -30,13 +32,14 @@ from review_agent_eval.models import (  # noqa: E402
 from review_agent_eval import repository as repository_models  # noqa: E402
 
 
-ANNOTATION_PROTOCOL_VERSION = "core-annotation-v1"
-PACKET_SCHEMA_VERSION = "core_blind_review_packet_v3"
-BATCH_SCHEMA_VERSION = "core_blind_review_batch_v1"
-RESPONSE_SCHEMA_VERSION = "core_independent_human_response_v2"
-APPROVAL_SCHEMA_VERSION = "core_human_approval_decision_v1"
-ADJUDICATION_SCHEMA_VERSION = "core_human_adjudication_v1"
-LEDGER_SCHEMA_VERSION = "core_human_approval_record_v2"
+ANNOTATION_PROTOCOL_VERSION = "core-annotation-v2"
+PACKET_SCHEMA_VERSION = "core_blind_review_packet_v4"
+BATCH_SCHEMA_VERSION = "core_blind_review_batch_v2"
+RESPONSE_SCHEMA_VERSION = "core_independent_human_response_v3"
+APPROVAL_SCHEMA_VERSION = "core_human_approval_decision_v2"
+ADJUDICATION_SCHEMA_VERSION = "core_human_adjudication_v2"
+LEDGER_SCHEMA_VERSION = "core_human_approval_record_v3"
+PACKET_BINDING_SCHEMA_VERSION = "core_blind_review_binding_v2"
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_TEXT_CHARS = 32_768
 
@@ -505,6 +508,12 @@ def make_packet_binding(
     )
     for key, value in repository.items():
         _require_text(value, f"repository binding.{key}")
+    target_repository = _repository_review_target(case).repository
+    if (
+        repository["base_revision"] != target_repository.base_revision
+        or repository["head_revision"] != target_repository.head_revision
+    ):
+        raise HumanReviewError("repository binding differs from EvalCase review target")
     _require_digest(fixture_manifest.get("fixture_manifest_digest"), "fixture manifest digest")
     protocol = _strict_object(
         dict(protocol_binding), {"version", "sha256"}, "annotation protocol binding"
@@ -513,7 +522,7 @@ def make_packet_binding(
         raise HumanReviewError("annotation protocol version is stale")
     _require_digest(protocol["sha256"], "annotation protocol digest")
     return {
-        "schema_version": "core_blind_review_binding_v1",
+        "schema_version": PACKET_BINDING_SCHEMA_VERSION,
         "task_id": case.task_id,
         "case_version": case.case_version,
         "canonical_eval_input_digest": case.eval_input().digest(),
@@ -568,8 +577,15 @@ def _repository_binding(annotation: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
+def _repository_review_target(case: EvalCase) -> RepositoryReviewTarget:
+    target = case.input.review_target
+    if type(target) is not RepositoryReviewTarget:
+        raise HumanReviewError("Core human review requires a Repository review target")
+    return target
+
+
 def _fixture_root(eval_root: Path, case: EvalCase) -> Path:
-    relative = case.input.repository.path
+    relative = _repository_review_target(case).repository.path
     if relative is None:
         raise HumanReviewError("Core Case fixture repository path is missing")
     root = _safe_child(eval_root, relative, "fixture repository")
@@ -619,9 +635,10 @@ def _replay_fixture(
     }
     if actual != dict(expected):
         raise HumanReviewError("fixture replay differs from the current repository binding")
-    if case.input.repository.base_revision != actual["base_revision"]:
+    repository = _repository_review_target(case).repository
+    if repository.base_revision != actual["base_revision"]:
         raise HumanReviewError("EvalInput base revision differs from fixture replay")
-    if case.input.repository.head_revision != actual["head_revision"]:
+    if repository.head_revision != actual["head_revision"]:
         raise HumanReviewError("EvalInput head revision differs from fixture replay")
     return root, manifest
 
@@ -909,6 +926,57 @@ def _validate_fixture_manifest(value: Any) -> dict[str, Any]:
     return payload
 
 
+def _validate_packet_binding(
+    value: Any,
+    eval_input: EvalInput,
+    fixture_manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = _strict_object(
+        value,
+        {
+            "schema_version",
+            "task_id",
+            "case_version",
+            "canonical_eval_input_digest",
+            "canonical_case_digest",
+            "repository_binding",
+            "fixture_manifest_digest",
+            "annotation_protocol",
+        },
+        "blind-review packet binding",
+    )
+    if payload["schema_version"] != PACKET_BINDING_SCHEMA_VERSION:
+        raise HumanReviewError(
+            "blind-review packet binding is stale and requires independent re-review"
+        )
+    if payload["task_id"] != eval_input.task_id:
+        raise HumanReviewError("packet binding task differs from EvalInput")
+    if type(payload["case_version"]) is not int or payload["case_version"] < 1:
+        raise HumanReviewError("packet binding Case version is invalid")
+    if payload["canonical_eval_input_digest"] != eval_input.digest():
+        raise HumanReviewError("packet binding EvalInput digest does not match")
+    _require_digest(payload["canonical_case_digest"], "packet binding Case digest")
+    if payload["fixture_manifest_digest"] != fixture_manifest["fixture_manifest_digest"]:
+        raise HumanReviewError("packet binding fixture digest does not match")
+    protocol = _validate_protocol(
+        payload["annotation_protocol"], "packet annotation_protocol"
+    )
+    repository_binding = _strict_object(
+        payload["repository_binding"],
+        {"base_revision", "head_revision", "base_tree", "head_tree", "source_digest"},
+        "packet repository binding",
+    )
+    target = eval_input.review_target
+    if type(target) is not RepositoryReviewTarget:
+        raise HumanReviewError("Core blind-review packet Target must be Repository")
+    if (
+        repository_binding["base_revision"] != target.repository.base_revision
+        or repository_binding["head_revision"] != target.repository.head_revision
+    ):
+        raise HumanReviewError("packet Repository binding differs from EvalInput")
+    return {**payload, "annotation_protocol": protocol}
+
+
 def _validate_packet(packet: Mapping[str, Any]) -> None:
     payload = _strict_object(
         packet,
@@ -926,7 +994,14 @@ def _validate_packet(packet: Mapping[str, Any]) -> None:
         raise HumanReviewError("blind-review packet schema is unsupported")
     if payload["response_schema_version"] != RESPONSE_SCHEMA_VERSION:
         raise HumanReviewError("blind-review response schema is stale")
-    _validate_fixture_manifest(payload["fixture_manifest"])
+    fixture_manifest = _validate_fixture_manifest(payload["fixture_manifest"])
+    try:
+        eval_input = EvalInput.from_dict(payload["eval_input"])
+    except Exception as exc:
+        raise HumanReviewError(
+            "blind-review packet EvalInput is not the sole v2 projection"
+        ) from exc
+    _validate_packet_binding(payload["binding"], eval_input, fixture_manifest)
     core = {key: payload[key] for key in payload if key != "packet_digest"}
     if _require_digest(payload["packet_digest"], "packet digest") != canonical_sha256(core):
         raise HumanReviewError("blind-review packet digest does not match")
@@ -1674,15 +1749,22 @@ def _hydrate_ledger_record(
     )
     core = {key: payload[key] for key in payload if key != "record_digest"}
     if payload["schema_version"] != LEDGER_SCHEMA_VERSION:
-        raise HumanReviewError("ledger schema is unsupported")
+        raise HumanReviewError(
+            "ledger schema is stale and requires independent re-review"
+        )
     if payload["record_revision"] != 1 or payload["previous_record_digest"] is not None:
         raise HumanReviewError("ledger record attempts an unsupported update/rollback")
     if _require_digest(payload["record_digest"], "record digest") != canonical_sha256(core):
         raise HumanReviewError("ledger record digest does not match")
     if payload["binding"] != expected_packet["binding"]:
-        raise HumanReviewError("ledger record has a stale Case/fixture/protocol binding")
+        raise HumanReviewError(
+            "ledger record has a stale Case/fixture/protocol binding and requires "
+            "independent re-review"
+        )
     if payload["packet_digest"] != expected_packet["packet_digest"]:
-        raise HumanReviewError("ledger record has a stale packet digest")
+        raise HumanReviewError(
+            "ledger record has a stale packet digest and requires independent re-review"
+        )
     response_container = _strict_object(
         payload["response"],
         {
@@ -1853,6 +1935,8 @@ def project_ledger_record(
     result["human_review"].update(
         {
             "status": record["status"],
+            "approval_identity_status": "current_source_bound",
+            "prior_approval_carried_forward": False,
             "final_decision": record["final_decision"],
             "author_id": identities["author_id"],
             "reviewer_id": identities["reviewer_id"],

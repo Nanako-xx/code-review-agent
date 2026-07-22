@@ -21,17 +21,23 @@ if str(AUTHORING_ROOT) not in sys.path:
     sys.path.insert(0, str(AUTHORING_ROOT))
 
 from review_agent_eval.cases import (  # noqa: E402
+    REPOSITORY_MATERIALIZER_PROTOCOL,
     SUITE_MANIFEST_SCHEMA_VERSION,
     SuiteManifest,
 )
 from review_agent_eval.models import (  # noqa: E402
+    EVAL_CASE_SCHEMA_VERSION,
+    EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
     EvalCase,
     EvalSubmission,
     canonical_json,
     canonical_sha256,
+    stable_id,
 )
 from review_agent_eval.repository import FixtureRepositoryBuilder  # noqa: E402
 from core_human_review import (  # noqa: E402
+    ANNOTATION_PROTOCOL_VERSION,
     annotation_protocol_binding,
     fixture_manifest_from_mappings,
     load_source_bound_ledger_record,
@@ -40,17 +46,48 @@ from core_human_review import (  # noqa: E402
 )
 
 
-CORE_SOURCE_VERSION = "core-2026-07-19-v2"
-CASE_VERSION = 2
+CORE_SOURCE_VERSION = "core-2026-07-21-v3"
+CASE_VERSION = 3
 PROTOCOL_ID = "native_repository"
-GOLDEN_INDEX_SCHEMA_VERSION = "core_golden_index_v1"
-GOLDEN_ENTRY_SCHEMA_VERSION = "core_golden_entry_v1"
-SUITE_SOURCE_PACKET_SCHEMA_VERSION = "core_suite_source_v2"
+CASE_PROVENANCE_SCHEMA_VERSION = "core_case_provenance_v2"
+GOLDEN_INDEX_SCHEMA_VERSION = "core_golden_index_v2"
+GOLDEN_ENTRY_SCHEMA_VERSION = "core_golden_entry_v2"
+SUITE_SOURCE_PACKET_SCHEMA_VERSION = "core_suite_source_v3"
+GOLDEN_RUN_BINDING_SCHEMA_VERSION = "core_golden_run_binding_v2"
+GOLDEN_REPLAY_BINDING_SCHEMA_VERSION = "core_golden_repository_replay_v2"
+GOLDEN_MATERIALIZATION_BINDING_SCHEMA_VERSION = (
+    "core_golden_materialization_binding_v2"
+)
+GOLDEN_RUN_INSTANCE_KEY = "core-golden-authoring-v2"
+GOLDEN_ATTEMPT = 1
+ANNOTATION_RECORD_SCHEMA_VERSION = "core_annotation_record_v2"
+HUMAN_REVIEW_RECORD_SCHEMA_VERSION = "core_human_review_record_v2"
+GOLDEN_SCENARIOS = (
+    "perfect",
+    "empty",
+    "duplicate",
+    "fabricated",
+    "unsupported-evidence",
+    "compound",
+    "judge-unknown",
+    "unsupported-intent",
+    "contradicted-intent",
+    "bad-evidence",
+    "bad-evidence-path",
+    "bad-evidence-line",
+)
+REPOSITORY_WIRE_CONTRACT = {
+    "case_schema_version": EVAL_CASE_SCHEMA_VERSION,
+    "input_schema_version": EVAL_INPUT_SCHEMA_VERSION,
+    "submission_schema_version": EVAL_SUBMISSION_SCHEMA_VERSION,
+    "review_target_kind": "repository",
+    "materializer_protocol": REPOSITORY_MATERIALIZER_PROTOCOL,
+}
 
 # This is intentionally pending until a person independently annotates and
 # signs each frozen blind-review packet.  A model/sub-agent review must never
-# be recorded as the human audit required by Task 13.
-HUMAN_REVIEW_STATUS = "pending_human_review"
+# be recorded as the external human audit gate.
+HUMAN_REVIEW_STATUS = "requires_independent_re_review"
 
 
 @dataclass(frozen=True)
@@ -139,6 +176,12 @@ def _finding(
         "severity": severity,
         "category": category,
         "required": required,
+        "metric_authority": {
+            "severity_scorable": True,
+            "severity_authority": "expert_annotation",
+            "location_scorable": True,
+            "location_authority": "expert_annotation",
+        },
         "locations": list(locations),
         "evidence_anchors": list(anchors),
         "required_context_level": context,
@@ -1548,11 +1591,12 @@ def _json_bytes(value: Any, *, pretty: bool = False) -> bytes:
 def _case_source_content_hash(spec: CoreCaseSpec, built: Any) -> str:
     return canonical_sha256(
         {
-            "schema_version": "core_case_provenance_v1",
+            "schema_version": CASE_PROVENANCE_SCHEMA_VERSION,
             "task_id": spec.task_id,
             "case_version": CASE_VERSION,
             "source_version": CORE_SOURCE_VERSION,
-            "annotation_protocol_version": "core-annotation-v1",
+            "annotation_protocol_version": ANNOTATION_PROTOCOL_VERSION,
+            "review_target_kind": "repository",
             "review_request": dict(spec.request),
             "fixture_source_digest": built.source_digest,
             "base_tree": built.base_tree,
@@ -1593,8 +1637,10 @@ def _pending_human_review(
 ) -> dict[str, Any]:
     packet = _blind_review_packet(case, built, fixture_manifest, protocol_binding)
     return {
-        "schema_version": "core_human_review_record_v1",
+        "schema_version": HUMAN_REVIEW_RECORD_SCHEMA_VERSION,
         "status": HUMAN_REVIEW_STATUS,
+        "approval_identity_status": "requires_re_review",
+        "prior_approval_carried_forward": False,
         "final_decision": None,
         "task_id": case.task_id,
         "case_version": case.case_version,
@@ -1604,7 +1650,7 @@ def _pending_human_review(
         "head_revision": built.head_revision,
         "base_tree": built.base_tree,
         "head_tree": built.head_tree,
-        "annotation_protocol_version": "core-annotation-v1",
+        "annotation_protocol_version": ANNOTATION_PROTOCOL_VERSION,
         "blind_review_packet_digest": packet["packet_digest"],
         "author_id": None,
         "reviewer_id": None,
@@ -1642,7 +1688,7 @@ def _annotation_record(
         "human_review_completed": False,
     }
     annotation = {
-        "schema_version": "core_annotation_record_v1",
+        "schema_version": ANNOTATION_RECORD_SCHEMA_VERSION,
         "task_id": spec.task_id,
         "case_version": CASE_VERSION,
         "suite_id": spec.suite_id,
@@ -1651,7 +1697,7 @@ def _annotation_record(
             "source_version": CORE_SOURCE_VERSION,
             "author_id": None,
             "truth_frozen_at": None,
-            "status": "draft_pending_human_author",
+            "status": "draft_requires_independent_re_review",
         },
         "intent_expectation": dict(spec.intent_expectation),
         "case_binding": {
@@ -1660,8 +1706,8 @@ def _annotation_record(
             "case_source_content_hash": case.source.content_hash,
         },
         "provenance_binding": {
-            "schema_version": "core_case_provenance_v1",
-            "annotation_protocol_version": "core-annotation-v1",
+            "schema_version": CASE_PROVENANCE_SCHEMA_VERSION,
+            "annotation_protocol_version": ANNOTATION_PROTOCOL_VERSION,
             "content_hash": case.source.content_hash,
         },
         "repository_binding": {
@@ -1700,7 +1746,7 @@ def _annotation_record(
         "checklist": checklist,
         "human_review": human_review,
         "disagreements": {
-            "status": "pending_blind_review",
+            "status": "requires_independent_re_review",
             "items": [],
             "adjudicator_id": None,
             "adjudication_digest": None,
@@ -1782,6 +1828,73 @@ def _submission_finding(
     }
 
 
+def _golden_run_id() -> str:
+    return stable_id(
+        "run",
+        {
+            "schema_version": GOLDEN_RUN_BINDING_SCHEMA_VERSION,
+            "run_instance_key": GOLDEN_RUN_INSTANCE_KEY,
+            "source_version": CORE_SOURCE_VERSION,
+            "scenario_order": list(GOLDEN_SCENARIOS),
+        },
+    )
+
+
+def _golden_trial_id(case: EvalCase, scenario: str) -> str:
+    try:
+        trial_index = GOLDEN_SCENARIOS.index(scenario) + 1
+    except ValueError as exc:
+        raise ValueError("Golden scenario is not registered: %s" % scenario) from exc
+    return stable_id("trial", _golden_run_id(), case.task_id, trial_index)
+
+
+def _golden_replay_binding_digest(case: EvalCase) -> str:
+    target = case.input.review_target
+    if target.kind.value != "repository":
+        raise ValueError("Core Golden replay requires a Repository review target")
+    return canonical_sha256(
+        {
+            "schema_version": GOLDEN_REPLAY_BINDING_SCHEMA_VERSION,
+            "task_id": case.task_id,
+            "repository": target.repository.to_dict(),
+        }
+    )
+
+
+def _golden_materialization_id(case: EvalCase, scenario: str) -> str:
+    trial_id = _golden_trial_id(case, scenario)
+    return stable_id(
+        "materialization",
+        {
+            "schema_version": GOLDEN_MATERIALIZATION_BINDING_SCHEMA_VERSION,
+            "run_id": _golden_run_id(),
+            "task_id": case.task_id,
+            "trial_id": trial_id,
+            "attempt": GOLDEN_ATTEMPT,
+            "eval_input_digest": case.eval_input().digest(),
+            "review_target_digest": canonical_sha256(case.input.review_target),
+            "wire_contract": dict(REPOSITORY_WIRE_CONTRACT),
+            "suite_preparation_binding_digest": None,
+            "replay_binding_digest": _golden_replay_binding_digest(case),
+        },
+    )
+
+
+def _bind_golden_evidence(
+    values: Iterable[Mapping[str, Any]], target_materialization_id: str
+) -> list[dict[str, Any]]:
+    result = []
+    for value in values:
+        item = dict(value)
+        source = dict(item["source"])
+        if "target_materialization_id" in source:
+            raise ValueError("unbound Golden Evidence unexpectedly carries an identity")
+        source["target_materialization_id"] = target_materialization_id
+        item["source"] = source
+        result.append(item)
+    return result
+
+
 def _golden_submission(
     case: EvalCase,
     scenario: str,
@@ -1790,19 +1903,23 @@ def _golden_submission(
     evidence: Iterable[Mapping[str, Any]] = (),
     intent: Mapping[str, Any] | None = None,
 ) -> EvalSubmission:
+    trial_id = _golden_trial_id(case, scenario)
+    materialization_id = _golden_materialization_id(case, scenario)
     return EvalSubmission.from_dict(
         {
-            "schema_version": "eval_submission_v1",
+            "schema_version": EVAL_SUBMISSION_SCHEMA_VERSION,
             "task_id": case.task_id,
-            "agent_id": "task13-golden-agent",
-            "trial_id": "trial-golden-" + scenario,
+            "agent_id": "core-golden-agent-v2",
+            "trial_id": trial_id,
+            "eval_input_digest": case.eval_input().digest(),
+            "target_materialization_id": materialization_id,
             "status": "completed",
             "intent": _golden_intent(case) if intent is None else dict(intent),
             "review": {
                 "findings": list(findings),
                 "uncertainties": [],
             },
-            "evidence": list(evidence),
+            "evidence": _bind_golden_evidence(evidence, materialization_id),
             "usage": {
                 "elapsed_seconds": 0,
                 "input_tokens": None,
@@ -1848,17 +1965,17 @@ def _file_evidence(
 ) -> dict[str, Any]:
     return {
         "evidence_id": evidence_id,
-        "kind": "repository_file",
-        "revision": (
-            case.input.repository.head_revision if revision is None else revision
-        ),
-        "path": path,
-        "from_line": from_line,
-        "to_line": to_line,
-        "command": None,
-        "exit_code": None,
-        "stream": None,
-        "source_ref": None,
+        "source": {
+            "kind": "repository_file",
+            "revision": (
+                case.input.review_target.repository.head_revision
+                if revision is None
+                else revision
+            ),
+            "path": path,
+            "from_line": from_line,
+            "to_line": to_line,
+        },
         "content_hash": (
             hashlib.sha256(excerpt.encode("utf-8")).hexdigest()
             if content_hash is None
@@ -1879,9 +1996,9 @@ def _full_file_evidence(
     files = spec.base_files if snapshot == "base" else spec.head_files
     line_count = len(files[path].splitlines())
     revision = (
-        case.input.repository.base_revision
+        case.input.review_target.repository.base_revision
         if snapshot == "base"
-        else case.input.repository.head_revision
+        else case.input.review_target.repository.head_revision
     )
     return _file_evidence(
         evidence_id,
@@ -1994,12 +2111,25 @@ def _golden_outputs(
         (
             "bad-evidence-path",
             "finding-bad-evidence-path",
-            {**valid_bad_head, "path": "src/tokens.py"},
+            {
+                **valid_bad_head,
+                "source": {
+                    **valid_bad_head["source"],
+                    "path": "src/tokens.py",
+                },
+            },
         ),
         (
             "bad-evidence-line",
             "finding-bad-evidence-line",
-            {**valid_bad_head, "from_line": 99, "to_line": 99},
+            {
+                **valid_bad_head,
+                "source": {
+                    **valid_bad_head["source"],
+                    "from_line": 99,
+                    "to_line": 99,
+                },
+            },
         ),
     )
     bad_submissions = []
@@ -2191,6 +2321,11 @@ def _golden_outputs(
         ("contradicted-intent", contradicted_intent),
         *bad_submissions,
     ]
+    scenario_names = [scenario for scenario, _submission in submissions]
+    if len(scenario_names) != len(set(scenario_names)) or set(
+        scenario_names
+    ) != set(GOLDEN_SCENARIOS):
+        raise ValueError("Golden outputs do not match the fixed scenario registry")
     for scenario, submission in submissions:
         result[
             "cases/core/%s/golden/%s.json" % (submission.task_id, scenario)
@@ -2214,6 +2349,8 @@ def _golden_index(
             raise ValueError("Golden output path is not canonical: %s" % path)
         task_id = parts[2]
         case = cases[task_id]
+        submission = EvalSubmission.from_json(raw)
+        case.validate_submission(submission)
         core = {
             "path": path,
             "task_id": task_id,
@@ -2221,6 +2358,10 @@ def _golden_index(
             "scenario": parts[4][:-5],
             "raw_file_size_bytes": len(raw),
             "raw_file_sha256": hashlib.sha256(raw).hexdigest(),
+            "canonical_submission_digest": submission.digest(),
+            "eval_input_digest": submission.eval_input_digest,
+            "trial_id": submission.trial_id,
+            "target_materialization_id": submission.target_materialization_id,
         }
         entry_digest = canonical_sha256(
             {"schema_version": GOLDEN_ENTRY_SCHEMA_VERSION, **core}
@@ -2229,6 +2370,13 @@ def _golden_index(
     return {
         "schema_version": GOLDEN_INDEX_SCHEMA_VERSION,
         "source_version": CORE_SOURCE_VERSION,
+        "run_binding": {
+            "schema_version": GOLDEN_RUN_BINDING_SCHEMA_VERSION,
+            "run_instance_key": GOLDEN_RUN_INSTANCE_KEY,
+            "run_id": _golden_run_id(),
+            "attempt": GOLDEN_ATTEMPT,
+            "scenario_order": list(GOLDEN_SCENARIOS),
+        },
         "entries": entries,
     }
 
@@ -2284,7 +2432,7 @@ def build_outputs(
                     ] = text.encode("utf-8")
 
             payload = {
-                "schema_version": "eval_case_v1",
+                "schema_version": EVAL_CASE_SCHEMA_VERSION,
                 "task_id": spec.task_id,
                 "case_version": CASE_VERSION,
                 "source": {
@@ -2297,14 +2445,17 @@ def build_outputs(
                     "content_hash": _case_source_content_hash(spec, built),
                 },
                 "input": {
-                    "repository": {
-                        "source": "fixture",
-                        "path": f"{relative_root}/repository",
-                        "url": None,
-                        "base_revision": built.base_revision,
-                        "head_revision": built.head_revision,
+                    "review_target": {
+                        "kind": "repository",
+                        "repository": {
+                            "source": "fixture",
+                            "path": f"{relative_root}/repository",
+                            "url": None,
+                            "base_revision": built.base_revision,
+                            "head_revision": built.head_revision,
+                        },
+                        "review_request": dict(spec.request),
                     },
-                    "review_request": dict(spec.request),
                 },
                 "clarification_script": {
                     "max_rounds": max(1, len(spec.clarification_answers)),
@@ -2321,6 +2472,7 @@ def build_outputs(
                     "expected_findings": list(spec.expected_findings),
                     "known_invalid_findings": list(spec.known_invalid_findings),
                 },
+                "review_evaluator_context": {"truth_contexts": []},
             }
             case = EvalCase.from_dict(payload)
             fixture_manifest = fixture_manifest_from_mappings(
@@ -2375,6 +2527,7 @@ def build_outputs(
             "schema_version": SUITE_MANIFEST_SCHEMA_VERSION,
             "suite_id": suite_id,
             "suite_version": CORE_SOURCE_VERSION,
+            "wire_contract": dict(REPOSITORY_WIRE_CONTRACT),
             "source": {
                 "kind": "core",
                 "source_id": suite_id + "-source",
@@ -2382,6 +2535,7 @@ def build_outputs(
                 "source_uri": None,
                 "license": None,
                 "content_hash": source_content_hash,
+                "preparation_binding": None,
             },
             "cases": [],
         }
@@ -2400,7 +2554,7 @@ def build_outputs(
                     "dimensions": dimensions,
                     "raw_file_size_bytes": len(case_bytes),
                     "raw_file_sha256": hashlib.sha256(case_bytes).hexdigest(),
-                    "canonical_case_digest": canonical_sha256(case),
+                    "canonical_case_digest": case.digest(),
                     "eval_input_digest": case.eval_input().digest(),
                     "truth_completeness": case.review_truth.completeness.value,
                 }
@@ -2413,15 +2567,25 @@ def build_outputs(
     outputs["cases/core/README.md"] = (
         "# Core code-review Cases\n\n"
         "These files are generated by `eval/authoring/build_core_suites.py`. "
-        "Each Case keeps private truth and its audit record beside a deterministic "
-        "`repository/base` and `repository/head` fixture. The Agent receives only "
-        "the materialized repository and canonical EvalInput. Run the authoring "
-        "script with `--check` after any edit.\n\n"
+        "The sole active projection contains 18 `eval_case_v2` Cases, 12 "
+        "`eval_submission_v2` Golden submissions, and two `suite_manifest_v2` "
+        "Repository Suites at source version `core-2026-07-21-v3`. Each Case keeps "
+        "private truth and its audit record beside deterministic `repository/base` "
+        "and `repository/head` fixture bytes. The Agent receives only the canonical "
+        "EvalInput v2 Repository review target and a per-attempt materialization; "
+        "truth and audit sidecars remain evaluator-private.\n\n"
+        "Golden Submission identities use the fixed `core-golden-authoring-v2` run "
+        "binding, the scenario order recorded in `golden-index.json`, attempt 1, "
+        "and a replay digest over the exact Repository descriptor. These deterministic "
+        "fixtures exercise protocol semantics; they are not real Agent trials and "
+        "cannot satisfy promotion. Run the authoring script with `--check` after any "
+        "edit.\n\n"
         "These manifests are pending candidate snapshots, not release-ready Suites. "
-        "A Case must not be used as a release gate while its source-bound human-review "
-        "approval is missing, and a Regression candidate must additionally pass the "
-        "required repeated real-model baseline gate. The two gates fail closed and "
-        "must never be skipped or treated as advisory.\n"
+        "The v3 Case/Input digests supersede every earlier approval identity, so each "
+        "Case explicitly requires a fresh independent human Reviewer B review. A "
+        "Regression candidate must additionally pass a real current-Agent model "
+        "baseline with at least three trials for every Regression Case. AI, scripted, "
+        "or internally consistent fake evidence cannot satisfy either external gate.\n"
     ).encode("utf-8")
     return outputs
 
@@ -2520,8 +2684,10 @@ def write_outputs(eval_root: Path, outputs: Mapping[str, bytes]) -> None:
 
 def _summary(outputs: Mapping[str, bytes]) -> dict[str, Any]:
     return {
-        "schema_version": "core_suite_authoring_summary_v1",
+        "schema_version": "core_suite_authoring_summary_v2",
         "case_count": len(CASES),
+        "golden_count": len(GOLDEN_SCENARIOS),
+        "suite_count": 2,
         "regression_count": sum(item.split == "regression" for item in CASES),
         "capability_count": sum(item.split == "capability" for item in CASES),
         "generated_file_count": len(outputs),
