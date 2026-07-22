@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import stat
@@ -38,12 +37,11 @@ from review_agent_eval.models import (  # noqa: E402
     canonical_sha256,
     stable_id,
 )
-from review_agent_eval.repository import (  # noqa: E402
-    _WINDOWS_RESERVED as _REPOSITORY_WINDOWS_RESERVED,
-    FixtureRepositoryBuilder,
-)
+from review_agent_eval.repository import FixtureRepositoryBuilder  # noqa: E402
 from core_human_review import (  # noqa: E402
     ANNOTATION_PROTOCOL_VERSION,
+    _is_dos_83_alias_component,
+    _is_windows_reserved_component,
     annotation_protocol_binding,
     fixture_manifest_from_mappings,
     load_source_bound_ledger_record,
@@ -82,6 +80,22 @@ GOLDEN_SCENARIOS = (
     "bad-evidence-path",
     "bad-evidence-line",
 )
+_GOLDEN_TASK_BY_SCENARIO = MappingProxyType(
+    {
+        "perfect": "core-py-001",
+        "empty": "core-py-011",
+        "duplicate": "core-py-001",
+        "fabricated": "core-py-015",
+        "unsupported-evidence": "core-py-001",
+        "compound": "core-py-012",
+        "judge-unknown": "core-py-015",
+        "unsupported-intent": "core-py-004",
+        "contradicted-intent": "core-py-011",
+        "bad-evidence": "core-py-014",
+        "bad-evidence-path": "core-py-014",
+        "bad-evidence-line": "core-py-014",
+    }
+)
 REPOSITORY_WIRE_CONTRACT = {
     "case_schema_version": EVAL_CASE_SCHEMA_VERSION,
     "input_schema_version": EVAL_INPUT_SCHEMA_VERSION,
@@ -94,17 +108,6 @@ REPOSITORY_WIRE_CONTRACT = {
 # signs each frozen blind-review packet.  A model/sub-agent review must never
 # be recorded as the external human audit gate.
 HUMAN_REVIEW_STATUS = "requires_independent_re_review"
-
-
-# NTFS can resolve a DOS 8.3 short name such as ``REPOSI~1`` to a protected
-# long-name directory.  Reject the common bounded ASCII shape lexically on
-# every platform instead of probing host short-name settings.  This is
-# intentionally conservative: matching components are unavailable to the
-# authoring contract even when a particular host has no such alias.
-_DOS_83_ALIAS_RE = re.compile(
-    r"^(?P<prefix>[A-Za-z0-9]+)~(?P<ordinal>[1-9][0-9]*)"
-    r"(?:\.(?P<extension>[A-Za-z0-9]+))?$"
-)
 
 
 @dataclass(frozen=True)
@@ -1483,21 +1486,6 @@ def _absolute_lexical(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
 
 
-def _is_dos_83_alias_component(component: str) -> bool:
-    match = _DOS_83_ALIAS_RE.fullmatch(component)
-    if match is None:
-        return False
-    prefix = match.group("prefix")
-    ordinal = match.group("ordinal")
-    extension = match.group("extension")
-    return (
-        len(prefix) <= 6
-        and len(ordinal) <= 6
-        and len(prefix) + 1 + len(ordinal) <= 8
-        and (extension is None or len(extension) <= 3)
-    )
-
-
 def _safe_relative_parts(relative: str, *, context: str) -> tuple[str, ...]:
     if type(relative) is not str or not relative:
         raise ValueError("%s must be a non-empty relative POSIX path" % context)
@@ -1512,10 +1500,7 @@ def _safe_relative_parts(relative: str, *, context: str) -> tuple[str, ...]:
         raise ValueError(
             "%s contains a Windows trailing dot or space component" % context
         )
-    if any(
-        part.split(".", 1)[0].upper() in _REPOSITORY_WINDOWS_RESERVED
-        for part in raw_parts
-    ):
+    if any(_is_windows_reserved_component(part) for part in raw_parts):
         raise ValueError(
             "%s contains a Windows reserved device name component" % context
         )
@@ -1536,7 +1521,7 @@ def _assert_safe_existing_directory(path: Path, *, context: str) -> None:
         raise RuntimeError("%s is a link, reparse point, or non-directory" % context)
 
 
-def _assert_safe_root(root: Path, *, context: str) -> Path:
+def _assert_safe_root(root: Path, *, context: str, create: bool = False) -> Path:
     absolute = _absolute_lexical(root)
     existing = absolute
     missing: list[Path] = []
@@ -1550,8 +1535,10 @@ def _assert_safe_root(root: Path, *, context: str) -> Path:
     for ancestor in reversed(existing.parents):
         if ancestor == ancestor.parent:
             continue
-        if ancestor.exists():
+        if os.path.lexists(ancestor):
             _assert_safe_existing_directory(ancestor, context=context + " ancestor")
+    if not create:
+        return absolute
     for directory in reversed(missing):
         directory.mkdir()
         _assert_safe_existing_directory(directory, context=context)
@@ -1566,7 +1553,7 @@ def _safe_directory(
     context: str,
     create: bool,
 ) -> Path:
-    current = _assert_safe_root(root, context=context + " root")
+    current = _assert_safe_root(root, context=context + " root", create=create)
     for component in parts:
         current = current / component
         if not os.path.lexists(current):
@@ -2480,7 +2467,13 @@ def build_plan(
     temporary_parent = (
         None
         if temporary_root is None
-        else str(_assert_safe_root(temporary_root, context="authoring temporary root"))
+        else str(
+            _assert_safe_root(
+                temporary_root,
+                context="authoring temporary root",
+                create=True,
+            )
+        )
     )
     with tempfile.TemporaryDirectory(
         prefix="review-agent-core-suite-",
@@ -2745,11 +2738,40 @@ def _is_repository_path(portable_key: str) -> bool:
     )
 
 
-def _is_repository_fixture_path(portable_key: str) -> bool:
-    parts = tuple(portable_key.split("/"))
+def _registered_case_ids() -> frozenset[str]:
+    return frozenset(spec.task_id for spec in CASES)
+
+
+def _is_allowlisted_writable_shape(relative: str) -> bool:
+    parts = tuple(relative.split("/"))
+    registered = _registered_case_ids()
+    if parts == ("cases", "core", "README.md"):
+        return True
+    if parts == ("cases", "core", "golden-index.json"):
+        return True
+    if parts == ("suites", "core-regression", "manifest.json"):
+        return True
+    if parts == ("suites", "core-capability", "manifest.json"):
+        return True
+    if len(parts) == 4 and parts[:2] == ("cases", "core"):
+        return parts[2] in registered and parts[3] in {"case.json", "annotation.json"}
+    return (
+        len(parts) == 5
+        and parts[:2] == ("cases", "core")
+        and parts[2] in registered
+        and parts[3] == "golden"
+        and parts[4].endswith(".json")
+        and _GOLDEN_TASK_BY_SCENARIO.get(parts[4][:-5]) == parts[2]
+    )
+
+
+def _is_repository_fixture_path(relative: str) -> bool:
+    parts = tuple(relative.split("/"))
     return (
         len(parts) >= 6
-        and _is_repository_path(portable_key)
+        and parts[:2] == ("cases", "core")
+        and parts[2] in _registered_case_ids()
+        and parts[3] == "repository"
         and parts[4] in {"base", "head"}
     )
 
@@ -2796,15 +2818,15 @@ def _validated_plan_paths(plan: CoreBuildPlan) -> _ValidatedBuildPlanOwnership:
             "build-plan ownership sets overlap portably: " + ", ".join(aliases)
         )
     for portable_key, relative in writable_paths.items():
-        if _is_repository_path(portable_key):
+        if not _is_allowlisted_writable_shape(relative):
             raise ValueError(
-                "writable output cannot target a Repository fixture path: %s"
+                "writable output is not an allowlisted registered derived output: %s"
                 % relative
             )
-    for portable_key, relative in fixture_paths.items():
-        if not _is_repository_fixture_path(portable_key):
+    for _portable_key, relative in fixture_paths.items():
+        if not _is_repository_fixture_path(relative):
             raise ValueError(
-                "check-only fixture must be under repository/base or repository/head: %s"
+                "check-only fixture must be an exact registered repository/base or repository/head path: %s"
                 % relative
             )
     known_paths = dict(writable_paths)

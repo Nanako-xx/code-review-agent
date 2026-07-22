@@ -1069,6 +1069,37 @@ def test_core_authoring_outputs_are_reproducible(tmp_path: Path) -> None:
         sys.modules.pop(module_name, None)
 
 
+def test_core_authoring_write_outputs_round_trips_exact_bytes_and_check_is_clean(
+    tmp_path: Path,
+) -> None:
+    module_name = "_review_agent_core_suite_authoring_integration"
+    spec = importlib.util.spec_from_file_location(module_name, AUTHORING_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        plan = module.build_plan(tmp_path)
+        isolated_eval = tmp_path / "isolated-eval"
+        fixture_hashes: dict[str, str] = {}
+        for relative, raw in plan.check_only_fixtures.items():
+            target = isolated_eval.joinpath(*relative.split("/"))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+            fixture_hashes[relative] = hashlib.sha256(target.read_bytes()).hexdigest()
+
+        module.write_outputs(isolated_eval, plan)
+
+        for relative, expected in plan.writable_outputs.items():
+            assert isolated_eval.joinpath(*relative.split("/")).read_bytes() == expected
+        for relative, expected_hash in fixture_hashes.items():
+            target = isolated_eval.joinpath(*relative.split("/"))
+            assert hashlib.sha256(target.read_bytes()).hexdigest() == expected_hash
+        assert module.check_outputs(isolated_eval, plan) == []
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_annotation_guidelines_define_the_human_audit_contract() -> None:
     text = _required_file(ANNOTATION_GUIDELINES).read_text(encoding="utf-8")
     folded = text.casefold()

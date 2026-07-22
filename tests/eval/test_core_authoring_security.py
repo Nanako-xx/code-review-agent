@@ -246,27 +246,27 @@ def _write_test_file(eval_root: Path, relative: str, data: bytes) -> Path:
 
 
 FIXTURE_BASE_PATH = (
-    "cases/core/core-py-test/repository/base/src/input.py"
+    "cases/core/core-py-001/repository/base/src/input.py"
 )
 FIXTURE_HEAD_PATH = (
-    "cases/core/core-py-test/repository/head/src/input.py"
+    "cases/core/core-py-001/repository/head/src/input.py"
 )
-DERIVED_CASE_PATH = "cases/core/core-py-test/case.json"
+DERIVED_CASE_PATH = "cases/core/core-py-001/case.json"
 CASE_ALIAS_FIXTURE_PATH = (
-    "cases/core/core-py-test/Repository/base/src/input.py"
+    "cases/core/core-py-001/Repository/base/src/input.py"
 )
 NFC_FIXTURE_PATH = (
-    "cases/core/core-py-test/repository/base/src/caf\u00e9.py"
+    "cases/core/core-py-001/repository/base/src/caf\u00e9.py"
 )
 NFD_ALIAS_FIXTURE_PATH = (
-    "cases/core/core-py-test/REPOSITORY/base/src/cafe\u0301.py"
+    "cases/core/core-py-001/REPOSITORY/base/src/cafe\u0301.py"
 )
 WIN32_TRAILING_WRITABLE_PATHS = (
-    "cases/core/core-py-test/Repository./base/src/input.py",
-    "cases/core/core-py-test/repository /base/src/input.py",
-    "cases/core/core-py-test/RePoSiToRy./base/src/input.py",
-    "cases/core/core-py-test/R\u00c9POSITORY./base/src/input.py",
-    "cases/core/core-py-test/RE\u0301POSITORY /base/src/input.py",
+    "cases/core/core-py-001/Repository./base/src/input.py",
+    "cases/core/core-py-001/repository /base/src/input.py",
+    "cases/core/core-py-001/RePoSiToRy./base/src/input.py",
+    "cases/core/core-py-001/R\u00c9POSITORY./base/src/input.py",
+    "cases/core/core-py-001/RE\u0301POSITORY /base/src/input.py",
 )
 WIN32_RESERVED_COMPONENTS = (
     "CON",
@@ -276,11 +276,22 @@ WIN32_RESERVED_COMPONENTS = (
     *("COM%d.py" % value for value in range(1, 10)),
     *("lpt%d.data" % value for value in range(1, 10)),
 )
+NFKC_WINDOWS_RESERVED_COMPONENTS = (
+    "COM\N{SUPERSCRIPT ONE}",
+    "COM\N{SUPERSCRIPT TWO}.txt",
+    "COM\N{SUPERSCRIPT THREE}",
+    "LPT\N{SUPERSCRIPT ONE}",
+    "LPT\N{SUPERSCRIPT TWO}.txt",
+    "LPT\N{SUPERSCRIPT THREE}",
+)
 DOS_83_ALIAS_COMPONENTS = (
     "REPOSI~1",
     "reposi~1.txt",
     "RePoSi~1.TxT",
     "A~123456",
+    "CORE-P~1",
+    "CORE_P~1.txt",
+    "CORE$P~1",
 )
 DOS_83_NEAR_MISSES = (
     "REPOSII~1",
@@ -584,7 +595,7 @@ def test_write_rejects_repository_case_alias_without_fixture_overlap(
         lambda _root, relative, _data: writes.append(relative),
     )
 
-    with pytest.raises(ValueError, match="cannot target a Repository fixture path"):
+    with pytest.raises(ValueError, match="allowlisted|Repository fixture"):
         authoring_module.write_outputs(eval_root, plan)
 
     assert writes == []
@@ -596,7 +607,7 @@ def test_write_rejects_repository_case_alias_without_fixture_overlap(
         (
             {
                 DERIVED_CASE_PATH: b"first",
-                "cases/core/core-py-test/CASE.json": b"second",
+                "cases/core/core-py-001/CASE.json": b"second",
             },
             {},
             "writable output",
@@ -605,7 +616,7 @@ def test_write_rejects_repository_case_alias_without_fixture_overlap(
             {},
             {
                 FIXTURE_BASE_PATH: b"first",
-                "cases/core/core-py-test/repository/base/src/INPUT.py": b"second",
+                "cases/core/core-py-001/repository/base/src/INPUT.py": b"second",
             },
             "check-only fixture",
         ),
@@ -644,11 +655,11 @@ def test_build_plan_rejects_portable_collision_within_each_ownership_set(
     (
         (
             DERIVED_CASE_PATH,
-            "cases/core/core-py-test/CASE.json",
+            "cases/core/core-py-001/CASE.json",
         ),
         (
-            "cases/core/core-py-test/caf\u00e9.json",
-            "cases/core/core-py-test/cafe\u0301.json",
+            "cases/core/core-py-001/annotation.json",
+            "cases/core/core-py-001/ANNOTATION.json",
         ),
     ),
 )
@@ -681,11 +692,11 @@ def test_existing_inventory_rejects_portable_collisions_without_set_collapse(
     (
         (
             DERIVED_CASE_PATH,
-            "cases/core/core-py-test/CASE.json",
+            "cases/core/core-py-001/CASE.json",
         ),
         (
-            "cases/core/core-py-test/caf\u00e9.json",
-            "cases/core/core-py-test/cafe\u0301.json",
+            "cases/core/core-py-001/annotation.json",
+            "cases/core/core-py-001/ANNOTATION.json",
         ),
     ),
 )
@@ -750,9 +761,9 @@ def test_write_rejects_win32_trailing_dot_or_space_before_writer_call(
 @pytest.mark.parametrize(
     "relative",
     (
-        "cases/core/core-py-test/repository./base/src/input.py",
-        "cases/core/core-py-test/repository/base /src/input.py",
-        "cases/core/core-py-test/repository/base/src/cafe\u0301.py ",
+        "cases/core/core-py-001/repository./base/src/input.py",
+        "cases/core/core-py-001/repository/base /src/input.py",
+        "cases/core/core-py-001/repository/base/src/cafe\u0301.py ",
     ),
 )
 def test_check_only_fixture_rejects_win32_trailing_dot_or_space(
@@ -791,7 +802,7 @@ def test_write_rejects_windows_reserved_device_component_before_writer_call(
 ) -> None:
     eval_root = tmp_path / "eval"
     eval_root.mkdir()
-    relative = "cases/core/core-py-test/%s/case.json" % component
+    relative = "cases/core/core-py-001/%s/case.json" % component
     plan = _build_plan(
         authoring_module,
         writable_outputs={relative: b"attacker replacement"},
@@ -812,8 +823,8 @@ def test_write_rejects_windows_reserved_device_component_before_writer_call(
 @pytest.mark.parametrize(
     "relative",
     (
-        "cases/core/core-py-test/repository/base/src/CON.py",
-        "cases/core/core-py-test/repository/base/AUX/input.py",
+        "cases/core/core-py-001/repository/base/src/CON.py",
+        "cases/core/core-py-001/repository/base/AUX/input.py",
     ),
 )
 def test_check_only_reserved_device_rejects_before_writer_call(
@@ -843,11 +854,125 @@ def test_check_only_reserved_device_rejects_before_writer_call(
     assert writes == []
 
 
+@pytest.mark.parametrize("component", NFKC_WINDOWS_RESERVED_COMPONENTS)
+def test_write_rejects_nfkc_windows_reserved_device_component(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    relative = "cases/core/core-py-001/%s/case.json" % component
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={relative: b"attacker replacement"},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, target, _data: writes.append(target),
+    )
+
+    with pytest.raises(ValueError, match="Windows reserved device name"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+
+
 @pytest.mark.parametrize(
     "relative",
     (
-        "cases/core/core-py-test/Repository./base/src/input.py",
-        "cases/core/core-py-test/CON/case.json",
+        "README.md",
+        "annotation-guidelines.md",
+        "cases/core/unrelated.json",
+        "cases/core/core-py-999/case.json",
+        "cases/core/core-py-001/repository/base/src/input.py",
+        "cases/core/core-py-018/golden/perfect.json",
+        "suites/core-regression/unrelated.json",
+    ),
+)
+def test_writable_outputs_require_the_registered_derived_allowlist(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    with pytest.raises(ValueError, match="allowlisted|derived output|registered"):
+        authoring_module.check_outputs(
+            eval_root,
+            _build_plan(authoring_module, writable_outputs={relative: b"payload"}),
+        )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "cases/core/core-py-999/repository/base/src/input.py",
+        "cases/core/core-py-001/authoring-source/input.py",
+        "cases/core/core-py-001/Repository/base/src/input.py",
+        "cases/core/core-py-001/repository/other/src/input.py",
+    ),
+)
+def test_check_only_fixtures_require_registered_repository_base_or_head(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    with pytest.raises(ValueError, match="check-only fixture"):
+        authoring_module.check_outputs(
+            eval_root,
+            _build_plan(authoring_module, check_only_fixtures={relative: b"fixture"}),
+        )
+
+
+def test_check_outputs_missing_root_is_zero_mutation(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    eval_root = tmp_path / "missing-eval-root"
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={"cases/core/core-py-001/case.json": b"derived"},
+        check_only_fixtures={
+            "cases/core/core-py-001/repository/base/src/input.py": b"fixture"
+        },
+    )
+
+    errors = authoring_module.check_outputs(eval_root, plan)
+
+    assert errors == [
+        "missing writable output: cases/core/core-py-001/case.json",
+        "missing check-only fixture: cases/core/core-py-001/repository/base/src/input.py",
+    ]
+    assert not os.path.lexists(eval_root)
+
+
+def test_cli_check_missing_root_is_zero_mutation(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_root = tmp_path / "missing-cli-eval-root"
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={"cases/core/core-py-001/case.json": b"derived"},
+    )
+    monkeypatch.setattr(authoring_module, "build_plan", lambda _temporary: plan)
+
+    assert authoring_module.main(["--check", "--eval-root", str(eval_root)]) == 1
+    assert not os.path.lexists(eval_root)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "cases/core/core-py-001/Repository./base/src/input.py",
+        "cases/core/core-py-001/CON/case.json",
     ),
 )
 def test_existing_inventory_rejects_nonportable_win32_component(
@@ -881,7 +1006,7 @@ def test_write_rejects_dos_83_alias_before_writer_call(
 ) -> None:
     eval_root = tmp_path / "eval"
     eval_root.mkdir()
-    relative = "cases/core/core-py-test/%s/base/src/input.py" % component
+    relative = "cases/core/core-py-001/%s/base/src/input.py" % component
     plan = _build_plan(
         authoring_module,
         writable_outputs={relative: b"attacker replacement"},
@@ -908,7 +1033,7 @@ def test_check_only_dos_83_alias_rejects_before_writer_call(
 ) -> None:
     eval_root = tmp_path / "eval"
     eval_root.mkdir()
-    relative = "cases/core/core-py-test/repository/base/%s/input.py" % component
+    relative = "cases/core/core-py-001/repository/base/%s/input.py" % component
     plan = _build_plan(
         authoring_module,
         check_only_fixtures={relative: b"fixture"},
@@ -937,7 +1062,7 @@ def test_existing_inventory_rejects_dos_83_alias(
 ) -> None:
     eval_root = tmp_path / "eval"
     (eval_root / "cases" / "core").mkdir(parents=True)
-    relative = "cases/core/core-py-test/%s/case.json" % component
+    relative = "cases/core/core-py-001/%s/case.json" % component
 
     def nonportable_inventory(_root: Path, _eval_root: Path) -> Iterator[str]:
         yield relative
@@ -958,7 +1083,7 @@ def test_bounded_dos_83_rejection_keeps_non_alias_paths_accepted(
     relative: str,
 ) -> None:
     assert authoring_module._safe_relative_parts(
-        "cases/core/core-py-test/repository/base/src/" + relative,
+        "cases/core/core-py-001/repository/base/src/" + relative,
         context="normal path",
     )[-1] == relative
 
@@ -1108,8 +1233,8 @@ def test_authoring_rejects_a_linked_parent_directory_without_external_mutation(
     sentinel = b"outside directory must survive"
     marker = outside / "payload.bin"
     marker.write_bytes(sentinel)
-    linked_parent = generated / "linked-parent"
-    relative = "cases/core/linked-parent/payload.bin"
+    linked_parent = generated / "core-py-001"
+    relative = "cases/core/core-py-001/case.json"
 
     with _directory_link_or_skip(linked_parent, outside):
         if operation == "write":
@@ -1215,7 +1340,7 @@ def test_authoring_rejects_reparse_metadata_without_platform_link_privileges(
     operation: str,
 ) -> None:
     eval_root = tmp_path / "eval"
-    target = eval_root / "cases" / "core" / "marked.bin"
+    target = eval_root / "cases" / "core" / "core-py-001" / "case.json"
     target.parent.mkdir(parents=True)
     sentinel = b"reparse-marked target must not change"
     target.write_bytes(sentinel)
@@ -1227,7 +1352,7 @@ def test_authoring_rejects_reparse_metadata_without_platform_link_privileges(
             authoring_module,
             operation,
             eval_root,
-            "cases/core/marked.bin",
+            "cases/core/core-py-001/case.json",
             sentinel,
         ),
     )

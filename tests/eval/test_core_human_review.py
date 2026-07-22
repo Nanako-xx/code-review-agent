@@ -37,6 +37,7 @@ from core_human_review import (  # noqa: E402
     verify_completed_response,
     verify_current_case_approval,
 )
+import core_human_review as human_review_module  # noqa: E402
 from review_agent_eval.models import (  # noqa: E402
     EvalCase,
     RepositoryReviewTarget,
@@ -314,6 +315,128 @@ def test_export_rejects_symlink_or_reparse_ancestor(tmp_path: Path) -> None:
         export_blind_review_batch(
             EVAL_ROOT, link / "packet", [TASK_ID], "human-symlink-batch"
         )
+
+
+def test_containment_uses_canonical_existing_identity_for_short_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    alias_output = tmp_path / "REPOSI~1" / "new" / "packet"
+
+    def canonical(path: Path) -> Path:
+        if path == alias_output:
+            return repository / "new" / "packet"
+        if path == alias_output.parent:
+            return repository / "new"
+        return path
+
+    monkeypatch.setattr(human_review_module, "_canonical_path_for_containment", canonical)
+
+    assert human_review_module._is_within(alias_output, repository)
+
+
+def test_outside_repository_read_rejects_injected_short_alias_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    outside = tmp_path / "packet.json"
+    outside.write_bytes(b"{}")
+    monkeypatch.setattr(human_review_module, "REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(
+        human_review_module,
+        "_canonical_path_for_containment",
+        lambda path: repository / path.name if path == outside else path,
+    )
+
+    with pytest.raises(HumanReviewError, match="outside the repository"):
+        human_review_module._read_regular(
+            outside, "packet", outside_repository=True
+        )
+
+
+def test_export_rejects_injected_short_alias_before_any_output_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    alias_parent = tmp_path / "REPOSI~1"
+    if not os.path.lexists(alias_parent):
+        alias_parent.mkdir()
+    sentinel = alias_parent / "sentinel.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    output = alias_parent / "packet"
+    monkeypatch.setattr(human_review_module, "REPOSITORY_ROOT", repository)
+
+    def canonical(path: Path) -> Path:
+        if path == output:
+            return repository / "packet"
+        if path == alias_parent:
+            return repository
+        return path
+
+    monkeypatch.setattr(human_review_module, "_canonical_path_for_containment", canonical)
+
+    with pytest.raises(HumanReviewError, match="outside the repository"):
+        export_blind_review_batch(
+            EVAL_ROOT,
+            output,
+            [TASK_ID],
+            "human-short-alias-batch",
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert sorted(path.name for path in alias_parent.iterdir()) == ["sentinel.txt"]
+
+
+@pytest.mark.parametrize(
+    "component",
+    ("COM\N{SUPERSCRIPT ONE}", "COM\N{SUPERSCRIPT TWO}.txt", "LPT\N{SUPERSCRIPT THREE}"),
+)
+def test_human_review_shared_path_policy_rejects_nfkc_device_names(
+    component: str,
+) -> None:
+    with pytest.raises(HumanReviewError, match="Windows reserved device name"):
+        human_review_module._safe_relative_parts(
+            "repository/base/%s/input.py" % component,
+            "fixture path",
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows GetShortPathNameW capability")
+def test_windows_get_short_path_name_capability(tmp_path: Path) -> None:
+    long_directory = tmp_path / "core-authoring-short-path-capability"
+    long_directory.mkdir()
+
+    short_path = human_review_module._windows_short_path_name(long_directory)
+
+    assert short_path
+    assert Path(short_path).exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DOS short-path containment")
+def test_windows_short_path_alias_cannot_bypass_repository_containment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository-long-name"
+    repository.mkdir()
+    short_path = human_review_module._windows_short_path_name(repository)
+    assert short_path is not None
+    if os.path.normcase(short_path) == os.path.normcase(str(repository)):
+        pytest.skip("this volume did not expose a distinct DOS short-path alias")
+    output = Path(short_path) / "packet"
+    monkeypatch.setattr(human_review_module, "REPOSITORY_ROOT", repository)
+
+    with pytest.raises(HumanReviewError, match="outside the repository"):
+        export_blind_review_batch(
+            EVAL_ROOT,
+            output,
+            [TASK_ID],
+            "human-real-short-alias-batch",
+        )
+
+    assert not os.path.lexists(output)
 
 
 def test_packet_verifier_rejects_fixture_tampering_and_private_extra_file(tmp_path: Path) -> None:

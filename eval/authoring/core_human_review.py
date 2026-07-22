@@ -11,6 +11,7 @@ import re
 import stat
 import sys
 import tempfile
+import unicodedata
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -108,6 +109,17 @@ _OBVIOUS_MACHINE_SUBSTRINGS = (
 _OBVIOUS_MACHINE_TOKENS = frozenset(
     {"agent", "assistant", "bot", "gpt", "llm", "model", "subagent"}
 )
+_WINDOWS_RESERVED_STEMS = frozenset(
+    str(item).casefold()
+    for item in getattr(repository_models, "_WINDOWS_RESERVED", frozenset())
+)
+# NTFS can resolve a DOS 8.3 short name such as ``REPOSI~1`` to a protected
+# long-name directory. Reject the bounded shape on every platform, including
+# punctuation-bearing prefixes such as ``CORE-P~1`` and ``CORE_P~1``.
+_DOS_83_ALIAS_RE = re.compile(
+    r"^(?P<prefix>[^.~]+)~(?P<ordinal>[1-9][0-9]*)"
+    r"(?:\.(?P<extension>[^.]+))?$"
+)
 
 
 class HumanReviewError(ValueError):
@@ -128,6 +140,70 @@ class VerifiedResponse:
 
 def _absolute(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
+
+
+def _is_windows_reserved_component(component: str) -> bool:
+    stem = unicodedata.normalize("NFKC", component).split(".", 1)[0]
+    return stem.casefold() in _WINDOWS_RESERVED_STEMS
+
+
+def _is_dos_83_alias_component(component: str) -> bool:
+    match = _DOS_83_ALIAS_RE.fullmatch(component)
+    if match is None:
+        return False
+    prefix = match.group("prefix")
+    ordinal = match.group("ordinal")
+    extension = match.group("extension")
+    return (
+        1 <= len(prefix) <= 6
+        and len(ordinal) <= 6
+        and len(prefix) + 1 + len(ordinal) <= 8
+        and (extension is None or 1 <= len(extension) <= 3)
+    )
+
+
+def _windows_short_path_name(path: Path) -> str | None:
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_short = kernel32.GetShortPathNameW
+    get_short.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+    get_short.restype = wintypes.DWORD
+    source = str(_absolute(path))
+    size = 260
+    while True:
+        buffer = ctypes.create_unicode_buffer(size)
+        result = get_short(source, buffer, size)
+        if result == 0:
+            raise OSError(ctypes.get_last_error(), "GetShortPathNameW failed")
+        if result < size:
+            return buffer.value
+        size = result + 1
+
+
+def _windows_long_path_name(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_long = kernel32.GetLongPathNameW
+    get_long.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+    get_long.restype = wintypes.DWORD
+    source = str(path)
+    size = 260
+    while True:
+        buffer = ctypes.create_unicode_buffer(size)
+        result = get_long(source, buffer, size)
+        if result == 0:
+            raise OSError(ctypes.get_last_error(), "GetLongPathNameW failed")
+        if result < size:
+            return Path(buffer.value)
+        size = result + 1
 
 
 def _is_link_or_reparse(metadata: os.stat_result) -> bool:
@@ -198,9 +274,37 @@ def _assert_safe_existing_ancestors(path: Path, context: str) -> None:
             raise HumanReviewError(f"{context} contains a symlink/junction/reparse point: {item}")
 
 
+def _canonical_existing_path(path: Path, context: str = "path") -> Path:
+    absolute = _absolute(path)
+    _assert_safe_existing_ancestors(absolute, context)
+    try:
+        resolved = Path(os.path.realpath(os.fspath(absolute)))
+        return _absolute(_windows_long_path_name(resolved))
+    except OSError as exc:
+        raise HumanReviewError(f"{context} could not be canonicalized") from exc
+
+
+def _canonical_path_for_containment(path: Path) -> Path:
+    absolute = _absolute(path)
+    current = absolute
+    missing: list[str] = []
+    while not os.path.lexists(current):
+        missing.append(current.name)
+        parent = current.parent
+        if parent == current:
+            raise HumanReviewError(f"path has no existing directory ancestor: {path}")
+        current = parent
+    canonical = _canonical_existing_path(current, "containment path")
+    for component in reversed(missing):
+        canonical = canonical / component
+    return canonical
+
+
 def _is_within(path: Path, root: Path) -> bool:
     try:
-        _absolute(path).relative_to(_absolute(root))
+        _canonical_path_for_containment(path).relative_to(
+            _canonical_path_for_containment(root)
+        )
         return True
     except ValueError:
         return False
@@ -214,6 +318,12 @@ def _safe_relative_parts(value: str, context: str) -> tuple[str, ...]:
     parts = value.split("/")
     if any(part in {"", ".", ".."} or ":" in part for part in parts):
         raise HumanReviewError(f"{context} contains an unsafe path component")
+    if any(part.endswith((".", " ")) for part in parts):
+        raise HumanReviewError(f"{context} contains a Windows trailing dot or space")
+    if any(_is_windows_reserved_component(part) for part in parts):
+        raise HumanReviewError(f"{context} contains a Windows reserved device name")
+    if any(_is_dos_83_alias_component(part) for part in parts):
+        raise HumanReviewError(f"{context} contains a possible Windows 8.3 short-name alias")
     pure = PurePosixPath(value)
     if pure.is_absolute() or tuple(pure.parts) != tuple(parts):
         raise HumanReviewError(f"{context} is not a canonical relative POSIX path")
@@ -285,6 +395,8 @@ def _read_regular(path: Path, context: str, *, outside_repository: bool = False)
     if outside_repository and _is_within(path, REPOSITORY_ROOT):
         raise HumanReviewError(f"{context} must remain outside the repository")
     parent_chain = _capture_directory_chain(path.parent, context)
+    if outside_repository and _is_within(path, REPOSITORY_ROOT):
+        raise HumanReviewError(f"{context} must remain outside the repository")
     try:
         before = path.lstat()
     except FileNotFoundError as exc:
@@ -340,6 +452,8 @@ def _read_regular(path: Path, context: str, *, outside_repository: bool = False)
     ):
         raise HumanReviewError(f"{context} changed while it was read")
     _verify_directory_chain(parent_chain, context)
+    if outside_repository and _is_within(path, REPOSITORY_ROOT):
+        raise HumanReviewError(f"{context} must remain outside the repository")
     return raw
 
 
@@ -797,6 +911,8 @@ def export_blind_review_batch(
         raise HumanReviewError("blind-review output already exists; overwrite is forbidden")
     parent = output_directory.parent
     _assert_directory(parent, "blind-review output parent")
+    parent_chain = _capture_directory_chain(parent, "blind-review output parent")
+    _verify_directory_chain(parent_chain, "blind-review output parent")
     if not task_ids or len(set(task_ids)) != len(task_ids):
         raise HumanReviewError("task_ids must be a non-empty unique list")
 
@@ -829,9 +945,13 @@ def export_blind_review_batch(
         raise HumanReviewError(
             "deterministic blind-review staging directory already exists; refusing reuse"
         )
+    _verify_directory_chain(parent_chain, "blind-review output parent")
     temporary.mkdir()
     try:
         assert temporary is not None
+        staging_chain = _capture_directory_chain(temporary, "blind-review staging")
+        _verify_directory_chain(parent_chain, "blind-review output parent")
+        _verify_directory_chain(staging_chain, "blind-review staging")
         _write_new(temporary / "batch.json", canonical_json(batch).encode("utf-8"))
         _write_new(temporary / "protocol.md", protocol_raw)
         for case, fixture_root, fixture_manifest, packet in prepared:
@@ -844,10 +964,19 @@ def export_blind_review_batch(
                 (json.dumps(template, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=True) + "\n").encode("utf-8"),
             )
             _copy_fixture(fixture_root, case_root, fixture_manifest)
+        _verify_directory_chain(parent_chain, "blind-review output parent")
+        _verify_directory_chain(staging_chain, "blind-review staging")
         verify_blind_review_batch(eval_root, temporary)
+        _verify_directory_chain(parent_chain, "blind-review output parent")
+        _verify_directory_chain(staging_chain, "blind-review staging")
         repository_models._rename_directory_no_replace(
             temporary, output_directory
         )
+        _verify_directory_chain(parent_chain, "blind-review output parent")
+        published_chain = _capture_directory_chain(output_directory, "blind-review output")
+        _verify_directory_chain(published_chain, "blind-review output")
+        if _is_within(output_directory, REPOSITORY_ROOT):
+            raise HumanReviewError("blind-review output must be outside the repository")
         temporary = None
     finally:
         if temporary is not None and os.path.lexists(temporary):
@@ -1049,6 +1178,8 @@ def verify_blind_review_batch(eval_root: Path, batch_directory: Path) -> Mapping
     _assert_directory(batch_directory, "blind-review batch")
     if _is_within(batch_directory, REPOSITORY_ROOT):
         raise HumanReviewError("blind-review batch must remain outside the repository")
+    batch_chain = _capture_directory_chain(batch_directory, "blind-review batch")
+    _verify_directory_chain(batch_chain, "blind-review batch")
     batch, _ = _load_json_file(
         batch_directory / "batch.json", "batch manifest", canonical=True, outside_repository=True
     )
@@ -1112,6 +1243,7 @@ def verify_blind_review_batch(eval_root: Path, batch_directory: Path) -> Mapping
             )
             if packet_file != source:
                 raise HumanReviewError("packet fixture bytes do not replay exactly")
+    _verify_directory_chain(batch_chain, "blind-review batch")
     actual_files = _walk_regular_files(batch_directory)
     if actual_files != expected_files:
         raise HumanReviewError(
@@ -1119,6 +1251,7 @@ def verify_blind_review_batch(eval_root: Path, batch_directory: Path) -> Mapping
             f"missing={sorted(expected_files - actual_files)!r}, "
             f"unexpected={sorted(actual_files - expected_files)!r}"
         )
+    _verify_directory_chain(batch_chain, "blind-review batch")
     return batch
 
 
