@@ -276,6 +276,19 @@ WIN32_RESERVED_COMPONENTS = (
     *("COM%d.py" % value for value in range(1, 10)),
     *("lpt%d.data" % value for value in range(1, 10)),
 )
+DOS_83_ALIAS_COMPONENTS = (
+    "REPOSI~1",
+    "reposi~1.txt",
+    "RePoSi~1.TxT",
+    "A~123456",
+)
+DOS_83_NEAR_MISSES = (
+    "REPOSII~1",
+    "REPOSI~1234567",
+    "REPOSI~1.LONG",
+    "REPOSI~X",
+    "normal~name.txt",
+)
 
 
 def test_authoring_module_exposes_only_the_core_v2_projection(
@@ -857,6 +870,97 @@ def test_existing_inventory_rejects_nonportable_win32_component(
 
     with pytest.raises(ValueError, match="Windows"):
         authoring_module._existing_generated_files(eval_root)
+
+
+@pytest.mark.parametrize("component", DOS_83_ALIAS_COMPONENTS)
+def test_write_rejects_dos_83_alias_before_writer_call(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    relative = "cases/core/core-py-test/%s/base/src/input.py" % component
+    plan = _build_plan(
+        authoring_module,
+        writable_outputs={relative: b"attacker replacement"},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, target, _data: writes.append(target),
+    )
+
+    with pytest.raises(ValueError, match="8.3 short-name alias"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+
+
+@pytest.mark.parametrize("component", DOS_83_ALIAS_COMPONENTS)
+def test_check_only_dos_83_alias_rejects_before_writer_call(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    relative = "cases/core/core-py-test/repository/base/%s/input.py" % component
+    plan = _build_plan(
+        authoring_module,
+        check_only_fixtures={relative: b"fixture"},
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        authoring_module,
+        "_write_bytes_safely",
+        lambda _root, target, _data: writes.append(target),
+    )
+
+    with pytest.raises(ValueError, match="8.3 short-name alias"):
+        authoring_module.check_outputs(eval_root, plan)
+    with pytest.raises(ValueError, match="8.3 short-name alias"):
+        authoring_module.write_outputs(eval_root, plan)
+
+    assert writes == []
+
+
+@pytest.mark.parametrize("component", DOS_83_ALIAS_COMPONENTS)
+def test_existing_inventory_rejects_dos_83_alias(
+    authoring_module: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    eval_root = tmp_path / "eval"
+    (eval_root / "cases" / "core").mkdir(parents=True)
+    relative = "cases/core/core-py-test/%s/case.json" % component
+
+    def nonportable_inventory(_root: Path, _eval_root: Path) -> Iterator[str]:
+        yield relative
+
+    monkeypatch.setattr(
+        authoring_module,
+        "_walk_generated_files",
+        nonportable_inventory,
+    )
+
+    with pytest.raises(ValueError, match="8.3 short-name alias"):
+        authoring_module._existing_generated_files(eval_root)
+
+
+@pytest.mark.parametrize("relative", DOS_83_NEAR_MISSES)
+def test_bounded_dos_83_rejection_keeps_non_alias_paths_accepted(
+    authoring_module: ModuleType,
+    relative: str,
+) -> None:
+    assert authoring_module._safe_relative_parts(
+        "cases/core/core-py-test/repository/base/src/" + relative,
+        context="normal path",
+    )[-1] == relative
 
 
 def test_check_reports_drifted_and_missing_check_only_fixtures(

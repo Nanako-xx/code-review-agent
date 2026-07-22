@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import stat
@@ -93,6 +94,18 @@ REPOSITORY_WIRE_CONTRACT = {
 # signs each frozen blind-review packet.  A model/sub-agent review must never
 # be recorded as the external human audit gate.
 HUMAN_REVIEW_STATUS = "requires_independent_re_review"
+
+
+# NTFS can resolve a DOS 8.3 short name such as ``REPOSI~1`` to a protected
+# long-name directory.  Reject the common bounded ASCII shape lexically on
+# every platform instead of probing host short-name settings.  This is
+# intentionally conservative: matching components are unavailable to the
+# authoring contract even when a particular host has no such alias.
+_DOS_83_ALIAS_RE = re.compile(
+    r"^(?P<prefix>[A-Za-z0-9]+)~(?P<ordinal>[1-9][0-9]*)"
+    r"(?:\.(?P<extension>[A-Za-z0-9]+))?$"
+)
+
 
 @dataclass(frozen=True)
 class CoreCaseSpec:
@@ -1470,6 +1483,21 @@ def _absolute_lexical(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
 
 
+def _is_dos_83_alias_component(component: str) -> bool:
+    match = _DOS_83_ALIAS_RE.fullmatch(component)
+    if match is None:
+        return False
+    prefix = match.group("prefix")
+    ordinal = match.group("ordinal")
+    extension = match.group("extension")
+    return (
+        len(prefix) <= 6
+        and len(ordinal) <= 6
+        and len(prefix) + 1 + len(ordinal) <= 8
+        and (extension is None or len(extension) <= 3)
+    )
+
+
 def _safe_relative_parts(relative: str, *, context: str) -> tuple[str, ...]:
     if type(relative) is not str or not relative:
         raise ValueError("%s must be a non-empty relative POSIX path" % context)
@@ -1490,6 +1518,11 @@ def _safe_relative_parts(relative: str, *, context: str) -> tuple[str, ...]:
     ):
         raise ValueError(
             "%s contains a Windows reserved device name component" % context
+        )
+    if any(_is_dos_83_alias_component(part) for part in raw_parts):
+        raise ValueError(
+            "%s contains a possible Windows 8.3 short-name alias component"
+            % context
         )
     pure = PurePosixPath(relative)
     if pure.is_absolute() or tuple(pure.parts) != tuple(raw_parts):
