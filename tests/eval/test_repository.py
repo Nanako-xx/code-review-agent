@@ -14,17 +14,29 @@ import pytest
 from conftest import run_git
 import review_agent_eval.repository as repository_module
 from review_agent_eval.artifacts import TrialManifest
-from review_agent_eval.cases import CaseSplit, SuiteCase, SuiteKind, SuiteSource
+from review_agent_eval.cases import (
+    CaseSplit,
+    PublicSuitePreparationBindingV2,
+    REPOSITORY_MATERIALIZER_PROTOCOL,
+    SuiteCase,
+    SuiteKind,
+    SuiteSource,
+    WireContractV2,
+)
 from review_agent_eval.config import (
     derive_case_path_id,
     derive_trial_id,
     derive_trial_seed,
 )
 from review_agent_eval.models import (
+    EVAL_CASE_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
     EvalInput,
     Repository,
+    RepositoryReviewTarget,
     RepositorySource,
     ReviewRequest,
+    ReviewTargetKind,
     TrialStatus,
     TruthCompleteness,
     stable_id,
@@ -187,15 +199,18 @@ def _trial_binding(
     eval_input = EvalInput(
         schema_version=EvalInput.SCHEMA_VERSION,
         task_id="case-a",
-        repository=descriptor,
-        review_request=ReviewRequest(
-            title="Review the change",
-            description=None,
-            user_intent=None,
-            review_focus=None,
-            linked_requirements=(),
-            project_rules=(),
-            existing_ci_evidence=(),
+        review_target=RepositoryReviewTarget(
+            kind=ReviewTargetKind.REPOSITORY,
+            repository=descriptor,
+            review_request=ReviewRequest(
+                title="Review the change",
+                description=None,
+                user_intent=None,
+                review_focus=None,
+                linked_requirements=(),
+                project_rules=(),
+                existing_ci_evidence=(),
+            ),
         ),
     )
     suite_case = SuiteCase(
@@ -212,6 +227,13 @@ def _trial_binding(
         truth_completeness=TruthCompleteness.CLOSED_WORLD,
     )
     run_id = stable_id("run", "repository-tests")
+    wire_contract = WireContractV2(
+        case_schema_version=EVAL_CASE_SCHEMA_VERSION,
+        input_schema_version=EvalInput.SCHEMA_VERSION,
+        submission_schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
+        review_target_kind=ReviewTargetKind.REPOSITORY,
+        materializer_protocol=REPOSITORY_MATERIALIZER_PROTOCOL,
+    )
     trial_manifest = TrialManifest(
         schema_version=TrialManifest.SCHEMA_VERSION,
         run_id=run_id,
@@ -219,6 +241,11 @@ def _trial_binding(
         case_path_id=derive_case_path_id(eval_input.task_id),
         canonical_case_digest=suite_case.canonical_case_digest,
         eval_input_digest=eval_input.digest(),
+        wire_contract=wire_contract,
+        target_kind=ReviewTargetKind.REPOSITORY,
+        materializer_protocol=REPOSITORY_MATERIALIZER_PROTOCOL,
+        suite_preparation_binding_digest=None,
+        adapter_capabilities_digest="d" * 64,
         trial_id=derive_trial_id(run_id, eval_input.task_id, index),
         trial_index=index,
         seed=derive_trial_seed(run_id, eval_input.task_id, index),
@@ -260,6 +287,19 @@ def _preparer(
     )
 
 
+def _public_preparation_binding() -> PublicSuitePreparationBindingV2:
+    return PublicSuitePreparationBindingV2(
+        schema_version="public_suite_preparation_binding_v2",
+        source_catalog_digest="1" * 64,
+        acquisition_receipt_digest="2" * 64,
+        source_manifest_digest="3" * 64,
+        filter_manifest_digest="4" * 64,
+        preparation_packet_digest="5" * 64,
+        repository_catalog_digest="6" * 64,
+        frozen_bundle_trust_digest=None,
+    )
+
+
 def _remote_repository_and_binding(
     *,
     host: str = "example.test",
@@ -278,6 +318,7 @@ def _remote_repository_and_binding(
         source_uri="https://example.test/benchmark",
         license="MIT",
         content_hash="d" * 64,
+        preparation_binding=_public_preparation_binding(),
     )
     return remote, RepositoryAcquisitionBinding(
         repository=remote,
@@ -873,6 +914,7 @@ def test_remote_acquisition_binding_is_strict_and_binds_provenance() -> None:
         source_uri="https://example.test/benchmark",
         license="MIT",
         content_hash="d" * 64,
+        preparation_binding=_public_preparation_binding(),
     )
     binding = RepositoryAcquisitionBinding(
         repository=remote,

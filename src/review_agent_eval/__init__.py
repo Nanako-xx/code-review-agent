@@ -35,6 +35,14 @@ from .judge_exports import JUDGE_PUBLIC_NAMES as _judge_all
 from .review_exports import REVIEW_PUBLIC_NAMES as _review_all
 from .metrics_exports import METRICS_PUBLIC_NAMES as _metrics_all
 from .report_exports import REPORT_PUBLIC_NAMES as _report_all
+from .materialization import (
+    MaterializationError,
+    MaterializationRequest,
+    PreparedTargetMaterialization,
+    RepositoryTargetMaterializer,
+    TargetMaterializer,
+    repository_replay_binding_digest,
+)
 
 __all__ = list(__all__) + [
     "ADAPTER_IDENTITY_MISMATCH",
@@ -52,6 +60,12 @@ __all__ = list(__all__) + [
     "RunSetup",
     "TrialResult",
     "TrialRunner",
+    "MaterializationError",
+    "MaterializationRequest",
+    "PreparedTargetMaterialization",
+    "RepositoryTargetMaterializer",
+    "TargetMaterializer",
+    "repository_replay_binding_digest",
 ] + list(_match_location_all) + list(_evidence_checker_all) + list(
     _assignment_all
 ) + list(_intent_evaluator_all) + list(_judge_all) + list(_review_all) + list(

@@ -61,6 +61,7 @@ from .models import (
     MAX_IDENTIFIER_CHARS,
     Repository,
     RepositorySource,
+    RepositoryReviewTarget,
     SchemaError,
     TrialStatus,
     _JsonModel,
@@ -76,6 +77,24 @@ from .models import (
     canonical_sha256,
     stable_id,
 )
+
+
+def repository_from_eval_input(eval_input: EvalInput) -> Repository:
+    """Return the Repository descriptor carried by a Repository Target.
+
+    Repository preparation is a Target-specific operation.  Keeping this
+    projection in one place prevents the old v1 ``eval_input.repository``
+    shape from leaking back into the v2 runtime.
+    """
+
+    if not isinstance(eval_input, EvalInput):
+        raise TypeError("eval_input must be an EvalInput")
+    target = eval_input.review_target
+    if not isinstance(target, RepositoryReviewTarget):
+        raise RepositoryPreparationError(
+            "Repository preparation requires a repository review target"
+        )
+    return target.repository
 
 
 PREPARED_REPOSITORY_MANIFEST_SCHEMA_VERSION = (
@@ -5032,7 +5051,13 @@ class WorkspaceManifest(_JsonModel):
             or eval_input.digest() != suite_case.eval_input_digest
         ):
             raise SchemaError("EvalInput does not match immutable Trial binding")
-        if eval_input.repository != prepared.repository:
+        try:
+            input_repository = repository_from_eval_input(eval_input)
+        except RepositoryPreparationError as exc:
+            raise SchemaError(
+                "workspace requires a Repository review target"
+            ) from exc
+        if input_repository != prepared.repository:
             raise SchemaError(
                 "EvalInput Repository does not match PreparedRepository request"
             )
@@ -5351,6 +5376,36 @@ class TrialWorkspace:
     def closed(self) -> bool:
         return self._closed
 
+    def validate(self) -> None:
+        """Fail closed unless this is still the active published workspace."""
+
+        if self._closed:
+            raise RepositoryPreparationError("workspace lease is already closed")
+        self._preparer._assert_workspace_lease(self)
+
+    def read_file(self, relative_path: str) -> bytes:
+        """Read one canonical workspace file through Repository safety gates."""
+
+        self.validate()
+        canonical = canonical_repository_path(relative_path)
+        target = _secure_join(
+            self._path,
+            canonical,
+            "active Trial workspace file",
+        )
+        if os.name == "nt":
+            with _guard_windows_directory_chain(target.parent):
+                return _read_regular_file(
+                    target,
+                    maximum=MAX_GIT_BLOB_BYTES,
+                    context="active Trial workspace file",
+                )
+        return _read_regular_file(
+            target,
+            maximum=MAX_GIT_BLOB_BYTES,
+            context="active Trial workspace file",
+        )
+
     def record_terminal_status(self, status: TrialStatus) -> None:
         if self._closed:
             raise RepositoryPreparationError("closed workspace cannot record outcome")
@@ -5367,11 +5422,9 @@ class TrialWorkspace:
         self._terminal_status = status
 
     def __enter__(self) -> "TrialWorkspace":
-        if self._closed:
-            raise RepositoryPreparationError("workspace lease is already closed")
         if self._entered:
             raise RepositoryPreparationError("workspace lease is already entered")
-        self._preparer._assert_workspace_lease(self)
+        self.validate()
         self._entered = True
         return self
 
@@ -6906,4 +6959,5 @@ __all__ = [
     "WorkspaceManifest",
     "WorkspaceRetentionPolicy",
     "canonical_repository_path",
+    "repository_from_eval_input",
 ]
