@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import copy
 import datetime as _datetime
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -36,6 +37,7 @@ from review_agent_eval.adapters.swe_prbench import (
     SWE_PRBENCH_FIXTURE_SOURCE_MANIFEST_DIGEST,
     SWE_PRBENCH_FIXTURE_SOURCE_REVISION,
     SWE_PRBENCH_FIXTURE_SOURCE_URI,
+    SWE_PRBENCH_FROZEN_PROTOCOL_ID,
     SWE_PRBENCH_HARNESS_LICENSE,
     SWE_PRBENCH_HARNESS_REVISION,
     SWE_PRBENCH_NATIVE_PROTOCOL_ID,
@@ -49,21 +51,28 @@ from review_agent_eval.adapters.swe_prbench import (
     SWE_PRBENCH_SOURCE_RAW,
     FrozenContextRecord,
     FrozenContextEnvelope,
-    SWEPRBenchProtocolUnsupportedError,
     prepare_swe_prbench,
     prepare_swe_prbench_frozen_bundle,
     read_swe_prbench_frozen_bundle,
     validate_swe_prbench_source,
 )
+from review_agent_eval.cases import (
+    FROZEN_CONTEXT_MATERIALIZER_PROTOCOL,
+    REPOSITORY_MATERIALIZER_PROTOCOL,
+)
 from review_agent_eval.models import (
     CaseOrigin,
+    EvaluatorContextSourceKind,
+    EvaluatorContextTask,
     EvalCase,
-    FindingSeverity,
+    MetricAuthoritySource,
     NovelFindingPolicy,
     RepositorySource,
+    ReviewTargetKind,
     TruthCompleteness,
     canonical_sha256,
     canonical_json_bytes,
+    stable_id,
 )
 
 
@@ -259,7 +268,7 @@ def test_strict_parser_preserves_all_context_fields_and_cross_file_binding() -> 
     ).hexdigest()
 
 
-def test_native_repository_publishes_only_capability_cases_with_explicit_v1_placeholders(
+def test_native_repository_publishes_v2_repository_target_with_unscorable_authority(
     tmp_path: Path,
 ) -> None:
     manifest = _source_manifest(FIXTURE_ROOT)
@@ -275,31 +284,94 @@ def test_native_repository_publishes_only_capability_cases_with_explicit_v1_plac
     case = _load_case(result)
     assert entry.split.value == "capability"
     assert entry.protocol_id == SWE_PRBENCH_NATIVE_PROTOCOL_ID
+    assert result.manifest.wire_contract.review_target_kind is ReviewTargetKind.REPOSITORY
+    assert (
+        result.manifest.wire_contract.materializer_protocol
+        == REPOSITORY_MATERIALIZER_PROTOCOL
+    )
     assert entry.truth_completeness is TruthCompleteness.HUMAN_OBSERVED
     assert case.source.origin is CaseOrigin.SWE_PRBENCH
     assert case.source.source_version == SWE_PRBENCH_FIXTURE_SOURCE_REVISION
     assert case.source.license == SWE_PRBENCH_DATASET_LICENSE
-    assert case.input.repository.source is RepositorySource.GIT
-    assert case.input.repository.url == "https://github.com/dask/dask.git"
-    assert case.input.repository.base_revision == (
+    assert case.input.review_target.kind is ReviewTargetKind.REPOSITORY
+    assert case.input.review_target.repository.source is RepositorySource.GIT
+    assert case.input.review_target.repository.url == "https://github.com/dask/dask.git"
+    assert case.input.review_target.repository.base_revision == (
         "0a075534b29af7364b82fdf04a33838ab7189d77"
     )
-    assert case.input.repository.head_revision == (
+    assert case.input.review_target.repository.head_revision == (
         "59dab320f45e409dec89df9e13f02cb049db6eb4"
     )
-    assert case.input.review_request.user_intent is None
-    assert case.input.review_request.existing_ci_evidence == ()
+    assert case.input.review_target.review_request.user_intent is None
+    assert case.input.review_target.review_request.existing_ci_evidence == ()
     assert case.intent_truth.scorable is False
     assert case.review_truth.completeness is TruthCompleteness.HUMAN_OBSERVED
     assert case.review_truth.novel_finding_policy is NovelFindingPolicy.VERIFY
     assert len(case.review_truth.expected_findings) == 3
-    assert {item.severity for item in case.review_truth.expected_findings} == {
-        FindingSeverity.MEDIUM
-    }
+    assert {item.severity for item in case.review_truth.expected_findings} == {None}
+    assert all(
+        not item.metric_authority.severity_scorable
+        and item.metric_authority.severity_authority is None
+        and not item.metric_authority.location_scorable
+        and item.metric_authority.location_authority is None
+        for item in case.review_truth.expected_findings
+    )
     assert {item.category for item in case.review_truth.expected_findings} == {
         "human_review_comment"
     }
     assert all(item.locations[0].side is None for item in case.review_truth.expected_findings)
+    assert all(
+        len(item.locations) == 1
+        and item.locations[0].path
+        and item.locations[0].from_line is not None
+        for item in case.review_truth.expected_findings
+    )
+    assert len(case.review_evaluator_context.truth_contexts) == 3
+    assert all(
+        context.allowed_tasks == (EvaluatorContextTask.FINDING_EQUIVALENCE,)
+        and len(context.sources) == 1
+        and context.sources[0].kind is EvaluatorContextSourceKind.DIFF_HUNK
+        for context in case.review_evaluator_context.truth_contexts
+    )
+    assert "diff_hunk" not in json.dumps(case.eval_input().to_dict())
+    annotation = json.loads(
+        (
+            FIXTURE_ROOT
+            / "dataset"
+            / "annotations"
+            / "dask__12221_human.json"
+        ).read_text(encoding="utf-8")
+    )
+    annotation_source = next(
+        item
+        for item in manifest.files
+        if item.role == "annotation.dask__12221"
+    )
+    comments = {item["comment_id"]: item for item in annotation["comments"]}
+    for finding in case.review_truth.expected_findings:
+        comment_id = next(
+            item["comment_id"]
+            for item in annotation["comments"]
+            if item["body"] == finding.claim
+        )
+        context = next(
+            item
+            for item in case.review_evaluator_context.truth_contexts
+            if item.truth_id == finding.truth_id
+        )
+        source = context.sources[0]
+        assert source.content == comments[comment_id]["diff_hunk"]
+        assert source.provenance.source_file_sha256 == annotation_source.sha256
+        assert source.provenance.record_pointer.endswith(
+            "/comments/%d" % next(
+                index
+                for index, item in enumerate(annotation["comments"])
+                if item["comment_id"] == comment_id
+            )
+        )
+        assert source.provenance.record_sha256 == canonical_sha256(
+            comments[comment_id]
+        )
 
     dimensions = {item.name: item.value for item in entry.dimensions}
     assert dimensions["upstream_declared_difficulty"] == "Type1_Direct"
@@ -310,14 +382,10 @@ def test_native_repository_publishes_only_capability_cases_with_explicit_v1_plac
     assert dimensions["protocol_comparability"] == (
         "native_non_official_leaderboard"
     )
-    assert dimensions["severity_policy"] == (
-        "v1_placeholder_medium_not_metric_exclusion_pending_v2"
-    )
-    assert dimensions["line_policy"] == (
-        "v1_upstream_nullable_side_unknown_not_metric_exclusion_pending_v2"
-    )
+    assert dimensions["severity_policy"] == "not_scorable_no_upstream_authority"
+    assert dimensions["line_policy"] == "semantic_only_upstream_nullable_side_unknown"
     assert dimensions["diff_hunk_policy"] == (
-        "provenance_only_pending_evaluator_context_v2"
+        "truth_scoped_evaluator_context_finding_equivalence_only"
     )
 
     receipt = read_public_preparation_receipt(result.suite_root)
@@ -344,20 +412,67 @@ def test_native_repository_publishes_only_capability_cases_with_explicit_v1_plac
     assert mapping_payload["underlying_repository_license"] == (
         "not_normalized_by_upstream"
     )
-    limitations = mapping_payload["eval_v1_limitations"]
-    assert limitations["severity"].endswith("requires_eval_v2")
-    assert limitations["location_side"].endswith("requires_eval_v2")
-    assert limitations["diff_hunk_context"].endswith("requires_eval_v2")
-    assert limitations["official_frozen_context"].endswith("requires_eval_v2")
+    assert "eval_v1_limitations" not in mapping_payload
+    assert "requires_eval_v2" not in mapping.record_json
+
+
+def test_truth_context_uses_original_comment_index_when_truth_order_differs(
+    tmp_path: Path,
+) -> None:
+    root = _copy_fixture(tmp_path)
+    annotation_path = (
+        root / "dataset" / "annotations" / "dask__12221_human.json"
+    )
+    annotation = json.loads(annotation_path.read_text(encoding="utf-8"))
+    annotation["substantive_comment_ids"] = ["c_3", "c_1", "c_2"]
+    annotation_path.write_text(json.dumps(annotation), encoding="utf-8")
+    manifest = _source_manifest(root)
+    result = prepare_swe_prbench(
+        root,
+        tmp_path / "reordered-suite",
+        source_manifest=manifest,
+        filter_manifest=_filter_manifest(
+            SWE_PRBENCH_PROTOCOL_NATIVE,
+            source_profile=SWE_PRBENCH_SOURCE_PROFILE_EXPLICIT,
+        ),
+        protocol=SWE_PRBENCH_PROTOCOL_NATIVE,
+        expected_source_manifest_digest=manifest.digest(),
+    )
+
+    case = _load_case(result)
+    contexts = {
+        item.truth_id: item
+        for item in case.review_evaluator_context.truth_contexts
+    }
+    receipts = {
+        item.truth_id: item
+        for item in result.receipt.records
+        if item.truth_id is not None
+    }
+    for source_index, comment in enumerate(annotation["comments"]):
+        if comment["comment_id"] not in annotation["substantive_comment_ids"]:
+            continue
+        truth_id = stable_id(
+            "swe-truth", annotation["task_id"], comment["comment_id"]
+        )
+        source = contexts[truth_id].sources[0]
+        expected_pointer = (
+            "dataset/annotations/dask__12221_human.json#/comments/%d"
+            % source_index
+        )
+        assert source.provenance.record_pointer == expected_pointer
+        assert source.provenance.record_sha256 == canonical_sha256(comment)
+        assert source.content == comment["diff_hunk"]
+        assert receipts[truth_id].record_pointer == expected_pointer
 
 
 @pytest.mark.parametrize(
     ("selected", "truth_status", "expected"),
     (
-        (True, "representable_eval_case_v1", "selected_included"),
+        (True, "representable", "selected_included"),
         (True, "empty_ground_truth", "selected_isolated"),
-        (False, "representable_eval_case_v1", "unselected_filtered"),
-        (False, "claim_exceeds_eval_case_v1", "upstream_isolated"),
+        (False, "representable", "unselected_filtered"),
+        (False, "claim_exceeds_claim_limit", "upstream_isolated"),
     ),
 )
 def test_record_partition_is_mutually_exclusive(
@@ -366,15 +481,77 @@ def test_record_partition_is_mutually_exclusive(
     assert swe_adapter._record_partition(selected, truth_status) == expected
 
 
-def test_runnable_frozen_protocol_is_explicitly_blocked_without_any_fallback(
+def test_frozen_protocol_publishes_runnable_frozen_target_suite(
     tmp_path: Path,
 ) -> None:
     manifest = _source_manifest(FIXTURE_ROOT)
-    output = tmp_path / "must-not-exist"
-    with pytest.raises(
-        SWEPRBenchProtocolUnsupportedError,
-        match="eval_input_v1 has no typed frozen-context channel",
-    ):
+    result = prepare_swe_prbench(
+        FIXTURE_ROOT,
+        tmp_path / "frozen-suite",
+        source_manifest=manifest,
+        filter_manifest=_filter_manifest(SWE_PRBENCH_PROTOCOL_FROZEN),
+        protocol=SWE_PRBENCH_PROTOCOL_FROZEN,
+    )
+
+    entry = result.manifest.cases[0]
+    case = _load_case(result)
+    assert result.manifest.suite_id == "swe-prbench-frozen"
+    assert entry.protocol_id == SWE_PRBENCH_FROZEN_PROTOCOL_ID
+    assert entry.protocol_id != SWE_PRBENCH_NATIVE_PROTOCOL_ID
+    assert result.manifest.wire_contract.review_target_kind is ReviewTargetKind.FROZEN_CONTEXT
+    assert (
+        result.manifest.wire_contract.materializer_protocol
+        == FROZEN_CONTEXT_MATERIALIZER_PROTOCOL
+    )
+    assert case.input.review_target.kind is ReviewTargetKind.FROZEN_CONTEXT
+    target = case.input.review_target
+    bundle_root = result.suite_root / "frozen_bundle"
+    bundle = read_swe_prbench_frozen_bundle(
+        bundle_root, expected_bundle_id=target.bundle_id
+    )
+    assert target.bundle_id == bundle.manifest.bundle_id
+    assert bundle.manifest.records[0].task_id == case.task_id
+    assert target.record_id == case.task_id
+    assert case.review_truth.expected_findings
+    assert all(
+        item.severity is None
+        and not item.metric_authority.severity_scorable
+        and not item.metric_authority.location_scorable
+        for item in case.review_truth.expected_findings
+    )
+    assert all(
+        "requires_eval_v2" not in json.dumps(item.to_dict())
+        for item in case.review_truth.expected_findings
+    )
+
+    from review_agent_eval.frozen_context import open_frozen_context_replay
+
+    preparation = result.manifest.source.preparation_binding
+    assert preparation is not None
+    replay = open_frozen_context_replay(
+        bundle_root=bundle_root,
+        eval_input=case.eval_input(),
+        suite_preparation_binding=preparation,
+        suite_preparation_binding_digest=preparation.digest(),
+    )
+    assert replay.read_exact() == json.loads(
+        (FIXTURE_ROOT / "dataset" / "contexts" / "config_A" / "dask__12221.json").read_text(
+            encoding="utf-8"
+        )
+    )["rendered"].encode("utf-8")
+
+
+def test_frozen_temp_container_is_cleaned_when_mapping_fails_after_bundle_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _source_manifest(FIXTURE_ROOT)
+    output = tmp_path / "mapping-failure-suite"
+
+    def fail_mapping(*args, **kwargs):
+        raise PublicPreparationError("injected mapping failure")
+
+    monkeypatch.setattr(swe_adapter, "_mapping_record", fail_mapping)
+    with pytest.raises(PublicPreparationError, match="injected mapping failure"):
         prepare_swe_prbench(
             FIXTURE_ROOT,
             output,
@@ -382,6 +559,119 @@ def test_runnable_frozen_protocol_is_explicitly_blocked_without_any_fallback(
             filter_manifest=_filter_manifest(SWE_PRBENCH_PROTOCOL_FROZEN),
             protocol=SWE_PRBENCH_PROTOCOL_FROZEN,
         )
+    assert not output.exists()
+    assert not tuple(tmp_path.glob(".mapping-failure-suite.frozen.*"))
+
+
+@pytest.mark.parametrize(
+    ("target_field", "wrong_value"),
+    (("bundle_id", "unrelated-bundle"), ("record_id", "unrelated-record")),
+)
+def test_frozen_target_binding_is_rejected_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_field: str,
+    wrong_value: str,
+) -> None:
+    manifest = _source_manifest(FIXTURE_ROOT)
+    output = tmp_path / ("wrong-%s-suite" % target_field)
+    real_write = swe_adapter.write_public_suite
+
+    def write_with_wrong_target(*args, **kwargs):
+        prepared = list(kwargs["cases"])
+        case = prepared[0].case
+        target = replace(
+            case.input.review_target,
+            **{target_field: wrong_value},
+        )
+        wrong_case = replace(
+            case,
+            input=replace(case.input, review_target=target),
+        )
+        prepared[0] = replace(prepared[0], case=wrong_case)
+        kwargs["cases"] = tuple(prepared)
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(swe_adapter, "write_public_suite", write_with_wrong_target)
+    with pytest.raises(PublicPreparationError, match="Frozen.*Target|bundle"):
+        prepare_swe_prbench(
+            FIXTURE_ROOT,
+            output,
+            source_manifest=manifest,
+            filter_manifest=_filter_manifest(SWE_PRBENCH_PROTOCOL_FROZEN),
+            protocol=SWE_PRBENCH_PROTOCOL_FROZEN,
+        )
+    assert not output.exists()
+
+
+def test_frozen_record_drift_after_verify_is_rejected_before_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _source_manifest(FIXTURE_ROOT)
+    output = tmp_path / "drift-suite"
+    real_mapping = swe_adapter._mapping_record
+    mutated = False
+
+    def mutate_verified_record(*args, **kwargs):
+        nonlocal mutated
+        if not mutated:
+            record_path = next(
+                tmp_path.glob(
+                    ".drift-suite.frozen.*/bundle/records/*/*.json"
+                )
+            )
+            payload = json.loads(record_path.read_text(encoding="utf-8"))
+            payload["record"]["rendered"] += "\npost-verify drift"
+            record_path.write_bytes(canonical_json_bytes(payload))
+            mutated = True
+        return real_mapping(*args, **kwargs)
+
+    def forbid_writer(*args, **kwargs):  # pragma: no cover - assertion path
+        raise AssertionError("drifted bundle must fail before Suite writer")
+
+    monkeypatch.setattr(swe_adapter, "_mapping_record", mutate_verified_record)
+    monkeypatch.setattr(swe_adapter, "write_public_suite", forbid_writer)
+    with pytest.raises(PublicPreparationError, match="drift|binding|hash|size"):
+        prepare_swe_prbench(
+            FIXTURE_ROOT,
+            output,
+            source_manifest=manifest,
+            filter_manifest=_filter_manifest(SWE_PRBENCH_PROTOCOL_FROZEN),
+            protocol=SWE_PRBENCH_PROTOCOL_FROZEN,
+        )
+    assert mutated
+    assert not output.exists()
+
+
+def test_staging_frozen_bundle_verifier_blocks_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _source_manifest(FIXTURE_ROOT)
+    output = tmp_path / "staging-rejected-suite"
+    real_read = swe_adapter.read_swe_prbench_frozen_bundle
+    staging_checks: list[Path] = []
+
+    def reject_staging_bundle(root, *args, **kwargs):
+        path = Path(root)
+        if path.name == "frozen_bundle" and path.parent.name.endswith(".staging"):
+            staging_checks.append(path)
+            raise PublicSourceIntegrityError("injected staging bundle rejection")
+        return real_read(root, *args, **kwargs)
+
+    monkeypatch.setattr(
+        swe_adapter,
+        "read_swe_prbench_frozen_bundle",
+        reject_staging_bundle,
+    )
+    with pytest.raises(PublicPreparationError, match="staging|Frozen bundle"):
+        prepare_swe_prbench(
+            FIXTURE_ROOT,
+            output,
+            source_manifest=manifest,
+            filter_manifest=_filter_manifest(SWE_PRBENCH_PROTOCOL_FROZEN),
+            protocol=SWE_PRBENCH_PROTOCOL_FROZEN,
+        )
+    assert staging_checks
     assert not output.exists()
 
 
@@ -404,7 +694,7 @@ def test_frozen_bundle_is_exact_typed_create_only_and_not_a_runnable_suite(
     assert len(prepared.manifest.records) == 1
     binding = prepared.manifest.records[0]
     assert binding.config_name == "config_B"
-    assert binding.review_truth_status == "representable_eval_case_v1"
+    assert binding.review_truth_status == "representable"
     assert prepared.manifest.harness_revision == SWE_PRBENCH_HARNESS_REVISION
     assert prepared.manifest.harness_license == "MIT"
     assert prepared.manifest.dataset_license == "CC-BY-4.0"
@@ -816,7 +1106,7 @@ def test_oversized_human_comment_is_not_truncated_or_split(tmp_path: Path) -> No
         expected_source_manifest_digest=manifest.digest(),
     )
     binding = bundle.manifest.records[0]
-    assert binding.review_truth_status == "claim_exceeds_eval_case_v1"
+    assert binding.review_truth_status == "claim_exceeds_claim_limit"
     assert binding.offending_record_sha256 == canonical_sha256(
         annotation["comments"][0]
     )
@@ -826,7 +1116,7 @@ def test_oversized_human_comment_is_not_truncated_or_split(tmp_path: Path) -> No
         SWE_PRBENCH_PROTOCOL_NATIVE,
         source_profile=SWE_PRBENCH_SOURCE_PROFILE_EXPLICIT,
     )
-    with pytest.raises(PublicPreparationError, match="no runnable native cases"):
+    with pytest.raises(PublicPreparationError, match="no runnable cases"):
         prepare_swe_prbench(
             root,
             tmp_path / "oversized-native",

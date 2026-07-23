@@ -108,13 +108,19 @@ def test_target_replay_integrity_error_has_stable_cli_category() -> None:
     ) == ("integrity", EXIT_INTEGRITY)
 
 
-def test_parser_exposes_only_the_four_task_12_commands() -> None:
+def test_parser_exposes_the_four_trial_commands_and_public_prepare() -> None:
     parser = _build_parser()
     action = next(
         item for item in parser._actions if item.dest == "command"  # type: ignore[attr-defined]
     )
 
-    assert set(action.choices) == {"prepare", "run-agent", "evaluate", "inspect"}
+    assert set(action.choices) == {
+        "prepare",
+        "prepare-public",
+        "run-agent",
+        "evaluate",
+        "inspect",
+    }
     assert "compare" not in action.choices
     assert "calibrate" not in action.choices
 

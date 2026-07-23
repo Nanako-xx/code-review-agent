@@ -2,12 +2,9 @@
 
 The pinned upstream dataset has two materially different execution protocols:
 
-* ``native_repository`` can be represented by canonical ``eval_input_v1`` and
-  is therefore published as a runnable public capability Suite.
-* ``official_frozen_context`` cannot currently be represented without changing
-  the canonical Agent input protocol.  This module preserves those records in
-  an immutable, hash-bound bundle, but deliberately refuses to manufacture a
-  runnable ``EvalCase`` from a repository fixture or an unrelated input field.
+* ``native_repository`` is published as a runnable Repository Target Suite.
+* ``official_frozen_context`` is published as a runnable Frozen Context Target
+  Suite backed by the verified, hash-bound bundle format.
 
 No function in this module performs network I/O.  Callers must acquire source
 bytes before preparation and bind every consumed file in a
@@ -26,10 +23,18 @@ import re
 import tempfile
 from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from ..cases import CaseDimension, CaseSplit
+from ..cases import (
+    FROZEN_CONTEXT_MATERIALIZER_PROTOCOL,
+    REPOSITORY_MATERIALIZER_PROTOCOL,
+    CaseDimension,
+    CaseSplit,
+    WireContractV2,
+)
 from ..datasets import _coerce_suite_root
 from ..models import (
     EVAL_CASE_SCHEMA_VERSION,
+    EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
     MAX_CLAIM_CHARS,
     MAX_COUNTER,
     MAX_IDENTIFIER_CHARS,
@@ -38,18 +43,27 @@ from ..models import (
     ClarificationScript,
     EvalCase,
     EvalCaseInput,
+    EvaluatorContextProvenance,
+    EvaluatorContextSource,
+    EvaluatorContextSourceKind,
+    EvaluatorContextTask,
     ExpectedFinding,
-    FindingSeverity,
+    FrozenContextReviewTarget,
     IntentTruth,
+    MetricAuthority,
     NovelFindingPolicy,
     Repository,
+    RepositoryReviewTarget,
     RepositorySource,
     RequiredContextLevel,
     ReviewRequest,
+    ReviewEvaluatorContext,
     ReviewTruth,
+    ReviewTargetKind,
     SchemaError,
     TruthCompleteness,
     TruthLocation,
+    TruthEvaluatorContext,
     _JsonModel,
     _array,
     _boolean,
@@ -70,8 +84,11 @@ from ..models import (
 from ._public import (
     PUBLIC_FILTER_MANIFEST_SCHEMA_VERSION,
     PUBLIC_SOURCE_MANIFEST_SCHEMA_VERSION,
+    PublicDatasetError,
+    PublicConflictError,
     PublicFilterManifest,
     PublicFormatError,
+    PublicFrozenBundlePublication,
     PublicOptionalDependencyError,
     PublicPreparationError,
     PublicPreparationResult,
@@ -138,9 +155,24 @@ SWE_PRBENCH_LANGUAGES = (
 )
 
 SWE_PRBENCH_ADAPTER_ID = "swe-prbench-adapter"
-SWE_PRBENCH_ADAPTER_VERSION = "swe-prbench-adapter-v1"
-SWE_PRBENCH_NATIVE_PROTOCOL_ID = "swe-prbench-native-repository-v1"
+SWE_PRBENCH_ADAPTER_VERSION = "swe-prbench-adapter-v2"
+SWE_PRBENCH_NATIVE_PROTOCOL_ID = "swe-prbench-native-repository-v2"
+SWE_PRBENCH_FROZEN_PROTOCOL_ID = "swe-prbench-official-frozen-context-v2"
 SWE_PRBENCH_UNDERLYING_REPOSITORY_LICENSE = "not_normalized_by_upstream"
+SWE_PRBENCH_NATIVE_WIRE_CONTRACT = WireContractV2(
+    case_schema_version=EVAL_CASE_SCHEMA_VERSION,
+    input_schema_version=EVAL_INPUT_SCHEMA_VERSION,
+    submission_schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
+    review_target_kind=ReviewTargetKind.REPOSITORY,
+    materializer_protocol=REPOSITORY_MATERIALIZER_PROTOCOL,
+)
+SWE_PRBENCH_FROZEN_WIRE_CONTRACT = WireContractV2(
+    case_schema_version=EVAL_CASE_SCHEMA_VERSION,
+    input_schema_version=EVAL_INPUT_SCHEMA_VERSION,
+    submission_schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
+    review_target_kind=ReviewTargetKind.FROZEN_CONTEXT,
+    materializer_protocol=FROZEN_CONTEXT_MATERIALIZER_PROTOCOL,
+)
 SWE_PRBENCH_FROZEN_BUNDLE_SCHEMA_VERSION = (
     "swe_prbench_frozen_context_bundle_v1"
 )
@@ -151,6 +183,7 @@ SWE_PRBENCH_FROZEN_ENVELOPE_SCHEMA_VERSION = (
     "swe_prbench_frozen_context_envelope_v1"
 )
 SWE_PRBENCH_FROZEN_MANIFEST_PATH = "frozen_bundle_manifest.json"
+SWE_PRBENCH_FROZEN_SUITE_RELATIVE_ROOT = "frozen_bundle"
 
 SWE_PRBENCH_FULL_PR_COUNT = 350
 SWE_PRBENCH_FULL_CONTEXT_COUNT = 1050
@@ -389,10 +422,6 @@ _FILTER_NAMES = frozenset(
 )
 
 
-class SWEPRBenchProtocolUnsupportedError(PublicPreparationError):
-    """The requested SWE-PRBench protocol has no truthful canonical mapping."""
-
-
 @dataclass(frozen=True)
 class FrozenContextRecord(_JsonModel):
     """The exact eight-field official frozen-context record."""
@@ -578,12 +607,12 @@ class FrozenContextBinding(_JsonModel):
             "frozen binding.annotation_record_sha256",
         )
         if self.review_truth_status not in {
-            "representable_eval_case_v1",
+            "representable",
             "empty_ground_truth",
-            "claim_exceeds_eval_case_v1",
+            "claim_exceeds_claim_limit",
         }:
             raise PublicFormatError("frozen binding has an unknown review_truth_status")
-        if self.review_truth_status == "representable_eval_case_v1":
+        if self.review_truth_status == "representable":
             if self.review_truth_reason is not None or self.offending_record_sha256 is not None:
                 raise PublicFormatError("representable frozen binding may not claim an isolation")
         else:
@@ -1919,15 +1948,15 @@ def _select_truth(annotation: Mapping[str, Any], fallback: Optional[str]) -> _Tr
             return _TruthSelection(
                 (),
                 fallback_used,
-                "claim_exceeds_eval_case_v1",
-                "comment %s has %d chars; EvalCase v1 claim limit is %d"
+                "claim_exceeds_claim_limit",
+                "comment %s has %d chars; canonical claim limit is %d"
                 % (item["comment_id"], len(item["body"]), MAX_CLAIM_CHARS),
                 digest,
             )
     return _TruthSelection(
         selected,
         fallback_used,
-        "representable_eval_case_v1",
+        "representable",
         None,
         None,
     )
@@ -1979,7 +2008,7 @@ def validate_swe_prbench_source(
         truth = _select_truth(dataset.annotations[task_id].value, parsed_filter.fallback)
         if truth.status == "empty_ground_truth":
             empty.append(task_id)
-        elif truth.status == "claim_exceeds_eval_case_v1":
+        elif truth.status == "claim_exceeds_claim_limit":
             oversized.append(task_id)
     return SWEPRBenchSourceValidation(
         source_manifest_digest=source_manifest.digest(),
@@ -2015,37 +2044,120 @@ def _finding(task_id: str, comment: Mapping[str, Any], changed_files: Sequence[s
     return ExpectedFinding(
         truth_id=stable_id("swe-truth", task_id, comment["comment_id"]),
         claim=comment["body"],
-        severity=FindingSeverity.MEDIUM,
+        severity=None,
         category="human_review_comment",
         required=True,
+        metric_authority=MetricAuthority(
+            severity_scorable=False,
+            severity_authority=None,
+            location_scorable=False,
+            location_authority=None,
+        ),
         locations=(location,),
         evidence_anchors=(),
         required_context_level=_required_context(comment, changed_files),
         rationale=(
-            "SWE-PRBench human-observed substantive review comment. MEDIUM and "
-            "human_review_comment are eval_case_v1 schema placeholders, not "
-            "authoritative labels or metric exclusions; that distinction requires "
-            "the eval v2 authority contract."
+            "SWE-PRBench human-observed substantive review comment. The upstream "
+            "record has no severity or location metric authority; path and line "
+            "are retained only as semantic diagnostic context."
         ),
     )
 
 
-def _case_dimensions(pr: Mapping[str, Any], truth_count: int) -> Tuple[CaseDimension, ...]:
+def _resolve_annotation_comment(
+    annotation: _BoundRecord,
+    comment: Mapping[str, Any],
+) -> Tuple[int, Mapping[str, Any], str]:
+    comment_id = comment["comment_id"]
+    matches = [
+        (source_index, source_comment)
+        for source_index, source_comment in enumerate(annotation.value["comments"])
+        if source_comment["comment_id"] == comment_id
+    ]
+    if len(matches) != 1:
+        raise PublicFormatError(
+            "SWE-PRBench selected comment_id %s must resolve to exactly one original annotation comment"
+            % comment_id
+        )
+    source_index, source_comment = matches[0]
+    if canonical_sha256(source_comment) != canonical_sha256(comment):
+        raise PublicFormatError(
+            "SWE-PRBench selected comment %s drifted from its original annotation record"
+            % comment_id
+        )
+    return (
+        source_index,
+        source_comment,
+        stable_id(
+            "swe-truth",
+            annotation.value["task_id"],
+            source_comment["comment_id"],
+        ),
+    )
+
+
+def _review_evaluator_contexts(
+    *,
+    annotation: _BoundRecord,
+    findings: Sequence[ExpectedFinding],
+    comments: Sequence[Mapping[str, Any]],
+) -> ReviewEvaluatorContext:
+    if len(findings) != len(comments):
+        raise PublicFormatError(
+            "SWE-PRBench findings and selected comments must have equal length"
+        )
+    contexts = []
+    for finding, comment in zip(findings, comments):
+        source_index, source_comment, truth_id = _resolve_annotation_comment(
+            annotation, comment
+        )
+        if finding.truth_id != truth_id:
+            raise PublicFormatError(
+                "SWE-PRBench Finding truth_id does not bind its original annotation comment"
+            )
+        content = source_comment["diff_hunk"]
+        source = EvaluatorContextSource(
+            kind=EvaluatorContextSourceKind.DIFF_HUNK,
+            content=content,
+            content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            provenance=EvaluatorContextProvenance(
+                source_role=annotation.source_role,
+                source_file_sha256=annotation.source_sha256,
+                record_pointer=annotation.pointer + "/comments/%d" % source_index,
+                record_sha256=canonical_sha256(source_comment),
+            ),
+        )
+        contexts.append(
+            TruthEvaluatorContext(
+                truth_id=truth_id,
+                allowed_tasks=(EvaluatorContextTask.FINDING_EQUIVALENCE,),
+                sources=(source,),
+            )
+        )
+    return ReviewEvaluatorContext(truth_contexts=tuple(contexts))
+
+
+def _case_dimensions(
+    pr: Mapping[str, Any], truth_count: int, protocol: str
+) -> Tuple[CaseDimension, ...]:
+    frozen = protocol == SWE_PRBENCH_PROTOCOL_FROZEN
     values = {
         "benchmark": SWE_PRBENCH_DATASET_ID,
         "language": pr["language"],
         "repository": pr["repo"],
         "upstream_declared_difficulty": pr["difficulty"],
         "difficulty_policy": "upstream_declared_not_gate_truth",
-        "protocol": SWE_PRBENCH_PROTOCOL_NATIVE,
-        "protocol_comparability": "native_non_official_leaderboard",
+        "protocol": protocol,
+        "protocol_comparability": (
+            "official_frozen_context" if frozen else "native_non_official_leaderboard"
+        ),
         "truth_completeness": TruthCompleteness.HUMAN_OBSERVED.value,
         "truth_finding_count": str(truth_count),
-        "severity_policy": "v1_placeholder_medium_not_metric_exclusion_pending_v2",
-        "category_policy": "v1_placeholder_human_review_comment_pending_v2",
-        "line_policy": "v1_upstream_nullable_side_unknown_not_metric_exclusion_pending_v2",
-        "diff_hunk_policy": "provenance_only_pending_evaluator_context_v2",
-        "context_level_policy": "v1_is_in_diff_and_changed_files_not_context_binding",
+        "severity_policy": "not_scorable_no_upstream_authority",
+        "category_policy": "source_record_kind_human_review_comment",
+        "line_policy": "semantic_only_upstream_nullable_side_unknown",
+        "diff_hunk_policy": "truth_scoped_evaluator_context_finding_equivalence_only",
+        "context_level_policy": "semantic_is_in_diff_and_changed_files",
         "dataset_license": SWE_PRBENCH_DATASET_LICENSE,
         "underlying_repository_license": "not_normalized_by_upstream",
         "harness_revision": SWE_PRBENCH_HARNESS_REVISION,
@@ -2063,7 +2175,7 @@ def _mapping_record(
     disposition: str,
 ) -> Dict[str, Any]:
     return {
-        "schema_version": "swe_prbench_adapter_mapping_v1",
+        "schema_version": "swe_prbench_adapter_mapping_v2",
         "task_id": pr.value["task_id"],
         "protocol": parsed_filter.protocol,
         "source_format": parsed_filter.source_format,
@@ -2085,19 +2197,9 @@ def _mapping_record(
             "status": truth.status,
             "reason": truth.reason,
             "offending_record_sha256": truth.offending_record_sha256,
-            "severity_policy": (
-                "v1_placeholder_medium_not_metric_exclusion_pending_v2"
-            ),
-            "category_policy": "v1_placeholder_human_review_comment_pending_v2",
-            "nullable_line_policy": (
-                "v1_preserve_null_side_unknown_not_metric_exclusion_pending_v2"
-            ),
-        },
-        "eval_v1_limitations": {
-            "severity": "placeholder_is_still_scored_requires_eval_v2",
-            "location_side": "unknown_side_is_still_metric_visible_requires_eval_v2",
-            "diff_hunk_context": "provenance_only_not_pair_context_requires_eval_v2",
-            "official_frozen_context": "bundle_only_not_runnable_requires_eval_v2",
+            "severity_policy": "not_scorable_no_upstream_authority",
+            "category_policy": "source_record_kind_human_review_comment",
+            "nullable_line_policy": "semantic_only_upstream_nullable_side_unknown",
         },
         "difficulty_policy": "upstream_declared_dimension_only_not_gate_truth",
         "disposition": disposition,
@@ -2107,10 +2209,10 @@ def _mapping_record(
 def _record_partition(selected: bool, truth_status: str) -> str:
     """Return exactly one source-record partition for auditable statistics."""
 
-    representable = truth_status == "representable_eval_case_v1"
+    representable = truth_status == "representable"
     if not representable and truth_status not in {
         "empty_ground_truth",
-        "claim_exceeds_eval_case_v1",
+        "claim_exceeds_claim_limit",
     }:
         raise PublicFormatError("unknown SWE-PRBench truth status")
     if selected:
@@ -2118,40 +2220,81 @@ def _record_partition(selected: bool, truth_status: str) -> str:
     return "unselected_filtered" if representable else "upstream_isolated"
 
 
-def prepare_swe_prbench(
+def _frozen_bundle_extra_files(
+    bundle: PreparedFrozenContextBundle,
+    relative_root: str,
+) -> Dict[str, bytes]:
+    """Copy the verified Frozen bundle into a Suite-owned subdirectory."""
+
+    try:
+        extras: Dict[str, bytes] = {}
+        manifest_raw = _read_single_link_regular_file(
+            bundle.root,
+            SWE_PRBENCH_FROZEN_MANIFEST_PATH,
+            _MAX_FROZEN_MANIFEST_BYTES,
+            "SWE-PRBench frozen context bundle manifest",
+        )
+        if manifest_raw != canonical_json_bytes(bundle.manifest.to_dict()):
+            raise PublicPreparationError(
+                "verified Frozen bundle manifest drifted before copy"
+            )
+        extras[
+            "%s/%s" % (relative_root, SWE_PRBENCH_FROZEN_MANIFEST_PATH)
+        ] = manifest_raw
+        for binding in bundle.manifest.records:
+            raw = _read_single_link_regular_file(
+                bundle.root,
+                binding.path,
+                _MAX_FROZEN_RECORD_BYTES,
+                "SWE-PRBench frozen context bundle record",
+            )
+            if (
+                len(raw) != binding.size_bytes
+                or hashlib.sha256(raw).hexdigest() != binding.sha256
+            ):
+                raise PublicPreparationError(
+                    "verified Frozen bundle record size/hash drifted before copy"
+                )
+            envelope = FrozenContextEnvelope.from_json(raw)
+            if canonical_json_bytes(envelope.to_dict()) != raw:
+                raise PublicPreparationError(
+                    "verified Frozen bundle record canonical bytes drifted before copy"
+                )
+            record = envelope.record
+            if (
+                envelope.bundle_id != bundle.manifest.bundle_id
+                or record.digest() != binding.record_digest
+                or record.task_id != binding.task_id
+                or record.config_name != binding.config_name
+                or record.rendered_sha256 != binding.rendered_sha256
+                or record.rendered_utf8_bytes != binding.rendered_utf8_bytes
+            ):
+                raise PublicPreparationError(
+                    "verified Frozen bundle record binding drifted before copy"
+                )
+            extras["%s/%s" % (relative_root, binding.path)] = raw
+        return extras
+    except PublicPreparationError:
+        raise
+    except (PublicDatasetError, OSError, SchemaError) as exc:
+        raise PublicPreparationError(
+            "verified Frozen bundle drifted before copy"
+        ) from exc
+
+
+def _prepare_swe_prbench_projection(
     source_root: os.PathLike[str] | str,
     output_root: os.PathLike[str] | str,
     *,
     source_manifest: PublicSourceManifest,
     filter_manifest: PublicFilterManifest,
     protocol: str,
+    parsed_filter: _Filter,
+    frozen_bundle: Optional[PreparedFrozenContextBundle],
     expected_source_manifest_digest: Optional[str] = None,
     suite_id: Optional[str] = None,
     suite_version: str = "v0.4.1-b87f5797",
 ) -> PublicPreparationResult:
-    """Publish a runnable native Suite or reject unsupported frozen execution.
-
-    ``official_frozen_context`` intentionally has no runnable mapping in
-    ``eval_input_v1``.  Use :func:`prepare_swe_prbench_frozen_bundle` to prepare
-    and audit those exact source records while the canonical protocol evolves.
-    """
-
-    parsed_filter = _parse_filter(filter_manifest, protocol)
-    if protocol == SWE_PRBENCH_PROTOCOL_FROZEN:
-        _validate_source_manifest(
-            source_manifest,
-            parsed_filter,
-            expected_source_manifest_digest,
-        )
-        if os.path.lexists(os.path.abspath(os.fspath(output_root))):
-            raise PublicPreparationError("frozen runnable output path already exists")
-        raise SWEPRBenchProtocolUnsupportedError(
-            "official_frozen_context is blocked: eval_input_v1 has no typed frozen-context channel; "
-            "no EvalCase was produced and no fallback to native_repository or ExistingCIEvidence is allowed. "
-            "Use prepare_swe_prbench_frozen_bundle() for hash-bound source preparation."
-        )
-    if protocol != SWE_PRBENCH_PROTOCOL_NATIVE:
-        raise PublicFormatError("unknown SWE-PRBench protocol")
     dataset = _parse_dataset(
         source_root,
         source_manifest,
@@ -2159,7 +2302,16 @@ def prepare_swe_prbench(
         expected_source_manifest_digest,
     )
     _validate_filter_targets(dataset, parsed_filter)
-    resolved_suite_id = suite_id or "swe-prbench-native"
+    resolved_suite_id = suite_id or (
+        "swe-prbench-frozen"
+        if protocol == SWE_PRBENCH_PROTOCOL_FROZEN
+        else "swe-prbench-native"
+    )
+    wire_contract = (
+        SWE_PRBENCH_FROZEN_WIRE_CONTRACT
+        if protocol == SWE_PRBENCH_PROTOCOL_FROZEN
+        else SWE_PRBENCH_NATIVE_WIRE_CONTRACT
+    )
     prepared_cases: List[PublicPreparedCase] = []
     receipts: List[PublicRecordReceipt] = []
     statistics = {
@@ -2177,8 +2329,8 @@ def prepare_swe_prbench(
         "oversized_claim_isolations": 0,
         "expected_findings": 0,
         "nullable_line_findings": 0,
-        "v1_placeholder_severity_findings": 0,
-        "v1_placeholder_category_findings": 0,
+        "severity_unscorable_findings": 0,
+        "location_unscorable_findings": 0,
         "fallback_cases": 0,
         "capability_cases": 0,
     }
@@ -2194,7 +2346,7 @@ def prepare_swe_prbench(
         selected = _selected(pr, parsed_filter)
         partition = _record_partition(selected, truth.status)
         statistics[partition] += 1
-        representable = truth.status == "representable_eval_case_v1"
+        representable = truth.status == "representable"
         statistics[
             "source_representable_records"
             if representable
@@ -2208,7 +2360,7 @@ def prepare_swe_prbench(
         }[partition]
         if truth.status == "empty_ground_truth":
             statistics["empty_ground_truth_isolations"] += 1
-        elif truth.status == "claim_exceeds_eval_case_v1":
+        elif truth.status == "claim_exceeds_claim_limit":
             statistics["oversized_claim_isolations"] += 1
         mapping = _mapping_record(
             pr_record, annotation, contexts, parsed_filter, truth, disposition
@@ -2256,42 +2408,69 @@ def prepare_swe_prbench(
             for comment in truth.comments
         )
         for index, comment in enumerate(truth.comments):
-            truth_id = findings[index].truth_id
-            source_index = annotation.value["comments"].index(comment)
+            source_index, source_comment, truth_id = _resolve_annotation_comment(
+                annotation, comment
+            )
+            if findings[index].truth_id != truth_id:
+                raise PublicFormatError(
+                    "SWE-PRBench Finding truth_id does not bind its original annotation comment"
+                )
             receipts.append(
                 PublicRecordReceipt.from_record(
                     task_id=task_id,
                     truth_id=truth_id,
                     source_role=annotation.source_role,
                     record_pointer=annotation.pointer + "/comments/%d" % source_index,
-                    upstream_id=comment["comment_id"],
-                    record=comment,
+                    upstream_id=source_comment["comment_id"],
+                    record=source_comment,
                     disposition="included",
                 )
             )
-        case_hash = canonical_sha256(
-            {
-                "adapter_version": SWE_PRBENCH_ADAPTER_VERSION,
-                "dataset_revision": source_manifest.source_revision,
-                "protocol": SWE_PRBENCH_PROTOCOL_NATIVE,
-                "pr_record_sha256": pr_record.record_sha256,
-                "annotation_record_sha256": annotation.record_sha256,
-            }
+        review_evaluator_context = _review_evaluator_contexts(
+            annotation=annotation,
+            findings=findings,
+            comments=truth.comments,
         )
-        case = EvalCase(
-            schema_version=EVAL_CASE_SCHEMA_VERSION,
-            task_id=task_id,
-            case_version=1,
-            source=CaseSource(
-                suite=resolved_suite_id,
-                origin=CaseOrigin.SWE_PRBENCH,
-                source_id=task_id,
-                source_version=source_manifest.source_revision,
-                source_uri=source_manifest.source_uri,
-                license=SWE_PRBENCH_DATASET_LICENSE,
-                content_hash=case_hash,
-            ),
-            input=EvalCaseInput(
+        if protocol == SWE_PRBENCH_PROTOCOL_FROZEN:
+            assert frozen_bundle is not None
+            config = parsed_filter.context_config
+            bindings = [
+                item
+                for item in frozen_bundle.manifest.records
+                if item.task_id == task_id and item.config_name == config
+            ]
+            if len(bindings) != 1:
+                raise PublicPreparationError(
+                    "Frozen Suite has no unique context binding for %s" % task_id
+                )
+            binding = bindings[0]
+            from ..frozen_context import frozen_context_source_binding_digest
+
+            review_target = FrozenContextReviewTarget(
+                kind=ReviewTargetKind.FROZEN_CONTEXT,
+                bundle_id=frozen_bundle.manifest.bundle_id,
+                record_id=binding.task_id,
+                context_format="rendered_text",
+                rendered_sha256=binding.rendered_sha256,
+                rendered_utf8_bytes=binding.rendered_utf8_bytes,
+                source_binding_digest=frozen_context_source_binding_digest(
+                    frozen_bundle, binding
+                ),
+            )
+            case_protocol = protocol
+            case_hash = canonical_sha256(
+                {
+                    "adapter_version": SWE_PRBENCH_ADAPTER_VERSION,
+                    "dataset_revision": source_manifest.source_revision,
+                    "protocol": protocol,
+                    "pr_record_sha256": pr_record.record_sha256,
+                    "annotation_record_sha256": annotation.record_sha256,
+                    "frozen_record_digest": binding.record_digest,
+                }
+            )
+        else:
+            review_target = RepositoryReviewTarget(
+                kind=ReviewTargetKind.REPOSITORY,
                 repository=Repository(
                     source=RepositorySource.GIT,
                     path=None,
@@ -2308,7 +2487,31 @@ def prepare_swe_prbench(
                     project_rules=(),
                     existing_ci_evidence=(),
                 ),
+            )
+            case_protocol = protocol
+            case_hash = canonical_sha256(
+                {
+                    "adapter_version": SWE_PRBENCH_ADAPTER_VERSION,
+                    "dataset_revision": source_manifest.source_revision,
+                    "protocol": protocol,
+                    "pr_record_sha256": pr_record.record_sha256,
+                    "annotation_record_sha256": annotation.record_sha256,
+                }
+            )
+        case = EvalCase(
+            schema_version=EVAL_CASE_SCHEMA_VERSION,
+            task_id=task_id,
+            case_version=1,
+            source=CaseSource(
+                suite=resolved_suite_id,
+                origin=CaseOrigin.SWE_PRBENCH,
+                source_id=task_id,
+                source_version=source_manifest.source_revision,
+                source_uri=source_manifest.source_uri,
+                license=SWE_PRBENCH_DATASET_LICENSE,
+                content_hash=case_hash,
             ),
+            input=EvalCaseInput(review_target=review_target),
             clarification_script=ClarificationScript(max_rounds=1, answers=()),
             intent_truth=IntentTruth(
                 scorable=False,
@@ -2323,20 +2526,25 @@ def prepare_swe_prbench(
                 expected_findings=findings,
                 known_invalid_findings=(),
             ),
+            review_evaluator_context=review_evaluator_context,
         )
         prepared_cases.append(
             PublicPreparedCase(
                 case=case,
                 split=CaseSplit.CAPABILITY,
-                protocol_id=SWE_PRBENCH_NATIVE_PROTOCOL_ID,
-                dimensions=_case_dimensions(pr, len(findings)),
+                protocol_id=(
+                    SWE_PRBENCH_FROZEN_PROTOCOL_ID
+                    if protocol == SWE_PRBENCH_PROTOCOL_FROZEN
+                    else SWE_PRBENCH_NATIVE_PROTOCOL_ID
+                ),
+                dimensions=_case_dimensions(pr, len(findings), case_protocol),
             )
         )
         statistics["included_cases"] += 1
         statistics["capability_cases"] += 1
         statistics["expected_findings"] += len(findings)
-        statistics["v1_placeholder_severity_findings"] += len(findings)
-        statistics["v1_placeholder_category_findings"] += len(findings)
+        statistics["severity_unscorable_findings"] += len(findings)
+        statistics["location_unscorable_findings"] += len(findings)
         statistics["nullable_line_findings"] += sum(
             comment["line"] is None for comment in truth.comments
         )
@@ -2371,7 +2579,7 @@ def prepare_swe_prbench(
             if _selected(item.value, parsed_filter)
         ]
         raise PublicPreparationError(
-            "SWE-PRBench selected records produced no runnable native cases; fail-closed tasks: %s"
+            "SWE-PRBench selected records produced no runnable cases; fail-closed tasks: %s"
             % ", ".join(isolated[:20])
         )
     if parsed_filter.source_profile == SWE_PRBENCH_SOURCE_PROFILE_FIXTURE:
@@ -2381,6 +2589,22 @@ def prepare_swe_prbench(
     else:
         assert expected_source_manifest_digest is not None
         trusted_source_digest = expected_source_manifest_digest
+    frozen_publication = (
+        None
+        if frozen_bundle is None
+        else PublicFrozenBundlePublication(
+            bundle=frozen_bundle,
+            relative_root=SWE_PRBENCH_FROZEN_SUITE_RELATIVE_ROOT,
+        )
+    )
+    extras = (
+        _frozen_bundle_extra_files(
+            frozen_bundle,
+            frozen_publication.relative_root,
+        )
+        if frozen_bundle is not None and frozen_publication is not None
+        else {}
+    )
     return write_public_suite(
         output_root,
         suite_id=resolved_suite_id,
@@ -2389,14 +2613,88 @@ def prepare_swe_prbench(
         adapter_version=SWE_PRBENCH_ADAPTER_VERSION,
         source_manifest=source_manifest,
         filter_manifest=filter_manifest,
+        wire_contract=wire_contract,
         cases=prepared_cases,
         actual_statistics=tuple(
             PublicStatistic(name=name, value=value)
             for name, value in statistics.items()
         ),
         records=receipts,
+        extra_files=extras,
         expected_source_manifest_digest=trusted_source_digest,
+        frozen_publication=frozen_publication,
     )
+
+
+def prepare_swe_prbench(
+    source_root: os.PathLike[str] | str,
+    output_root: os.PathLike[str] | str,
+    *,
+    source_manifest: PublicSourceManifest,
+    filter_manifest: PublicFilterManifest,
+    protocol: str,
+    expected_source_manifest_digest: Optional[str] = None,
+    suite_id: Optional[str] = None,
+    suite_version: str = "v0.4.1-b87f5797",
+) -> PublicPreparationResult:
+    """Publish one target-specific, runnable SWE-PRBench v2 Suite."""
+
+    parsed_filter = _parse_filter(filter_manifest, protocol)
+    if protocol not in (SWE_PRBENCH_PROTOCOL_NATIVE, SWE_PRBENCH_PROTOCOL_FROZEN):
+        raise PublicFormatError("unknown SWE-PRBench protocol")
+    output = Path(os.path.abspath(os.fspath(output_root)))
+    if os.path.lexists(output):
+        raise PublicConflictError("public Suite output already exists")
+
+    projection_kwargs = {
+        "source_manifest": source_manifest,
+        "filter_manifest": filter_manifest,
+        "protocol": protocol,
+        "parsed_filter": parsed_filter,
+        "expected_source_manifest_digest": expected_source_manifest_digest,
+        "suite_id": suite_id,
+        "suite_version": suite_version,
+    }
+    if protocol == SWE_PRBENCH_PROTOCOL_NATIVE:
+        return _prepare_swe_prbench_projection(
+            source_root,
+            output_root,
+            frozen_bundle=None,
+            **projection_kwargs,
+        )
+
+    parent = _assert_publication_parent(output.parent)
+    bundle_container = Path(
+        tempfile.mkdtemp(prefix=".%s.frozen." % output.name, dir=parent)
+    )
+    bundle_container_identity: Optional[Tuple[int, int, int]] = None
+    try:
+        bundle_container_identity = _file_identity(
+            os.lstat(str(bundle_container))
+        )
+        frozen_bundle = prepare_swe_prbench_frozen_bundle(
+            source_root,
+            bundle_container / "bundle",
+            source_manifest=source_manifest,
+            filter_manifest=filter_manifest,
+            expected_source_manifest_digest=expected_source_manifest_digest,
+        )
+        return _prepare_swe_prbench_projection(
+            source_root,
+            output_root,
+            frozen_bundle=frozen_bundle,
+            **projection_kwargs,
+        )
+    finally:
+        if (
+            bundle_container_identity is not None
+            and os.path.lexists(bundle_container)
+        ):
+            _cleanup_owned_staging(
+                bundle_container,
+                parent,
+                bundle_container_identity,
+            )
 
 
 def prepare_swe_prbench_frozen_bundle(
@@ -2437,7 +2735,7 @@ def prepare_swe_prbench_frozen_bundle(
     parent = _assert_publication_parent(output.parent)
     output = parent / output.name
     if os.path.lexists(output):
-        raise PublicPreparationError("frozen context bundle output already exists")
+        raise PublicConflictError("frozen context bundle output already exists")
     source_digest = source_manifest.digest()
     filter_digest = filter_manifest.digest()
     identity_records: List[Dict[str, Any]] = []
@@ -2553,14 +2851,10 @@ def prepare_swe_prbench_frozen_bundle(
         )
         if loaded.manifest != manifest:
             raise PublicSourceIntegrityError("staged frozen context bundle drifted")
+        prepared = PreparedFrozenContextBundle(root=output, manifest=manifest)
         _publish_directory_create_only(staging, output)
         published = True
-        final = read_swe_prbench_frozen_bundle(
-            output, expected_bundle_id=bundle_id
-        )
-        if final.manifest != manifest:
-            raise PublicSourceIntegrityError("published frozen context bundle drifted")
-        return final
+        return prepared
     finally:
         if not published and os.path.lexists(staging):
             _cleanup_owned_staging(staging, parent, staging_identity)
@@ -2667,12 +2961,14 @@ __all__ = [
     "SWE_PRBENCH_DIFFICULTIES",
     "SWE_PRBENCH_LANGUAGES",
     "SWE_PRBENCH_NATIVE_PROTOCOL_ID",
+    "SWE_PRBENCH_FROZEN_PROTOCOL_ID",
+    "SWE_PRBENCH_NATIVE_WIRE_CONTRACT",
+    "SWE_PRBENCH_FROZEN_WIRE_CONTRACT",
     "SWE_PRBENCH_OFFICIAL_RAW_SOURCE_MANIFEST_DIGEST",
     "SWE_PRBENCH_FIXTURE_SOURCE_MANIFEST_DIGEST",
     "SWE_PRBENCH_FROZEN_BUNDLE_SCHEMA_VERSION",
     "SWE_PRBENCH_FROZEN_RECORD_SCHEMA_VERSION",
     "SWE_PRBENCH_FROZEN_ENVELOPE_SCHEMA_VERSION",
-    "SWEPRBenchProtocolUnsupportedError",
     "FrozenContextRecord",
     "FrozenContextEnvelope",
     "FrozenContextBinding",

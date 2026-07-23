@@ -45,12 +45,14 @@ from review_agent_eval.adapters.aacr_bench import (
     prepare_aacr_bench,
 )
 from review_agent_eval.cases import CaseSplit
+from review_agent_eval.cases import REPOSITORY_MATERIALIZER_PROTOCOL
 from review_agent_eval.datasets import CaseBank
 from review_agent_eval.models import (
     DiffSide,
-    FindingSeverity,
+    MetricAuthoritySource,
     NovelFindingPolicy,
     RequiredContextLevel,
+    ReviewTargetKind,
     SchemaError,
     TruthCompleteness,
     canonical_sha256,
@@ -215,18 +217,24 @@ def test_prepare_maps_official_records_and_publishes_case_bank(tmp_path: Path) -
     entry = first.manifest.cases[0]
     assert entry.split is CaseSplit.CAPABILITY
     assert entry.protocol_id == AACR_PROTOCOL_ID
+    assert first.manifest.wire_contract.review_target_kind is ReviewTargetKind.REPOSITORY
+    assert (
+        first.manifest.wire_contract.materializer_protocol
+        == REPOSITORY_MATERIALIZER_PROTOCOL
+    )
 
     bank = CaseBank.open(first.suite_root)
     case = bank.evaluator_case(entry.task_id)
-    assert case.input.repository.base_revision == (
+    assert case.input.review_target.kind is ReviewTargetKind.REPOSITORY
+    assert case.input.review_target.repository.base_revision == (
         "a050e422e23ce3eaee960b75ceff236b34f369b9"
     )
-    assert case.input.repository.head_revision == (
+    assert case.input.review_target.repository.head_revision == (
         "0c65673a6fd2421be8fbe613116077120adea068"
     )
-    assert case.input.repository.url == "https://github.com/FreeCAD/FreeCAD.git"
-    assert case.input.review_request.title is None
-    assert case.input.review_request.description is None
+    assert case.input.review_target.repository.url == "https://github.com/FreeCAD/FreeCAD.git"
+    assert case.input.review_target.review_request.title is None
+    assert case.input.review_target.review_request.description is None
     assert case.intent_truth.scorable is False
     assert case.review_truth.completeness is TruthCompleteness.EXPERT_AUGMENTED
     assert case.review_truth.novel_finding_policy is NovelFindingPolicy.VERIFY
@@ -234,7 +242,14 @@ def test_prepare_maps_official_records_and_publishes_case_bank(tmp_path: Path) -
     positive, negative = _split_payloads(source)
     expected = case.review_truth.expected_findings[0]
     assert expected.claim == positive[0]["comments"][0]["note"]
-    assert expected.severity is FindingSeverity.MEDIUM
+    assert expected.severity is None
+    assert expected.metric_authority.severity_scorable is False
+    assert expected.metric_authority.severity_authority is None
+    assert expected.metric_authority.location_scorable is True
+    assert (
+        expected.metric_authority.location_authority
+        is MetricAuthoritySource.UPSTREAM_ANNOTATION
+    )
     assert expected.category == "Performance"
     assert expected.required is True
     assert expected.required_context_level is RequiredContextLevel.FILE
@@ -269,8 +284,9 @@ def test_prepare_maps_official_records_and_publishes_case_bank(tmp_path: Path) -
     assert dimensions["completeness"] == "expert_augmented"
     assert dimensions["protocol"] == AACR_PROTOCOL_ID
     assert dimensions["language"] == "C++"
-    assert dimensions["severity_source"] == "adapter-neutral"
-    assert dimensions["severity_metric_scope"] == "exclude-core"
+    assert dimensions["severity_source"] == "upstream_unavailable"
+    assert dimensions["severity_metric_scope"] == "not_scorable"
+    assert dimensions["location_metric_scope"] == "upstream_annotation"
     assert dimensions["isolated_truth_count"] == "0"
     assert dimensions["polarity_conflict_isolated_truth_count"] == "0"
     assert dimensions["reversed_line_range_isolated_truth_count"] == "0"
@@ -291,8 +307,8 @@ def test_prepare_maps_official_records_and_publishes_case_bank(tmp_path: Path) -
     assert positive_receipt.disposition == "expected_finding"
     assert "benchmark=AACR-Bench" in positive_receipt.reason
     assert "profile=fixture" in positive_receipt.reason
-    assert "severity=adapter-neutral-medium" in positive_receipt.reason
-    assert "exclude-core-severity" in positive_receipt.reason
+    assert "severity=not-scorable" in positive_receipt.reason
+    assert "location=upstream-annotation" in positive_receipt.reason
     assert (
         "underlying_repository_license=not_normalized_by_upstream"
         in positive_receipt.reason
@@ -308,12 +324,16 @@ def test_prepare_maps_official_records_and_publishes_case_bank(tmp_path: Path) -
     assert statistics["selected_prs"] == 1
     assert statistics["expected_findings"] == 1
     assert statistics["known_invalid_findings"] == 1
-    assert statistics["neutral_medium_findings"] == 1
+    assert statistics["severity_unscorable_findings"] == 1
     assert statistics["pr_record_receipts"] == 2
     assert statistics["source_comments"] == 2
     assert statistics["source_scorable_comments"] == 2
     assert statistics["source_isolated_comments"] == 0
     assert statistics["selected_scorable_comments"] == 2
+    assert all(
+        "requires_eval_v2" not in item.record_json
+        for item in first.receipt.records
+    )
 
     with pytest.raises(PublicPreparationError, match="already exists"):
         prepare_aacr_bench(

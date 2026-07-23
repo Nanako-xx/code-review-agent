@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import stat
 import tempfile
-from typing import Any, ClassVar, Dict, Iterable, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Iterable, Mapping, Optional, Tuple
 import unicodedata
 
 from ..artifacts import (
@@ -34,13 +34,16 @@ from ..cases import (
     MAX_SUITE_CASES,
     MAX_SUITE_MANIFEST_BYTES,
     MAX_SUITE_TOTAL_CASE_BYTES,
+    PUBLIC_SUITE_PREPARATION_BINDING_SCHEMA_VERSION,
     SUITE_MANIFEST_SCHEMA_VERSION,
     CaseDimension,
     CaseSplit,
+    PublicSuitePreparationBindingV2,
     SuiteCase,
     SuiteKind,
     SuiteManifest,
     SuiteSource,
+    WireContractV2,
     _portable_case_path,
     validate_case_for_manifest,
 )
@@ -57,6 +60,8 @@ from ..models import (
     MAX_IDENTIFIER_CHARS,
     MAX_URL_CHARS,
     EvalCase,
+    FrozenContextReviewTarget,
+    ReviewTargetKind,
     SchemaError,
     _JsonModel,
     _array,
@@ -73,6 +78,9 @@ from ..models import (
     canonical_json_bytes,
     canonical_sha256,
 )
+
+if TYPE_CHECKING:
+    from .swe_prbench import PreparedFrozenContextBundle
 
 
 PUBLIC_SOURCE_MANIFEST_SCHEMA_VERSION = "public_dataset_source_v1"
@@ -118,7 +126,19 @@ class PublicPreparationError(PublicDatasetError):
     """A canonical public Suite could not be published safely."""
 
 
-class PublicOptionalDependencyError(PublicDatasetError):
+class PublicConflictError(PublicPreparationError):
+    """Create-only public output conflicts with an existing owner."""
+
+
+class PublicPreconditionError(PublicPreparationError):
+    """The host environment cannot begin the requested preparation."""
+
+
+class PublicOperationalError(PublicPreparationError):
+    """Publication failed because of an operational platform or I/O error."""
+
+
+class PublicOptionalDependencyError(PublicPreconditionError):
     """A declared optional public-data format lacks its reader dependency."""
 
 
@@ -144,6 +164,116 @@ def verify_public_source_manifest_digest(
             "public source manifest digest does not match the expected digest"
         )
     return actual
+
+
+def verify_public_filter_manifest_digest(
+    manifest: "PublicFilterManifest", expected_profile_digest: str
+) -> str:
+    """Bind a canonical filter/profile manifest to an external trust anchor."""
+
+    if not isinstance(manifest, PublicFilterManifest):
+        raise PublicSourceIntegrityError(
+            "filter manifest digest verification requires PublicFilterManifest"
+        )
+    try:
+        expected = _digest(
+            expected_profile_digest,
+            "expected public profile digest",
+        )
+    except SchemaError as exc:
+        raise PublicSourceIntegrityError(str(exc)) from exc
+    actual = manifest.digest()
+    if actual != expected:
+        raise PublicSourceIntegrityError(
+            "public filter manifest digest does not match the expected profile digest"
+        )
+    return actual
+
+
+def _public_control_file(
+    path: os.PathLike[str] | str,
+    *,
+    maximum_bytes: int,
+    context: str,
+) -> bytes:
+    """Read one bounded control file without following links or reparses."""
+
+    if not isinstance(path, (str, os.PathLike)):
+        raise PublicSourceIntegrityError("%s path is invalid" % context)
+    lexical = Path(os.path.abspath(os.fspath(path)))
+    if not lexical.name:
+        raise PublicSourceIntegrityError("%s path must name a file" % context)
+    try:
+        parent = _coerce_suite_root(lexical.parent)
+    except SchemaError as exc:
+        raise PublicSourceIntegrityError(
+            "%s parent is not a secure directory" % context
+        ) from exc
+    if os.path.normcase(str(lexical.parent)) != os.path.normcase(str(parent)):
+        raise PublicSourceIntegrityError(
+            "%s path may not traverse a symlink or reparse point" % context
+        )
+    return _read_single_link_regular_file(
+        parent,
+        lexical.name,
+        maximum_bytes,
+        context,
+    )
+
+
+def read_public_source_manifest(
+    path: os.PathLike[str] | str,
+    *,
+    expected_source_manifest_digest: str,
+) -> "PublicSourceManifest":
+    """Securely read canonical source-control JSON and verify its trust anchor."""
+
+    raw = _public_control_file(
+        path,
+        maximum_bytes=MAX_PUBLIC_SOURCE_MANIFEST_BYTES,
+        context="public source manifest control file",
+    )
+    try:
+        manifest = PublicSourceManifest.from_json(raw)
+    except SchemaError as exc:
+        raise PublicSourceIntegrityError(
+            "public source manifest control file is malformed"
+        ) from exc
+    if canonical_json_bytes(manifest.to_dict()) != raw:
+        raise PublicSourceIntegrityError(
+            "public source manifest control file is not canonical JSON"
+        )
+    verify_public_source_manifest_digest(
+        manifest,
+        expected_source_manifest_digest,
+    )
+    return manifest
+
+
+def read_public_filter_manifest(
+    path: os.PathLike[str] | str,
+    *,
+    expected_profile_digest: str,
+) -> "PublicFilterManifest":
+    """Securely read canonical filter JSON and verify the profile trust anchor."""
+
+    raw = _public_control_file(
+        path,
+        maximum_bytes=MAX_PUBLIC_FILTER_MANIFEST_BYTES,
+        context="public filter manifest control file",
+    )
+    try:
+        manifest = PublicFilterManifest.from_json(raw)
+    except SchemaError as exc:
+        raise PublicSourceIntegrityError(
+            "public filter manifest control file is malformed"
+        ) from exc
+    if canonical_json_bytes(manifest.to_dict()) != raw:
+        raise PublicSourceIntegrityError(
+            "public filter manifest control file is not canonical JSON"
+        )
+    verify_public_filter_manifest_digest(manifest, expected_profile_digest)
+    return manifest
 
 
 def _portable_path_key(path: str) -> Tuple[str, ...]:
@@ -1033,6 +1163,28 @@ class PublicPreparedCase:
 
 
 @dataclass(frozen=True)
+class PublicFrozenBundlePublication:
+    bundle: "PreparedFrozenContextBundle"
+    relative_root: str
+
+    def __post_init__(self) -> None:
+        from .swe_prbench import PreparedFrozenContextBundle
+
+        if type(self.bundle) is not PreparedFrozenContextBundle:
+            raise PublicPreparationError(
+                "frozen publication.bundle must be PreparedFrozenContextBundle"
+            )
+        object.__setattr__(
+            self,
+            "relative_root",
+            _portable_case_path(
+                self.relative_root,
+                "frozen publication.relative_root",
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class PublicPreparationReceipt(_JsonModel):
     SCHEMA_VERSION: ClassVar[str] = PUBLIC_PREPARATION_RECEIPT_SCHEMA_VERSION
 
@@ -1286,6 +1438,7 @@ class PublicPreparationResult:
     suite_root: Path
     manifest: SuiteManifest
     receipt: PublicPreparationReceipt
+    bundle_id: Optional[str] = None
 
     @property
     def preparation_packet_digest(self) -> str:
@@ -1355,7 +1508,7 @@ def _assert_publication_parent(path: Path) -> Path:
     try:
         metadata = os.lstat(str(lexical))
     except OSError as exc:
-        raise PublicPreparationError(
+        raise PublicPreconditionError(
             "public Suite output parent must already exist"
         ) from exc
     if (
@@ -1363,17 +1516,17 @@ def _assert_publication_parent(path: Path) -> Path:
         or _has_reparse_attribute(metadata)
         or not stat.S_ISDIR(metadata.st_mode)
     ):
-        raise PublicPreparationError(
+        raise PublicPreconditionError(
             "public Suite output parent must be a real directory"
         )
     try:
         resolved = lexical.resolve(strict=True)
     except OSError as exc:
-        raise PublicPreparationError(
+        raise PublicPreconditionError(
             "public Suite output parent could not be resolved"
         ) from exc
     if os.path.normcase(str(lexical)) != os.path.normcase(str(resolved)):
-        raise PublicPreparationError(
+        raise PublicPreconditionError(
             "public Suite output parent may not traverse a symlink or reparse point"
         )
     return resolved
@@ -1785,15 +1938,15 @@ def _publish_directory_create_only(staging: Path, output: Path) -> None:
             os.rename(staging, output)
             return
         except FileExistsError as exc:
-            raise PublicPreparationError(
+            raise PublicConflictError(
                 "public Suite output already exists"
             ) from exc
         except OSError as exc:
-            if getattr(exc, "winerror", None) in (80, 183):
-                raise PublicPreparationError(
+            if getattr(exc, "winerror", None) in (80, 183) or os.path.lexists(output):
+                raise PublicConflictError(
                     "public Suite output already exists"
                 ) from exc
-            raise PublicPreparationError(
+            raise PublicOperationalError(
                 "public Suite could not be published without replacement"
             ) from exc
 
@@ -1805,7 +1958,7 @@ def _publish_directory_create_only(staging: Path, output: Path) -> None:
         libc = ctypes.CDLL(None, use_errno=True)
         renameat2 = libc.renameat2
     except (AttributeError, ImportError, OSError) as exc:
-        raise PublicPreparationError(
+        raise PublicOperationalError(
             "platform lacks atomic create-only directory publication"
         ) from exc
     renameat2.argtypes = (
@@ -1827,8 +1980,8 @@ def _publish_directory_create_only(staging: Path, output: Path) -> None:
         return
     error = ctypes.get_errno()
     if error in (errno.EEXIST, errno.ENOTEMPTY):
-        raise PublicPreparationError("public Suite output already exists")
-    raise PublicPreparationError(
+        raise PublicConflictError("public Suite output already exists")
+    raise PublicOperationalError(
         "public Suite could not be published without replacement: %s"
         % os.strerror(error)
     )
@@ -1842,11 +1995,228 @@ class _PreparedCaseFile:
     binding: SuiteCase
 
 
+def _public_source_catalog_digest(source_manifest: PublicSourceManifest) -> str:
+    """Bind the verified source manifest as the public source catalog root.
+
+    Task 4A only has the already-verified source manifest/receipt boundary;
+    acquisition and catalog artifacts are deliberately not implemented here.
+    These domain-separated digests make that existing trust root explicit
+    without inventing a downloader or a catalog parser.
+    """
+
+    return canonical_sha256(
+        {
+            "schema_version": "public-source-catalog-projection-v2",
+            "source_manifest": source_manifest.to_dict(),
+        }
+    )
+
+
+def _public_acquisition_receipt_digest(
+    source_manifest: PublicSourceManifest,
+) -> str:
+    return canonical_sha256(
+        {
+            "schema_version": "verified-public-source-receipt-projection-v2",
+            "source_manifest_digest": source_manifest.digest(),
+            "files": [item.to_dict() for item in source_manifest.files],
+        }
+    )
+
+
+def _repository_target_catalog_digest(
+    cases: Tuple[SuiteCase, ...],
+    prepared_cases: Tuple[_PreparedCaseFile, ...],
+) -> str:
+    targets = []
+    for item, prepared in zip(cases, prepared_cases):
+        target = prepared.prepared.case.input.review_target
+        if target.kind is not ReviewTargetKind.REPOSITORY:
+            raise PublicPreparationError(
+                "Repository Suite contains a non-Repository Target"
+            )
+        targets.append(
+            {
+                "task_id": item.task_id,
+                "target": target.to_dict(),
+            }
+        )
+    return canonical_sha256(
+        {
+            "schema_version": "repository-target-catalog-projection-v2",
+            "targets": targets,
+        }
+    )
+
+
+def _validate_frozen_case_targets(
+    bundle: "PreparedFrozenContextBundle",
+    case_files: Tuple[_PreparedCaseFile, ...],
+) -> None:
+    from ..frozen_context import (
+        frozen_context_record_id,
+        frozen_context_source_binding_digest,
+    )
+    from ..materialization import MaterializationError
+
+    for item in case_files:
+        case = item.prepared.case
+        target = case.input.review_target
+        if not isinstance(target, FrozenContextReviewTarget):
+            raise PublicPreparationError(
+                "Frozen Suite contains a non-Frozen Case Target"
+            )
+        if target.bundle_id != bundle.manifest.bundle_id:
+            raise PublicPreparationError(
+                "Frozen Case Target bundle_id does not match the verified bundle"
+            )
+        matches = [
+            binding
+            for binding in bundle.manifest.records
+            if frozen_context_record_id(binding) == target.record_id
+        ]
+        if len(matches) != 1:
+            raise PublicPreparationError(
+                "Frozen Case Target record_id does not uniquely match the verified bundle"
+            )
+        binding = matches[0]
+        try:
+            source_binding_digest = frozen_context_source_binding_digest(
+                bundle, binding
+            )
+        except (PublicDatasetError, SchemaError, MaterializationError, TypeError) as exc:
+            raise PublicPreparationError(
+                "Frozen Case Target source binding could not be verified"
+            ) from exc
+        if (
+            binding.task_id != case.task_id
+            or target.context_format != "rendered_text"
+            or target.rendered_sha256 != binding.rendered_sha256
+            or target.rendered_utf8_bytes != binding.rendered_utf8_bytes
+            or target.source_binding_digest != source_binding_digest
+        ):
+            raise PublicPreparationError(
+                "Frozen Case Target binding does not match the verified bundle record"
+            )
+
+
+def _validate_frozen_publication_inputs(
+    publication: PublicFrozenBundlePublication,
+    *,
+    source_manifest: PublicSourceManifest,
+    filter_manifest: PublicFilterManifest,
+    case_files: Tuple[_PreparedCaseFile, ...],
+) -> None:
+    bundle = publication.bundle
+    if (
+        bundle.manifest.source_manifest_digest != source_manifest.digest()
+        or bundle.manifest.filter_manifest_digest != filter_manifest.digest()
+    ):
+        raise PublicPreparationError(
+            "Frozen bundle source/filter binding does not match Suite inputs"
+        )
+    _validate_frozen_case_targets(bundle, case_files)
+
+
+def _verify_staged_frozen_publication(
+    staging: Path,
+    publication: PublicFrozenBundlePublication,
+    case_files: Tuple[_PreparedCaseFile, ...],
+) -> None:
+    from .swe_prbench import read_swe_prbench_frozen_bundle
+    from ..materialization import MaterializationError
+
+    try:
+        staged = read_swe_prbench_frozen_bundle(
+            staging / Path(*publication.relative_root.split("/")),
+            expected_bundle_id=publication.bundle.manifest.bundle_id,
+        )
+    except (PublicDatasetError, SchemaError, MaterializationError, TypeError) as exc:
+        raise PublicPreparationError(
+            "staging Frozen bundle verifier rejected publication"
+        ) from exc
+    if staged.manifest != publication.bundle.manifest:
+        raise PublicPreparationError(
+            "staging Frozen bundle manifest differs from the verified source bundle"
+        )
+    _validate_frozen_case_targets(staged, case_files)
+
+
+def _preparation_binding(
+    *,
+    source_manifest: PublicSourceManifest,
+    filter_manifest: PublicFilterManifest,
+    preparation_packet_digest: str,
+    wire_contract: WireContractV2,
+    manifest_cases: Tuple[SuiteCase, ...],
+    case_files: Tuple[_PreparedCaseFile, ...],
+    frozen_publication: Optional[PublicFrozenBundlePublication],
+) -> PublicSuitePreparationBindingV2:
+    source_digest = source_manifest.digest()
+    filter_digest = filter_manifest.digest()
+    repository_catalog_digest = None
+    frozen_bundle_trust = None
+    if wire_contract.review_target_kind is ReviewTargetKind.REPOSITORY:
+        if frozen_publication is not None:
+            raise PublicPreparationError(
+                "Repository Suite may not carry a Frozen bundle binding"
+            )
+        repository_catalog_digest = _repository_target_catalog_digest(
+            manifest_cases, case_files
+        )
+    elif wire_contract.review_target_kind is ReviewTargetKind.FROZEN_CONTEXT:
+        if frozen_publication is None:
+            raise PublicPreparationError(
+                "Frozen Suite requires a verified Frozen bundle"
+            )
+        # Import lazily: frozen_context re-exports the SWE bundle verifier and
+        # imports this module for its public-source errors.
+        from ..frozen_context import frozen_bundle_trust_digest
+        from ..materialization import MaterializationError
+
+        provisional = PublicSuitePreparationBindingV2(
+            schema_version=PUBLIC_SUITE_PREPARATION_BINDING_SCHEMA_VERSION,
+            source_catalog_digest=_public_source_catalog_digest(source_manifest),
+            acquisition_receipt_digest=_public_acquisition_receipt_digest(
+                source_manifest
+            ),
+            source_manifest_digest=source_digest,
+            filter_manifest_digest=filter_digest,
+            preparation_packet_digest=preparation_packet_digest,
+            repository_catalog_digest=None,
+            frozen_bundle_trust_digest="0" * 64,
+        )
+        try:
+            frozen_bundle_trust = frozen_bundle_trust_digest(
+                frozen_publication.bundle, provisional
+            )
+        except (PublicDatasetError, SchemaError, MaterializationError, TypeError) as exc:
+            raise PublicPreparationError(
+                "Frozen Suite trust binding could not be derived"
+            ) from exc
+    else:  # pragma: no cover - WireContractV2 validates this enum
+        raise PublicPreparationError("public Suite Target kind is unsupported")
+
+    return PublicSuitePreparationBindingV2(
+        schema_version=PUBLIC_SUITE_PREPARATION_BINDING_SCHEMA_VERSION,
+        source_catalog_digest=_public_source_catalog_digest(source_manifest),
+        acquisition_receipt_digest=_public_acquisition_receipt_digest(
+            source_manifest
+        ),
+        source_manifest_digest=source_digest,
+        filter_manifest_digest=filter_digest,
+        preparation_packet_digest=preparation_packet_digest,
+        repository_catalog_digest=repository_catalog_digest,
+        frozen_bundle_trust_digest=frozen_bundle_trust,
+    )
+
+
 def _preflight_public_cases(
     cases: Iterable[PublicPreparedCase],
     *,
     suite_id: str,
     source_manifest: PublicSourceManifest,
+    wire_contract: WireContractV2,
 ) -> Tuple[_PreparedCaseFile, ...]:
     bounded = []
     for item in cases:
@@ -1886,6 +2256,10 @@ def _preflight_public_cases(
             raise PublicPreparationError(
                 "public Case provenance does not match the requested Suite"
             )
+        if case.input.review_target.kind is not wire_contract.review_target_kind:
+            raise PublicPreparationError(
+                "public Case Target kind does not match the Suite wire contract"
+            )
         path = "cases/%s.json" % case.task_id
         raw = canonical_json_bytes(case.to_dict())
         if len(raw) > MAX_EVAL_CASE_BYTES:
@@ -1922,11 +2296,13 @@ def write_public_suite(
     adapter_version: str,
     source_manifest: PublicSourceManifest,
     filter_manifest: PublicFilterManifest,
+    wire_contract: WireContractV2,
     cases: Iterable[PublicPreparedCase],
     actual_statistics: Iterable[PublicStatistic],
     records: Iterable[PublicRecordReceipt],
     extra_files: Optional[Mapping[str, bytes]] = None,
     expected_source_manifest_digest: Optional[str] = None,
+    frozen_publication: Optional[PublicFrozenBundlePublication] = None,
 ) -> PublicPreparationResult:
     """Create and atomically publish one immutable canonical public Suite."""
 
@@ -1934,6 +2310,10 @@ def write_public_suite(
     suite_version = _identifier(suite_version, "public Suite suite_version")
     adapter_id = _identifier(adapter_id, "public Suite adapter_id")
     adapter_version = _identifier(adapter_version, "public Suite adapter_version")
+    if type(wire_contract) is not WireContractV2:
+        raise PublicPreparationError(
+            "public Suite wire_contract must be a WireContractV2"
+        )
     if not isinstance(source_manifest, PublicSourceManifest):
         raise PublicPreparationError("public Suite source manifest is invalid")
     if expected_source_manifest_digest is not None:
@@ -1948,7 +2328,19 @@ def write_public_suite(
         cases,
         suite_id=suite_id,
         source_manifest=source_manifest,
+        wire_contract=wire_contract,
     )
+    if frozen_publication is not None:
+        if type(frozen_publication) is not PublicFrozenBundlePublication:
+            raise PublicPreparationError(
+                "frozen_publication must be PublicFrozenBundlePublication"
+            )
+        _validate_frozen_publication_inputs(
+            frozen_publication,
+            source_manifest=source_manifest,
+            filter_manifest=filter_manifest,
+            case_files=case_files,
+        )
     manifest_cases = tuple(item.binding for item in case_files)
     case_bindings_digest = _case_bindings_digest(manifest_cases)
     statistics = _ordered_statistics(
@@ -1983,11 +2375,21 @@ def write_public_suite(
         records_digest=_records_digest(record_receipts),
         extra_files_digest=_extra_files_digest(extra_bindings),
     )
+    preparation_binding = _preparation_binding(
+        source_manifest=source_manifest,
+        filter_manifest=filter_manifest,
+        preparation_packet_digest=packet_digest,
+        wire_contract=wire_contract,
+        manifest_cases=manifest_cases,
+        case_files=tuple(case_files),
+        frozen_publication=frozen_publication,
+    )
 
     manifest = SuiteManifest(
         schema_version=SUITE_MANIFEST_SCHEMA_VERSION,
         suite_id=suite_id,
         suite_version=suite_version,
+        wire_contract=wire_contract,
         source=SuiteSource(
             kind=SuiteKind.PUBLIC,
             source_id=source_manifest.dataset_id,
@@ -1995,6 +2397,7 @@ def write_public_suite(
             source_uri=source_manifest.source_uri,
             license=source_manifest.license,
             content_hash=packet_digest,
+            preparation_binding=preparation_binding,
         ),
         cases=manifest_cases,
     )
@@ -2024,7 +2427,17 @@ def write_public_suite(
     parent = _assert_publication_parent(lexical_output.parent)
     output = parent / lexical_output.name
     if os.path.lexists(output):
-        raise PublicPreparationError("public Suite output already exists")
+        raise PublicConflictError("public Suite output already exists")
+    prepared_result = PublicPreparationResult(
+        output,
+        manifest,
+        receipt,
+        bundle_id=(
+            None
+            if frozen_publication is None
+            else frozen_publication.bundle.manifest.bundle_id
+        ),
+    )
     staging = Path(
         tempfile.mkdtemp(prefix=".%s." % output.name, suffix=".staging", dir=parent)
     )
@@ -2057,6 +2470,12 @@ def write_public_suite(
             receipt_bytes,
             expected_root_identity=staging_identity,
         )
+        if frozen_publication is not None:
+            _verify_staged_frozen_publication(
+                staging,
+                frozen_publication,
+                case_files,
+            )
         CaseBank.open(staging)
         loaded_receipt = read_public_preparation_receipt(staging)
         if loaded_receipt != receipt:
@@ -2066,13 +2485,7 @@ def write_public_suite(
 
         _publish_directory_create_only(staging, output)
         published = True
-        bank = CaseBank.open(output)
-        final_receipt = read_public_preparation_receipt(output)
-        if bank.manifest != manifest or final_receipt != receipt:
-            raise PublicPreparationError(
-                "published public Suite failed immutable re-verification"
-            )
-        return PublicPreparationResult(output, manifest, receipt)
+        return prepared_result
     finally:
         if not published and os.path.lexists(staging):
             _cleanup_owned_staging(staging, parent, staging_identity)
@@ -2209,6 +2622,20 @@ def read_public_preparation_receipt(
         raise PublicSourceIntegrityError(
             "public Suite source metadata does not bind the source manifest"
         )
+    preparation = manifest.source.preparation_binding
+    if preparation is None:
+        raise PublicSourceIntegrityError(
+            "public Suite is missing its preparation binding"
+        )
+    if (
+        preparation.source_manifest_digest != receipt.source_manifest_digest
+        or preparation.filter_manifest_digest != receipt.filter_manifest_digest
+        or preparation.preparation_packet_digest
+        != receipt.preparation_packet_digest
+    ):
+        raise PublicSourceIntegrityError(
+            "public Suite preparation binding does not match the receipt"
+        )
     if manifest.source.content_hash != receipt.preparation_packet_digest:
         raise PublicSourceIntegrityError(
             "public Suite source hash does not bind the preparation packet"
@@ -2273,8 +2700,14 @@ __all__ = [
     "PublicSourceIntegrityError",
     "PublicFormatError",
     "PublicPreparationError",
+    "PublicConflictError",
+    "PublicPreconditionError",
+    "PublicOperationalError",
     "PublicOptionalDependencyError",
     "verify_public_source_manifest_digest",
+    "verify_public_filter_manifest_digest",
+    "read_public_source_manifest",
+    "read_public_filter_manifest",
     "PublicSourceFile",
     "PublicStatistic",
     "PublicSourceManifest",
@@ -2284,6 +2717,7 @@ __all__ = [
     "PublicExtraFile",
     "PublicRecordReceipt",
     "PublicPreparedCase",
+    "PublicFrozenBundlePublication",
     "PublicPreparationReceipt",
     "PublicPreparationResult",
     "write_public_suite",

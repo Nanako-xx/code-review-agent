@@ -32,10 +32,20 @@ from review_agent_eval.adapters._public import (
     verify_public_source_manifest_digest,
     write_public_suite,
 )
-from review_agent_eval.cases import CaseDimension, CaseSplit, SuiteManifest
+from review_agent_eval.cases import (
+    REPOSITORY_MATERIALIZER_PROTOCOL,
+    CaseDimension,
+    CaseSplit,
+    SuiteManifest,
+    WireContractV2,
+)
 from review_agent_eval.datasets import CaseBank
 from review_agent_eval.models import (
+    EVAL_CASE_SCHEMA_VERSION,
+    EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
     EvalCase,
+    ReviewTargetKind,
     SchemaError,
     canonical_json,
     canonical_json_bytes,
@@ -53,7 +63,7 @@ SUITE_ID = "public-suite"
 
 def _case_payload(task_id: str = "public-task-001") -> dict:
     return {
-        "schema_version": "eval_case_v1",
+        "schema_version": EVAL_CASE_SCHEMA_VERSION,
         "task_id": task_id,
         "case_version": 1,
         "source": {
@@ -66,21 +76,24 @@ def _case_payload(task_id: str = "public-task-001") -> dict:
             "content_hash": "c" * 64,
         },
         "input": {
-            "repository": {
-                "source": "fixture",
-                "path": "repositories/%s" % task_id,
-                "url": None,
-                "base_revision": BASE,
-                "head_revision": HEAD,
-            },
-            "review_request": {
-                "title": "Review %s" % task_id,
-                "description": None,
-                "user_intent": None,
-                "review_focus": None,
-                "linked_requirements": [],
-                "project_rules": [],
-                "existing_ci_evidence": [],
+            "review_target": {
+                "kind": "repository",
+                "repository": {
+                    "source": "fixture",
+                    "path": "repositories/%s" % task_id,
+                    "url": None,
+                    "base_revision": BASE,
+                    "head_revision": HEAD,
+                },
+                "review_request": {
+                    "title": "Review %s" % task_id,
+                    "description": None,
+                    "user_intent": None,
+                    "review_focus": None,
+                    "linked_requirements": [],
+                    "project_rules": [],
+                    "existing_ci_evidence": [],
+                },
             },
         },
         "clarification_script": {"max_rounds": 1, "answers": []},
@@ -97,7 +110,18 @@ def _case_payload(task_id: str = "public-task-001") -> dict:
             "expected_findings": [],
             "known_invalid_findings": [],
         },
+        "review_evaluator_context": {"truth_contexts": []},
     }
+
+
+def _repository_wire_contract() -> WireContractV2:
+    return WireContractV2(
+        case_schema_version=EVAL_CASE_SCHEMA_VERSION,
+        input_schema_version=EVAL_INPUT_SCHEMA_VERSION,
+        submission_schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
+        review_target_kind=ReviewTargetKind.REPOSITORY,
+        materializer_protocol=REPOSITORY_MATERIALIZER_PROTOCOL,
+    )
 
 
 def _source_manifest(source_root: Path) -> PublicSourceManifest:
@@ -181,6 +205,7 @@ def _write_suite(
         adapter_version="adapter-v1",
         source_manifest=source_manifest,
         filter_manifest=filter_manifest or _filter_manifest("Python"),
+        wire_contract=_repository_wire_contract(),
         cases=(_prepared_case(),),
         actual_statistics=statistics
         or (PublicStatistic("case_count", 1),),
@@ -328,6 +353,7 @@ def test_control_plane_expected_source_manifest_digest_is_enforced(
             adapter_version="adapter-v1",
             source_manifest=source,
             filter_manifest=_filter_manifest("Python"),
+            wire_contract=_repository_wire_contract(),
             cases=(_prepared_case(),),
             actual_statistics=(PublicStatistic("case_count", 1),),
             records=(_record(),),
@@ -343,6 +369,7 @@ def test_control_plane_expected_source_manifest_digest_is_enforced(
         adapter_version="adapter-v1",
         source_manifest=source,
         filter_manifest=_filter_manifest("Python"),
+        wire_contract=_repository_wire_contract(),
         cases=(_prepared_case(),),
         actual_statistics=(PublicStatistic("case_count", 1),),
         records=(_record(),),
@@ -467,6 +494,14 @@ def test_write_public_suite_round_trips_through_case_bank_and_packet_receipt(
     assert result.suite_manifest_digest == result.manifest.digest()
     assert result.case_bindings_digest == loaded.case_bindings_digest
     assert bank.manifest.source.content_hash != source.digest()
+    assert bank.manifest.wire_contract == _repository_wire_contract()
+    preparation = bank.manifest.source.preparation_binding
+    assert preparation is not None
+    assert preparation.source_manifest_digest == source.digest()
+    assert preparation.filter_manifest_digest == loaded.filter_manifest_digest
+    assert preparation.preparation_packet_digest == loaded.preparation_packet_digest
+    assert preparation.repository_catalog_digest is not None
+    assert preparation.frozen_bundle_trust_digest is None
     assert loaded.extra_files[0].path == "contexts/public-task-001.json"
     assert loaded.extra_files[0].sha256 == hashlib.sha256(b"frozen context").hexdigest()
 
@@ -517,7 +552,9 @@ def test_self_consistent_receipt_component_tamper_breaks_suite_packet_binding(
     # component digest, but the immutable Suite packet hash must still reject it.
     assert PublicPreparationReceipt.from_dict(payload)
     _rewrite_receipt(result.suite_root, payload)
-    with pytest.raises(PublicSourceIntegrityError, match="preparation packet"):
+    with pytest.raises(
+        PublicSourceIntegrityError, match="preparation (packet|binding)"
+    ):
         read_public_preparation_receipt(result.suite_root)
 
 
@@ -539,7 +576,9 @@ def test_case_bindings_digest_rejects_case_manifest_rewrite_without_packet_updat
     entry = result.manifest.cases[0]
     case_path = result.suite_root / Path(*entry.path.split("/"))
     case_payload = json.loads(case_path.read_text(encoding="utf-8"))
-    case_payload["input"]["review_request"]["title"] = "attacker-controlled"
+    case_payload["input"]["review_target"]["review_request"][
+        "title"
+    ] = "attacker-controlled"
     changed_case = EvalCase.from_dict(case_payload)
     changed_raw = canonical_json_bytes(changed_case.to_dict())
     case_path.write_bytes(changed_raw)
@@ -573,7 +612,9 @@ def test_external_anchors_reject_fully_self_consistent_suite_rewrite(
     entry = result.manifest.cases[0]
     case_path = result.suite_root / Path(*entry.path.split("/"))
     case_payload = json.loads(case_path.read_text(encoding="utf-8"))
-    case_payload["input"]["review_request"]["title"] = "attacker-controlled"
+    case_payload["input"]["review_target"]["review_request"][
+        "title"
+    ] = "attacker-controlled"
     changed_case = EvalCase.from_dict(case_payload)
     changed_raw = canonical_json_bytes(changed_case.to_dict())
     case_path.write_bytes(changed_raw)
@@ -593,6 +634,9 @@ def test_external_anchors_reject_fully_self_consistent_suite_rewrite(
     provisional_receipt = PublicPreparationReceipt.from_dict(receipt_payload)
     new_packet_digest = provisional_receipt.preparation_packet_digest
     manifest_payload["source"]["content_hash"] = new_packet_digest
+    manifest_payload["source"]["preparation_binding"][
+        "preparation_packet_digest"
+    ] = new_packet_digest
     changed_manifest = SuiteManifest.from_dict(manifest_payload)
     manifest_path.write_bytes(canonical_json_bytes(changed_manifest.to_dict()))
 
@@ -727,6 +771,7 @@ def test_extra_files_reject_control_plane_and_portable_path_collisions(
             adapter_version="adapter-v1",
             source_manifest=source,
             filter_manifest=_filter_manifest("Python"),
+            wire_contract=_repository_wire_contract(),
             cases=(_prepared_case(),),
             actual_statistics=(PublicStatistic("case_count", 1),),
             records=(_record(),),
@@ -753,6 +798,7 @@ def test_publication_is_create_only_and_preserves_existing_output(tmp_path: Path
             adapter_version="adapter-v1",
             source_manifest=source,
             filter_manifest=_filter_manifest("Python"),
+            wire_contract=_repository_wire_contract(),
             cases=(_prepared_case(),),
             actual_statistics=(PublicStatistic("case_count", 1),),
             records=(_record(),),
@@ -809,6 +855,7 @@ def test_suite_budgets_fail_before_staging_is_created(
             adapter_version="adapter-v1",
             source_manifest=source,
             filter_manifest=_filter_manifest("Python"),
+            wire_contract=_repository_wire_contract(),
             cases=cases,
             actual_statistics=(PublicStatistic("case_count", len(cases)),),
             records=tuple(_record(task_id=item.case.task_id) for item in cases),
@@ -907,6 +954,7 @@ def test_failed_publication_uses_owned_cleanup_not_recursive_rmtree(
             adapter_version="adapter-v1",
             source_manifest=source,
             filter_manifest=_filter_manifest("Python"),
+            wire_contract=_repository_wire_contract(),
             cases=(_prepared_case(),),
             actual_statistics=(PublicStatistic("case_count", 1),),
             records=(_record(),),

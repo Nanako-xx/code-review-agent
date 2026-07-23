@@ -27,9 +27,16 @@ from ._public import (
     VerifiedPublicSource,
     write_public_suite,
 )
-from ..cases import CaseDimension, CaseSplit
+from ..cases import (
+    REPOSITORY_MATERIALIZER_PROTOCOL,
+    CaseDimension,
+    CaseSplit,
+    WireContractV2,
+)
 from ..models import (
     EVAL_CASE_SCHEMA_VERSION,
+    EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
     CaseOrigin,
     CaseSource,
     ClarificationScript,
@@ -37,15 +44,19 @@ from ..models import (
     EvalCase,
     EvalCaseInput,
     ExpectedFinding,
-    FindingSeverity,
     IntentTruth,
     KnownInvalidFinding,
+    MetricAuthority,
+    MetricAuthoritySource,
     NovelFindingPolicy,
     Repository,
     RepositorySource,
+    RepositoryReviewTarget,
     RequiredContextLevel,
     ReviewRequest,
     ReviewTruth,
+    ReviewEvaluatorContext,
+    ReviewTargetKind,
     SchemaError,
     TruthCompleteness,
     TruthLocation,
@@ -74,9 +85,17 @@ AACR_LANGUAGE_SELECTOR = "language"
 
 AACR_SUITE_ID = "aacr-bench"
 AACR_FIXTURE_SUITE_ID = "aacr-bench-fixture"
-AACR_PROTOCOL_ID = "aacr-repository-v1"
+AACR_PROTOCOL_ID = "aacr-repository-v2"
 AACR_ADAPTER_ID = "aacr-bench"
 AACR_ADAPTER_VERSION = "github-split-v2"
+
+AACR_WIRE_CONTRACT = WireContractV2(
+    case_schema_version=EVAL_CASE_SCHEMA_VERSION,
+    input_schema_version=EVAL_INPUT_SCHEMA_VERSION,
+    submission_schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
+    review_target_kind=ReviewTargetKind.REPOSITORY,
+    materializer_protocol=REPOSITORY_MATERIALIZER_PROTOCOL,
+)
 
 AACR_FIXTURE_SOURCE_MANIFEST_DIGEST = (
     "b7d211701d1a5060962625e0f0d362e82f6732c2dc11f6984cb75ae697fe8813"
@@ -887,16 +906,22 @@ def _build_case(
                 ExpectedFinding(
                     truth_id=comment.truth_id,
                     claim=comment.record["note"],  # type: ignore[arg-type]
-                    severity=FindingSeverity.MEDIUM,
+                    severity=None,
                     category=comment.record["category"],  # type: ignore[arg-type]
                     required=True,
+                    metric_authority=MetricAuthority(
+                        severity_scorable=False,
+                        severity_authority=None,
+                        location_scorable=True,
+                        location_authority=MetricAuthoritySource.UPSTREAM_ANNOTATION,
+                    ),
                     locations=(_location(comment),),
                     evidence_anchors=(),
                     required_context_level=_CONTEXT_MAP[comment.context],
                     rationale=(
-                        "AACR-Bench positive sample. Upstream supplies no "
-                        "severity; medium is an adapter-neutral placeholder "
-                        "and must not be mixed with Core severity metrics."
+                        "AACR-Bench positive sample. The upstream record supplies "
+                        "no severity authority; its path and line range remain "
+                        "the upstream annotation authority for location."
                     ),
                 )
             )
@@ -905,8 +930,8 @@ def _build_case(
                     comment,
                     "expected_finding",
                     receipt_marker
-                    + "positive-sample; severity=adapter-neutral-medium; "
-                    "exclude-core-severity",
+                    + "positive-sample; severity=not-scorable; "
+                    "location=upstream-annotation",
                 )
             )
         else:
@@ -929,7 +954,7 @@ def _build_case(
                     "known_invalid",
                     receipt_marker
                     + "negative-sample; upstream-has-no-severity; "
-                    "exclude-core-severity",
+                    "severity=not-scorable",
                 )
             )
 
@@ -947,21 +972,24 @@ def _build_case(
             content_hash=_case_content_hash(aggregate),
         ),
         input=EvalCaseInput(
-            repository=Repository(
-                source=RepositorySource.GIT,
-                path=None,
-                url=metadata.repository_url,
-                base_revision=metadata.target_commit,
-                head_revision=metadata.source_commit,
-            ),
-            review_request=ReviewRequest(
-                title=None,
-                description=None,
-                user_intent=None,
-                review_focus=None,
-                linked_requirements=(),
-                project_rules=(),
-                existing_ci_evidence=(),
+            review_target=RepositoryReviewTarget(
+                kind=ReviewTargetKind.REPOSITORY,
+                repository=Repository(
+                    source=RepositorySource.GIT,
+                    path=None,
+                    url=metadata.repository_url,
+                    base_revision=metadata.target_commit,
+                    head_revision=metadata.source_commit,
+                ),
+                review_request=ReviewRequest(
+                    title=None,
+                    description=None,
+                    user_intent=None,
+                    review_focus=None,
+                    linked_requirements=(),
+                    project_rules=(),
+                    existing_ci_evidence=(),
+                ),
             ),
         ),
         clarification_script=ClarificationScript(max_rounds=1, answers=()),
@@ -978,6 +1006,7 @@ def _build_case(
             expected_findings=tuple(expected),
             known_invalid_findings=tuple(invalid),
         ),
+        review_evaluator_context=ReviewEvaluatorContext(truth_contexts=()),
     )
     dimensions = (
         CaseDimension(name="benchmark", value="AACR-Bench"),
@@ -1020,8 +1049,9 @@ def _build_case(
                 )
             ),
         ),
-        CaseDimension(name="severity_source", value="adapter-neutral"),
-        CaseDimension(name="severity_metric_scope", value="exclude-core"),
+        CaseDimension(name="severity_source", value="upstream_unavailable"),
+        CaseDimension(name="severity_metric_scope", value="not_scorable"),
+        CaseDimension(name="location_metric_scope", value="upstream_annotation"),
         CaseDimension(name="dataset_license_scope", value="aacr_dataset_only"),
         CaseDimension(
             name="underlying_repository_license",
@@ -1359,7 +1389,7 @@ def prepare_aacr_bench(
             "reversed_line_range_isolated_comments": source_reversed_isolated_comments,
             "polarity_conflict_isolated_comments": source_polarity_isolated_comments,
             "rejected_comments": source_isolated_comments,
-            "neutral_medium_findings": expected_findings,
+            "severity_unscorable_findings": expected_findings,
             "zero_positive_prs": zero_positive_prs,
             "negative_only_prs": negative_only_prs,
             "zero_truth_prs": zero_truth_prs,
@@ -1378,6 +1408,7 @@ def prepare_aacr_bench(
         adapter_version=AACR_ADAPTER_VERSION,
         source_manifest=source_manifest,
         filter_manifest=filter_manifest,
+        wire_contract=AACR_WIRE_CONTRACT,
         cases=prepared_cases,
         actual_statistics=tuple(
             PublicStatistic(name=name, value=value)
@@ -1407,6 +1438,7 @@ __all__ = [
     "AACR_SUITE_ID",
     "AACR_FIXTURE_SUITE_ID",
     "AACR_PROTOCOL_ID",
+    "AACR_WIRE_CONTRACT",
     "AACR_ADAPTER_ID",
     "AACR_ADAPTER_VERSION",
     "AACR_LANGUAGES",
