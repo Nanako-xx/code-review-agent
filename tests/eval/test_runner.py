@@ -36,7 +36,9 @@ from review_agent_eval.materialization import (
 from review_agent_eval.runner import (
     CapabilityPolicy,
     EvalRunner,
+    RunPlan,
     RunIncompatibilityError,
+    RunnerError,
 )
 from review_agent_eval.submission import failure_submission
 
@@ -628,6 +630,62 @@ def test_filter_mode_rechecks_final_identity_before_creating_the_run(tmp_path: P
     assert not (runner.artifact_store.root / config.run_id).exists()
     persisted = runner.artifact_store.load_run_preflight(setup.config.run_id)
     assert persisted == setup.preflight.to_dict()
+
+
+def test_filter_plan_commits_without_repeating_preflight(tmp_path: Path):
+    snapshot = _two_case_snapshot()
+    config = make_config(case_snapshot=snapshot, instance="planned-filter")
+    adapter = _SelectiveIncompatibleAdapter()
+    runner = _runner(tmp_path, adapter)
+
+    plan = runner.plan_run(config, snapshot, policy=CapabilityPolicy.FILTER)
+
+    assert plan.config.run_id != config.run_id
+    assert tuple(item.task_id for item in plan.case_snapshot.cases) == (
+        KEPT_TASK_ID,
+    )
+    assert adapter.compatibility_calls == 3
+
+    setup = runner.commit_run(plan)
+
+    assert setup.config == plan.config
+    assert setup.case_snapshot == plan.case_snapshot
+    assert setup.preflight == plan.preflight
+    assert adapter.compatibility_calls == 3
+    assert runner.artifact_store.load_run_preflight(
+        plan.config.run_id
+    ) == plan.preflight.to_dict()
+
+
+def test_run_plan_rejects_direct_construction(tmp_path: Path):
+    snapshot = make_case_snapshot()
+    config = make_config(case_snapshot=snapshot, instance="forged-plan")
+    runner = _runner(tmp_path, _SuccessAdapter())
+    trusted = runner.plan_run(config, snapshot)
+
+    with pytest.raises(TypeError, match="plan_run"):
+        RunPlan(
+            config=trusted.config,
+            case_snapshot=trusted.case_snapshot,
+            preflight=trusted.preflight,
+        )
+
+
+def test_run_plan_cannot_be_committed_by_a_different_runner(tmp_path: Path):
+    snapshot = make_case_snapshot()
+    config = make_config(case_snapshot=snapshot, instance="cross-runner-plan")
+    runner_a_root = tmp_path / "runner-a"
+    runner_b_root = tmp_path / "runner-b"
+    runner_a_root.mkdir()
+    runner_b_root.mkdir()
+    runner_a = _runner(runner_a_root, _SuccessAdapter())
+    runner_b = _runner(runner_b_root, _SuccessAdapter())
+    plan = runner_a.plan_run(config, snapshot)
+
+    with pytest.raises(RunnerError, match="different EvalRunner"):
+        runner_b.commit_run(plan)
+
+    assert not (runner_b.artifact_store.root / plan.config.run_id).exists()
 
 
 def test_filter_mode_fails_closed_if_final_identity_drifts(tmp_path: Path):

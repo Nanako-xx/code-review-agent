@@ -184,6 +184,110 @@ def test_prepare_and_run_agent_use_the_v2_subprocess_protocol_without_evaluation
     assert result["trials"][0]["submission_status"] == "completed"
 
 
+def test_filter_prepare_resume_reuses_canonical_planned_run_before_acquisition(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import review_agent_eval.cli as cli_module
+    from review_agent_eval.artifacts import ArtifactStore
+
+    from .test_runner import _SelectiveIncompatibleAdapter, _two_case_snapshot
+
+    snapshot = _two_case_snapshot()
+
+    class SnapshotBank:
+        def snapshot(self):
+            return snapshot
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_case_bank",
+        lambda _args, _suite_root: SnapshotBank(),
+    )
+    adapters = []
+    original_configs = []
+
+    def adapter_for(config):
+        original_configs.append(config)
+        adapter = _SelectiveIncompatibleAdapter()
+        adapters.append(adapter)
+        return _SelectiveIncompatibleAdapter, adapter
+
+    monkeypatch.setattr(cli_module, "_agent_adapter", adapter_for)
+    acquisitions = []
+    expected_run_id = None
+
+    def record_acquisition(_args, roots, selected_snapshot):
+        if expected_run_id is not None:
+            ArtifactStore(roots[1], create_root=False).load_run_config(
+                expected_run_id
+            )
+        acquisitions.append(
+            tuple(item.task_id for item in selected_snapshot.cases)
+        )
+
+    monkeypatch.setattr(
+        cli_module, "_prepare_repository_targets", record_acquisition
+    )
+    roots = _roots(tmp_path)
+    arguments = [
+        "prepare",
+        *_root_arguments(roots),
+        "--capability-policy",
+        "filter",
+        "--run-instance-key",
+        "filter-resume",
+        "--json",
+    ]
+
+    assert main(arguments) == EXIT_OK
+    first = _json_stdout(capsys)
+    expected_run_id = first["run_id"]
+    assert expected_run_id != original_configs[0].run_id
+    run_root = roots["runs"] / expected_run_id
+    immutable_paths = (
+        "run_config.json",
+        "case_snapshot.json",
+        "receipts/capability_preflight.json",
+        "run_manifest.json",
+    )
+    first_bytes = {
+        relative: (run_root / relative).read_bytes()
+        for relative in immutable_paths
+    }
+    assert acquisitions == [("task-kept",)]
+
+    original_load_preflight = ArtifactStore.load_run_preflight
+    monkeypatch.setattr(
+        ArtifactStore,
+        "load_run_preflight",
+        lambda _self, _run_id: {},
+    )
+    assert main([*arguments, "--resume"]) == EXIT_INTEGRITY
+    _json_stdout(capsys)
+    assert acquisitions == [("task-kept",)]
+    monkeypatch.setattr(
+        ArtifactStore,
+        "load_run_preflight",
+        original_load_preflight,
+    )
+
+    assert main([*arguments, "--resume"]) == EXIT_OK
+    resumed = _json_stdout(capsys)
+    assert resumed["run_id"] == expected_run_id
+    assert resumed["resumed"] is True
+    assert acquisitions == [("task-kept",), ("task-kept",)]
+    assert {
+        relative: (run_root / relative).read_bytes()
+        for relative in immutable_paths
+    } == first_bytes
+    assert len(
+        [path for path in roots["runs"].iterdir() if path.name.startswith("run-")]
+    ) == 1
+    assert all(adapter.run_calls == 0 for adapter in adapters)
+
+
 def test_full_prepare_run_evaluate_inspect_flow_keeps_stages_separate(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

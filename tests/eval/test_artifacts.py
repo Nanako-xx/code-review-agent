@@ -54,6 +54,9 @@ from review_agent_eval.models import (
 )
 
 from .test_config import (
+    _judge_input_context_payload,
+    _model_turn_context_block_payload,
+    _review_context_payload,
     adapter_capabilities,
     agent_config,
     budgets,
@@ -2551,6 +2554,177 @@ def test_evaluator_outputs_and_reports_are_versioned_without_mutating_submission
             review_matches={},
             judge_input={},
             judge_output={},
+            score={},
+        )
+
+
+def test_evaluation_typed_context_artifacts_round_trip_env_like_code(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator_config(), config.resource_budgets
+    )
+    content = "count = len(items)\naffinity = score(item)"
+    review_payload = _review_context_payload(content)
+    input_payload = _judge_input_context_payload(content)
+    output_payload = _model_turn_context_block_payload(content)
+
+    receipt = store.write_evaluation(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        evaluator_execution=execution,
+        revision="typed-context-round-trip",
+        intent_matches={},
+        review_matches=review_payload,
+        judge_input=input_payload,
+        judge_output=output_payload,
+        score={"total": 1},
+    )
+    assert receipt.evaluation_id is not None
+
+    bundle = store.load_evaluation_bundle(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        receipt.evaluation_id,
+    )
+    assert bundle.intent_matches == {}
+    assert bundle.review_matches == review_payload
+    assert bundle.judge_input == input_payload
+    assert bundle.judge_output == output_payload
+
+
+def _safe_evaluation_context_payloads() -> dict:
+    return {
+        "review_matches": _review_context_payload("ordinary context"),
+        "judge_input": _judge_input_context_payload("ordinary context"),
+        "judge_output": _model_turn_context_block_payload("ordinary context"),
+    }
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "count = len(items)\napi_key=ordinary-secret",
+        "<think>private intermediate steps</think>",
+    ],
+)
+def test_evaluation_judge_output_context_still_rejects_sensitive_content(
+    tmp_path,
+    content,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator_config(), config.resource_budgets
+    )
+    payload = _model_turn_context_block_payload(content)
+    safe_payloads = _safe_evaluation_context_payloads()
+
+    with pytest.raises(SchemaError):
+        store.write_evaluation(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            evaluator_execution=execution,
+            revision="typed-context-sensitive",
+            intent_matches={},
+            review_matches=safe_payloads["review_matches"],
+            judge_input=safe_payloads["judge_input"],
+            judge_output=payload,
+            score={},
+        )
+
+
+def test_evaluation_score_does_not_enable_typed_context_exception(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator_config(), config.resource_budgets
+    )
+    score = _model_turn_context_block_payload(
+        "count = len(items)\naffinity = score(item)"
+    )
+    safe_payloads = _safe_evaluation_context_payloads()
+
+    with pytest.raises(SchemaError, match="full environment dump"):
+        store.write_evaluation(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            evaluator_execution=execution,
+            revision="typed-context-rejected-score",
+            intent_matches={},
+            review_matches=safe_payloads["review_matches"],
+            judge_input=safe_payloads["judge_input"],
+            judge_output=safe_payloads["judge_output"],
+            score=score,
+        )
+
+
+@pytest.mark.parametrize("artifact_name", ["intent_matches", "judge_output"])
+def test_evaluation_context_policy_rejects_untyped_or_wrong_schema_payloads(
+    tmp_path,
+    artifact_name,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator_config(), config.resource_budgets
+    )
+    payload = _model_turn_context_block_payload(
+        "count = len(items)\naffinity = score(item)"
+    )
+    if artifact_name == "intent_matches":
+        payload = {"not_a_judge_schema": payload}
+    else:
+        payload["schema_version"] = "unknown"
+    safe_payloads = _safe_evaluation_context_payloads()
+    values = {
+        "intent_matches": {},
+        "review_matches": safe_payloads["review_matches"],
+        "judge_input": safe_payloads["judge_input"],
+        "judge_output": safe_payloads["judge_output"],
+        "score": {},
+    }
+    values[artifact_name] = payload
+
+    with pytest.raises(SchemaError, match="full environment dump"):
+        store.write_evaluation(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            evaluator_execution=execution,
+            revision="typed-context-policy-rejected-" + artifact_name,
+            **values,
+        )
+
+
+def test_evaluation_context_policy_rejects_typed_schema_with_wrong_root_fields(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator_config(), config.resource_budgets
+    )
+    safe_payloads = _safe_evaluation_context_payloads()
+
+    with pytest.raises(SchemaError):
+        store.write_evaluation(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            evaluator_execution=execution,
+            revision="typed-context-invalid-root",
+            intent_matches={},
+            review_matches=safe_payloads["review_matches"],
+            judge_input={
+                "schema_version": "eval_judge_input_artifact_v1",
+                "claims": [],
+            },
+            judge_output=safe_payloads["judge_output"],
             score={},
         )
 

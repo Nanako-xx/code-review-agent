@@ -610,6 +610,86 @@ def _repository_preparer(
     )
 
 
+def _snapshot_has_target_kind(snapshot: Any, kind: Any) -> bool:
+    return any(case.input.review_target.kind is kind for case in snapshot.cases)
+
+
+def _repository_preparer_context(
+    args: argparse.Namespace,
+    roots: tuple[Path, Path, Path, Path],
+    snapshot: Any,
+    *,
+    cache_only: bool,
+) -> Any:
+    from contextlib import nullcontext
+
+    from .models import ReviewTargetKind
+
+    if _snapshot_has_target_kind(snapshot, ReviewTargetKind.REPOSITORY):
+        return _repository_preparer(args, roots, cache_only=cache_only)
+    return nullcontext(None)
+
+
+def _frozen_target_materializers(
+    snapshot: Any,
+    *,
+    suite_root: Path,
+    workspace_root: Path,
+) -> dict[Any, Any]:
+    from .adapters.swe_prbench import SWE_PRBENCH_FROZEN_SUITE_RELATIVE_ROOT
+    from .frozen_context import FrozenContextTargetMaterializer
+    from .models import ReviewTargetKind
+
+    if not _snapshot_has_target_kind(snapshot, ReviewTargetKind.FROZEN_CONTEXT):
+        return {}
+    return {
+        ReviewTargetKind.FROZEN_CONTEXT: FrozenContextTargetMaterializer(
+            bundle_root=suite_root / SWE_PRBENCH_FROZEN_SUITE_RELATIVE_ROOT,
+            workspace_root=workspace_root,
+        )
+    }
+
+
+def _frozen_target_replay_resolvers(
+    snapshot: Any,
+    *,
+    suite_root: Path,
+) -> dict[Any, Any]:
+    from .adapters.swe_prbench import SWE_PRBENCH_FROZEN_SUITE_RELATIVE_ROOT
+    from .models import ReviewTargetKind
+    from .target_replay import FrozenContextReplayResolver
+
+    if not _snapshot_has_target_kind(snapshot, ReviewTargetKind.FROZEN_CONTEXT):
+        return {}
+    return {
+        ReviewTargetKind.FROZEN_CONTEXT: FrozenContextReplayResolver(
+            bundle_root=suite_root / SWE_PRBENCH_FROZEN_SUITE_RELATIVE_ROOT
+        )
+    }
+
+
+def _prepare_repository_targets(
+    args: argparse.Namespace,
+    roots: tuple[Path, Path, Path, Path],
+    snapshot: Any,
+) -> None:
+    from .models import RepositoryReviewTarget
+    from .repository import repository_from_eval_input
+
+    eval_inputs = tuple(
+        case.input
+        for case in snapshot.cases
+        if isinstance(case.input.review_target, RepositoryReviewTarget)
+    )
+    with _repository_preparer_context(
+        args, roots, snapshot, cache_only=False
+    ) as preparer:
+        if preparer is None:
+            return
+        for eval_input in eval_inputs:
+            preparer.prepare(repository_from_eval_input(eval_input))
+
+
 def _agent_adapter(config: Any):
     from .adapters.agent_factory import (
         build_agent_adapter,
@@ -1098,8 +1178,6 @@ def _handle_prepare_public(args: argparse.Namespace) -> int:
 
 
 def _handle_prepare(args: argparse.Namespace) -> int:
-    from .repository import repository_from_eval_input
-
     roots = _roots(args)
     suite_root, runs_root, _data_root, _workspace_root = roots
     if args.overwrite:
@@ -1127,35 +1205,10 @@ def _handle_prepare(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     store = _artifact_store(runs_root, create=True)
-    if args.resume:
-        from .artifacts import ArtifactStateError
-
-        try:
-            existing = store.load_run_config(config.run_id)
-        except (ArtifactStateError, FileNotFoundError):
-            existing = None
-        if existing is not None:
-            if existing != config:
-                raise CliConflictError("existing Run ID is bound to different config bytes")
-            # ``prepare`` is the only phase allowed to acquire repository
-            # data.  Resuming an existing immutable plan therefore verifies
-            # (and, if necessary, repairs) its cache here instead of deferring
-            # a missing-cache failure to run-agent/evaluate.
-            with _repository_preparer(args, roots, cache_only=False) as preparer:
-                for case_entry in snapshot.cases:
-                    preparer.prepare(
-                        repository_from_eval_input(case_entry.input)
-                    )
-            _emit(args, "prepare", "ok", message="existing immutable Run reused", run_id=config.run_id, resumed=True)
-            return EXIT_OK
     adapter_factory, adapter = _agent_adapter(config)
-    from .runner import CapabilityPolicy, EvalRunner
+    from .runner import CapabilityPolicy, CapabilityPreflight, EvalRunner
 
     policy = CapabilityPolicy(args.capability_policy)
-    with _repository_preparer(args, roots, cache_only=False) as preparer:
-        # Preparation is the only stage allowed to acquire repository data.
-        for case_entry in snapshot.cases:
-            preparer.prepare(repository_from_eval_input(case_entry.input))
     runner = EvalRunner(
         store,
         None,
@@ -1165,7 +1218,44 @@ def _handle_prepare(args: argparse.Namespace) -> int:
         capability_policy=policy,
         max_workers=config.resource_budgets.max_parallel_trials,
     )
-    setup = runner.create_run(config, snapshot, policy=policy)
+    plan = runner.plan_run(config, snapshot, policy=policy)
+    existing = None
+    if args.resume:
+        from .artifacts import ArtifactStateError
+
+        try:
+            existing = store.load_run_config(plan.config.run_id)
+        except (ArtifactStateError, FileNotFoundError):
+            existing = None
+        if existing is not None:
+            persisted_snapshot = store.load_case_snapshot(plan.config.run_id)
+            persisted_preflight = CapabilityPreflight.from_dict(
+                store.load_run_preflight(plan.config.run_id)
+            )
+            if (
+                existing != plan.config
+                or persisted_snapshot != plan.case_snapshot
+                or persisted_preflight != plan.preflight
+            ):
+                raise CliConflictError(
+                    "existing Run ID is bound to a different canonical plan"
+                )
+
+    # ``prepare`` is the only phase allowed to acquire repository data.  It
+    # happens after capability preflight and only for compatible Repository
+    # Targets; Frozen Targets have no Repository preparer at all.
+    _prepare_repository_targets(args, roots, plan.case_snapshot)
+    if existing is not None:
+        _emit(
+            args,
+            "prepare",
+            "ok",
+            message="existing immutable Run reused",
+            run_id=plan.config.run_id,
+            resumed=True,
+        )
+        return EXIT_OK
+    setup = runner.commit_run(plan)
     _emit(
         args,
         "prepare",
@@ -1182,7 +1272,7 @@ def _handle_prepare(args: argparse.Namespace) -> int:
 
 def _handle_run_agent(args: argparse.Namespace) -> int:
     roots = _roots(args)
-    suite_root, runs_root, _data_root, _workspace_root = roots
+    suite_root, runs_root, _data_root, workspace_root = roots
     run_id = _run_id(args)
     if args.overwrite:
         raise CliConflictError("run-agent never overwrites immutable Submissions")
@@ -1205,12 +1295,20 @@ def _handle_run_agent(args: argparse.Namespace) -> int:
     adapter_factory, adapter = _agent_adapter(config)
     from .runner import EvalRunner
 
-    with _repository_preparer(args, roots, cache_only=True) as preparer:
+    run_snapshot = store.load_case_snapshot(run_id)
+    with _repository_preparer_context(
+        args, roots, run_snapshot, cache_only=True
+    ) as preparer:
         runner = EvalRunner(
             store,
             preparer,
             adapter,
             case_provider=bank,
+            target_materializers=_frozen_target_materializers(
+                run_snapshot,
+                suite_root=suite_root,
+                workspace_root=workspace_root,
+            ),
             adapter_factory=adapter_factory,
             max_workers=args.max_workers,
             retry_incomplete=args.resume,
@@ -1301,12 +1399,19 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
             return judge_holder[0]
 
         judge_factory = build_judge
-    with _repository_preparer(args, roots, cache_only=True) as preparer:
+    run_snapshot = store.load_case_snapshot(run_id)
+    with _repository_preparer_context(
+        args, roots, run_snapshot, cache_only=True
+    ) as preparer:
         orchestrator = EvaluationOrchestrator(
             store,
             bank,
             repository_preparer=preparer,
             judge_factory=judge_factory,
+            target_replay_resolvers=_frozen_target_replay_resolvers(
+                run_snapshot,
+                suite_root=suite_root,
+            ),
         )
         bundle = orchestrator.evaluate_run(
             run_id,

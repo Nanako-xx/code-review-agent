@@ -27,7 +27,7 @@ import stat
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import (
@@ -118,6 +118,7 @@ MAX_ADAPTER_DIAGNOSTIC_BYTES = 4 * 1024
 TRACE_READ_CHUNK_BYTES = 64 * 1024
 MAX_TRACE_NODES = 100_000
 ADAPTER_IDENTITY_MISMATCH = "runner_incompatible.adapter_identity_mismatch"
+_RUN_PLAN_SEAL_TOKEN = object()
 
 
 class RunnerError(RuntimeError):
@@ -380,6 +381,39 @@ class CapabilityPreflight:
     @property
     def digest(self) -> str:
         return canonical_sha256(self.to_dict())
+
+
+@dataclass(frozen=True, init=False)
+class RunPlan:
+    """A fully resolved, compatible Run identity not yet committed."""
+
+    config: EvalRunConfig
+    case_snapshot: RunCaseSnapshot
+    preflight: CapabilityPreflight
+    _owner: object = field(repr=False, compare=False)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise TypeError("RunPlan must be created by EvalRunner.plan_run")
+
+    @classmethod
+    def _seal(
+        cls,
+        *,
+        config: EvalRunConfig,
+        case_snapshot: RunCaseSnapshot,
+        preflight: CapabilityPreflight,
+        owner: object,
+        _token: object = None,
+    ) -> "RunPlan":
+        if _token is not _RUN_PLAN_SEAL_TOKEN:
+            raise TypeError("RunPlan can only be sealed by EvalRunner.plan_run")
+        result = object.__new__(cls)
+        object.__setattr__(result, "config", config)
+        object.__setattr__(result, "case_snapshot", case_snapshot)
+        object.__setattr__(result, "preflight", preflight)
+        object.__setattr__(result, "_owner", owner)
+        return result
 
 
 @dataclass(frozen=True)
@@ -1685,6 +1719,7 @@ class EvalRunner:
         self.adapter_factory = adapter_factory
         self.max_workers = max_workers
         self.retry_incomplete = retry_incomplete
+        self._plan_owner_token = object()
         self._cancel_event = threading.Event()
         # ArtifactStore intentionally uses non-blocking filesystem locks to
         # detect competing writers.  The bounded worker pool is one trusted
@@ -1775,14 +1810,14 @@ class EvalRunner:
             issues=tuple(issues),
         )
 
-    def create_run(
+    def plan_run(
         self,
         config: EvalRunConfig,
         case_snapshot: RunCaseSnapshot,
         *,
         policy: Optional[CapabilityPolicy] = None,
-    ) -> RunSetup:
-        """Preflight and create an immutable Run plan."""
+    ) -> RunPlan:
+        """Resolve one canonical compatible Run identity without committing it."""
 
         config, case_snapshot = self._verified_inputs(config, case_snapshot)
         selected_policy = policy or self.capability_policy
@@ -1856,16 +1891,53 @@ class EvalRunner:
                 source_preflight,
                 final_preflight,
             )
+        return RunPlan._seal(
+            config=config,
+            case_snapshot=case_snapshot,
+            preflight=preflight,
+            owner=self._plan_owner_token,
+            _token=_RUN_PLAN_SEAL_TOKEN,
+        )
+
+    def commit_run(self, plan: RunPlan) -> RunSetup:
+        """Commit one previously resolved Run without repeating preflight."""
+
+        if not isinstance(plan, RunPlan):
+            raise TypeError("plan must be a RunPlan")
+        if getattr(plan, "_owner", None) is not self._plan_owner_token:
+            raise RunnerError("RunPlan belongs to a different EvalRunner")
+        config, case_snapshot = self._verified_inputs(
+            plan.config,
+            plan.case_snapshot,
+        )
+        self._validate_persisted_preflight(
+            config,
+            case_snapshot,
+            plan.preflight,
+        )
         manifest = self.artifact_store.create_run(
             config,
             case_snapshot,
-            run_preflight=preflight.to_dict(),
+            run_preflight=plan.preflight.to_dict(),
         )
         return RunSetup(
             config=config,
             case_snapshot=case_snapshot,
             manifest=manifest,
-            preflight=preflight,
+            preflight=plan.preflight,
+        )
+
+    def create_run(
+        self,
+        config: EvalRunConfig,
+        case_snapshot: RunCaseSnapshot,
+        *,
+        policy: Optional[CapabilityPolicy] = None,
+    ) -> RunSetup:
+        """Preflight and create an immutable Run plan."""
+
+        return self.commit_run(
+            self.plan_run(config, case_snapshot, policy=policy)
         )
 
     def run(
@@ -2913,6 +2985,7 @@ __all__ = [
     "PreflightMode",
     "CapabilityIssue",
     "CapabilityPreflight",
+    "RunPlan",
     "RunSetup",
     "TrialResult",
     "RunResult",

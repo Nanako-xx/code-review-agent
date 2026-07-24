@@ -25,6 +25,7 @@ from review_agent_eval.config import (
     derive_evaluation_id,
     derive_trial_id,
     load_eval_run_config,
+    validate_safe_json,
     validate_trial_id,
 )
 from review_agent_eval.models import (
@@ -1051,6 +1052,235 @@ def test_config_rejects_secrets_full_env_url_userinfo_and_raw_reasoning(
     assert "ordinary-secret" not in str(caught.value)
     assert "sk-test-secret-value" not in str(caught.value)
     assert "user:password" not in str(caught.value)
+
+
+_ENV_LIKE_CODE_CONTEXT = (
+    "count = len(items)\n"
+    "affinity = score(item)"
+)
+
+
+_REVIEW_EVALUATION_ROOT_FIELDS = (
+    "schema_version",
+    "evaluator_revision",
+    "evaluator_execution_digest",
+    "submission_digest",
+    "submission_review_digest",
+    "submission_evidence_digest",
+    "eval_input_digest",
+    "review_truth_digest",
+    "deterministic_context_digest",
+    "review_policy_version",
+    "assignment_policy_version",
+    "location_policy_version",
+    "evidence_integrity_policy_version",
+    "truth_completeness",
+    "novel_finding_policy",
+    "status",
+    "phase",
+    "generated_findings",
+    "expected_truth_findings",
+    "known_invalid_truth_findings",
+    "location_candidates",
+    "known_invalid_candidates",
+    "expected_candidates",
+    "assignments",
+    "finding_outcomes",
+    "unmatched_expected_truth_ids",
+    "judge_requests",
+    "judge_decisions",
+    "judge_failures",
+    "judge_ungraded",
+    "evidence_integrity_results",
+    "coverage",
+    "metrics",
+    "reason_codes",
+    "limit_failure",
+)
+
+
+def _context_block(
+    content: Any,
+    *,
+    model_payload: bool = False,
+    content_digest: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "ref_id": "context-1",
+        "kind": "code",
+        ("data_boundary" if model_payload else "trust"): (
+            "untrusted_repository_data"
+        ),
+        "content": content,
+        "metadata": {},
+        "content_digest": content_digest or canonical_sha256(content),
+    }
+
+
+def _review_context_payload(content: Any) -> Dict[str, Any]:
+    payload = dict.fromkeys(_REVIEW_EVALUATION_ROOT_FIELDS)
+    payload["schema_version"] = "eval_review_evaluation_v1"
+    payload["judge_requests"] = [
+        {"request": {"contexts": [_context_block(content)]}}
+    ]
+    return payload
+
+
+def _judge_input_context_payload(content: Any) -> Dict[str, Any]:
+    return {
+        "schema_version": "eval_judge_input_artifact_v1",
+        "evaluator_execution_digest": "0" * 64,
+        "requests": [{"contexts": [_context_block(content)]}],
+    }
+
+
+def _judge_output_request_context_payload(content: Any) -> Dict[str, Any]:
+    return {
+        "schema_version": "eval_judge_output_artifact_v1",
+        "evaluator_execution_digest": "0" * 64,
+        "input_artifact_digest": "1" * 64,
+        "intent_evaluation_digest": None,
+        "results": [{"request": {"contexts": [_context_block(content)]}}],
+    }
+
+
+def _model_turn_context_block_payload(content: Any) -> Dict[str, Any]:
+    return {
+        "schema_version": "eval_judge_output_artifact_v1",
+        "evaluator_execution_digest": "0" * 64,
+        "input_artifact_digest": "1" * 64,
+        "intent_evaluation_digest": None,
+        "results": [
+            {},
+            {
+                "model_turn": {
+                    "messages": [
+                        {
+                            "content": {
+                                "context_blocks": [
+                                    _context_block(content, model_payload=True)
+                                ],
+                            }
+                        }
+                    ]
+                }
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("policy", "payload_factory"),
+    [
+        ("review_matches", _review_context_payload),
+        ("judge_input", _judge_input_context_payload),
+        ("judge_output", _judge_output_request_context_payload),
+        ("judge_output", _model_turn_context_block_payload),
+    ],
+)
+def test_safe_json_typed_evaluator_context_is_artifact_and_path_scoped(
+    policy: str,
+    payload_factory: Any,
+) -> None:
+    payload = payload_factory(_ENV_LIKE_CODE_CONTEXT)
+
+    with pytest.raises(SchemaError, match="full environment dump"):
+        validate_safe_json(payload)
+
+    validate_safe_json(payload, evaluator_context_policy=policy)
+
+
+def test_evaluator_context_policy_rejects_review_bypass_and_invalid_bindings() -> None:
+    with pytest.raises(SchemaError):
+        validate_safe_json(
+            {"safe": "ordinary"},
+            evaluator_context_policy="judge_input",
+        )
+
+    with pytest.raises(SchemaError, match="full environment dump"):
+        validate_safe_json(
+            {
+                "not_a_judge_schema": {
+                    "contexts": [{"content": _ENV_LIKE_CODE_CONTEXT}]
+                }
+            },
+            evaluator_context_policy="review_matches",
+        )
+
+    wrong_schema = _judge_input_context_payload(_ENV_LIKE_CODE_CONTEXT)
+    wrong_schema["schema_version"] = "unknown"
+    with pytest.raises(SchemaError, match="full environment dump"):
+        validate_safe_json(
+            wrong_schema,
+            evaluator_context_policy="judge_input",
+        )
+
+    wrong_root = _judge_input_context_payload(_ENV_LIKE_CODE_CONTEXT)
+    wrong_root["unexpected"] = True
+    with pytest.raises(SchemaError, match="full environment dump"):
+        validate_safe_json(
+            wrong_root,
+            evaluator_context_policy="judge_input",
+        )
+
+    wrong_path = _judge_input_context_payload("ordinary")
+    wrong_path["requests"] = [
+        {"not_contexts": [_context_block(_ENV_LIKE_CODE_CONTEXT)]}
+    ]
+    with pytest.raises(SchemaError, match="full environment dump"):
+        validate_safe_json(
+            wrong_path,
+            evaluator_context_policy="judge_input",
+        )
+
+    wrong_digest = _judge_input_context_payload("ordinary context")
+    wrong_digest["requests"][0]["contexts"][0]["content_digest"] = "f" * 64
+    with pytest.raises(SchemaError):
+        validate_safe_json(
+            wrong_digest,
+            evaluator_context_policy="judge_input",
+        )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "count = len(items)\napi_key=ordinary-secret",
+        "<think>private intermediate steps</think>",
+    ],
+)
+def test_typed_context_block_content_still_rejects_sensitive_text(
+    content: str,
+) -> None:
+    with pytest.raises(SchemaError):
+        validate_safe_json(
+            _model_turn_context_block_payload(content),
+            evaluator_context_policy="judge_output",
+        )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "FIRST_VALUE = compute_value()\napi_key=ordinary-secret",
+        "<think>private intermediate steps</think>",
+        "https://user:password@example.test/context",
+        {
+            "HOME": "/private",
+            "PATH": "/bin",
+            "USER": "private-user",
+        },
+        {"client_secret": "ordinary-secret"},
+    ],
+)
+def test_typed_evaluator_context_never_allows_other_unsafe_classes(
+    content: Any,
+) -> None:
+    with pytest.raises(SchemaError):
+        validate_safe_json(
+            _judge_input_context_payload(content),
+            evaluator_context_policy="judge_input",
+        )
 
 
 def test_strict_hydration_rejects_unknown_duplicate_and_digest_mismatch(

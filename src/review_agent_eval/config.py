@@ -244,20 +244,245 @@ def validate_safe_text(value: Any, context: str = "value") -> str:
     return text
 
 
-def validate_safe_json(value: Any, context: str = "value") -> None:
+_REVIEW_EVALUATION_SAFE_ROOT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "evaluator_revision",
+        "evaluator_execution_digest",
+        "submission_digest",
+        "submission_review_digest",
+        "submission_evidence_digest",
+        "eval_input_digest",
+        "review_truth_digest",
+        "deterministic_context_digest",
+        "review_policy_version",
+        "assignment_policy_version",
+        "location_policy_version",
+        "evidence_integrity_policy_version",
+        "truth_completeness",
+        "novel_finding_policy",
+        "status",
+        "phase",
+        "generated_findings",
+        "expected_truth_findings",
+        "known_invalid_truth_findings",
+        "location_candidates",
+        "known_invalid_candidates",
+        "expected_candidates",
+        "assignments",
+        "finding_outcomes",
+        "unmatched_expected_truth_ids",
+        "judge_requests",
+        "judge_decisions",
+        "judge_failures",
+        "judge_ungraded",
+        "evidence_integrity_results",
+        "coverage",
+        "metrics",
+        "reason_codes",
+        "limit_failure",
+    }
+)
+_EVALUATOR_CONTEXT_POLICIES = {
+    "review_matches": (
+        "eval_review_evaluation_v1",
+        _REVIEW_EVALUATION_SAFE_ROOT_FIELDS,
+        (
+            (
+                "judge_requests",
+                int,
+                "request",
+                "contexts",
+                int,
+                "content",
+            ),
+        ),
+    ),
+    "judge_input": (
+        "eval_judge_input_artifact_v1",
+        frozenset({"schema_version", "evaluator_execution_digest", "requests"}),
+        (("requests", int, "contexts", int, "content"),),
+    ),
+    "judge_output": (
+        "eval_judge_output_artifact_v1",
+        frozenset(
+            {
+                "schema_version",
+                "evaluator_execution_digest",
+                "input_artifact_digest",
+                "intent_evaluation_digest",
+                "results",
+            }
+        ),
+        (
+            ("results", int, "request", "contexts", int, "content"),
+            (
+                "results",
+                int,
+                "model_turn",
+                "messages",
+                int,
+                "content",
+                "context_blocks",
+                int,
+                "content",
+            ),
+        ),
+    ),
+}
+_JUDGE_CONTEXT_BLOCK_FIELDS = frozenset(
+    {"ref_id", "kind", "trust", "content", "metadata", "content_digest"}
+)
+_JUDGE_MODEL_CONTEXT_BLOCK_FIELDS = frozenset(
+    {
+        "ref_id",
+        "kind",
+        "data_boundary",
+        "content",
+        "metadata",
+        "content_digest",
+    }
+)
+
+
+def validate_safe_json(
+    value: Any,
+    context: str = "value",
+    *,
+    evaluator_context_policy: Optional[str] = None,
+) -> None:
     """Validate a JSON tree before it crosses the persistent artifact boundary."""
 
-    def walk(item: Any, item_context: str, depth: int) -> None:
+    if (
+        evaluator_context_policy is not None
+        and evaluator_context_policy not in _EVALUATOR_CONTEXT_POLICIES
+    ):
+        raise SchemaError("%s has an unknown evaluator context policy" % context)
+
+    policy_root = value.to_dict() if isinstance(value, _JsonModel) else value
+    if evaluator_context_policy is not None:
+        schema_version, root_fields, _ = _EVALUATOR_CONTEXT_POLICIES[
+            evaluator_context_policy
+        ]
+        if not (
+            type(policy_root) is dict
+            or isinstance(policy_root, _MAPPING_PROXY_TYPE)
+        ) or (
+            frozenset(policy_root) != root_fields
+            or policy_root.get("schema_version") != schema_version
+        ):
+            raise SchemaError(
+                "%s evaluator context policy cannot bypass the full environment "
+                "dump heuristic for this root artifact" % context
+            )
+
+    def path_matches(
+        path: Tuple[Any, ...],
+        expected: Tuple[Any, ...],
+    ) -> bool:
+        return len(path) == len(expected) and all(
+            type(actual) is int if wanted is int else actual == wanted
+            for actual, wanted in zip(path, expected)
+        )
+
+    def value_at_path(path: Tuple[Any, ...]) -> Any:
+        item = policy_root
+        for part in path:
+            if type(part) is int:
+                if type(item) not in (list, tuple) or not 0 <= part < len(item):
+                    return None
+                item = item[part]
+            else:
+                if not (
+                    type(item) is dict
+                    or isinstance(item, _MAPPING_PROXY_TYPE)
+                ) or part not in item:
+                    return None
+                item = item[part]
+        return item
+
+    def allows_evaluator_context_content(
+        path: Tuple[Any, ...],
+        content: str,
+    ) -> bool:
+        if evaluator_context_policy is None:
+            return False
+        schema_version, root_fields, allowed_paths = _EVALUATOR_CONTEXT_POLICIES[
+            evaluator_context_policy
+        ]
+        if not (
+            type(policy_root) is dict
+            or isinstance(policy_root, _MAPPING_PROXY_TYPE)
+        ):
+            return False
+        if (
+            frozenset(policy_root) != root_fields
+            or policy_root.get("schema_version") != schema_version
+            or not any(path_matches(path, expected) for expected in allowed_paths)
+        ):
+            return False
+        block = value_at_path(path[:-1])
+        if not (type(block) is dict or isinstance(block, _MAPPING_PROXY_TYPE)):
+            return False
+        expected_block_fields = (
+            _JUDGE_MODEL_CONTEXT_BLOCK_FIELDS
+            if "context_blocks" in path
+            else _JUDGE_CONTEXT_BLOCK_FIELDS
+        )
+        return (
+            frozenset(block) == expected_block_fields
+            and block.get("content") == content
+            and block.get("content_digest") == canonical_sha256(content)
+        )
+
+    def walk(
+        item: Any,
+        item_context: str,
+        depth: int,
+        path: Tuple[Any, ...],
+    ) -> None:
         if depth > 128:
             raise SchemaError("%s exceeds the maximum nesting depth" % context)
         if item is None or type(item) in (bool, int, float):
             return
         if type(item) is str:
-            validate_safe_text(item, item_context)
+            evaluator_context_path = (
+                evaluator_context_policy is not None
+                and any(
+                    path_matches(path, expected)
+                    for expected in _EVALUATOR_CONTEXT_POLICIES[
+                        evaluator_context_policy
+                    ][2]
+                )
+            )
+            evaluator_context_content_allowed = (
+                allows_evaluator_context_content(path, item)
+                if evaluator_context_path
+                else False
+            )
+            try:
+                validate_safe_text(item, item_context)
+            except SchemaError as exc:
+                if not (
+                    evaluator_context_content_allowed
+                    and str(exc)
+                    == "%s contains a forbidden full environment dump"
+                    % item_context
+                ):
+                    raise
+            if evaluator_context_path and not evaluator_context_content_allowed:
+                raise SchemaError(
+                    "%s has an invalid evaluator context binding" % item_context
+                )
             return
         if type(item) in (list, tuple):
             for index, child in enumerate(item):
-                walk(child, "%s[%d]" % (item_context, index), depth + 1)
+                walk(
+                    child,
+                    "%s[%d]" % (item_context, index),
+                    depth + 1,
+                    (*path, index),
+                )
             return
         if type(item) is dict or isinstance(item, _MAPPING_PROXY_TYPE):
             environment_keys = {
@@ -279,14 +504,19 @@ def validate_safe_json(value: Any, context: str = "value") -> None:
                         % item_context
                     )
                 validate_safe_text(key, "%s key" % item_context)
-                walk(child, "%s.%s" % (item_context, key), depth + 1)
+                walk(
+                    child,
+                    "%s.%s" % (item_context, key),
+                    depth + 1,
+                    (*path, key),
+                )
             return
         if isinstance(item, _JsonModel):
-            walk(item.to_dict(), item_context, depth + 1)
+            walk(item.to_dict(), item_context, depth + 1, path)
             return
         raise SchemaError("%s contains a non-JSON value" % item_context)
 
-    walk(value, context, 0)
+    walk(value, context, 0, ())
 
 
 def validate_path_segment(value: Any, context: str = "identifier") -> str:

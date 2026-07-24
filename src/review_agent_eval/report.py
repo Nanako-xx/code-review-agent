@@ -427,22 +427,42 @@ def _safe_eval_input_projection(value: Any) -> Dict[str, Any]:
 
 def _safe_intent_evaluation_projection(value: IntentEvaluationResult) -> Dict[str, Any]:
     digest = value.digest()
-    return _redacted_artifact_projection(
+    source = value.to_dict()
+    for field in (
+        "judge_requests",
+        "judge_decisions",
+        "judge_failures",
+        "judge_ungraded",
+    ):
+        source.pop(field, None)
+    projection = _redacted_artifact_projection(
         artifact_kind="intent_evaluation",
-        source_payload=value.to_dict(),
+        source_payload=source,
         source_digest=digest,
         source_id="intent-evaluation-" + digest,
     )
+    projection["redactions"].append("judge_payloads:judge_artifact_refs")
+    return projection
 
 
 def _safe_review_evaluation_projection(value: ReviewEvaluationResult) -> Dict[str, Any]:
     digest = value.digest()
-    return _redacted_artifact_projection(
+    source = value.to_dict()
+    for field in (
+        "judge_requests",
+        "judge_decisions",
+        "judge_failures",
+        "judge_ungraded",
+    ):
+        source.pop(field, None)
+    projection = _redacted_artifact_projection(
         artifact_kind="review_evaluation",
-        source_payload=value.to_dict(),
+        source_payload=source,
         source_digest=digest,
         source_id="review-evaluation-" + digest,
     )
+    projection["redactions"].append("judge_payloads:judge_artifact_refs")
+    return projection
 
 
 def _timeline_projection(values: Sequence[Any]) -> list[Dict[str, Any]]:

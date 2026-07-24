@@ -30,6 +30,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Mapping,
     Optional,
     Tuple,
 )
@@ -58,6 +59,7 @@ from .config import (
     validate_safe_text,
     validate_trial_id,
     validate_trial_id_shape,
+    _EVALUATOR_CONTEXT_POLICIES,
 )
 from .models import (
     EVAL_SUBMISSION_SCHEMA_VERSION,
@@ -155,6 +157,36 @@ _EVALUATION_JSON_ARTIFACT_NAMES = (
     "judge_output.json",
     "score.json",
 )
+_EVALUATOR_CONTEXT_POLICY_BY_ARTIFACT = {
+    "review_matches.json": "review_matches",
+    "judge_input.json": "judge_input",
+    "judge_output.json": "judge_output",
+}
+_EVALUATOR_CONTEXT_POLICY_BY_BUNDLE_FIELD = {
+    "_review_matches_json": "review_matches",
+    "_judge_input_json": "judge_input",
+    "_judge_output_json": "judge_output",
+}
+
+
+def _evaluator_context_policy_for_payload(
+    value: Any,
+    candidate_policy: Optional[str],
+) -> Optional[str]:
+    if candidate_policy is None:
+        return None
+    policy = _EVALUATOR_CONTEXT_POLICIES.get(candidate_policy)
+    if policy is None:
+        return candidate_policy
+    payload = value.to_dict() if isinstance(value, _JsonModel) else value
+    if (
+        isinstance(payload, Mapping)
+        and payload.get("schema_version") == policy[0]
+    ):
+        return candidate_policy
+    return None
+
+
 _EVALUATION_OPTIONAL_ARTIFACT_NAMES = ("report.md",)
 _EVALUATION_NAMESPACE_FILENAMES = frozenset(
     (
@@ -2255,8 +2287,20 @@ class ResumePlan:
     terminal: bool
 
 
-def _canonical_payload_text(value: Any, context: str) -> str:
-    validate_safe_json(value, context)
+def _canonical_payload_text(
+    value: Any,
+    context: str,
+    *,
+    evaluator_context_policy: Optional[str] = None,
+) -> str:
+    validate_safe_json(
+        value,
+        context,
+        evaluator_context_policy=_evaluator_context_policy_for_payload(
+            value,
+            evaluator_context_policy,
+        ),
+    )
     return canonical_json_bytes(value).decode("utf-8", "strict")
 
 
@@ -2422,7 +2466,13 @@ class EvaluationArtifactBundle:
             if type(value) is not str:
                 raise TypeError("evaluation bundle payload snapshots must be strings")
             decoded = _decoded_payload(value)
-            if _canonical_payload_text(decoded, "evaluation bundle payload") != value:
+            if _canonical_payload_text(
+                decoded,
+                "evaluation bundle payload",
+                evaluator_context_policy=(
+                    _EVALUATOR_CONTEXT_POLICY_BY_BUNDLE_FIELD.get(name)
+                ),
+            ) != value:
                 raise ArtifactIntegrityError(
                     "evaluation bundle payload is not canonical"
                 )
@@ -3671,6 +3721,7 @@ class ArtifactStore:
         expected: Optional[ArtifactRef] = None,
         budget: Optional[_ReadBudget] = None,
         maximum: Optional[int] = None,
+        evaluator_context_policy: Optional[str] = None,
     ) -> Any:
         active_budget = budget or _ReadBudget(self.max_total_read_bytes)
         data = self._read_bytes(
@@ -3687,7 +3738,14 @@ class ArtifactStore:
         )
         if canonical_json_bytes(value) != data:
             raise ArtifactIntegrityError("JSON artifact is not canonical UTF-8 JSON")
-        validate_safe_json(value, "artifact")
+        validate_safe_json(
+            value,
+            "artifact",
+            evaluator_context_policy=_evaluator_context_policy_for_payload(
+                value,
+                evaluator_context_policy,
+            ),
+        )
         return value
 
     def _read_text(
@@ -3746,8 +3804,16 @@ class ArtifactStore:
         value: Any,
         *,
         maximum: Optional[int] = None,
+        evaluator_context_policy: Optional[str] = None,
     ) -> ArtifactRef:
-        validate_safe_json(value, "artifact")
+        validate_safe_json(
+            value,
+            "artifact",
+            evaluator_context_policy=_evaluator_context_policy_for_payload(
+                value,
+                evaluator_context_policy,
+            ),
+        )
         data = canonical_json_bytes(value)
         if len(data) > min(self.max_file_bytes, maximum or self.max_file_bytes):
             raise ArtifactIntegrityError("JSON artifact exceeds its byte limit")
@@ -6301,14 +6367,20 @@ class ArtifactStore:
 
         payloads: Dict[str, str] = {}
         for filename in _EVALUATION_JSON_ARTIFACT_NAMES[1:]:
+            evaluator_context_policy = (
+                _EVALUATOR_CONTEXT_POLICY_BY_ARTIFACT.get(filename)
+            )
             payload = self._read_json(
                 self._target(plan.run_id, expected_prefix + filename),
                 expected=refs[filename],
                 budget=budget,
                 maximum=evaluation_limit,
+                evaluator_context_policy=evaluator_context_policy,
             )
             payloads[filename] = _canonical_payload_text(
-                payload, "evaluation artifact"
+                payload,
+                "evaluation artifact",
+                evaluator_context_policy=evaluator_context_policy,
             )
         report = None
         if "report.md" in refs:
@@ -6854,7 +6926,14 @@ class ArtifactStore:
         artifacts: List[ArtifactRef] = []
         for filename, value in values:
             relative_path = "%s/%s" % (base, filename)
-            validate_safe_json(value, "evaluation artifact")
+            validate_safe_json(
+                value,
+                "evaluation artifact",
+                evaluator_context_policy=_evaluator_context_policy_for_payload(
+                    value,
+                    _EVALUATOR_CONTEXT_POLICY_BY_ARTIFACT.get(filename),
+                ),
+            )
             data = canonical_json_bytes(value)
             if len(data) > min(self.max_file_bytes, evaluation_limit):
                 raise ArtifactIntegrityError(
@@ -7003,6 +7082,11 @@ class ArtifactStore:
                         relative_path,
                         value,
                         maximum=evaluation_limit,
+                        evaluator_context_policy=(
+                            _EVALUATOR_CONTEXT_POLICY_BY_ARTIFACT.get(
+                                relative_path.rsplit("/", 1)[-1]
+                            )
+                        ),
                     )
                     if written != expected_ref:
                         raise ArtifactIntegrityError(
