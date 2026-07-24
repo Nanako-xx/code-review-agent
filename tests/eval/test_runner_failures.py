@@ -14,9 +14,11 @@ from review_agent_eval.adapters.base import (
     AdapterCompatibility,
     AdapterIncompatibilityReason,
     AgentAdapterIncompatibleError,
+    AgentRunConfig,
 )
 from review_agent_eval.artifacts import ArtifactIntegrityError, ArtifactStore
 from review_agent_eval.config import ResourceBudgets
+from review_agent_eval.materialization import MaterializationRequest
 from review_agent_eval.models import (
     ClarificationAction,
     ClarificationAnswer,
@@ -37,9 +39,23 @@ from review_agent_eval.runner import (
 )
 from review_agent_eval.submission import failure_submission
 
-from .test_artifacts import TASK_ID, completed_submission, make_case_snapshot, make_config
+from .test_artifacts import (
+    TASK_ID,
+    completed_submission,
+    make_case_snapshot,
+    make_config,
+)
 from .test_config import run_config
-from .test_runner import _workspace_factory
+from .test_runner import _materializer_factory
+
+
+def _bound_completed_submission(config: Any, target_materialization_id: str | None):
+    return replace(
+        completed_submission(config.trial_id),
+        task_id=config.task_id,
+        eval_input_digest=config.eval_input_digest,
+        target_materialization_id=target_materialization_id,
+    )
 
 
 class _DynamicIncompatibilityAdapter:
@@ -62,16 +78,18 @@ class _DynamicIncompatibilityAdapter:
         config,
         clarification_channel,
         *,
+        target_access=None,
+        target_materialization_id=None,
         cancel_event=None,
     ):
-        del eval_input, clarification_channel, cancel_event
+        del eval_input, clarification_channel, target_access, cancel_event
         self.run_calls += 1
         self.workspaces.append(str(workspace))
         if self.dynamic:
             raise AgentAdapterIncompatibleError(
                 AdapterIncompatibilityReason.EXISTING_CI_EVIDENCE
             )
-        return completed_submission(config.trial_id)
+        return _bound_completed_submission(config, target_materialization_id)
 
 
 class _StaticIncompatibilityAdapter(_DynamicIncompatibilityAdapter):
@@ -108,11 +126,19 @@ class _DiagnosticSuccessAdapter:
         config,
         clarification_channel,
         *,
+        target_access=None,
+        target_materialization_id=None,
         cancel_event=None,
     ):
-        del eval_input, workspace, clarification_channel, cancel_event
+        del (
+            eval_input,
+            workspace,
+            clarification_channel,
+            target_access,
+            cancel_event,
+        )
         self.run_calls += 1
-        return completed_submission(config.trial_id)
+        return _bound_completed_submission(config, target_materialization_id)
 
 
 class _ParallelAdapter(_DiagnosticSuccessAdapter):
@@ -128,6 +154,8 @@ class _ParallelAdapter(_DiagnosticSuccessAdapter):
         config,
         clarification_channel,
         *,
+        target_access=None,
+        target_materialization_id=None,
         cancel_event=None,
     ):
         with self._lock:
@@ -137,6 +165,8 @@ class _ParallelAdapter(_DiagnosticSuccessAdapter):
             workspace,
             config,
             clarification_channel,
+            target_access=target_access,
+            target_materialization_id=target_materialization_id,
             cancel_event=cancel_event,
         )
 
@@ -189,9 +219,11 @@ class _ClarificationAdapter:
         config,
         clarification_channel,
         *,
+        target_access=None,
+        target_materialization_id=None,
         cancel_event=None,
     ):
-        del workspace, cancel_event
+        del workspace, target_access, cancel_event
         exchange = clarification_channel.ask(
             question_id="question-runner",
             dimension=IntentDimension.GOAL,
@@ -212,6 +244,7 @@ class _ClarificationAdapter:
         return failure_submission(
             eval_input=eval_input,
             config=config,
+            target_materialization_id=target_materialization_id,
             code=FailureCode.CLARIFICATION_REQUIRED,
             message="question remains unresolved",
             retryable=False,
@@ -229,15 +262,17 @@ class _TraceAdapter(_DiagnosticSuccessAdapter):
         config,
         clarification_channel,
         *,
+        target_access=None,
+        target_materialization_id=None,
         cancel_event=None,
     ):
-        del eval_input, clarification_channel, cancel_event
+        del eval_input, clarification_channel, target_access, cancel_event
         self.run_calls += 1
         trace_dir = workspace / "agent-trace"
         trace_dir.mkdir()
         (trace_dir / "events.jsonl").write_bytes(b'{"event":"private"}\n')
         return replace(
-            completed_submission(config.trial_id),
+            _bound_completed_submission(config, target_materialization_id),
             trace_ref=TraceRef.from_dict(
                 {"type": "local_path", "value": "agent-trace"}
             ),
@@ -255,9 +290,19 @@ class _FactoryDriftAdapter(_DiagnosticSuccessAdapter):
         config,
         clarification_channel,
         *,
+        target_access=None,
+        target_materialization_id=None,
         cancel_event=None,
     ):
-        del eval_input, workspace, config, clarification_channel, cancel_event
+        del (
+            eval_input,
+            workspace,
+            config,
+            clarification_channel,
+            target_access,
+            target_materialization_id,
+            cancel_event,
+        )
         raise AssertionError("identity-drifted Adapter must never run")
 
 
@@ -275,9 +320,11 @@ class _CancellableAdapter(_DiagnosticSuccessAdapter):
         config,
         clarification_channel,
         *,
+        target_access=None,
+        target_materialization_id=None,
         cancel_event=None,
     ):
-        del workspace, clarification_channel
+        del workspace, clarification_channel, target_access
         self.started.set()
         while cancel_event is None or not cancel_event.is_set():
             time.sleep(0.005)
@@ -285,6 +332,7 @@ class _CancellableAdapter(_DiagnosticSuccessAdapter):
         return failure_submission(
             eval_input=eval_input,
             config=config,
+            target_materialization_id=target_materialization_id,
             code=FailureCode.PROCESS_KILLED,
             message="cancelled",
             retryable=False,
@@ -296,7 +344,7 @@ def _runner(tmp_path: Path, adapter: Any, **kwargs: Any) -> EvalRunner:
         ArtifactStore(tmp_path / ".eval-runs"),
         None,
         adapter,
-        workspace_factory=_workspace_factory(tmp_path / ".workspaces"),
+        materializer_factory=_materializer_factory(tmp_path / ".workspaces"),
         max_workers=kwargs.pop("max_workers", 1),
         **kwargs,
     )
@@ -449,7 +497,7 @@ def test_parallel_trials_reject_shared_adapter_before_run_creation(
     assert not (runner.artifact_store.root / config.run_id).exists()
 
 
-def test_pre_cancelled_run_commits_process_killed_without_creating_workspace(
+def test_pre_cancelled_run_remains_incomplete_without_creating_workspace(
     tmp_path: Path,
 ):
     snapshot = make_case_snapshot()
@@ -461,12 +509,13 @@ def test_pre_cancelled_run_commits_process_killed_without_creating_workspace(
 
     result = runner.run(config, snapshot, cancel_event=cancelled)
 
-    submission = result.trials[0].submission
-    assert result.status.value == "completed"
-    assert submission is not None
-    assert submission.status is SubmissionStatus.FAILED
-    assert submission.failure is not None
-    assert submission.failure.code is FailureCode.PROCESS_KILLED
+    trial = result.trials[0]
+    assert result.status.value == "incomplete"
+    assert trial.status.value == "incomplete"
+    assert trial.submission is None
+    assert trial.attempt == 1
+    assert trial.workspace_binding_id is None
+    assert trial.diagnostic == "cancelled before Trial invocation"
     assert adapter.run_calls == 0
     assert not (tmp_path / ".workspaces").exists()
 
@@ -601,12 +650,37 @@ def test_resume_adopts_orphan_submission_before_starting_a_new_attempt(tmp_path:
         config.run_id, plan.task_id, plan.trial_id
     )
     assert running.active_attempt == 1
+    eval_input = snapshot.eval_input(plan.task_id)
+    request = MaterializationRequest(
+        eval_input=eval_input,
+        trial_manifest=trial_manifest,
+        suite_case=config.suite.case(plan.task_id),
+        attempt=1,
+        wire_contract=config.wire_contract,
+        suite_preparation_binding=snapshot.manifest.source.preparation_binding,
+        suite_preparation_binding_digest=(
+            config.suite_preparation_binding_digest
+        ),
+        adapter_capabilities=config.adapter_capabilities,
+    )
+    materialized = _materializer_factory(tmp_path / ".workspaces")(request)
+    materialized.validate()
     runner.artifact_store.write_prepare_stage(
         config.run_id,
         plan.task_id,
         plan.trial_id,
-        snapshot.eval_input(plan.task_id),
+        eval_input,
+        materialized.manifest,
         attempt=1,
+    )
+    binding = AgentRunConfig.bind(
+        config,
+        eval_input,
+        trial_manifest.trial_index,
+    )
+    orphan_submission = _bound_completed_submission(
+        binding,
+        materialized.materialization_id,
     )
     base = "cases/%s/trials/%s" % (
         trial_manifest.case_path_id,
@@ -626,17 +700,28 @@ def test_resume_adopts_orphan_submission_before_starting_a_new_attempt(tmp_path:
     runner.artifact_store._write_json(
         config.run_id,
         "%s/submission.json" % base,
-        completed_submission(plan.trial_id),
+        orphan_submission,
     )
 
-    result = runner.run(config.run_id)
+    try:
+        result = runner.run(config.run_id)
+        materialized.validate()
+    finally:
+        state = runner.artifact_store.load_trial_state(
+            config.run_id,
+            plan.task_id,
+            plan.trial_id,
+        )
+        materialized.close(state.status)
 
     assert result.status.value == "completed"
     assert result.trials[0].skipped is True
     assert result.trials[0].attempt == 1
     assert result.trials[0].submission is not None
     assert result.trials[0].submission.status is SubmissionStatus.COMPLETED
+    assert result.trials[0].submission == orphan_submission
     assert adapter.run_calls == 0
+    assert materialized.closed is True
 
 
 def test_per_trial_adapter_factory_identity_drift_is_not_scored_as_agent_failure(
@@ -649,7 +734,7 @@ def test_per_trial_adapter_factory_identity_drift_is_not_scored_as_agent_failure
         ArtifactStore(tmp_path / ".eval-runs"),
         None,
         base_adapter,
-        workspace_factory=_workspace_factory(tmp_path / ".workspaces"),
+        materializer_factory=_materializer_factory(tmp_path / ".workspaces"),
         adapter_factory=_FactoryDriftAdapter,
     )
 
@@ -716,7 +801,7 @@ def test_adapter_factory_exception_is_a_harness_failure(tmp_path: Path):
         ArtifactStore(tmp_path / ".eval-runs"),
         None,
         base,
-        workspace_factory=_workspace_factory(tmp_path / ".workspaces"),
+        materializer_factory=_materializer_factory(tmp_path / ".workspaces"),
         adapter_factory=raising_factory,
     )
 

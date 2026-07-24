@@ -4,7 +4,15 @@ import json
 
 import pytest
 
+from review_agent_eval.evidence_checker import EvidenceIntegrity, EvidenceReasonCode
 from review_agent_eval.models import EvalInput, SchemaError, SubmissionEvidence
+
+from .test_frozen_evidence import (
+    FrozenHarness,
+    _checker,
+    _evidence,
+    frozen_harness,
+)
 
 
 BASE = "a" * 40
@@ -109,3 +117,16 @@ def test_evidence_source_kind_shape_mixing_is_rejected() -> None:
         SchemaError, match=r"evidence.source.*unknown field\(s\): command"
     ):
         SubmissionEvidence.from_dict(payload)
+
+
+def test_frozen_evidence_rejects_content_hash_drift(
+    frozen_harness: FrozenHarness,
+) -> None:
+    result = _checker(frozen_harness).check_item(
+        _evidence(frozen_harness, content_hash="0" * 64)
+    )
+
+    assert result.integrity is EvidenceIntegrity.INVALID
+    assert {item.reason_code for item in result.diagnostics} == {
+        EvidenceReasonCode.CONTENT_HASH_MISMATCH
+    }
