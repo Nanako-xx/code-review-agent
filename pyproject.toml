@@ -11,6 +11,7 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+eval-public = ["pyarrow>=14.0"]
 
 [project.scripts]
 review-agent = "review_agent.cli:main"

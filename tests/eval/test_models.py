@@ -50,33 +50,53 @@ HEAD = "b" * 40
 EMPTY_HASH = hashlib.sha256(b"").hexdigest()
 CI_TEXT = "tests passed"
 CI_HASH = hashlib.sha256(CI_TEXT.encode("utf-8")).hexdigest()
+MATERIALIZATION_ID = "materialization-001"
 
 
 def input_payload() -> dict:
     return {
-        "schema_version": "eval_input_v1",
+        "schema_version": "eval_input_v2",
         "task_id": "task-001",
-        "repository": {
-            "source": "fixture",
-            "path": "fixtures/auth-repo",
-            "url": None,
-            "base_revision": BASE,
-            "head_revision": HEAD,
+        "review_target": {
+            "kind": "repository",
+            "repository": {
+                "source": "fixture",
+                "path": "fixtures/auth-repo",
+                "url": None,
+                "base_revision": BASE,
+                "head_revision": HEAD,
+            },
+            "review_request": {
+                "title": "Review authorization change",
+                "description": None,
+                "user_intent": "Preserve admin-only access",
+                "review_focus": None,
+                "linked_requirements": ["REQ-7 must remain true"],
+                "project_rules": ["Do not weaken authorization"],
+                "existing_ci_evidence": [
+                    {
+                        "source_id": "ci-1",
+                        "text": CI_TEXT,
+                        "content_hash": CI_HASH,
+                    }
+                ],
+            },
         },
-        "review_request": {
-            "title": "Review authorization change",
-            "description": None,
-            "user_intent": "Preserve admin-only access",
-            "review_focus": None,
-            "linked_requirements": ["REQ-7 must remain true"],
-            "project_rules": ["Do not weaken authorization"],
-            "existing_ci_evidence": [
-                {
-                    "source_id": "ci-1",
-                    "text": CI_TEXT,
-                    "content_hash": CI_HASH,
-                }
-            ],
+    }
+
+
+def frozen_input_payload() -> dict:
+    return {
+        "schema_version": "eval_input_v2",
+        "task_id": "task-frozen",
+        "review_target": {
+            "kind": "frozen_context",
+            "bundle_id": "bundle-001",
+            "record_id": "record-001",
+            "context_format": "rendered_text",
+            "rendered_sha256": "e" * 64,
+            "rendered_utf8_bytes": 128,
+            "source_binding_digest": "f" * 64,
         },
     }
 
@@ -119,10 +139,12 @@ def review_payload() -> dict:
 
 def submission_payload() -> dict:
     return {
-        "schema_version": "eval_submission_v1",
+        "schema_version": "eval_submission_v2",
         "task_id": "task-001",
         "agent_id": "agent-current",
         "trial_id": "trial-001",
+        "eval_input_digest": EvalInput.from_dict(input_payload()).digest(),
+        "target_materialization_id": MATERIALIZATION_ID,
         "status": "completed",
         "intent": intent_payload(),
         "review": review_payload(),
@@ -153,7 +175,7 @@ def clarification_answer_payload(
 def case_payload() -> dict:
     raw_input = input_payload()
     return {
-        "schema_version": "eval_case_v1",
+        "schema_version": "eval_case_v2",
         "task_id": raw_input["task_id"],
         "case_version": 1,
         "source": {
@@ -165,10 +187,7 @@ def case_payload() -> dict:
             "license": None,
             "content_hash": "c" * 64,
         },
-        "input": {
-            "repository": raw_input["repository"],
-            "review_request": raw_input["review_request"],
-        },
+        "input": {"review_target": raw_input["review_target"]},
         "clarification_script": {
             "max_rounds": 2,
             "answers": [clarification_answer_payload()],
@@ -204,6 +223,12 @@ def case_payload() -> dict:
                     "severity": "high",
                     "category": "security",
                     "required": True,
+                    "metric_authority": {
+                        "severity_scorable": True,
+                        "severity_authority": "expert_annotation",
+                        "location_scorable": True,
+                        "location_authority": "expert_annotation",
+                    },
                     "locations": [
                         {
                             "path": "app/auth.py",
@@ -239,6 +264,56 @@ def case_payload() -> dict:
                 }
             ],
         },
+        "review_evaluator_context": {"truth_contexts": []},
+    }
+
+
+def evidence_source_payload(kind: str) -> dict:
+    common = {
+        "kind": kind,
+        "target_materialization_id": MATERIALIZATION_ID,
+    }
+    if kind == "repository_file":
+        return dict(
+            common,
+            revision="HEAD",
+            path="../not-authorized.py",
+            from_line=9,
+            to_line=3,
+        )
+    if kind == "repository_diff":
+        return dict(
+            common,
+            base_revision="BASE",
+            head_revision="HEAD",
+            path="../not-authorized.py",
+        )
+    if kind == "frozen_context":
+        return dict(common, context_ref="context-001", from_line=9, to_line=3)
+    if kind == "command_output":
+        return dict(
+            common,
+            command=["tool", "--flag"],
+            exit_code=7,
+            stream="stderr",
+            artifact_ref="artifact-001",
+        )
+    if kind == "external_record":
+        return dict(common, source_ref="dangling-attestation")
+    raise AssertionError("unknown test evidence kind")
+
+
+def evaluator_source_payload(content: str = "@@ -1 +1 @@\n-old\n+new") -> dict:
+    return {
+        "kind": "diff_hunk",
+        "content": content,
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "provenance": {
+            "source_role": "annotations",
+            "source_file_sha256": "1" * 64,
+            "record_pointer": "/records/0/comments/0",
+            "record_sha256": "2" * 64,
+        },
     }
 
 
@@ -268,7 +343,7 @@ def exchange_payload(
     }
 
 
-def test_eval_enums_are_owned_by_eval_and_have_frozen_v1_values() -> None:
+def test_eval_enums_are_owned_by_eval_and_have_frozen_v2_values() -> None:
     assert {item.value for item in TrialStatus} == {
         "pending",
         "running",
@@ -294,7 +369,29 @@ def test_eval_enums_are_owned_by_eval_and_have_frozen_v1_values() -> None:
         "clarification_required",
         "agent_blocked",
         "adapter_error",
+        "harness_materialization_error",
         "unknown",
+    }
+    assert {item.value for item in eval_models.ReviewTargetKind} == {
+        "repository",
+        "frozen_context",
+    }
+    assert {item.value for item in EvidenceKind} == {
+        "repository_file",
+        "repository_diff",
+        "frozen_context",
+        "command_output",
+        "external_record",
+    }
+    assert {item.value for item in eval_models.MetricAuthoritySource} == {
+        "expert_annotation",
+        "upstream_annotation",
+    }
+    assert {item.value for item in eval_models.EvaluatorContextTask} == {
+        "finding_equivalence"
+    }
+    assert {item.value for item in eval_models.EvaluatorContextSourceKind} == {
+        "diff_hunk"
     }
     assert {item.value for item in IntentDimension} == {
         "goal",
@@ -353,15 +450,139 @@ def test_eval_input_round_trips_as_deeply_immutable_tuples_without_private_scrip
     model = EvalInput.from_dict(input_payload())
 
     assert model.to_dict() == input_payload()
-    assert isinstance(model.review_request.linked_requirements, tuple)
-    assert isinstance(model.review_request.existing_ci_evidence, tuple)
+    assert isinstance(model.review_target.review_request.linked_requirements, tuple)
+    assert isinstance(model.review_target.review_request.existing_ci_evidence, tuple)
     assert not hasattr(model, "clarification_script")
     assert "clarification_script" not in model.to_dict()
     assert "clarification_policy" not in canonical_json(model)
     with pytest.raises(FrozenInstanceError):
         model.task_id = "changed"  # type: ignore[misc]
     with pytest.raises(AttributeError):
-        model.review_request.linked_requirements.append("mutate")  # type: ignore[attr-defined]
+        model.review_target.review_request.linked_requirements.append("mutate")  # type: ignore[attr-defined]
+
+
+def test_repository_and_frozen_review_targets_round_trip_without_inline_content() -> None:
+    repository_input = EvalInput.from_dict(input_payload())
+    frozen_input = EvalInput.from_dict(frozen_input_payload())
+
+    assert (
+        repository_input.review_target.kind
+        is eval_models.ReviewTargetKind.REPOSITORY
+    )
+    assert (
+        frozen_input.review_target.kind
+        is eval_models.ReviewTargetKind.FROZEN_CONTEXT
+    )
+    assert frozen_input.to_dict() == frozen_input_payload()
+    assert "rendered" not in frozen_input.to_dict()["review_target"]
+
+
+def test_metric_authority_accepts_only_authorized_severity_and_location_shapes() -> None:
+    unscorable = case_payload()
+    finding = unscorable["review_truth"]["expected_findings"][0]
+    finding["severity"] = None
+    finding["metric_authority"] = {
+        "severity_scorable": False,
+        "severity_authority": None,
+        "location_scorable": False,
+        "location_authority": None,
+    }
+    assert EvalCase.from_dict(unscorable).to_dict() == unscorable
+
+    invalid_cases = []
+
+    missing_severity = case_payload()
+    missing_severity["review_truth"]["expected_findings"][0]["severity"] = None
+    invalid_cases.append(missing_severity)
+
+    unauthorized_severity = case_payload()
+    unauthorized_severity["review_truth"]["expected_findings"][0][
+        "metric_authority"
+    ].update(severity_scorable=False, severity_authority=None)
+    invalid_cases.append(unauthorized_severity)
+
+    missing_severity_authority = case_payload()
+    missing_severity_authority["review_truth"]["expected_findings"][0][
+        "metric_authority"
+    ]["severity_authority"] = None
+    invalid_cases.append(missing_severity_authority)
+
+    incomplete_location = case_payload()
+    incomplete_location["review_truth"]["expected_findings"][0]["locations"][0].update(
+        from_line=None, to_line=None
+    )
+    invalid_cases.append(incomplete_location)
+
+    unauthorized_location = case_payload()
+    unauthorized_location["review_truth"]["expected_findings"][0][
+        "metric_authority"
+    ]["location_scorable"] = False
+    invalid_cases.append(unauthorized_location)
+
+    for payload in invalid_cases:
+        with pytest.raises(SchemaError):
+            EvalCase.from_dict(payload)
+
+
+def test_evaluator_context_hash_provenance_and_truth_references_are_strict() -> None:
+    payload = case_payload()
+    payload["review_evaluator_context"]["truth_contexts"] = [
+        {
+            "truth_id": "invalid-1",
+            "allowed_tasks": ["finding_equivalence"],
+            "sources": [evaluator_source_payload("known invalid context")],
+        },
+        {
+            "truth_id": "issue-1",
+            "allowed_tasks": ["finding_equivalence"],
+            "sources": [evaluator_source_payload()],
+        },
+    ]
+
+    case = EvalCase.from_dict(payload)
+
+    assert [
+        item.truth_id for item in case.review_evaluator_context.truth_contexts
+    ] == ["invalid-1", "issue-1"]
+    assert case.to_dict() == payload
+
+    bad_hash = case_payload()
+    bad_hash["review_evaluator_context"]["truth_contexts"] = [
+        {
+            "truth_id": "issue-1",
+            "allowed_tasks": ["finding_equivalence"],
+            "sources": [evaluator_source_payload()],
+        }
+    ]
+    bad_hash["review_evaluator_context"]["truth_contexts"][0]["sources"][0][
+        "content_sha256"
+    ] = "0" * 64
+
+    orphan = case_payload()
+    orphan["review_evaluator_context"]["truth_contexts"] = [
+        {
+            "truth_id": "outside-case",
+            "allowed_tasks": ["finding_equivalence"],
+            "sources": [],
+        }
+    ]
+
+    duplicate = case_payload()
+    context = {
+        "truth_id": "issue-1",
+        "allowed_tasks": ["finding_equivalence"],
+        "sources": [],
+    }
+    duplicate["review_evaluator_context"]["truth_contexts"] = [context, dict(context)]
+
+    empty_tasks = case_payload()
+    empty_tasks["review_evaluator_context"]["truth_contexts"] = [
+        {"truth_id": "issue-1", "allowed_tasks": [], "sources": []}
+    ]
+
+    for invalid in (bad_hash, orphan, duplicate, empty_tasks):
+        with pytest.raises(SchemaError):
+            EvalCase.from_dict(invalid)
 
 
 def test_eval_case_keeps_truth_and_clarification_private_from_agent_input() -> None:
@@ -392,6 +613,7 @@ def test_eval_case_constructor_requires_the_canonical_private_input_type() -> No
             clarification_script=case.clarification_script,
             intent_truth=case.intent_truth,
             review_truth=case.review_truth,
+            review_evaluator_context=case.review_evaluator_context,
         )
 
 
@@ -410,6 +632,16 @@ def test_eval_case_constructor_requires_the_canonical_private_input_type() -> No
             {"code": "adapter_error", "message": "Adapter failed", "retryable": False},
             intent_payload(),
             review_payload(),
+        ),
+        (
+            "failed",
+            {
+                "code": "harness_materialization_error",
+                "message": "Target materialization failed",
+                "retryable": False,
+            },
+            None,
+            None,
         ),
         (
             "blocked",
@@ -475,6 +707,16 @@ def test_all_terminal_submission_forms_round_trip(
             "failed",
             {"code": "invalid_json", "message": "Bad JSON", "retryable": False},
             None,
+            None,
+        ),
+        (
+            "failed",
+            {
+                "code": "harness_materialization_error",
+                "message": "Target materialization failed",
+                "retryable": False,
+            },
+            intent_payload(),
             None,
         ),
         (
@@ -570,15 +812,7 @@ def test_typed_evidence_preserves_scorable_bad_revision_path_and_coordinates() -
         evidence_items.append(
             {
                 "evidence_id": "evidence-%d" % index,
-                "kind": kind.value,
-                "revision": "HEAD",
-                "path": "../not-authorized.py",
-                "from_line": 9,
-                "to_line": 3,
-                "command": ["tool", "--flag"],
-                "exit_code": 7,
-                "stream": "stderr",
-                "source_ref": "dangling-attestation",
+                "source": evidence_source_payload(kind.value),
                 "content_hash": EMPTY_HASH,
                 "excerpt": "",
             }
@@ -588,10 +822,15 @@ def test_typed_evidence_preserves_scorable_bad_revision_path_and_coordinates() -
 
     submission = EvalSubmission.from_dict(payload)
 
-    assert {item.kind for item in submission.evidence} == set(EvidenceKind)
-    assert all(item.revision == "HEAD" for item in submission.evidence)
-    assert all(item.path == "../not-authorized.py" for item in submission.evidence)
-    assert all(item.from_line == 9 and item.to_line == 3 for item in submission.evidence)
+    assert {item.source.kind for item in submission.evidence} == set(EvidenceKind)
+    repository_file = next(
+        item.source
+        for item in submission.evidence
+        if item.source.kind is EvidenceKind.REPOSITORY_FILE
+    )
+    assert repository_file.revision == "HEAD"
+    assert repository_file.path == "../not-authorized.py"
+    assert repository_file.from_line == 9 and repository_file.to_line == 3
     assert submission.to_dict()["evidence"] == evidence_items
 
 
@@ -773,10 +1012,32 @@ def test_canonical_json_and_full_sha256_ids_are_stable_and_json_ready_only() -> 
     assert canonical_json(value) == expected
     assert canonical_sha256(value) == hashlib.sha256(expected.encode("utf-8")).hexdigest()
 
-    derived = stable_id("finding", "eval_submission_v1", {"claim": "x"})
+    derived = stable_id("finding", "eval_submission_v2", {"claim": "x"})
+    assert derived == (
+        "finding-01f0a36e533b474486b4f7eab76f4db9"
+        "10c7cb73be7599d69f1f4b182671fd9b"
+    )
+    v1_payload = {
+        "namespace": "review_agent_eval.identity_v1",
+        "kind": "finding",
+        "identity": ["eval_submission_v2", {"claim": "x"}],
+    }
+    v1_vector = "finding-" + hashlib.sha256(
+        json.dumps(
+            v1_payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert v1_vector == (
+        "finding-0e0ccba55dc4a108d45f4d944a20f3c0"
+        "7df22fee0c45884e8206a52d929c609d"
+    )
     assert re.fullmatch(r"finding-[0-9a-f]{64}", derived)
-    assert derived == stable_id("finding", "eval_submission_v1", {"claim": "x"})
-    assert derived != stable_id("finding", "eval_submission_v1", {"claim": "y"})
+    assert derived != v1_vector
+    assert derived != stable_id("finding", "eval_submission_v2", {"claim": "y"})
 
     with pytest.raises(SchemaError):
         canonical_json(Path("not-json"))
@@ -803,4 +1064,4 @@ def test_enum_leaf_types_are_materialized_for_case_and_submission() -> None:
     assert submission.intent is not None
     assert submission.intent.status is IntentResult.SUFFICIENT
     assert submission.review is not None
-    assert case.input.repository.source is RepositorySource.FIXTURE
+    assert case.input.review_target.repository.source is RepositorySource.FIXTURE

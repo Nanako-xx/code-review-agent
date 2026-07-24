@@ -37,6 +37,7 @@ from review_agent_eval.report import (
 from review_agent_eval.metrics_exports import METRICS_PUBLIC_NAMES
 from review_agent_eval.report_exports import REPORT_PUBLIC_NAMES
 from tests.eval.test_metrics import (
+    TARGET_MATERIALIZATION_ID,
     _failed_submission,
     _case_and_snapshot,
     _completed_submission,
@@ -259,6 +260,18 @@ def test_markdown_is_pure_deterministic_and_shows_metric_coverage() -> None:
     assert "Coverage" in first
     assert "failure_as_miss_count" in first
     assert "missing_count" in first
+    assert "Target kind" in first
+    assert "Wire contract digest" in first
+    assert "Adapter capabilities digest" in first
+    assert "Isolation profile" in first
+    assert "Metric authority profile" in first
+    assert "Metric authority policy digest" in first
+    assert "Authority coverage" in first
+    assert "location_precision_excluded_truth_count" in first
+    partition = summary.partitions[0]
+    assert partition["authority_coverage"] == partition["aggregate_score"][
+        "authority_coverage"
+    ]
     assert "Critical/high required misses" in first
     assert "overall_score" not in first.lower()
     assert "overall score" not in first.lower()
@@ -291,6 +304,7 @@ def test_failed_partial_evaluation_is_scored_per_phase_not_dropped() -> None:
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     ).evaluate(submission, case.review_truth)
     score = TrialScorer().score(
@@ -494,6 +508,7 @@ def test_inspection_redacts_non_opaque_trace_refs(trace_ref) -> None:
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     ).evaluate(submission, case.review_truth)
     score = TrialScorer().score(
@@ -687,9 +702,16 @@ def test_incompatible_case_scores_are_partitioned_without_cross_rollup() -> None
         )
     manifest = SuiteManifest.from_dict(
         {
-            "schema_version": "suite_manifest_v1",
+            "schema_version": "suite_manifest_v2",
             "suite_id": "metrics-suite",
             "suite_version": "v1",
+            "wire_contract": {
+                "case_schema_version": "eval_case_v2",
+                "input_schema_version": "eval_input_v2",
+                "submission_schema_version": "eval_submission_v2",
+                "review_target_kind": "repository",
+                "materializer_protocol": "repository-materializer-v2",
+            },
             "source": {
                 "kind": "core",
                 "source_id": "metrics-partition-source",
@@ -697,6 +719,7 @@ def test_incompatible_case_scores_are_partitioned_without_cross_rollup() -> None
                 "source_uri": None,
                 "license": None,
                 "content_hash": "6" * 64,
+                "preparation_binding": None,
             },
             "cases": records,
         }
@@ -722,6 +745,7 @@ def test_incompatible_case_scores_are_partitioned_without_cross_rollup() -> None
         replace(
             base_submission,
             task_id=second_case.task_id,
+            eval_input_digest=second_case.eval_input().digest(),
             trial_id=config.trial_id(second_case.task_id, 1),
         ),
     )
@@ -736,6 +760,7 @@ def test_incompatible_case_scores_are_partitioned_without_cross_rollup() -> None
             eval_input=case.eval_input(),
             replay=replay,
             trial_id=submission.trial_id,
+            target_materialization_id=TARGET_MATERIALIZATION_ID,
             evaluator_execution=execution,
         ).evaluate(submission, case.review_truth)
         score = TrialScorer().score(
@@ -802,6 +827,7 @@ def test_novel_disallowed_is_separate_from_fabricated_diagnostics() -> None:
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     )
     pending = evaluator.evaluate(submission, case.review_truth)
@@ -871,6 +897,7 @@ def test_pending_evaluator_work_is_visible_and_not_agent_failure() -> None:
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     ).evaluate(submission, case.review_truth)
     source = TrialEvaluationSource(

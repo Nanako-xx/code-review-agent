@@ -427,22 +427,42 @@ def _safe_eval_input_projection(value: Any) -> Dict[str, Any]:
 
 def _safe_intent_evaluation_projection(value: IntentEvaluationResult) -> Dict[str, Any]:
     digest = value.digest()
-    return _redacted_artifact_projection(
+    source = value.to_dict()
+    for field in (
+        "judge_requests",
+        "judge_decisions",
+        "judge_failures",
+        "judge_ungraded",
+    ):
+        source.pop(field, None)
+    projection = _redacted_artifact_projection(
         artifact_kind="intent_evaluation",
-        source_payload=value.to_dict(),
+        source_payload=source,
         source_digest=digest,
         source_id="intent-evaluation-" + digest,
     )
+    projection["redactions"].append("judge_payloads:judge_artifact_refs")
+    return projection
 
 
 def _safe_review_evaluation_projection(value: ReviewEvaluationResult) -> Dict[str, Any]:
     digest = value.digest()
-    return _redacted_artifact_projection(
+    source = value.to_dict()
+    for field in (
+        "judge_requests",
+        "judge_decisions",
+        "judge_failures",
+        "judge_ungraded",
+    ):
+        source.pop(field, None)
+    projection = _redacted_artifact_projection(
         artifact_kind="review_evaluation",
-        source_payload=value.to_dict(),
+        source_payload=source,
         source_digest=digest,
         source_id="review-evaluation-" + digest,
     )
+    projection["redactions"].append("judge_payloads:judge_artifact_refs")
+    return projection
 
 
 def _timeline_projection(values: Sequence[Any]) -> list[Dict[str, Any]]:
@@ -1685,6 +1705,7 @@ class ReportBuilder:
                     "partition_id": partition_id,
                     "compatibility_digest": compatibility_digest,
                     "compatibility": aggregate.compatibility.to_dict(),
+                    "authority_coverage": aggregate.authority_coverage.to_dict(),
                     "aggregate_score": aggregate.to_dict(),
                     "case_scores": [item.to_dict() for item in cases],
                     "groupings": groupings,
@@ -2430,6 +2451,15 @@ class ReportBuilder:
                     case_path_id=case_path_id,
                     canonical_case_digest=case_digest,
                     eval_input_digest=input_digest,
+                    wire_contract=run_config.wire_contract,
+                    target_kind=run_config.wire_contract.review_target_kind,
+                    materializer_protocol=run_config.materializer_protocol,
+                    suite_preparation_binding_digest=(
+                        run_config.suite_preparation_binding_digest
+                    ),
+                    adapter_capabilities_digest=(
+                        run_config.adapter_capabilities_digest
+                    ),
                     trial_id=plan.trial_id,
                     trial_index=trial_index,
                     seed=derive_trial_seed(
@@ -2930,9 +2960,19 @@ def render_run_markdown(summary: RunReportSummary) -> str:
                 [
                     f"### Partition {index}: `{partition.get('partition_id')}`",
                     "",
+                    f"- Target kind: `{compatibility.get('target_kind')}`",
+                    f"- Wire contract digest: `{compatibility.get('wire_contract_digest')}`",
+                    f"- Wire contract: `{canonical_json(compatibility.get('wire_contract'))}`",
+                    f"- Adapter capabilities digest: `{compatibility.get('adapter_capabilities_digest')}`",
+                    f"- Isolation profile: `{compatibility.get('isolation_profile')}`",
                     f"- Truth completeness: `{compatibility.get('truth_completeness')}`",
                     f"- Protocol: `{compatibility.get('protocol_id')}`",
                     f"- Novel Finding policy: `{compatibility.get('novel_finding_policy')}`",
+                    f"- Metric authority profile digest: `{compatibility.get('metric_authority_profile_digest')}`",
+                    f"- Metric authority profile: `{canonical_json(compatibility.get('metric_authority_profile'))}`",
+                    f"- Metric authority policy version: `{compatibility.get('metric_authority_policy_version')}`",
+                    f"- Metric authority policy digest: `{compatibility.get('metric_authority_policy_digest')}`",
+                    f"- Authority coverage: `{canonical_json(partition.get('authority_coverage'))}`",
                     "",
                 ]
             )

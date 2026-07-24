@@ -35,25 +35,49 @@ __all__ = [
     "AgentAdapterConfigError",
     "AgentAdapterFactory",
     "CURRENT_AGENT_ADAPTER_KIND",
+    "CURRENT_AGENT_ADAPTER_VERSION",
     "SnapshotAgentAdapterFactory",
+    "adapter_capabilities_from_snapshot",
     "build_agent_adapter",
     "build_agent_adapter_factory",
     "build_agent_adapter_from_snapshot",
     "SUBPROCESS_JSON_ADAPTER_KIND",
+    "SUBPROCESS_JSON_ADAPTER_VERSION",
+    "SUBPROCESS_INVOCATION_SCHEMA_VERSION",
+    "SUBPROCESS_WIRE_VERSION",
     "SubprocessAgentAdapter",
+    "current_agent_capabilities",
+    "subprocess_adapter_capabilities",
 ]
 
 
 def __getattr__(name: str) -> Any:
-    if name in {"SUBPROCESS_JSON_ADAPTER_KIND", "SubprocessAgentAdapter"}:
+    if name in {
+        "SUBPROCESS_JSON_ADAPTER_KIND",
+        "SUBPROCESS_JSON_ADAPTER_VERSION",
+        "SUBPROCESS_INVOCATION_SCHEMA_VERSION",
+        "SUBPROCESS_WIRE_VERSION",
+        "SubprocessAgentAdapter",
+        "subprocess_adapter_capabilities",
+    }:
         from .subprocess_agent import (
             SUBPROCESS_JSON_ADAPTER_KIND,
+            SUBPROCESS_JSON_ADAPTER_VERSION,
+            SUBPROCESS_INVOCATION_SCHEMA_VERSION,
+            SUBPROCESS_WIRE_VERSION,
             SubprocessAgentAdapter,
+            subprocess_adapter_capabilities,
         )
 
         value = {
             "SUBPROCESS_JSON_ADAPTER_KIND": SUBPROCESS_JSON_ADAPTER_KIND,
+            "SUBPROCESS_JSON_ADAPTER_VERSION": SUBPROCESS_JSON_ADAPTER_VERSION,
+            "SUBPROCESS_INVOCATION_SCHEMA_VERSION": (
+                SUBPROCESS_INVOCATION_SCHEMA_VERSION
+            ),
+            "SUBPROCESS_WIRE_VERSION": SUBPROCESS_WIRE_VERSION,
             "SubprocessAgentAdapter": SubprocessAgentAdapter,
+            "subprocess_adapter_capabilities": subprocess_adapter_capabilities,
         }[name]
         globals()[name] = value
         return value
@@ -80,7 +104,9 @@ def __getattr__(name: str) -> Any:
         "AgentAdapterConfigError",
         "AgentAdapterFactory",
         "CURRENT_AGENT_ADAPTER_KIND",
+        "CURRENT_AGENT_ADAPTER_VERSION",
         "SnapshotAgentAdapterFactory",
+        "adapter_capabilities_from_snapshot",
         "build_agent_adapter",
         "build_agent_adapter_factory",
         "build_agent_adapter_from_snapshot",
@@ -90,4 +116,9 @@ def __getattr__(name: str) -> Any:
         value = getattr(factory, name)
         globals()[name] = value
         return value
+    if name == "current_agent_capabilities":
+        from .current_agent import current_agent_capabilities
+
+        globals()[name] = current_agent_capabilities
+        return current_agent_capabilities
     raise AttributeError(name)

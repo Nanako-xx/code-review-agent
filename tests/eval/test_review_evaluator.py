@@ -7,7 +7,7 @@ from typing import Iterator
 
 import pytest
 
-from tests.eval.test_evidence_checker import _build_harness
+from tests.eval.test_evidence_checker import TARGET_MATERIALIZATION_ID, _build_harness
 from tests.eval.test_evidence_checker import _file_evidence
 from tests.eval.test_judge import _Factory, _execution
 from review_agent.model_protocol import ModelResponseKind, ModelTurnResponse
@@ -28,6 +28,8 @@ from review_agent_eval.models import (
     IntentResult,
     IssueJudgement,
     KnownInvalidFinding,
+    MetricAuthority,
+    MetricAuthoritySource,
     RequiredContextLevel,
     ReviewTruth,
     SubmissionFinding,
@@ -37,12 +39,14 @@ from review_agent_eval.models import (
     SubmissionUsage,
     SubmissionEvidence,
     TruthCompleteness,
+    TruthLocation,
     NovelFindingPolicy,
 )
 from review_agent_eval.review_evaluator import (
     FindingDisposition,
     FindingResolution,
     ReviewEvaluationPhase,
+    ReviewCandidateRecord,
     ReviewEvaluationResult,
     ReviewEvaluationStatus,
     ReviewEvaluator,
@@ -51,6 +55,26 @@ from review_agent_eval.review_evaluator import (
     ReviewPairContextEntry,
     ReviewTruthKind,
 )
+
+
+def _core_authority() -> MetricAuthority:
+    return MetricAuthority(
+        severity_scorable=True,
+        severity_authority=MetricAuthoritySource.EXPERT_ANNOTATION,
+        location_scorable=True,
+        location_authority=MetricAuthoritySource.EXPERT_ANNOTATION,
+    )
+
+
+def _core_location() -> tuple[TruthLocation, ...]:
+    return (
+        TruthLocation(
+            path="src/app.py",
+            side=DiffSide.RIGHT,
+            from_line=1,
+            to_line=1,
+        ),
+    )
 
 
 @pytest.fixture
@@ -92,7 +116,8 @@ def _truth(truth_id: str, claim: str) -> ReviewTruth:
                 severity=FindingSeverity.HIGH,
                 category="correctness",
                 required=True,
-                locations=(),
+                metric_authority=_core_authority(),
+                locations=_core_location(),
                 evidence_anchors=(),
                 required_context_level=RequiredContextLevel.DIFF,
                 rationale="The changed code can lose an error condition.",
@@ -114,6 +139,8 @@ def _submission(
         task_id=harness.eval_input.task_id,
         agent_id="agent-test",
         trial_id="trial-review-evaluator",
+        eval_input_digest=harness.eval_input.digest(),
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         status=SubmissionStatus.COMPLETED,
         intent=SubmissionIntent(
             status=IntentResult.SUFFICIENT,
@@ -146,6 +173,7 @@ def _evaluator(harness: object) -> ReviewEvaluator:
         eval_input=harness.eval_input,
         replay=harness.replay,
         trial_id="trial-review-evaluator",
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=_execution(),
     )
 
@@ -172,6 +200,33 @@ def test_exact_expected_finding_is_assigned_without_a_model_call(harness: object
     assert outcome.matched_expected_truth_id == "truth-exact"
 
 
+def test_exact_match_omits_unscorable_missing_truth_severity(
+    harness: object,
+) -> None:
+    evaluator = _evaluator(harness)
+    finding = _finding(
+        "finding-no-severity",
+        "The changed branch can return the wrong result.",
+    )
+    truth = _truth("truth-no-severity", finding.claim)
+    expected = replace(
+        truth.expected_findings[0],
+        severity=None,
+        metric_authority=MetricAuthority(
+            severity_scorable=False,
+            severity_authority=None,
+            location_scorable=True,
+            location_authority=MetricAuthoritySource.EXPERT_ANNOTATION,
+        ),
+    )
+    truth = replace(truth, expected_findings=(expected,))
+
+    result = evaluator.evaluate(_submission(harness, finding), truth)
+
+    assert result.expected_candidates[0].severity_assessment is None
+    assert result.finding_outcomes[0].severity_assessment is None
+
+
 def test_non_exact_expected_pair_emits_a_typed_pending_request(harness: object) -> None:
     evaluator = _evaluator(harness)
     submission = _submission(
@@ -189,6 +244,71 @@ def test_non_exact_expected_pair_emits_a_typed_pending_request(harness: object) 
     assert result.judge_requests[0].finding_id == "finding-pending"
     assert result.finding_outcomes[0].issue_resolution is FindingResolution.PENDING_JUDGE
     assert result.finding_outcomes[0].disposition is FindingDisposition.UNGRADED
+
+
+def test_pending_semantic_candidate_rejects_forged_severity_assessment(
+    harness: object,
+) -> None:
+    evaluator = _evaluator(harness)
+    finding = _finding("finding-pending-wire", "A different defect description.")
+    pending = evaluator.evaluate(
+        _submission(harness, finding),
+        _truth("truth-pending-wire", "The changed branch returns a wrong value."),
+    )
+    forged = pending.expected_candidates[0].to_dict()
+    assert forged["relation"] is None
+    forged["severity_assessment"] = "consistent"
+
+    with pytest.raises(ValueError, match="unresolved semantic"):
+        ReviewCandidateRecord.from_dict(forged)
+
+
+def test_semantic_match_discards_unscorable_judge_severity_assessment(
+    harness: object,
+) -> None:
+    evaluator = _evaluator(harness)
+    finding = _finding(
+        "finding-semantic-no-severity",
+        "A different description of the same defect.",
+    )
+    truth = _truth(
+        "truth-semantic-no-severity",
+        "The changed branch can return the wrong result.",
+    )
+    expected = replace(
+        truth.expected_findings[0],
+        severity=None,
+        metric_authority=MetricAuthority(
+            severity_scorable=False,
+            severity_authority=None,
+            location_scorable=True,
+            location_authority=MetricAuthoritySource.EXPERT_ANNOTATION,
+        ),
+    )
+    truth = replace(truth, expected_findings=(expected,))
+
+    pending = evaluator.evaluate(_submission(harness, finding), truth)
+
+    assert pending.judge_requests[0].request.items[1].metadata["severity"] is None
+    typed = _run_scripted_judge(
+        pending.judge_requests[0],
+        evaluator.evaluator_execution,
+        relation="equivalent",
+        score_ppm=900_000,
+        severity_assessment="overstated",
+        actionability="actionable",
+    )
+    result = evaluator.evaluate(
+        _submission(harness, finding),
+        truth,
+        judge_results=(typed,),
+    )
+
+    candidate = result.expected_candidates[0]
+    assert candidate.relation.value == "equivalent"
+    assert candidate.edge_weight == result.assignments[0].weight
+    assert candidate.severity_assessment is None
+    assert result.finding_outcomes[0].severity_assessment is None
 
 
 def test_review_evaluation_round_trip_replays_against_bound_inputs(harness: object) -> None:
@@ -265,7 +385,8 @@ def test_known_invalid_has_precedence_over_expected_assignment(harness: object) 
                 severity=FindingSeverity.HIGH,
                 category="correctness",
                 required=True,
-                locations=(),
+                metric_authority=_core_authority(),
+                locations=_core_location(),
                 evidence_anchors=(),
                 required_context_level=RequiredContextLevel.DIFF,
                 rationale="expected",
@@ -391,6 +512,7 @@ def test_scoped_context_is_bound_to_the_finding_judge_request(harness: object) -
         eval_input=harness.eval_input,
         replay=harness.replay,
         trial_id="trial-review-evaluator",
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=_execution(),
         context_bundle=context,
     )

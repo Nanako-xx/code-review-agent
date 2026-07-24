@@ -14,7 +14,10 @@ from typing import (
     runtime_checkable,
 )
 
+from ..artifacts import TargetAccess
+from ..cases import WireContractV2
 from ..config import (
+    AdapterCapabilitiesV2,
     AgentConfigSnapshot,
     ClarificationMatcherSnapshot,
     EvalRunConfig,
@@ -26,6 +29,7 @@ from ..models import (
     EvalInput,
     EvalSubmission,
     FailureCode,
+    ReviewTargetKind,
     SchemaError,
     _digest,
     _identifier,
@@ -50,6 +54,9 @@ class AgentRunConfig:
     run_id: str
     task_id: str
     eval_input_digest: str
+    wire_contract: WireContractV2
+    adapter_capabilities: AdapterCapabilitiesV2
+    adapter_capabilities_digest: str
     clarification_matcher: ClarificationMatcherSnapshot
     clarification_matcher_config_digest: str
     trial_index: int
@@ -63,6 +70,9 @@ class AgentRunConfig:
         run_id: str,
         task_id: str,
         eval_input_digest: str,
+        wire_contract: WireContractV2,
+        adapter_capabilities: AdapterCapabilitiesV2,
+        adapter_capabilities_digest: str,
         clarification_matcher: ClarificationMatcherSnapshot,
         clarification_matcher_config_digest: str,
         trial_index: int,
@@ -78,6 +88,13 @@ class AgentRunConfig:
         object.__setattr__(self, "run_id", run_id)
         object.__setattr__(self, "task_id", task_id)
         object.__setattr__(self, "eval_input_digest", eval_input_digest)
+        object.__setattr__(self, "wire_contract", wire_contract)
+        object.__setattr__(self, "adapter_capabilities", adapter_capabilities)
+        object.__setattr__(
+            self,
+            "adapter_capabilities_digest",
+            adapter_capabilities_digest,
+        )
         object.__setattr__(self, "clarification_matcher", clarification_matcher)
         object.__setattr__(
             self,
@@ -94,6 +111,31 @@ class AgentRunConfig:
         validate_run_id(self.run_id)
         _identifier(self.task_id, "agent run config.task_id")
         _digest(self.eval_input_digest, "agent run config.eval_input_digest")
+        if not isinstance(self.wire_contract, WireContractV2):
+            raise SchemaError(
+                "agent run config.wire_contract must be WireContractV2"
+            )
+        if not isinstance(self.adapter_capabilities, AdapterCapabilitiesV2):
+            raise SchemaError(
+                "agent run config.adapter_capabilities must be AdapterCapabilitiesV2"
+            )
+        _digest(
+            self.adapter_capabilities_digest,
+            "agent run config.adapter_capabilities_digest",
+        )
+        if self.adapter_capabilities_digest != self.adapter_capabilities.digest():
+            raise SchemaError(
+                "agent run config adapter capability digest drifted"
+            )
+        if (
+            self.adapter_capabilities.input_schema_version
+            != self.wire_contract.input_schema_version
+            or self.adapter_capabilities.submission_schema_version
+            != self.wire_contract.submission_schema_version
+        ):
+            raise SchemaError(
+                "agent run config adapter capabilities do not match wire contract"
+            )
         if not isinstance(
             self.clarification_matcher,
             ClarificationMatcherSnapshot,
@@ -148,6 +190,11 @@ class AgentRunConfig:
             run_id=run_config.run_id,
             task_id=eval_input.task_id,
             eval_input_digest=eval_input.digest(),
+            wire_contract=run_config.wire_contract,
+            adapter_capabilities=run_config.adapter_capabilities,
+            adapter_capabilities_digest=(
+                run_config.adapter_capabilities_digest
+            ),
             clarification_matcher=run_config.clarification_matcher,
             clarification_matcher_config_digest=(
                 run_config.clarification_matcher_config_digest
@@ -165,6 +212,9 @@ class AgentRunConfig:
         run_id: str,
         task_id: str,
         eval_input_digest: str,
+        wire_contract: WireContractV2,
+        adapter_capabilities: AdapterCapabilitiesV2,
+        adapter_capabilities_digest: str,
         clarification_matcher: ClarificationMatcherSnapshot,
         clarification_matcher_config_digest: str,
         trial_index: int,
@@ -178,6 +228,9 @@ class AgentRunConfig:
             run_id=run_id,
             task_id=task_id,
             eval_input_digest=eval_input_digest,
+            wire_contract=wire_contract,
+            adapter_capabilities=adapter_capabilities,
+            adapter_capabilities_digest=adapter_capabilities_digest,
             clarification_matcher=clarification_matcher,
             clarification_matcher_config_digest=(
                 clarification_matcher_config_digest
@@ -204,6 +257,10 @@ class AgentRunConfig:
     @property
     def max_trace_bytes(self) -> int:
         return self.budgets.max_trace_bytes
+
+    @property
+    def target_kind(self) -> ReviewTargetKind:
+        return self.wire_contract.review_target_kind
 
 
 class AgentAdapterError(RuntimeError):
@@ -238,6 +295,8 @@ class AdapterIncompatibilityReason(str, Enum):
     CANONICAL_MATERIAL_CLAIM_UNAVAILABLE = (
         "adapter_incompatible.canonical_material_claim_unavailable"
     )
+    TARGET_KIND = "adapter_incompatible.target_kind"
+    CAPABILITY_MISMATCH = "adapter_incompatible.capability_mismatch"
 
 
 class AgentAdapterIncompatibleError(RuntimeError):
@@ -294,6 +353,8 @@ class AgentUnderTestAdapter(Protocol):
         config: AgentRunConfig,
         clarification_channel: ClarificationChannel,
         *,
+        target_access: TargetAccess,
+        target_materialization_id: str,
         cancel_event: Any,
     ) -> EvalSubmission:
         ...

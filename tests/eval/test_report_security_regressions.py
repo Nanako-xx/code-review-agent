@@ -6,6 +6,7 @@ import pytest
 
 from review_agent_eval.artifacts import ArtifactStore
 from review_agent_eval.intent_evaluator import IntentEvaluator
+from review_agent_eval.judge import JudgeContextKind, repository_context
 from review_agent_eval.metrics import MetricsAggregator, TrialScore
 from review_agent_eval.models import TraceRef, TraceType
 from review_agent_eval.report import (
@@ -15,8 +16,13 @@ from review_agent_eval.report import (
     TrialEvaluationSource,
     TrialInspection,
 )
-from review_agent_eval.review_evaluator import ReviewEvaluator
+from review_agent_eval.review_evaluator import (
+    ReviewContextBundle,
+    ReviewEvaluator,
+    ReviewFindingContextEntry,
+)
 from tests.eval.test_metrics import (
+    TARGET_MATERIALIZATION_ID,
     _case_and_snapshot,
     _completed_submission,
     _score_completed,
@@ -31,6 +37,90 @@ class _ForgedReplay:
 
     def to_dict(self):
         return self._payload
+
+
+def test_inspection_replaces_raw_judge_payloads_with_digest_refs() -> None:
+    case, replay, execution, config = _score_sources()
+    base_submission = _completed_submission(config, 1)
+    finding_id = base_submission.review.findings[0].finding_id
+    submission = replace(
+        base_submission,
+        review=replace(
+            base_submission.review,
+            findings=(
+                replace(
+                    base_submission.review.findings[0],
+                    claim="A semantic claim that requires Judge work.",
+                ),
+            ),
+        ),
+    )
+    context_content = (
+        "FIRST_VALUE = compute_value()\n"
+        "SECOND_VALUE = fallback_value()"
+    )
+    context = repository_context(
+        source_id="inspection-env-like-code",
+        kind=JudgeContextKind.CODE,
+        content=context_content,
+        revision="head",
+        path="src/app.py",
+    )
+    context_bundle = ReviewContextBundle.create(
+        finding_entries=(
+            ReviewFindingContextEntry.create(finding_id, (context,)),
+        )
+    )
+    intent_result = IntentEvaluator().evaluate(
+        submission.intent,
+        case.intent_truth,
+        case.clarification_script,
+    )
+    review_result = ReviewEvaluator(
+        eval_input=case.eval_input(),
+        replay=replay,
+        trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
+        evaluator_execution=execution,
+        context_bundle=context_bundle,
+    ).evaluate(submission, case.review_truth)
+    assert review_result.judge_requests
+
+    inspection = ReportBuilder().build_inspection(
+        config,
+        execution,
+        "metrics-eval-v1",
+        trial_source=TrialEvaluationSource(
+            eval_case=case,
+            submission=submission,
+            intent_result=intent_result,
+            review_result=review_result,
+        ),
+    )
+    payload = inspection.to_dict()
+
+    for projection_name in ("intent_evaluation", "review_evaluation"):
+        projection = payload[projection_name]
+        assert projection["source_digest"] == (
+            intent_result.digest()
+            if projection_name == "intent_evaluation"
+            else review_result.digest()
+        )
+        assert "judge_payloads:judge_artifact_refs" in projection["redactions"]
+        for field in (
+            "judge_requests",
+            "judge_decisions",
+            "judge_failures",
+            "judge_ungraded",
+        ):
+            assert field not in projection["payload"]
+
+    request_refs = payload["judge_artifact_refs"]["review"]["requests"]
+    assert len(request_refs) == 1
+    assert request_refs[0]["request_id"] == review_result.judge_requests[0].request_id
+    assert request_refs[0]["request_digest"]
+    assert request_refs[0]["parent_result_digest"] == review_result.digest()
+    assert context_content not in inspection.to_json()
 
 
 def test_inspection_rejects_an_uninspected_trial_manifest_ref_tampering(
@@ -98,6 +188,7 @@ def test_trace_ref_projection_is_a_versioned_redacted_artifact_wrapper() -> None
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     ).evaluate(submission, case.review_truth)
     source = TrialEvaluationSource(
@@ -291,6 +382,7 @@ def test_pending_and_missing_evaluator_outputs_remain_distinct() -> None:
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=pending_submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     ).evaluate(pending_submission, case.review_truth)
 

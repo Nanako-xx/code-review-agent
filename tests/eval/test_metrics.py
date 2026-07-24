@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 from dataclasses import replace
 
 import pytest
@@ -43,9 +44,12 @@ from review_agent_eval.models import (
     IntentDimension,
     IntentResult,
     IntentTruth,
+    MetricAuthority,
+    MetricAuthoritySource,
     NovelFindingPolicy,
     RequiredContextLevel,
     ReviewTruth,
+    ReviewEvaluatorContext,
     SubmissionFailure,
     SubmissionFinding,
     SubmissionIntent,
@@ -61,10 +65,20 @@ from tests.eval.test_config import run_config
 from tests.eval.test_intent_evaluator import judge_failure
 from tests.eval.test_review_evaluator import _run_scripted_judge
 from tests.eval.test_review_truth_completeness import _execution, _fixture
+from tests.eval.test_review_truth_completeness import TARGET_MATERIALIZATION_ID
 
 
 CLAIM = "The changed branch can return the wrong result."
 GOAL = "Preserve the changed branch result."
+
+
+def _core_authority() -> MetricAuthority:
+    return MetricAuthority(
+        severity_scorable=True,
+        severity_authority=MetricAuthoritySource.EXPERT_ANNOTATION,
+        location_scorable=True,
+        location_authority=MetricAuthoritySource.EXPERT_ANNOTATION,
+    )
 
 
 def _case_and_snapshot(
@@ -87,6 +101,15 @@ def _case_and_snapshot(
                     severity=FindingSeverity.HIGH,
                     category="correctness",
                     required=True,
+                    metric_authority=(
+                        _core_authority()
+                        if with_location
+                        else replace(
+                            _core_authority(),
+                            location_scorable=False,
+                            location_authority=None,
+                        )
+                    ),
                     locations=(
                         (
                             TruthLocation(
@@ -121,8 +144,7 @@ def _case_and_snapshot(
             content_hash="9" * 64,
         ),
         input=EvalCaseInput(
-            repository=eval_input.repository,
-            review_request=eval_input.review_request,
+            review_target=eval_input.review_target,
         ),
         clarification_script=ClarificationScript(max_rounds=1, answers=()),
         intent_truth=(
@@ -150,13 +172,21 @@ def _case_and_snapshot(
             )
         ),
         review_truth=truth,
+        review_evaluator_context=ReviewEvaluatorContext(truth_contexts=()),
     )
     case_bytes = case.to_json().encode("utf-8")
     manifest = SuiteManifest.from_dict(
         {
-            "schema_version": "suite_manifest_v1",
+            "schema_version": "suite_manifest_v2",
             "suite_id": "metrics-suite",
             "suite_version": "v1",
+            "wire_contract": {
+                "case_schema_version": "eval_case_v2",
+                "input_schema_version": "eval_input_v2",
+                "submission_schema_version": "eval_submission_v2",
+                "review_target_kind": "repository",
+                "materializer_protocol": "repository-materializer-v2",
+            },
             "source": {
                 "kind": "core",
                 "source_id": "metrics-suite-source",
@@ -164,6 +194,7 @@ def _case_and_snapshot(
                 "source_uri": None,
                 "license": None,
                 "content_hash": "8" * 64,
+                "preparation_binding": None,
             },
             "cases": [
                 {
@@ -209,6 +240,8 @@ def _completed_submission(config, trial_index: int, finding_count: int = 1, *, u
         task_id=config.suite.cases[0].task_id,
         agent_id=config.agent.agent_id,
         trial_id=config.trial_id(config.suite.cases[0].task_id, trial_index),
+        eval_input_digest=config.suite.cases[0].eval_input_digest,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         status=SubmissionStatus.COMPLETED,
         intent=SubmissionIntent(
             status=IntentResult.SUFFICIENT,
@@ -246,6 +279,8 @@ def _failed_submission(config, trial_index: int, *, usage=None):
         task_id=config.suite.cases[0].task_id,
         agent_id=config.agent.agent_id,
         trial_id=config.trial_id(config.suite.cases[0].task_id, trial_index),
+        eval_input_digest=config.suite.cases[0].eval_input_digest,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         status=SubmissionStatus.FAILED,
         intent=None,
         review=None,
@@ -309,6 +344,7 @@ def _score_completed(case, replay, execution, config, trial_index: int, finding_
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     ).evaluate(submission, case.review_truth)
     scorer = scorer or TrialScorer()
@@ -359,7 +395,7 @@ def test_v1_severity_and_line_policies_are_fixed_and_digest_bound() -> None:
         )
 
 
-def test_trial_score_binds_sources_and_exposes_zero_denominator_as_null() -> None:
+def test_trial_score_binds_sources_and_exposes_unscorable_authority_as_null() -> None:
     case, replay, execution, config = _score_sources()
     submission, intent_result, review_result, score = _score_completed(
         case, replay, execution, config, 1
@@ -369,10 +405,54 @@ def test_trial_score_binds_sources_and_exposes_zero_denominator_as_null() -> Non
     assert score.contribution(CoreMetric.ISSUE_PRECISION).denominator == 1
     assert score.contribution(CoreMetric.SEVERITY_WEIGHTED_RECALL).numerator == 4
     assert score.contribution(CoreMetric.SEVERITY_WEIGHTED_RECALL).denominator == 4
-    assert score.contribution(CoreMetric.LINE_RECALL).denominator == 0
+    assert score.contribution(CoreMetric.LINE_RECALL).source_status is MetricSourceStatus.NOT_SCORABLE
+    assert score.contribution(CoreMetric.LINE_RECALL).numerator is None
+    assert score.contribution(CoreMetric.LINE_RECALL).denominator is None
     assert score.contribution(CoreMetric.EVIDENCE_VALIDITY).numerator == 0
     assert score.contribution(CoreMetric.PUBLISHABLE_FINDING_PRECISION).numerator == 0
     assert score.compatibility.metrics_policy == DEFAULT_METRICS_POLICY
+    compatibility = score.to_dict()["compatibility"]
+    assert compatibility["target_kind"] == "repository"
+    assert compatibility["wire_contract"] == config.wire_contract.to_dict()
+    assert compatibility["wire_contract_digest"] == canonical_sha256(
+        config.wire_contract.to_dict()
+    )
+    assert (
+        compatibility["adapter_capabilities_digest"]
+        == config.adapter_capabilities_digest
+    )
+    assert (
+        compatibility["isolation_profile"]
+        == config.adapter_capabilities.isolation_profile
+    )
+    assert compatibility["metric_authority_profile"] == {
+        "authorities": [
+            {
+                "severity_scorable": True,
+                "severity_authority": "expert_annotation",
+                "location_scorable": False,
+                "location_authority": None,
+            }
+        ]
+    }
+    assert compatibility["metric_authority_profile_digest"] == canonical_sha256(
+        compatibility["metric_authority_profile"]
+    )
+    assert (
+        compatibility["metric_authority_policy_version"]
+        == execution.metric_authority_policy_version
+    )
+    assert len(compatibility["metric_authority_policy_digest"]) == 64
+    assert score.to_dict()["authority_coverage"] == {
+        "expected_truth_count": 1,
+        "required_expected_truth_count": 1,
+        "severity_eligible_required_truth_count": 1,
+        "severity_excluded_required_truth_count": 0,
+        "location_precision_eligible_truth_count": 0,
+        "location_precision_excluded_truth_count": 1,
+        "location_recall_eligible_required_truth_count": 0,
+        "location_recall_excluded_required_truth_count": 1,
+    }
     assert score.to_dict()["compatibility"]["metrics_policy"]["severity_weights"]["weights"] == [
         {"severity": "critical", "weight": 8},
         {"severity": "high", "weight": 4},
@@ -399,10 +479,85 @@ def test_trial_score_binds_sources_and_exposes_zero_denominator_as_null() -> Non
 
     case_score = MetricsAggregator().aggregate_case((score,), planned_trial_count=1)
     line = case_score.metric(CoreMetric.LINE_RECALL)
-    assert line.numerator == 0
-    assert line.denominator == 0
+    assert line.numerator is None
+    assert line.denominator is None
     assert line.value_ppm is None
-    assert line.null_reason is MetricNullReason.ZERO_DENOMINATOR
+    assert line.null_reason is MetricNullReason.NOT_SCORABLE
+    assert line.coverage.not_scorable_count == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("target_kind", "frozen_context"),
+        ("wire_contract_digest", "0" * 64),
+        ("adapter_capabilities_digest", "1" * 64),
+        ("isolation_profile", "forged-isolation-v9"),
+        ("metric_authority_profile_digest", "2" * 64),
+        ("metric_authority_policy_version", "forged-authority-v9"),
+        ("metric_authority_policy_digest", "3" * 64),
+    ),
+)
+def test_trial_score_hydration_rejects_forged_v2_compatibility_binding(
+    field: str,
+    replacement: str,
+) -> None:
+    case, replay, execution, config = _score_sources()
+    submission, intent_result, review_result, score = _score_completed(
+        case, replay, execution, config, 1
+    )
+    forged = deepcopy(score.to_dict())
+    forged["compatibility"][field] = replacement
+
+    with pytest.raises(ValueError, match="source-bound replay"):
+        TrialScore.from_dict(
+            forged,
+            scorer=TrialScorer(),
+            run_config=config,
+            evaluator_execution=execution,
+            evaluation_revision="metrics-eval-v1",
+            eval_case=case,
+            submission=submission,
+            trial_index=1,
+            intent_result=intent_result,
+            review_result=review_result,
+        )
+
+
+@pytest.mark.parametrize(
+    "path",
+    ("wire_contract", "metric_authority_profile", "authority_coverage"),
+)
+def test_trial_score_hydration_rejects_forged_v2_snapshot_or_coverage(
+    path: str,
+) -> None:
+    case, replay, execution, config = _score_sources()
+    submission, intent_result, review_result, score = _score_completed(
+        case, replay, execution, config, 1
+    )
+    forged = deepcopy(score.to_dict())
+    if path == "wire_contract":
+        forged["compatibility"][path]["materializer_protocol"] = (
+            "frozen-context-materializer-v2"
+        )
+    elif path == "metric_authority_profile":
+        forged["compatibility"][path]["authorities"] = []
+    else:
+        forged[path]["expected_truth_count"] = 0
+
+    with pytest.raises(ValueError, match="source-bound replay"):
+        TrialScore.from_dict(
+            forged,
+            scorer=TrialScorer(),
+            run_config=config,
+            evaluator_execution=execution,
+            evaluation_revision="metrics-eval-v1",
+            eval_case=case,
+            submission=submission,
+            trial_index=1,
+            intent_result=intent_result,
+            review_result=review_result,
+        )
 
 
 def test_line_metrics_use_only_the_final_assignment_truth_location() -> None:
@@ -422,6 +577,7 @@ def test_line_metrics_ignore_a_matching_location_on_an_unassigned_truth() -> Non
         severity=FindingSeverity.HIGH,
         category="correctness",
         required=True,
+        metric_authority=_core_authority(),
         locations=(
             TruthLocation(
                 path="src/app.py",
@@ -440,6 +596,7 @@ def test_line_metrics_ignore_a_matching_location_on_an_unassigned_truth() -> Non
         severity=FindingSeverity.MEDIUM,
         category="correctness",
         required=False,
+        metric_authority=_core_authority(),
         locations=(
             TruthLocation(
                 path="src/app.py",
@@ -465,6 +622,7 @@ def test_line_metrics_ignore_a_matching_location_on_an_unassigned_truth() -> Non
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     )
     pending = evaluator.evaluate(submission, case.review_truth)
@@ -517,6 +675,8 @@ def test_case_aggregation_uses_ratio_of_sums_not_average_of_percentages() -> Non
     assert precision.value_ppm == 666_667
     assert aggregate.metric(CoreMetric.ISSUE_RECALL).value_ppm == 1_000_000
     assert aggregate.metric(CoreMetric.PLAUSIBLE_RATE).numerator == 1
+    assert first.authority_coverage == second.authority_coverage
+    assert aggregate.authority_coverage == first.authority_coverage
 
     hydrated_case = CaseScore.from_json(
         aggregate.to_json(),
@@ -529,6 +689,7 @@ def test_case_aggregation_uses_ratio_of_sums_not_average_of_percentages() -> Non
         (aggregate,),
         source_trials=(first, second),
     )
+    assert overall.authority_coverage == aggregate.authority_coverage
     hydrated_overall = AggregateScore.from_json(
         overall.to_json(),
         aggregator=MetricsAggregator(),
@@ -596,6 +757,7 @@ def test_failed_trial_scores_non_null_partial_review_and_failure_independently()
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     ).evaluate(submission, case.review_truth)
 
@@ -628,6 +790,7 @@ def test_partial_submission_parts_are_scored_independently_when_one_result_is_mi
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     ).evaluate(submission, case.review_truth)
 
@@ -649,6 +812,7 @@ def test_partial_submission_parts_are_scored_independently_when_one_result_is_mi
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=intent_absent_submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     ).evaluate(intent_absent_submission, case.review_truth)
     intent_absent_score = TrialScorer().score(
@@ -669,6 +833,7 @@ def test_partial_submission_parts_are_scored_independently_when_one_result_is_mi
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=completed_submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     ).evaluate(completed_submission, case.review_truth)
     completed_partial_score = TrialScorer().score(
@@ -773,6 +938,7 @@ def test_ungraded_review_does_not_enter_quality_ratio() -> None:
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     )
     pending = evaluator.evaluate(submission, case.review_truth)
@@ -826,6 +992,7 @@ def test_ungraded_review_does_not_enter_quality_ratio() -> None:
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=failed_submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     )
     failed_pending = failed_evaluator.evaluate(failed_submission, case.review_truth)
@@ -888,6 +1055,7 @@ def test_intent_and_review_scored_coverage_are_reported_independently() -> None:
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     ).evaluate(submission, case.review_truth)
     score = TrialScorer().score(
@@ -1051,6 +1219,7 @@ def test_evaluator_revision_is_part_of_score_compatibility() -> None:
         eval_input=case.eval_input(),
         replay=replay,
         trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
         evaluator_execution=execution,
     ).evaluate(submission, case.review_truth)
 

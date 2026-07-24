@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import stat
@@ -11,6 +10,7 @@ from typing import Any, Iterable, Optional, Tuple
 from .adapters.base import AgentAdapterError, AgentRunConfig
 from .models import (
     EVAL_SUBMISSION_SCHEMA_VERSION,
+    MAX_EVAL_SUBMISSION_BYTES,
     EvalInput,
     EvalSubmission,
     FailureCode,
@@ -23,6 +23,8 @@ from .models import (
     SubmissionStatus,
     SubmissionUsage,
     TraceRef,
+    TraceType,
+    _strict_json_loads,
     submission_status_for_failure,
 )
 
@@ -45,6 +47,7 @@ def failure_submission(
     *,
     eval_input: EvalInput,
     config: AgentRunConfig,
+    target_materialization_id: str,
     code: FailureCode,
     message: str,
     retryable: bool,
@@ -56,8 +59,21 @@ def failure_submission(
 ) -> EvalSubmission:
     """Build the one legal terminal status associated with ``code``."""
 
+    if not isinstance(eval_input, EvalInput):
+        raise TypeError("eval_input must be EvalInput")
+    if not isinstance(config, AgentRunConfig):
+        raise TypeError("config must be AgentRunConfig")
+    if eval_input.task_id != config.task_id:
+        raise SchemaError("failure submission eval_input task does not match config")
+    if eval_input.digest() != config.eval_input_digest:
+        raise SchemaError(
+            "failure submission eval_input_digest does not match config"
+        )
     status = submission_status_for_failure(code)
-    if status is SubmissionStatus.INVALID_OUTPUT:
+    if (
+        status is SubmissionStatus.INVALID_OUTPUT
+        or code is FailureCode.HARNESS_MATERIALIZATION_ERROR
+    ):
         intent = None
         review = None
         evidence = ()
@@ -66,6 +82,8 @@ def failure_submission(
         task_id=config.task_id,
         agent_id=config.agent_id,
         trial_id=config.trial_id,
+        eval_input_digest=config.eval_input_digest,
+        target_materialization_id=target_materialization_id,
         status=status,
         intent=intent,
         review=review,
@@ -85,6 +103,7 @@ def validate_submission_binding(
     *,
     eval_input: EvalInput,
     config: AgentRunConfig,
+    target_materialization_id: str,
     clarification_transcript: Optional[
         Iterable[SubmissionClarificationExchange]
     ] = None,
@@ -93,10 +112,38 @@ def validate_submission_binding(
 
     if not isinstance(submission, EvalSubmission):
         raise TypeError("submission must be EvalSubmission")
-    if submission.task_id != eval_input.task_id:
+    if (
+        submission.failure is not None
+        and submission.failure.code
+        is FailureCode.HARNESS_MATERIALIZATION_ERROR
+    ):
+        raise AgentAdapterError(
+            FailureCode.SCHEMA_MISMATCH,
+            "Agent output may not claim a Harness-owned failure code",
+            retryable=False,
+        )
+    if (
+        submission.task_id != eval_input.task_id
+        or submission.task_id != config.task_id
+    ):
         raise AgentAdapterError(
             FailureCode.SCHEMA_MISMATCH,
             "Agent output task identity does not match the invocation",
+            retryable=False,
+        )
+    if (
+        eval_input.digest() != config.eval_input_digest
+        or submission.eval_input_digest != config.eval_input_digest
+    ):
+        raise AgentAdapterError(
+            FailureCode.SCHEMA_MISMATCH,
+            "Agent output input digest does not match the invocation",
+            retryable=False,
+        )
+    if submission.target_materialization_id != target_materialization_id:
+        raise AgentAdapterError(
+            FailureCode.SCHEMA_MISMATCH,
+            "Agent output target materialization does not match the invocation",
             retryable=False,
         )
     if submission.agent_id != config.agent_id:
@@ -111,19 +158,72 @@ def validate_submission_binding(
             "Agent output trial identity does not match the invocation",
             retryable=False,
         )
-    if clarification_transcript is not None:
-        expected = tuple(clarification_transcript)
-        actual: Tuple[SubmissionClarificationExchange, ...] = (
-            ()
-            if submission.intent is None
-            else submission.intent.clarification_questions
+    if any(
+        item.source.kind not in config.adapter_capabilities.evidence_kinds
+        for item in submission.evidence
+    ):
+        raise AgentAdapterError(
+            FailureCode.SCHEMA_MISMATCH,
+            "Agent output evidence kind was not declared by its Adapter",
+            retryable=False,
         )
+
+    trace_protocol = config.adapter_capabilities.trace_protocol
+    if trace_protocol == "local-trace-v2":
+        if (
+            submission.trace_ref is not None
+            and submission.trace_ref.type is not TraceType.LOCAL_PATH
+        ):
+            raise AgentAdapterError(
+                FailureCode.SCHEMA_MISMATCH,
+                "Agent output trace does not match its declared protocol",
+                retryable=False,
+            )
+    elif trace_protocol == "none-v2":
+        if submission.trace_ref is not None:
+            raise AgentAdapterError(
+                FailureCode.SCHEMA_MISMATCH,
+                "Agent output trace is forbidden by its declared protocol",
+                retryable=False,
+            )
+    else:
+        raise AgentAdapterError(
+            FailureCode.SCHEMA_MISMATCH,
+            "Agent output trace protocol is unsupported",
+            retryable=False,
+        )
+
+    expected = (
+        ()
+        if clarification_transcript is None
+        else tuple(clarification_transcript)
+    )
+    actual: Tuple[SubmissionClarificationExchange, ...] = (
+        ()
+        if submission.intent is None
+        else submission.intent.clarification_questions
+    )
+    clarification_protocol = config.adapter_capabilities.clarification_protocol
+    if clarification_protocol == "none-v2":
+        if actual or expected:
+            raise AgentAdapterError(
+                FailureCode.SCHEMA_MISMATCH,
+                "Agent output clarification is forbidden by its declared protocol",
+                retryable=False,
+            )
+    elif clarification_protocol == "canonical-clarification-v2":
         if actual != expected:
             raise AgentAdapterError(
                 FailureCode.SCHEMA_MISMATCH,
                 "Agent output clarification transcript does not match the channel",
                 retryable=False,
             )
+    else:
+        raise AgentAdapterError(
+            FailureCode.SCHEMA_MISMATCH,
+            "Agent output clarification protocol is unsupported",
+            retryable=False,
+        )
     return submission
 
 
@@ -132,6 +232,7 @@ def parse_submission_output(
     *,
     eval_input: EvalInput,
     config: AgentRunConfig,
+    target_materialization_id: str,
     clarification_transcript: Optional[
         Iterable[SubmissionClarificationExchange]
     ] = None,
@@ -140,34 +241,38 @@ def parse_submission_output(
 
     if type(data) is not bytes:
         raise TypeError("Agent output must be bytes")
+    maximum = min(config.max_output_bytes, MAX_EVAL_SUBMISSION_BYTES)
+    if len(data) > maximum:
+        raise AgentAdapterError(
+            FailureCode.OUTPUT_OVERFLOW,
+            "Agent output exceeds its byte limit",
+            retryable=False,
+        )
     try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
+        payload = _strict_json_loads(
+            data,
+            MAX_EVAL_SUBMISSION_BYTES,
+            "EvalSubmission JSON",
+        )
+    except SchemaError as exc:
         raise AgentAdapterError(
             FailureCode.INVALID_JSON,
-            "Agent output is not valid UTF-8 JSON",
+            "Agent output is not one strict UTF-8 JSON document",
             retryable=False,
         ) from exc
     try:
-        json.loads(text)
-    except (json.JSONDecodeError, RecursionError) as exc:
-        raise AgentAdapterError(
-            FailureCode.INVALID_JSON,
-            "Agent output is not one valid JSON document",
-            retryable=False,
-        ) from exc
-    try:
-        submission = EvalSubmission.from_json(data)
+        submission = EvalSubmission.from_dict(payload)
     except (SchemaError, UnicodeError, ValueError, RecursionError) as exc:
         raise AgentAdapterError(
             FailureCode.SCHEMA_MISMATCH,
-            "Agent output does not satisfy EvalSubmission v1",
+            "Agent output does not satisfy EvalSubmission v2",
             retryable=False,
         ) from exc
     return validate_submission_binding(
         submission,
         eval_input=eval_input,
         config=config,
+        target_materialization_id=target_materialization_id,
         clarification_transcript=clarification_transcript,
     )
 

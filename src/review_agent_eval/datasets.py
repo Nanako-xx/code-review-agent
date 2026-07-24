@@ -24,6 +24,7 @@ from .models import (
     EvalCase,
     EvalInput,
     SchemaError,
+    UnsupportedProtocolVersionError,
     _JsonModel,
     _digest,
     _identifier,
@@ -318,6 +319,8 @@ def _verify_manifest_current(handle: CaseHandle) -> SuiteManifest:
     )
     try:
         current = SuiteManifest.from_json(raw)
+    except UnsupportedProtocolVersionError:
+        raise
     except SchemaError as exc:
         raise CaseIntegrityError(
             "Suite manifest changed into an invalid document: %s" % exc
@@ -356,9 +359,11 @@ def _load_case_from_handle(
         )
     try:
         case = EvalCase.from_json(raw)
+    except UnsupportedProtocolVersionError:
+        raise
     except SchemaError as exc:
         raise CaseIntegrityError(
-            "Case %s is not valid EvalCase v1: %s" % (handle.task_id, exc)
+            "Case %s is not valid EvalCase v2: %s" % (handle.task_id, exc)
         ) from exc
     try:
         validate_case_for_manifest(case, handle.entry, handle.manifest)

@@ -1,0 +1,104 @@
+{
+  "annotation_rationale": "The request explicitly preserves lock lifecycle; deleting one finally block affects successful return, handled RuntimeError, and other exceptional exits but remains one root cause and one independently fixable Finding.",
+  "authoring": {
+    "author_id": null,
+    "kind": "ai_assisted",
+    "source_version": "core-2026-07-21-v3",
+    "status": "draft_requires_independent_re_review",
+    "truth_frozen_at": null
+  },
+  "case_binding": {
+    "canonical_case_digest": "ac3f05647d0a83d851ef0e05ece2162de3dcd2507232ac91ebc8026a6532c502",
+    "case_source_content_hash": "cd77eff0a0f9bbc8812e60c3ef2f617ffe504c46b019f5611b8e18ad482c5807",
+    "eval_input_digest": "032c8b1dc9b4b9277b7b7708178d4867439294b21dd06661ed583fe690ec3156"
+  },
+  "case_version": 3,
+  "checklist": {
+    "agent_input_contains_no_truth": true,
+    "atomic_findings_reviewed": false,
+    "base_head_binding_reproduced": true,
+    "evidence_anchors_are_non_exclusive": false,
+    "fixture_contains_no_vcs_metadata": true,
+    "human_review_completed": false,
+    "known_invalid_traps_reviewed": false,
+    "semantic_truth_leakage_reviewed": false,
+    "severity_category_context_reviewed": false,
+    "truth_completeness_reviewed": false
+  },
+  "coverage": [
+    "duplicate_finding_trap",
+    "multi_location_one_issue",
+    "must_not_clarify"
+  ],
+  "disagreements": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "items": [],
+    "status": "requires_independent_re_review"
+  },
+  "human_review": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "annotation_protocol_version": "core-annotation-v2",
+    "approval_identity_status": "requires_re_review",
+    "author_id": null,
+    "base_revision": "39565aece64782a3909af7ec52e70e6632360410",
+    "base_tree": "b236f12f7c7d14d1cd9df01d15f2369c2c94bcde",
+    "blind_review_completed_at": null,
+    "blind_review_packet_digest": "3b0c2c1548e8633eca5b1cc4fd5594ce781ebf74d373b0a884aad7a8c3c0bcab",
+    "blind_review_started_at": null,
+    "canonical_case_digest": "ac3f05647d0a83d851ef0e05ece2162de3dcd2507232ac91ebc8026a6532c502",
+    "case_version": 3,
+    "eval_input_digest": "032c8b1dc9b4b9277b7b7708178d4867439294b21dd06661ed583fe690ec3156",
+    "final_decision": null,
+    "head_revision": "457bf4b29b75fdf64682cf33b44f5a8502b5d39d",
+    "head_tree": "010e5a25ce6bd63aec4f734e97346cbd3d855ea3",
+    "independent_annotation_digest": null,
+    "leakage_review_completed": false,
+    "prior_approval_carried_forward": false,
+    "review_batch_id": null,
+    "reviewer_id": null,
+    "schema_version": "core_human_review_record_v2",
+    "status": "requires_independent_re_review",
+    "task_id": "core-py-013"
+  },
+  "intent_expectation": {
+    "clarification_decision": "must_not_ask",
+    "final_source": "explicit",
+    "final_status": "sufficient",
+    "initial_source": "explicit",
+    "initial_status": "sufficient"
+  },
+  "provenance_binding": {
+    "annotation_protocol_version": "core-annotation-v2",
+    "content_hash": "cd77eff0a0f9bbc8812e60c3ef2f617ffe504c46b019f5611b8e18ad482c5807",
+    "schema_version": "core_case_provenance_v2"
+  },
+  "repository_binding": {
+    "base_revision": "39565aece64782a3909af7ec52e70e6632360410",
+    "base_tree": "b236f12f7c7d14d1cd9df01d15f2369c2c94bcde",
+    "head_revision": "457bf4b29b75fdf64682cf33b44f5a8502b5d39d",
+    "head_tree": "010e5a25ce6bd63aec4f734e97346cbd3d855ea3",
+    "source_digest": "37d9ce3394c52e49fdc8068fe6522666ecddcdba9c1a6f5e4cdca0a864ab327e"
+  },
+  "schema_version": "core_annotation_record_v2",
+  "suite_assignment": {
+    "promotion_evidence": null,
+    "split": "capability",
+    "status": "capability"
+  },
+  "suite_id": "core-capability",
+  "task_id": "core-py-013",
+  "truth_summary": {
+    "expected_finding_ids": [
+      "issue-0011"
+    ],
+    "expected_intent_ids": [
+      "intent-0027",
+      "intent-0028"
+    ],
+    "forbidden_intent_ids": [],
+    "known_invalid_finding_ids": [],
+    "truth_completeness": "closed_world"
+  }
+}

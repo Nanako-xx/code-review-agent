@@ -14,9 +14,11 @@ from review_agent_eval.cli import (
     EXIT_PRECONDITION,
     _canonical_digest,
     _build_parser,
+    _domain_error_category,
     main,
 )
 from review_agent_eval.repository import FixtureRepositoryBuilder
+from review_agent_eval.target_replay import TargetReplayIntegrityError
 
 from .test_agent_adapter import _AGENT_PROGRAM
 from .test_datasets import case_payload, write_suite
@@ -47,9 +49,13 @@ def _write_cli_suite(tmp_path: Path) -> tuple[dict[str, Path], Path]:
         tmp_path / "authored.git",
     )
     payload = case_payload()
-    payload["input"]["repository"]["base_revision"] = built.base_revision
-    payload["input"]["repository"]["head_revision"] = built.head_revision
-    payload["input"]["review_request"]["user_intent"] = (
+    payload["input"]["review_target"]["repository"][
+        "base_revision"
+    ] = built.base_revision
+    payload["input"]["review_target"]["repository"][
+        "head_revision"
+    ] = built.head_revision
+    payload["input"]["review_target"]["review_request"]["user_intent"] = (
         "Review the requested change"
     )
     payload["clarification_script"] = {"max_rounds": 1, "answers": []}
@@ -96,13 +102,25 @@ def _without_message(value: dict) -> dict:
     return {key: item for key, item in value.items() if key != "message"}
 
 
-def test_parser_exposes_only_the_four_task_12_commands() -> None:
+def test_target_replay_integrity_error_has_stable_cli_category() -> None:
+    assert _domain_error_category(
+        TargetReplayIntegrityError("fixture replay drift")
+    ) == ("integrity", EXIT_INTEGRITY)
+
+
+def test_parser_exposes_the_four_trial_commands_and_public_prepare() -> None:
     parser = _build_parser()
     action = next(
         item for item in parser._actions if item.dest == "command"  # type: ignore[attr-defined]
     )
 
-    assert set(action.choices) == {"prepare", "run-agent", "evaluate", "inspect"}
+    assert set(action.choices) == {
+        "prepare",
+        "prepare-public",
+        "run-agent",
+        "evaluate",
+        "inspect",
+    }
     assert "compare" not in action.choices
     assert "calibrate" not in action.choices
 
@@ -131,6 +149,143 @@ def test_prepare_dry_run_is_write_free_and_emits_stable_json(
     assert not roots["runs"].exists()
     assert not roots["data"].exists()
     assert not roots["workspaces"].exists()
+
+
+def test_prepare_and_run_agent_use_the_v2_subprocess_protocol_without_evaluation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    roots, program = _write_cli_suite(tmp_path)
+    common = _root_arguments(roots)
+    command = [
+        str(Path(sys.executable).resolve()),
+        str(program),
+        "success",
+        "{agent_id}",
+        "{task_id}",
+        "{trial_id}",
+    ]
+    prepare_args = [
+        "prepare",
+        *common,
+        "--agent-adapter",
+        "subprocess",
+        "--json",
+    ]
+    for item in command:
+        prepare_args.extend(("--agent-command", item))
+
+    assert main(prepare_args) == EXIT_OK
+    run_id = _json_stdout(capsys)["run_id"]
+
+    assert main(["run-agent", run_id, *common, "--json"]) == EXIT_OK
+    result = _json_stdout(capsys)
+    assert result["run_status"] == "completed"
+    assert result["trials"][0]["submission_status"] == "completed"
+
+
+def test_filter_prepare_resume_reuses_canonical_planned_run_before_acquisition(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import review_agent_eval.cli as cli_module
+    from review_agent_eval.artifacts import ArtifactStore
+
+    from .test_runner import _SelectiveIncompatibleAdapter, _two_case_snapshot
+
+    snapshot = _two_case_snapshot()
+
+    class SnapshotBank:
+        def snapshot(self):
+            return snapshot
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_case_bank",
+        lambda _args, _suite_root: SnapshotBank(),
+    )
+    adapters = []
+    original_configs = []
+
+    def adapter_for(config):
+        original_configs.append(config)
+        adapter = _SelectiveIncompatibleAdapter()
+        adapters.append(adapter)
+        return _SelectiveIncompatibleAdapter, adapter
+
+    monkeypatch.setattr(cli_module, "_agent_adapter", adapter_for)
+    acquisitions = []
+    expected_run_id = None
+
+    def record_acquisition(_args, roots, selected_snapshot):
+        if expected_run_id is not None:
+            ArtifactStore(roots[1], create_root=False).load_run_config(
+                expected_run_id
+            )
+        acquisitions.append(
+            tuple(item.task_id for item in selected_snapshot.cases)
+        )
+
+    monkeypatch.setattr(
+        cli_module, "_prepare_repository_targets", record_acquisition
+    )
+    roots = _roots(tmp_path)
+    arguments = [
+        "prepare",
+        *_root_arguments(roots),
+        "--capability-policy",
+        "filter",
+        "--run-instance-key",
+        "filter-resume",
+        "--json",
+    ]
+
+    assert main(arguments) == EXIT_OK
+    first = _json_stdout(capsys)
+    expected_run_id = first["run_id"]
+    assert expected_run_id != original_configs[0].run_id
+    run_root = roots["runs"] / expected_run_id
+    immutable_paths = (
+        "run_config.json",
+        "case_snapshot.json",
+        "receipts/capability_preflight.json",
+        "run_manifest.json",
+    )
+    first_bytes = {
+        relative: (run_root / relative).read_bytes()
+        for relative in immutable_paths
+    }
+    assert acquisitions == [("task-kept",)]
+
+    original_load_preflight = ArtifactStore.load_run_preflight
+    monkeypatch.setattr(
+        ArtifactStore,
+        "load_run_preflight",
+        lambda _self, _run_id: {},
+    )
+    assert main([*arguments, "--resume"]) == EXIT_INTEGRITY
+    _json_stdout(capsys)
+    assert acquisitions == [("task-kept",)]
+    monkeypatch.setattr(
+        ArtifactStore,
+        "load_run_preflight",
+        original_load_preflight,
+    )
+
+    assert main([*arguments, "--resume"]) == EXIT_OK
+    resumed = _json_stdout(capsys)
+    assert resumed["run_id"] == expected_run_id
+    assert resumed["resumed"] is True
+    assert acquisitions == [("task-kept",), ("task-kept",)]
+    assert {
+        relative: (run_root / relative).read_bytes()
+        for relative in immutable_paths
+    } == first_bytes
+    assert len(
+        [path for path in roots["runs"].iterdir() if path.name.startswith("run-")]
+    ) == 1
+    assert all(adapter.run_calls == 0 for adapter in adapters)
 
 
 def test_full_prepare_run_evaluate_inspect_flow_keeps_stages_separate(

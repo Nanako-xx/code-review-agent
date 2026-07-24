@@ -1,0 +1,104 @@
+{
+  "annotation_rationale": "The cleanup requirement is explicit and the context-manager deletion directly proves one file-handle lifecycle regression, so clarification is unnecessary.",
+  "authoring": {
+    "author_id": null,
+    "kind": "ai_assisted",
+    "source_version": "core-2026-07-21-v3",
+    "status": "draft_requires_independent_re_review",
+    "truth_frozen_at": null
+  },
+  "case_binding": {
+    "canonical_case_digest": "20d88674bb205942c861c9e9eeb8b1e9541a674bc78eaec39aa5e1adf6fcef2a",
+    "case_source_content_hash": "2d0d8fc25baa63b1ebafd2d2f6ce9ad78a1b9f7700da85a49be0b180cd94fcdf",
+    "eval_input_digest": "be89faab3c17c32906e6c5d2ec634dba7e0c361d49b6ef68c521352345ef6ec4"
+  },
+  "case_version": 3,
+  "checklist": {
+    "agent_input_contains_no_truth": true,
+    "atomic_findings_reviewed": false,
+    "base_head_binding_reproduced": true,
+    "evidence_anchors_are_non_exclusive": false,
+    "fixture_contains_no_vcs_metadata": true,
+    "human_review_completed": false,
+    "known_invalid_traps_reviewed": false,
+    "semantic_truth_leakage_reviewed": false,
+    "severity_category_context_reviewed": false,
+    "truth_completeness_reviewed": false
+  },
+  "coverage": [
+    "diff_context",
+    "must_not_clarify",
+    "resource_leak"
+  ],
+  "disagreements": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "items": [],
+    "status": "requires_independent_re_review"
+  },
+  "human_review": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "annotation_protocol_version": "core-annotation-v2",
+    "approval_identity_status": "requires_re_review",
+    "author_id": null,
+    "base_revision": "0c662510e00df34b06f02c09652b586f2cc787bd",
+    "base_tree": "b7fd06b6acf01619c3127f2ef8ca253e06dd5224",
+    "blind_review_completed_at": null,
+    "blind_review_packet_digest": "5eb0a510be7f00a651ebd59f8aa58e0e3725e2166a0891c3ee08243f3fc9903f",
+    "blind_review_started_at": null,
+    "canonical_case_digest": "20d88674bb205942c861c9e9eeb8b1e9541a674bc78eaec39aa5e1adf6fcef2a",
+    "case_version": 3,
+    "eval_input_digest": "be89faab3c17c32906e6c5d2ec634dba7e0c361d49b6ef68c521352345ef6ec4",
+    "final_decision": null,
+    "head_revision": "056514bc6dd12ccba0d053c14b6ea30a8c1fecb0",
+    "head_tree": "97c759a2ab74b00f164bffb488aa6ad18a9bafec",
+    "independent_annotation_digest": null,
+    "leakage_review_completed": false,
+    "prior_approval_carried_forward": false,
+    "review_batch_id": null,
+    "reviewer_id": null,
+    "schema_version": "core_human_review_record_v2",
+    "status": "requires_independent_re_review",
+    "task_id": "core-py-017"
+  },
+  "intent_expectation": {
+    "clarification_decision": "must_not_ask",
+    "final_source": "explicit",
+    "final_status": "sufficient",
+    "initial_source": "explicit",
+    "initial_status": "sufficient"
+  },
+  "provenance_binding": {
+    "annotation_protocol_version": "core-annotation-v2",
+    "content_hash": "2d0d8fc25baa63b1ebafd2d2f6ce9ad78a1b9f7700da85a49be0b180cd94fcdf",
+    "schema_version": "core_case_provenance_v2"
+  },
+  "repository_binding": {
+    "base_revision": "0c662510e00df34b06f02c09652b586f2cc787bd",
+    "base_tree": "b7fd06b6acf01619c3127f2ef8ca253e06dd5224",
+    "head_revision": "056514bc6dd12ccba0d053c14b6ea30a8c1fecb0",
+    "head_tree": "97c759a2ab74b00f164bffb488aa6ad18a9bafec",
+    "source_digest": "ca428f41c7b4c9cff9d8563e1311cf0fd238d9af5a0699a857402564c522d6aa"
+  },
+  "schema_version": "core_annotation_record_v2",
+  "suite_assignment": {
+    "promotion_evidence": null,
+    "split": "capability",
+    "status": "capability"
+  },
+  "suite_id": "core-capability",
+  "task_id": "core-py-017",
+  "truth_summary": {
+    "expected_finding_ids": [
+      "issue-0014"
+    ],
+    "expected_intent_ids": [
+      "intent-0036",
+      "intent-0037"
+    ],
+    "forbidden_intent_ids": [],
+    "known_invalid_finding_ids": [],
+    "truth_completeness": "closed_world"
+  }
+}

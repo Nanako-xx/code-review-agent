@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 from conftest import run_git
 
 from review_agent.checkpoint import CheckpointStore
 from review_agent.memory_models import MemoryExecutionConfig, MemoryMode
+from review_agent.model_adapter_factory import FakeModelAdapterFactory
+from review_agent.model_protocol import ModelResponseKind, ModelTurnResponse
 from review_agent.models import (
     ClarificationQuestion,
     ClarificationStatus,
     IntentDecision,
     IntentDecisionAction,
     IntentField,
+    IntentOrigin,
+    IntentSource,
     IntentStatus,
     ReviewRequest,
 )
@@ -87,6 +93,8 @@ def _pipeline(
     non_interactive: bool,
     clarifier=None,
     symbolic_head: bool = False,
+    existing_ci_evidence: tuple[str, ...] = (),
+    adapter_factory_builder=None,
 ) -> tuple[ReviewPipeline, SessionStore, CheckpointStore]:
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "app.py").write_text(
@@ -129,7 +137,11 @@ def _pipeline(
         base_revision=base,
         head_revision=requested_head,
         user_intent="Preserve addition semantics",
+        existing_ci_evidence=existing_ci_evidence,
     )
+    pipeline_kwargs = {}
+    if adapter_factory_builder is not None:
+        pipeline_kwargs["adapter_factory_builder"] = adapter_factory_builder
     return (
         ReviewPipeline(
             repository=git_repo,
@@ -137,9 +149,141 @@ def _pipeline(
             session_store=session_store,
             request=request,
             intent_clarifier=clarifier,
+            **pipeline_kwargs,
         ),
         session_store,
         checkpoint_store,
+    )
+
+
+def _ci_evidence_payload(source_id: str, text: str) -> str:
+    return json.dumps(
+        {
+            "source_id": source_id,
+            "text": text,
+            "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def test_ci_evidence_is_visible_to_intent_inference_without_explicit_authority(
+    git_repo: Path,
+) -> None:
+    encoded_evidence = (
+        _ci_evidence_payload("ci-pytest", "1 passed; regression job is green"),
+        _ci_evidence_payload("ci-empty", ""),
+    )
+    captured_contexts: list[dict[str, object]] = []
+    inferred_value = "Treat the supplied CI report as contextual input."
+
+    class IntentAdapter:
+        provider_name = "ci-intent-test"
+
+        def complete_turn(self, request):
+            context = json.loads(request.messages[0]["content"])
+            captured_contexts.append(context)
+            ci_observation_id = next(
+                observation_id
+                for observation_id, summary in context[
+                    "initial_observation_summaries"
+                ].items()
+                if "1 passed; regression job is green" in summary
+            )
+            return ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                provider_name=self.provider_name,
+                final_text=json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "field": "constraints",
+                                "value": inferred_value,
+                                "origin": "request_metadata",
+                                "confidence": "high",
+                                "source_refs": ["request.existing_ci_evidence"],
+                                "evidence_refs": [ci_observation_id],
+                                "rationale": "The CI signal is useful context but not authority.",
+                                "conclusion_impact": "supplemental",
+                            }
+                        ],
+                        "uncertainties": [],
+                        "summary": "CI evidence was considered as non-authoritative context.",
+                    }
+                ),
+            )
+
+    class Factory:
+        def __init__(self) -> None:
+            self.created = 0
+
+        def create(self):
+            self.created += 1
+            if self.created == 1:
+                return IntentAdapter()
+            return FakeModelAdapterFactory().create()
+
+    factory = Factory()
+    pipeline, session_store, checkpoint_store = _pipeline(
+        git_repo,
+        review_id="review-intent-ci-evidence",
+        non_interactive=True,
+        existing_ci_evidence=encoded_evidence,
+        adapter_factory_builder=lambda _config: factory,
+    )
+
+    result = pipeline.execute()
+
+    assert session_store.load().status is RunStatus.COMPLETED
+    assert len(captured_contexts) == 1
+    inference_context = captured_contexts[0]
+    request_summary = json.loads(inference_context["deterministic_request_summary"])
+    assert request_summary["existing_ci_evidence"] == list(encoded_evidence)
+
+    intent_store = result.context.intent_observations
+    assert intent_store is not None
+    ci_observations = [
+        item
+        for item in intent_store.list_observations()
+        if item.source.startswith("review_request.existing_ci_evidence:")
+    ]
+    assert ci_observations[0].source.startswith(
+        "review_request.existing_ci_evidence:0:"
+    )
+    assert ci_observations[1].source.startswith(
+        "review_request.existing_ci_evidence:1:"
+    )
+    head = result.context.manifest.revisions.resolved_head_sha
+    assert all(
+        item.revision == f"head@{head}"
+        and item.path is None
+        and item.line_start is None
+        and item.line_end is None
+        for item in ci_observations
+    )
+    summaries = inference_context["initial_observation_summaries"]
+    assert all(item.observation_id in summaries for item in ci_observations)
+    assert "1 passed; regression job is green" in summaries[
+        ci_observations[0].observation_id
+    ]
+    assert "(empty text)" in summaries[ci_observations[1].observation_id]
+    assert [
+        (checkpoint_store.run_dir / "observation_stores" / "intent").joinpath(
+            item.raw_artifact_ref
+        ).read_text(encoding="utf-8")
+        for item in ci_observations
+    ] == ["1 passed; regression job is green", ""]
+
+    inferred_claim = next(
+        claim for claim in result.context.intent_claims if claim.value == inferred_value
+    )
+    assert inferred_claim.source is IntentSource.INFERRED
+    assert inferred_claim.origin is IntentOrigin.LLM_INFERENCE
+    assert not any(
+        claim.source is IntentSource.EXPLICIT and claim.value == inferred_value
+        for claim in result.context.intent_claims
     )
 
 
@@ -178,11 +322,16 @@ def test_interactive_resolution_produces_sufficient_confirmed_intent(
 def test_awaiting_user_resume_reuses_intent_discovery_without_reinference(
     git_repo: Path,
 ) -> None:
+    encoded_evidence = (
+        _ci_evidence_payload("ci-resume", "resume check passed"),
+        _ci_evidence_payload("ci-resume-empty", ""),
+    )
     pipeline, session_store, checkpoint_store = _pipeline(
         git_repo,
         review_id="review-intent-resume",
         non_interactive=False,
         clarifier=DeferIntent(),
+        existing_ci_evidence=encoded_evidence,
     )
 
     first = pipeline.execute()
@@ -193,6 +342,18 @@ def test_awaiting_user_resume_reuses_intent_discovery_without_reinference(
     assert awaiting.status is RunStatus.AWAITING_USER
     discovery_before = awaiting.phases[RunPhase.INTENT_DISCOVERY.value]
     inference_before = awaiting.artifacts["intent_inference"]
+    assert first.context.intent_observations is not None
+    ci_observations_before = tuple(
+        item
+        for item in first.context.intent_observations.list_observations()
+        if item.source.startswith("review_request.existing_ci_evidence:")
+    )
+    ci_summaries_before = {
+        item.observation_id: first.context.intent_observations.summaries_by_id()[
+            item.observation_id
+        ]
+        for item in ci_observations_before
+    }
 
     clarifier = ResolveMaterialIntent()
     resumed = ReviewSessionResumer(
@@ -211,6 +372,19 @@ def test_awaiting_user_resume_reuses_intent_discovery_without_reinference(
     assert resumed.pipeline_result is not None
     assert resumed.pipeline_result.context.intent is not None
     assert resumed.pipeline_result.context.intent.status is IntentStatus.SUFFICIENT
+    assert resumed.pipeline_result.context.intent_observations is not None
+    ci_observations_after = tuple(
+        item
+        for item in resumed.pipeline_result.context.intent_observations.list_observations()
+        if item.source.startswith("review_request.existing_ci_evidence:")
+    )
+    assert ci_observations_after == ci_observations_before
+    assert {
+        item.observation_id: resumed.pipeline_result.context.intent_observations.summaries_by_id()[
+            item.observation_id
+        ]
+        for item in ci_observations_after
+    } == ci_summaries_before
 
 
 def test_resume_does_not_repeat_questions_with_committed_decisions(

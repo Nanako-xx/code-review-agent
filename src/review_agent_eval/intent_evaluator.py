@@ -11,7 +11,7 @@ consulted here.
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
 from enum import Enum
 import unicodedata
 from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple, cast
@@ -45,8 +45,10 @@ from .models import (
     SubmissionIntent,
     _strict_json_loads,
     canonical_json,
+    canonical_json_bytes,
     canonical_sha256,
     stable_id,
+    _json_tree,
 )
 
 
@@ -2213,32 +2215,10 @@ class IntentEvaluationResult:
         return canonical_sha256(self.to_dict())
 
     @classmethod
-    def from_dict(cls, value: Any) -> "IntentEvaluationResult":
-        fields = (
-            "schema_version",
-            "evaluator_revision",
-            "submission_intent_digest",
-            "intent_truth_digest",
-            "clarification_script_digest",
-            "policy_version",
-            "normalization_version",
-            "status",
-            "generated_claims",
-            "truth_claims",
-            "candidates",
-            "assignments",
-            "claim_outcomes",
-            "unmatched_generated_ids",
-            "unmatched_expected_truth_ids",
-            "unmatched_forbidden_truth_ids",
-            "judge_requests",
-            "judge_decisions",
-            "judge_failures",
-            "judge_ungraded",
-            "clarification",
-            "metrics",
-            "reason_codes",
-        )
+    def _parse_unbound(cls, value: Any) -> dict[str, Any]:
+        """Validate an untrusted payload without hydrating it as authoritative."""
+
+        fields = tuple(field.name for field in dataclass_fields(cls))
         payload = _strict_object(value, fields, "Intent evaluation")
         generated = _bounded_array(
             payload["generated_claims"],
@@ -2279,6 +2259,20 @@ class IntentEvaluationResult:
             "Intent evaluation.judge_ungraded",
             MAX_INTENT_CANDIDATE_EDGES,
         )
+        for name, maximum in (
+            ("unmatched_generated_ids", MAX_INTENT_PROJECTED_CLAIMS),
+            ("unmatched_expected_truth_ids", MAX_INTENT_CLAIMS),
+            ("unmatched_forbidden_truth_ids", MAX_INTENT_CLAIMS),
+            ("reason_codes", 128),
+        ):
+            _bounded_array(payload[name], f"Intent evaluation.{name}", maximum)
+        try:
+            _json_tree(payload, "Intent evaluation")
+            if len(canonical_json_bytes(payload)) > MAX_INTENT_EVALUATION_BYTES:
+                raise _error("Intent evaluation exceeds its canonical byte budget")
+        except ValueError as exc:
+            raise _error(str(exc)) from exc
+
         assignment_items = []
         for index, item in enumerate(assignments):
             assignment = _strict_object(
@@ -2296,7 +2290,7 @@ class IntentEvaluationResult:
                     weight=assignment_weight,
                 )
             )
-        return cls(
+        cls(
             schema_version=_text(payload["schema_version"], "Intent evaluation.schema_version"),
             evaluator_revision=_id(
                 payload["evaluator_revision"], "Intent evaluation.evaluator_revision"
@@ -2367,9 +2361,54 @@ class IntentEvaluationResult:
                 payload["reason_codes"], "Intent evaluation.reason_codes"
             ),
         )
+        return payload
 
     @classmethod
-    def from_json(cls, data: Any) -> "IntentEvaluationResult":
+    def from_dict(
+        cls,
+        value: Any,
+        *,
+        evaluator: "IntentEvaluator",
+        submission_intent: Optional[SubmissionIntent],
+        intent_truth: IntentTruth,
+        clarification_script: ClarificationScript,
+        clarification_match_receipts: Sequence[MaterialClaimMatchReceipt],
+        semantic_decisions: Sequence[IntentSemanticJudgeDecision],
+        semantic_failures: Sequence[IntentSemanticJudgeFailure],
+        semantic_ungraded: Sequence[IntentSemanticJudgeUngraded],
+    ) -> "IntentEvaluationResult":
+        """Hydrate only after a complete source-bound deterministic replay."""
+
+        if type(evaluator) is not IntentEvaluator:
+            raise _error("Intent hydration requires the real IntentEvaluator")
+        parsed = cls._parse_unbound(value)
+        replayed = evaluator.evaluate(
+            submission_intent,
+            intent_truth,
+            clarification_script,
+            receipts=clarification_match_receipts,
+            semantic_decisions=semantic_decisions,
+            semantic_failures=semantic_failures,
+            semantic_ungraded=semantic_ungraded,
+        )
+        if canonical_json_bytes(parsed) != canonical_json_bytes(replayed.to_dict()):
+            raise _error("persisted Intent evaluation differs from deterministic replay")
+        return replayed
+
+    @classmethod
+    def from_json(
+        cls,
+        data: Any,
+        *,
+        evaluator: "IntentEvaluator",
+        submission_intent: Optional[SubmissionIntent],
+        intent_truth: IntentTruth,
+        clarification_script: ClarificationScript,
+        clarification_match_receipts: Sequence[MaterialClaimMatchReceipt],
+        semantic_decisions: Sequence[IntentSemanticJudgeDecision],
+        semantic_failures: Sequence[IntentSemanticJudgeFailure],
+        semantic_ungraded: Sequence[IntentSemanticJudgeUngraded],
+    ) -> "IntentEvaluationResult":
         try:
             parsed = _strict_json_loads(
                 data, MAX_INTENT_EVALUATION_BYTES, "Intent evaluation JSON"
@@ -2381,7 +2420,20 @@ class IntentEvaluationResult:
                     "JSON contains duplicate object key", "duplicate JSON key"
                 )
             raise IntentEvaluationError(message) from exc
-        return cls.from_dict(parsed)
+        return cls.from_dict(
+            parsed,
+            evaluator=evaluator,
+            submission_intent=submission_intent,
+            intent_truth=intent_truth,
+            clarification_script=clarification_script,
+            clarification_match_receipts=clarification_match_receipts,
+            semantic_decisions=semantic_decisions,
+            semantic_failures=semantic_failures,
+            semantic_ungraded=semantic_ungraded,
+        )
+
+    serialize = to_dict
+    hydrate = from_dict
 
 
 def _strict_object(value: Any, fields: Sequence[str], context: str) -> dict[str, Any]:

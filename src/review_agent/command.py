@@ -123,6 +123,18 @@ class _MemoryJSONParseError(RuntimeError):
     pass
 
 
+_CI_EVIDENCE_BUNDLE_SCHEMA_VERSION = "review_agent_ci_evidence_bundle_v1"
+_CI_EVIDENCE_CONTROL_RELATIVE_PATH = PurePosixPath(".review-agent/eval-input")
+_CI_EVIDENCE_BUNDLE_PREFIX = "existing-ci-evidence."
+_CI_EVIDENCE_BUNDLE_SUFFIX = ".v1.json"
+_MAX_CI_EVIDENCE_BUNDLE_BYTES = 2 * 1024 * 1024
+_MAX_CI_EVIDENCE_ENTRIES = 256
+_MAX_CI_SOURCE_ID_CHARS = 512
+_MAX_CI_EVIDENCE_TEXT_CHARS = 32768
+_MAX_CI_EVIDENCE_PATH_CHARS = 4096
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     try:
@@ -218,6 +230,9 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument("--description")
     review.add_argument("--requirement", action="append", default=[])
     review.add_argument("--project-rule", action="append", default=[])
+    ci_evidence = review.add_mutually_exclusive_group()
+    ci_evidence.add_argument("--ci-evidence", action="append", default=[])
+    ci_evidence.add_argument("--ci-evidence-file")
     review.add_argument("--non-interactive", action="store_true")
     review.add_argument(
         "--reviewer-provider",
@@ -3929,8 +3944,233 @@ def _print_memory_execution_summary(
     print(f"{prefix}Memory required: {'yes' if config.required else 'no'}")
 
 
+def _ci_evidence_regular_file(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and not (getattr(metadata, "st_file_attributes", 0) & _REPARSE_POINT)
+        and metadata.st_nlink == 1
+    )
+
+
+def _ci_evidence_directory(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and not (getattr(metadata, "st_file_attributes", 0) & _REPARSE_POINT)
+    )
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _ci_evidence_bundle_path(repository: Path, supplied: str) -> Path:
+    if (
+        type(supplied) is not str
+        or not supplied
+        or len(supplied) > _MAX_CI_EVIDENCE_PATH_CHARS
+        or "\x00" in supplied
+    ):
+        raise ValueError("CI evidence file path is invalid")
+    candidate = Path(supplied)
+    if not candidate.is_absolute():
+        candidate = repository / candidate
+    candidate = Path(os.path.abspath(candidate))
+    expected_parent = repository.joinpath(*_CI_EVIDENCE_CONTROL_RELATIVE_PATH.parts)
+    if os.path.normcase(str(candidate.parent)) != os.path.normcase(
+        str(expected_parent)
+    ):
+        raise ValueError("CI evidence file must be inside the eval-input control root")
+    name = candidate.name
+    if not (
+        name.startswith(_CI_EVIDENCE_BUNDLE_PREFIX)
+        and name.endswith(_CI_EVIDENCE_BUNDLE_SUFFIX)
+    ):
+        raise ValueError("CI evidence bundle filename is not digest-bound")
+    digest = name[
+        len(_CI_EVIDENCE_BUNDLE_PREFIX) : -len(_CI_EVIDENCE_BUNDLE_SUFFIX)
+    ]
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError("CI evidence bundle filename digest is invalid")
+    return candidate
+
+
+def _read_ci_evidence_bundle_file(repository: Path, supplied: str) -> bytes:
+    candidate = _ci_evidence_bundle_path(repository, supplied)
+    control_root = candidate.parent
+    review_root = control_root.parent
+    directory_metadata: list[tuple[Path, os.stat_result]] = []
+    try:
+        for path in (review_root, control_root):
+            metadata = os.lstat(path)
+            if not _ci_evidence_directory(metadata):
+                raise ValueError("CI evidence path contains an unsafe directory")
+            directory_metadata.append((path, metadata))
+
+        before = os.lstat(candidate)
+        if (
+            not _ci_evidence_regular_file(before)
+            or before.st_size > _MAX_CI_EVIDENCE_BUNDLE_BYTES
+        ):
+            raise ValueError("CI evidence bundle is not a bounded regular file")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(candidate, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not _ci_evidence_regular_file(opened)
+                or not _same_file_identity(before, opened)
+                or opened.st_size > _MAX_CI_EVIDENCE_BUNDLE_BYTES
+            ):
+                raise ValueError("CI evidence bundle changed before it was opened")
+            chunks: list[bytes] = []
+            remaining = _MAX_CI_EVIDENCE_BUNDLE_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 64 * 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        path_after = os.lstat(candidate)
+        if (
+            len(data) > _MAX_CI_EVIDENCE_BUNDLE_BYTES
+            or len(data) != after.st_size
+            or not _ci_evidence_regular_file(after)
+            or not _same_file_identity(opened, after)
+            or not _same_file_identity(after, path_after)
+        ):
+            raise ValueError("CI evidence bundle changed while it was read")
+        for path, metadata in directory_metadata:
+            current = os.lstat(path)
+            if (
+                not _ci_evidence_directory(current)
+                or not _same_file_identity(metadata, current)
+            ):
+                raise ValueError("CI evidence directory changed while it was read")
+        return data
+    except ValueError:
+        raise
+    except OSError as error:
+        raise ValueError("CI evidence bundle could not be read safely") from error
+
+
+def _canonical_ci_evidence_entry(entry: Mapping[str, Any]) -> str:
+    return json.dumps(
+        dict(entry),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _load_ci_evidence_bundle(repository: Path, supplied: str) -> tuple[str, ...]:
+    candidate = _ci_evidence_bundle_path(repository, supplied)
+    data = _read_ci_evidence_bundle_file(repository, supplied)
+    expected_digest = candidate.name[
+        len(_CI_EVIDENCE_BUNDLE_PREFIX) : -len(_CI_EVIDENCE_BUNDLE_SUFFIX)
+    ]
+    if hashlib.sha256(data).hexdigest() != expected_digest:
+        raise ValueError("CI evidence bundle does not match its filename digest")
+    try:
+        payload = json.loads(
+            data.decode("utf-8", "strict"),
+            object_pairs_hook=_strict_cli_json_object,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError("CI evidence bundle contains a non-finite number")
+            ),
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError("CI evidence bundle is invalid JSON") from error
+    if type(payload) is not dict or set(payload) != {"schema_version", "entries"}:
+        raise ValueError("CI evidence bundle has an invalid root schema")
+    if payload["schema_version"] != _CI_EVIDENCE_BUNDLE_SCHEMA_VERSION:
+        raise ValueError("CI evidence bundle has an unsupported schema version")
+    entries = payload["entries"]
+    if type(entries) is not list or not 1 <= len(entries) <= _MAX_CI_EVIDENCE_ENTRIES:
+        raise ValueError("CI evidence bundle has an invalid entry count")
+    encoded: list[str] = []
+    source_ids: set[str] = set()
+    for entry in entries:
+        if type(entry) is not dict or set(entry) != {
+            "source_id",
+            "text",
+            "content_hash",
+        }:
+            raise ValueError("CI evidence bundle entry has an invalid schema")
+        source_id = entry["source_id"]
+        text = entry["text"]
+        content_hash = entry["content_hash"]
+        if (
+            type(source_id) is not str
+            or not source_id.strip()
+            or len(source_id) > _MAX_CI_SOURCE_ID_CHARS
+            or source_id != source_id.strip()
+            or any(
+                character.isspace()
+                or ord(character) < 32
+                or ord(character) == 127
+                for character in source_id
+            )
+        ):
+            raise ValueError("CI evidence source_id is invalid")
+        try:
+            source_id.encode("utf-8", "strict")
+        except UnicodeEncodeError as error:
+            raise ValueError("CI evidence source_id contains invalid Unicode") from error
+        if source_id in source_ids:
+            raise ValueError("CI evidence source_id is duplicated")
+        if type(text) is not str or len(text) > _MAX_CI_EVIDENCE_TEXT_CHARS:
+            raise ValueError("CI evidence text is invalid")
+        try:
+            encoded_text = text.encode("utf-8", "strict")
+        except UnicodeEncodeError as error:
+            raise ValueError("CI evidence text contains invalid Unicode") from error
+        if (
+            type(content_hash) is not str
+            or len(content_hash) != 64
+            or any(character not in "0123456789abcdef" for character in content_hash)
+            or hashlib.sha256(encoded_text).hexdigest() != content_hash
+        ):
+            raise ValueError("CI evidence content_hash is invalid")
+        source_ids.add(source_id)
+        encoded.append(_canonical_ci_evidence_entry(entry))
+
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if data != canonical:
+        raise ValueError("CI evidence bundle is not canonical JSON")
+    return tuple(encoded)
+
+
 def _run_review(args: argparse.Namespace) -> int:
     requested_repo = Path(args.repo).resolve()
+    try:
+        if args.ci_evidence and args.ci_evidence_file is not None:
+            raise ValueError("direct and file CI evidence are mutually exclusive")
+        existing_ci_evidence = tuple(args.ci_evidence)
+        if args.ci_evidence_file is not None:
+            existing_ci_evidence = _load_ci_evidence_bundle(
+                requested_repo,
+                args.ci_evidence_file,
+            )
+    except ValueError as error:
+        print(f"CI evidence input error: {error}", file=sys.stderr)
+        return 2
     resolver = RevisionResolver()
     try:
         repository_identity = resolver.repository_identity(requested_repo)
@@ -4020,6 +4260,7 @@ def _run_review(args: argparse.Namespace) -> int:
         user_intent=args.intent,
         review_focus=args.focus,
         project_rules=tuple(args.project_rule),
+        existing_ci_evidence=existing_ci_evidence,
     )
     pipeline = ReviewPipeline(
         repository=repo,

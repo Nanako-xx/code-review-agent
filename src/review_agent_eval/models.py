@@ -1,4 +1,4 @@
-"""Canonical, immutable v1 protocol models for code-review evaluation.
+"""Canonical, immutable v2 protocol models for code-review evaluation.
 
 This module deliberately depends only on Python's standard library.  The eval
 wire protocols are an authority boundary: product Runtime, Session, Memory,
@@ -13,13 +13,13 @@ import math
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple, Type, TypeVar
+from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union
 from urllib.parse import urlsplit
 
 
-EVAL_INPUT_SCHEMA_VERSION = "eval_input_v1"
-EVAL_SUBMISSION_SCHEMA_VERSION = "eval_submission_v1"
-EVAL_CASE_SCHEMA_VERSION = "eval_case_v1"
+EVAL_INPUT_SCHEMA_VERSION = "eval_input_v2"
+EVAL_SUBMISSION_SCHEMA_VERSION = "eval_submission_v2"
+EVAL_CASE_SCHEMA_VERSION = "eval_case_v2"
 
 MAX_EVAL_INPUT_BYTES = 2 * 1024 * 1024
 MAX_EVAL_SUBMISSION_BYTES = 16 * 1024 * 1024
@@ -36,6 +36,7 @@ MAX_QUESTION_CHARS = 8192
 MAX_ANSWER_CHARS = 8192
 MAX_UNCERTAINTY_CHARS = 8192
 MAX_EVIDENCE_EXCERPT_BYTES = 512 * 1024
+MAX_EVALUATOR_CONTEXT_CONTENT_BYTES = 512 * 1024
 
 MAX_REQUIREMENTS = 256
 MAX_PROJECT_RULES = 256
@@ -55,10 +56,25 @@ MAX_COMMAND_ARGUMENTS = 256
 MAX_LINE_NUMBER = 2_147_483_647
 MAX_COUNTER = 9_223_372_036_854_775_807
 MAX_JSON_DEPTH = 128
+MAX_JSON_INTEGER_DIGITS = 4096
 
 
 class SchemaError(ValueError):
-    """The value cannot be represented by a canonical eval v1 schema."""
+    """The value cannot be represented by a canonical eval v2 schema."""
+
+
+class UnsupportedProtocolVersionError(SchemaError):
+    """A root artifact declares a protocol version this implementation rejects."""
+
+    code = "unsupported_protocol_version"
+
+    def __init__(self, *, expected: str, actual: Any) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            "unsupported protocol version: expected %r, got %r"
+            % (expected, actual)
+        )
 
 
 class RepositorySource(str, Enum):
@@ -99,6 +115,7 @@ class FailureCode(str, Enum):
     CLARIFICATION_REQUIRED = "clarification_required"
     AGENT_BLOCKED = "agent_blocked"
     ADAPTER_ERROR = "adapter_error"
+    HARNESS_MATERIALIZATION_ERROR = "harness_materialization_error"
     UNKNOWN = "unknown"
 
 
@@ -148,9 +165,15 @@ class DiffSide(str, Enum):
     RIGHT = "right"
 
 
+class ReviewTargetKind(str, Enum):
+    REPOSITORY = "repository"
+    FROZEN_CONTEXT = "frozen_context"
+
+
 class EvidenceKind(str, Enum):
     REPOSITORY_FILE = "repository_file"
     REPOSITORY_DIFF = "repository_diff"
+    FROZEN_CONTEXT = "frozen_context"
     COMMAND_OUTPUT = "command_output"
     EXTERNAL_RECORD = "external_record"
 
@@ -202,6 +225,19 @@ class RequiredContextLevel(str, Enum):
     DIFF = "diff"
     FILE = "file"
     REPO = "repo"
+
+
+class MetricAuthoritySource(str, Enum):
+    EXPERT_ANNOTATION = "expert_annotation"
+    UPSTREAM_ANNOTATION = "upstream_annotation"
+
+
+class EvaluatorContextTask(str, Enum):
+    FINDING_EQUIVALENCE = "finding_equivalence"
+
+
+class EvaluatorContextSourceKind(str, Enum):
+    DIFF_HUNK = "diff_hunk"
 
 
 class IssueJudgement(str, Enum):
@@ -400,6 +436,17 @@ def _exact_fields(payload: Dict[str, Any], expected: Iterable[str], context: str
         raise _error("%s has %s" % (context, "; ".join(details)))
 
 
+def _require_root_schema_version(
+    payload: Dict[str, Any], expected: str, context: str
+) -> str:
+    if "schema_version" not in payload:
+        raise _error("%s has missing field(s): schema_version" % context)
+    actual = payload["schema_version"]
+    if actual != expected:
+        raise UnsupportedProtocolVersionError(expected=expected, actual=actual)
+    return expected
+
+
 def _array(value: Any, context: str, max_items: int) -> List[Any]:
     if type(value) is not list:
         raise _error("%s must be a JSON array" % context)
@@ -484,6 +531,13 @@ def _loose_submission_path(value: Any, context: str) -> Optional[str]:
     return path
 
 
+def _required_loose_submission_path(value: Any, context: str) -> str:
+    path = _loose_submission_path(value, context)
+    if path is None:
+        raise _error("%s must be a non-null path string" % context)
+    return path
+
+
 def _repository_url(value: Any, context: str) -> str:
     url = _string(value, context, MAX_URL_CHARS)
     if any(ord(character) < 32 or character.isspace() for character in url):
@@ -541,6 +595,19 @@ def _reject_constant(value: str) -> Any:
     raise _error("JSON contains non-standard numeric constant %s" % value)
 
 
+def _parse_json_integer(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise _error(
+            "JSON integer token exceeds the digit limit of %d"
+            % MAX_JSON_INTEGER_DIGITS
+        )
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise _error("JSON contains an invalid integer token") from exc
+
+
 def _strict_json_loads(data: Any, max_bytes: int, context: str) -> Any:
     if type(data) is bytes:
         if len(data) > max_bytes:
@@ -561,6 +628,7 @@ def _strict_json_loads(data: Any, max_bytes: int, context: str) -> Any:
             text,
             object_pairs_hook=_reject_duplicate_pairs,
             parse_constant=_reject_constant,
+            parse_int=_parse_json_integer,
         )
     except SchemaError:
         raise
@@ -621,7 +689,7 @@ def _json_ready(value: Any, context: str = "value", depth: int = 0) -> Any:
 
 
 def canonical_json(value: Any) -> str:
-    """Return the sole canonical v1 JSON text representation."""
+    """Return the sole canonical v2 JSON text representation."""
 
     return json.dumps(
         _json_ready(value),
@@ -646,7 +714,7 @@ def stable_id(prefix: str, *identity: Any) -> str:
     if type(prefix) is not str or _STABLE_PREFIX_RE.fullmatch(prefix) is None:
         raise _error("stable ID prefix is invalid")
     identity_payload = {
-        "namespace": "review_agent_eval.identity_v1",
+        "namespace": "review_agent_eval.identity_v2",
         "kind": prefix,
         "identity": list(identity),
     }
@@ -883,39 +951,179 @@ class ReviewRequest(_JsonModel):
 
 
 @dataclass(frozen=True)
+class RepositoryReviewTarget(_JsonModel):
+    kind: ReviewTargetKind
+    repository: Repository
+    review_request: ReviewRequest
+
+    def __post_init__(self) -> None:
+        if self.kind is not ReviewTargetKind.REPOSITORY:
+            raise _error("repository review_target.kind must be repository")
+        if not isinstance(self.repository, Repository):
+            raise _error("review_target.repository must be a Repository")
+        if not isinstance(self.review_request, ReviewRequest):
+            raise _error("review_target.review_request must be a ReviewRequest")
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "RepositoryReviewTarget":
+        payload = _object(value, "review_target")
+        _exact_fields(
+            payload,
+            ("kind", "repository", "review_request"),
+            "review_target",
+        )
+        return cls(
+            kind=_enum_value(
+                ReviewTargetKind, payload["kind"], "review_target.kind"
+            ),
+            repository=Repository.from_dict(payload["repository"]),
+            review_request=ReviewRequest.from_dict(payload["review_request"]),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "repository": self.repository.to_dict(),
+            "review_request": self.review_request.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class FrozenContextReviewTarget(_JsonModel):
+    kind: ReviewTargetKind
+    bundle_id: str
+    record_id: str
+    context_format: str
+    rendered_sha256: str
+    rendered_utf8_bytes: int
+    source_binding_digest: str
+
+    def __post_init__(self) -> None:
+        if self.kind is not ReviewTargetKind.FROZEN_CONTEXT:
+            raise _error("frozen review_target.kind must be frozen_context")
+        _identifier(self.bundle_id, "review_target.bundle_id")
+        _identifier(self.record_id, "review_target.record_id")
+        _string(
+            self.context_format,
+            "review_target.context_format",
+            MAX_IDENTIFIER_CHARS,
+        )
+        if self.context_format != "rendered_text":
+            raise _error("review_target.context_format must be rendered_text")
+        _digest(self.rendered_sha256, "review_target.rendered_sha256")
+        _integer(
+            self.rendered_utf8_bytes,
+            "review_target.rendered_utf8_bytes",
+            minimum=0,
+            maximum=MAX_COUNTER,
+        )
+        _digest(
+            self.source_binding_digest,
+            "review_target.source_binding_digest",
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "FrozenContextReviewTarget":
+        payload = _object(value, "review_target")
+        _exact_fields(
+            payload,
+            (
+                "kind",
+                "bundle_id",
+                "record_id",
+                "context_format",
+                "rendered_sha256",
+                "rendered_utf8_bytes",
+                "source_binding_digest",
+            ),
+            "review_target",
+        )
+        context_format = _string(
+            payload["context_format"],
+            "review_target.context_format",
+            MAX_IDENTIFIER_CHARS,
+        )
+        return cls(
+            kind=_enum_value(
+                ReviewTargetKind, payload["kind"], "review_target.kind"
+            ),
+            bundle_id=_identifier(payload["bundle_id"], "review_target.bundle_id"),
+            record_id=_identifier(payload["record_id"], "review_target.record_id"),
+            context_format=context_format,
+            rendered_sha256=_digest(
+                payload["rendered_sha256"], "review_target.rendered_sha256"
+            ),
+            rendered_utf8_bytes=_integer(
+                payload["rendered_utf8_bytes"],
+                "review_target.rendered_utf8_bytes",
+                minimum=0,
+                maximum=MAX_COUNTER,
+            ),
+            source_binding_digest=_digest(
+                payload["source_binding_digest"],
+                "review_target.source_binding_digest",
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "bundle_id": self.bundle_id,
+            "record_id": self.record_id,
+            "context_format": self.context_format,
+            "rendered_sha256": self.rendered_sha256,
+            "rendered_utf8_bytes": self.rendered_utf8_bytes,
+            "source_binding_digest": self.source_binding_digest,
+        }
+
+
+ReviewTargetV2 = Union[RepositoryReviewTarget, FrozenContextReviewTarget]
+
+
+def _review_target_from_dict(value: Any) -> ReviewTargetV2:
+    payload = _object(value, "review_target")
+    if "kind" not in payload:
+        raise _error("review_target has missing field(s): kind")
+    kind = _enum_value(ReviewTargetKind, payload["kind"], "review_target.kind")
+    if kind is ReviewTargetKind.REPOSITORY:
+        return RepositoryReviewTarget.from_dict(payload)
+    return FrozenContextReviewTarget.from_dict(payload)
+
+
+@dataclass(frozen=True)
 class EvalInput(_JsonModel):
     SCHEMA_VERSION: ClassVar[str] = EVAL_INPUT_SCHEMA_VERSION
 
     schema_version: str
     task_id: str
-    repository: Repository
-    review_request: ReviewRequest
+    review_target: ReviewTargetV2
 
     def __post_init__(self) -> None:
         if self.schema_version != self.SCHEMA_VERSION:
-            raise _error("EvalInput has an unknown schema_version")
+            raise UnsupportedProtocolVersionError(
+                expected=self.SCHEMA_VERSION, actual=self.schema_version
+            )
         _identifier(self.task_id, "eval_input.task_id")
-        if not isinstance(self.repository, Repository):
-            raise _error("eval_input.repository must be a Repository")
-        if not isinstance(self.review_request, ReviewRequest):
-            raise _error("eval_input.review_request must be a ReviewRequest")
+        if not isinstance(
+            self.review_target,
+            (RepositoryReviewTarget, FrozenContextReviewTarget),
+        ):
+            raise _error("eval_input.review_target must be a ReviewTargetV2")
         _check_model_size(self, MAX_EVAL_INPUT_BYTES, "EvalInput")
 
     @classmethod
     def from_dict(cls, value: Any) -> "EvalInput":
         payload = _object(value, "EvalInput")
+        _require_root_schema_version(payload, cls.SCHEMA_VERSION, "EvalInput")
         _exact_fields(
             payload,
-            ("schema_version", "task_id", "repository", "review_request"),
+            ("schema_version", "task_id", "review_target"),
             "EvalInput",
         )
-        if payload["schema_version"] != cls.SCHEMA_VERSION:
-            raise _error("EvalInput has an unknown schema_version")
         return cls(
-            schema_version=payload["schema_version"],
+            schema_version=cls.SCHEMA_VERSION,
             task_id=_identifier(payload["task_id"], "eval_input.task_id"),
-            repository=Repository.from_dict(payload["repository"]),
-            review_request=ReviewRequest.from_dict(payload["review_request"]),
+            review_target=_review_target_from_dict(payload["review_target"]),
         )
 
     @classmethod
@@ -928,44 +1136,36 @@ class EvalInput(_JsonModel):
         return {
             "schema_version": self.schema_version,
             "task_id": self.task_id,
-            "repository": self.repository.to_dict(),
-            "review_request": self.review_request.to_dict(),
+            "review_target": self.review_target.to_dict(),
         }
 
 
 @dataclass(frozen=True)
 class EvalCaseInput(_JsonModel):
-    repository: Repository
-    review_request: ReviewRequest
+    review_target: ReviewTargetV2
 
     def __post_init__(self) -> None:
-        if not isinstance(self.repository, Repository):
-            raise _error("case.input.repository must be a Repository")
-        if not isinstance(self.review_request, ReviewRequest):
-            raise _error("case.input.review_request must be a ReviewRequest")
+        if not isinstance(
+            self.review_target,
+            (RepositoryReviewTarget, FrozenContextReviewTarget),
+        ):
+            raise _error("case.input.review_target must be a ReviewTargetV2")
 
     @classmethod
     def from_dict(cls, value: Any) -> "EvalCaseInput":
         payload = _object(value, "case.input")
-        _exact_fields(payload, ("repository", "review_request"), "case.input")
-        return cls(
-            repository=Repository.from_dict(payload["repository"]),
-            review_request=ReviewRequest.from_dict(payload["review_request"]),
-        )
+        _exact_fields(payload, ("review_target",), "case.input")
+        return cls(review_target=_review_target_from_dict(payload["review_target"]))
 
     def to_eval_input(self, task_id: str) -> EvalInput:
         return EvalInput(
             schema_version=EVAL_INPUT_SCHEMA_VERSION,
             task_id=_identifier(task_id, "eval_case.task_id"),
-            repository=self.repository,
-            review_request=self.review_request,
+            review_target=self.review_target,
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "repository": self.repository.to_dict(),
-            "review_request": self.review_request.to_dict(),
-        }
+        return {"review_target": self.review_target.to_dict()}
 
 
 @dataclass(frozen=True)
@@ -1439,62 +1639,398 @@ class SubmissionReview(_JsonModel):
 
 
 @dataclass(frozen=True)
+class RepositoryFileEvidenceSource(_JsonModel):
+    kind: EvidenceKind
+    target_materialization_id: str
+    revision: str
+    path: str
+    from_line: int
+    to_line: int
+
+    def __post_init__(self) -> None:
+        if self.kind is not EvidenceKind.REPOSITORY_FILE:
+            raise _error("repository_file evidence.source.kind is invalid")
+        _identifier(
+            self.target_materialization_id,
+            "evidence.source.target_materialization_id",
+        )
+        _identifier(self.revision, "evidence.source.revision")
+        _required_loose_submission_path(self.path, "evidence.source.path")
+        _integer(
+            self.from_line,
+            "evidence.source.from_line",
+            minimum=1,
+            maximum=MAX_LINE_NUMBER,
+        )
+        _integer(
+            self.to_line,
+            "evidence.source.to_line",
+            minimum=1,
+            maximum=MAX_LINE_NUMBER,
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "RepositoryFileEvidenceSource":
+        payload = _object(value, "evidence.source")
+        _exact_fields(
+            payload,
+            (
+                "kind",
+                "target_materialization_id",
+                "revision",
+                "path",
+                "from_line",
+                "to_line",
+            ),
+            "evidence.source",
+        )
+        return cls(
+            kind=_enum_value(EvidenceKind, payload["kind"], "evidence.source.kind"),
+            target_materialization_id=_identifier(
+                payload["target_materialization_id"],
+                "evidence.source.target_materialization_id",
+            ),
+            revision=_identifier(payload["revision"], "evidence.source.revision"),
+            path=_required_loose_submission_path(
+                payload["path"], "evidence.source.path"
+            ),
+            from_line=_integer(
+                payload["from_line"],
+                "evidence.source.from_line",
+                minimum=1,
+                maximum=MAX_LINE_NUMBER,
+            ),
+            to_line=_integer(
+                payload["to_line"],
+                "evidence.source.to_line",
+                minimum=1,
+                maximum=MAX_LINE_NUMBER,
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "target_materialization_id": self.target_materialization_id,
+            "revision": self.revision,
+            "path": self.path,
+            "from_line": self.from_line,
+            "to_line": self.to_line,
+        }
+
+
+@dataclass(frozen=True)
+class RepositoryDiffEvidenceSource(_JsonModel):
+    kind: EvidenceKind
+    target_materialization_id: str
+    base_revision: str
+    head_revision: str
+    path: str
+
+    def __post_init__(self) -> None:
+        if self.kind is not EvidenceKind.REPOSITORY_DIFF:
+            raise _error("repository_diff evidence.source.kind is invalid")
+        _identifier(
+            self.target_materialization_id,
+            "evidence.source.target_materialization_id",
+        )
+        _identifier(self.base_revision, "evidence.source.base_revision")
+        _identifier(self.head_revision, "evidence.source.head_revision")
+        _required_loose_submission_path(self.path, "evidence.source.path")
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "RepositoryDiffEvidenceSource":
+        payload = _object(value, "evidence.source")
+        _exact_fields(
+            payload,
+            (
+                "kind",
+                "target_materialization_id",
+                "base_revision",
+                "head_revision",
+                "path",
+            ),
+            "evidence.source",
+        )
+        return cls(
+            kind=_enum_value(EvidenceKind, payload["kind"], "evidence.source.kind"),
+            target_materialization_id=_identifier(
+                payload["target_materialization_id"],
+                "evidence.source.target_materialization_id",
+            ),
+            base_revision=_identifier(
+                payload["base_revision"], "evidence.source.base_revision"
+            ),
+            head_revision=_identifier(
+                payload["head_revision"], "evidence.source.head_revision"
+            ),
+            path=_required_loose_submission_path(
+                payload["path"], "evidence.source.path"
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "target_materialization_id": self.target_materialization_id,
+            "base_revision": self.base_revision,
+            "head_revision": self.head_revision,
+            "path": self.path,
+        }
+
+
+@dataclass(frozen=True)
+class FrozenContextEvidenceSource(_JsonModel):
+    kind: EvidenceKind
+    target_materialization_id: str
+    context_ref: str
+    from_line: int
+    to_line: int
+
+    def __post_init__(self) -> None:
+        if self.kind is not EvidenceKind.FROZEN_CONTEXT:
+            raise _error("frozen_context evidence.source.kind is invalid")
+        _identifier(
+            self.target_materialization_id,
+            "evidence.source.target_materialization_id",
+        )
+        _identifier(self.context_ref, "evidence.source.context_ref")
+        _integer(
+            self.from_line,
+            "evidence.source.from_line",
+            minimum=1,
+            maximum=MAX_LINE_NUMBER,
+        )
+        _integer(
+            self.to_line,
+            "evidence.source.to_line",
+            minimum=1,
+            maximum=MAX_LINE_NUMBER,
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "FrozenContextEvidenceSource":
+        payload = _object(value, "evidence.source")
+        _exact_fields(
+            payload,
+            (
+                "kind",
+                "target_materialization_id",
+                "context_ref",
+                "from_line",
+                "to_line",
+            ),
+            "evidence.source",
+        )
+        return cls(
+            kind=_enum_value(EvidenceKind, payload["kind"], "evidence.source.kind"),
+            target_materialization_id=_identifier(
+                payload["target_materialization_id"],
+                "evidence.source.target_materialization_id",
+            ),
+            context_ref=_identifier(
+                payload["context_ref"], "evidence.source.context_ref"
+            ),
+            from_line=_integer(
+                payload["from_line"],
+                "evidence.source.from_line",
+                minimum=1,
+                maximum=MAX_LINE_NUMBER,
+            ),
+            to_line=_integer(
+                payload["to_line"],
+                "evidence.source.to_line",
+                minimum=1,
+                maximum=MAX_LINE_NUMBER,
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "target_materialization_id": self.target_materialization_id,
+            "context_ref": self.context_ref,
+            "from_line": self.from_line,
+            "to_line": self.to_line,
+        }
+
+
+@dataclass(frozen=True)
+class CommandOutputEvidenceSource(_JsonModel):
+    kind: EvidenceKind
+    target_materialization_id: str
+    command: Tuple[str, ...]
+    exit_code: int
+    stream: EvidenceStream
+    artifact_ref: str
+
+    def __post_init__(self) -> None:
+        if self.kind is not EvidenceKind.COMMAND_OUTPUT:
+            raise _error("command_output evidence.source.kind is invalid")
+        _identifier(
+            self.target_materialization_id,
+            "evidence.source.target_materialization_id",
+        )
+        raw_command = _sequence(
+            self.command, "evidence.source.command", MAX_COMMAND_ARGUMENTS
+        )
+        if not raw_command:
+            raise _error("evidence.source.command must be non-empty")
+        command = tuple(
+            _string(
+                item,
+                "evidence.source.command[%d]" % index,
+                MAX_CLAIM_CHARS,
+                allow_empty=True,
+            )
+            for index, item in enumerate(raw_command)
+        )
+        _integer(
+            self.exit_code,
+            "evidence.source.exit_code",
+            minimum=-MAX_COUNTER,
+            maximum=MAX_COUNTER,
+        )
+        _require_enum(EvidenceStream, self.stream, "evidence.source.stream")
+        _identifier(self.artifact_ref, "evidence.source.artifact_ref")
+        object.__setattr__(self, "command", command)
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "CommandOutputEvidenceSource":
+        payload = _object(value, "evidence.source")
+        _exact_fields(
+            payload,
+            (
+                "kind",
+                "target_materialization_id",
+                "command",
+                "exit_code",
+                "stream",
+                "artifact_ref",
+            ),
+            "evidence.source",
+        )
+        command = _array(
+            payload["command"], "evidence.source.command", MAX_COMMAND_ARGUMENTS
+        )
+        return cls(
+            kind=_enum_value(EvidenceKind, payload["kind"], "evidence.source.kind"),
+            target_materialization_id=_identifier(
+                payload["target_materialization_id"],
+                "evidence.source.target_materialization_id",
+            ),
+            command=tuple(command),
+            exit_code=_integer(
+                payload["exit_code"],
+                "evidence.source.exit_code",
+                minimum=-MAX_COUNTER,
+                maximum=MAX_COUNTER,
+            ),
+            stream=_enum_value(
+                EvidenceStream, payload["stream"], "evidence.source.stream"
+            ),
+            artifact_ref=_identifier(
+                payload["artifact_ref"], "evidence.source.artifact_ref"
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "target_materialization_id": self.target_materialization_id,
+            "command": list(self.command),
+            "exit_code": self.exit_code,
+            "stream": self.stream.value,
+            "artifact_ref": self.artifact_ref,
+        }
+
+
+@dataclass(frozen=True)
+class ExternalRecordEvidenceSource(_JsonModel):
+    kind: EvidenceKind
+    target_materialization_id: str
+    source_ref: str
+
+    def __post_init__(self) -> None:
+        if self.kind is not EvidenceKind.EXTERNAL_RECORD:
+            raise _error("external_record evidence.source.kind is invalid")
+        _identifier(
+            self.target_materialization_id,
+            "evidence.source.target_materialization_id",
+        )
+        _identifier(self.source_ref, "evidence.source.source_ref")
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "ExternalRecordEvidenceSource":
+        payload = _object(value, "evidence.source")
+        _exact_fields(
+            payload,
+            ("kind", "target_materialization_id", "source_ref"),
+            "evidence.source",
+        )
+        return cls(
+            kind=_enum_value(EvidenceKind, payload["kind"], "evidence.source.kind"),
+            target_materialization_id=_identifier(
+                payload["target_materialization_id"],
+                "evidence.source.target_materialization_id",
+            ),
+            source_ref=_identifier(
+                payload["source_ref"], "evidence.source.source_ref"
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "target_materialization_id": self.target_materialization_id,
+            "source_ref": self.source_ref,
+        }
+
+
+EvidenceSourceV2 = Union[
+    RepositoryFileEvidenceSource,
+    RepositoryDiffEvidenceSource,
+    FrozenContextEvidenceSource,
+    CommandOutputEvidenceSource,
+    ExternalRecordEvidenceSource,
+]
+
+
+_EVIDENCE_SOURCE_TYPES = (
+    RepositoryFileEvidenceSource,
+    RepositoryDiffEvidenceSource,
+    FrozenContextEvidenceSource,
+    CommandOutputEvidenceSource,
+    ExternalRecordEvidenceSource,
+)
+
+
+def _evidence_source_from_dict(value: Any) -> EvidenceSourceV2:
+    payload = _object(value, "evidence.source")
+    if "kind" not in payload:
+        raise _error("evidence.source has missing field(s): kind")
+    kind = _enum_value(EvidenceKind, payload["kind"], "evidence.source.kind")
+    source_type = {
+        EvidenceKind.REPOSITORY_FILE: RepositoryFileEvidenceSource,
+        EvidenceKind.REPOSITORY_DIFF: RepositoryDiffEvidenceSource,
+        EvidenceKind.FROZEN_CONTEXT: FrozenContextEvidenceSource,
+        EvidenceKind.COMMAND_OUTPUT: CommandOutputEvidenceSource,
+        EvidenceKind.EXTERNAL_RECORD: ExternalRecordEvidenceSource,
+    }[kind]
+    return source_type.from_dict(payload)
+
+
+@dataclass(frozen=True)
 class SubmissionEvidence(_JsonModel):
     evidence_id: str
-    kind: EvidenceKind
-    revision: str
-    path: Optional[str]
-    from_line: Optional[int]
-    to_line: Optional[int]
-    command: Optional[Tuple[str, ...]]
-    exit_code: Optional[int]
-    stream: Optional[EvidenceStream]
-    source_ref: Optional[str]
+    source: EvidenceSourceV2
     content_hash: str
     excerpt: str
 
     def __post_init__(self) -> None:
         _identifier(self.evidence_id, "evidence.evidence_id")
-        _require_enum(EvidenceKind, self.kind, "evidence.kind")
-        _identifier(self.revision, "evidence.revision")
-        _loose_submission_path(self.path, "evidence.path")
-        _optional_integer(
-            self.from_line,
-            "evidence.from_line",
-            minimum=1,
-            maximum=MAX_LINE_NUMBER,
-        )
-        _optional_integer(
-            self.to_line,
-            "evidence.to_line",
-            minimum=1,
-            maximum=MAX_LINE_NUMBER,
-        )
-        command: Optional[Tuple[str, ...]]
-        if self.command is None:
-            command = None
-        else:
-            raw_command = _sequence(
-                self.command, "evidence.command", MAX_COMMAND_ARGUMENTS
-            )
-            command = tuple(
-                _string(
-                    item,
-                    "evidence.command[%d]" % index,
-                    MAX_CLAIM_CHARS,
-                    allow_empty=True,
-                )
-                for index, item in enumerate(raw_command)
-            )
-        _optional_integer(
-            self.exit_code,
-            "evidence.exit_code",
-            minimum=-MAX_COUNTER,
-            maximum=MAX_COUNTER,
-        )
-        _require_optional_enum(EvidenceStream, self.stream, "evidence.stream")
-        if self.source_ref is not None:
-            _identifier(self.source_ref, "evidence.source_ref")
+        if not isinstance(self.source, _EVIDENCE_SOURCE_TYPES):
+            raise _error("evidence.source must be an EvidenceSourceV2")
         _digest(self.content_hash, "evidence.content_hash")
         excerpt = _string(
             self.excerpt,
@@ -1507,67 +2043,18 @@ class SubmissionEvidence(_JsonModel):
                 "evidence.excerpt exceeds the UTF-8 byte limit of %d"
                 % MAX_EVIDENCE_EXCERPT_BYTES
             )
-        object.__setattr__(self, "command", command)
 
     @classmethod
     def from_dict(cls, value: Any) -> "SubmissionEvidence":
         payload = _object(value, "evidence")
         _exact_fields(
             payload,
-            (
-                "evidence_id",
-                "kind",
-                "revision",
-                "path",
-                "from_line",
-                "to_line",
-                "command",
-                "exit_code",
-                "stream",
-                "source_ref",
-                "content_hash",
-                "excerpt",
-            ),
+            ("evidence_id", "source", "content_hash", "excerpt"),
             "evidence",
         )
-        if payload["command"] is None:
-            command = None
-        else:
-            command = tuple(
-                _array(payload["command"], "evidence.command", MAX_COMMAND_ARGUMENTS)
-            )
         return cls(
             evidence_id=_identifier(payload["evidence_id"], "evidence.evidence_id"),
-            kind=_enum_value(EvidenceKind, payload["kind"], "evidence.kind"),
-            revision=_identifier(payload["revision"], "evidence.revision"),
-            path=_loose_submission_path(payload["path"], "evidence.path"),
-            from_line=_optional_integer(
-                payload["from_line"],
-                "evidence.from_line",
-                minimum=1,
-                maximum=MAX_LINE_NUMBER,
-            ),
-            to_line=_optional_integer(
-                payload["to_line"],
-                "evidence.to_line",
-                minimum=1,
-                maximum=MAX_LINE_NUMBER,
-            ),
-            command=command,
-            exit_code=_optional_integer(
-                payload["exit_code"],
-                "evidence.exit_code",
-                minimum=-MAX_COUNTER,
-                maximum=MAX_COUNTER,
-            ),
-            stream=_optional_enum(
-                EvidenceStream, payload["stream"], "evidence.stream"
-            ),
-            source_ref=(
-                None
-                if payload["source_ref"] is None
-                else _identifier(payload["source_ref"], "evidence.source_ref")
-            ),
+            source=_evidence_source_from_dict(payload["source"]),
             content_hash=_digest(payload["content_hash"], "evidence.content_hash"),
             excerpt=_string(
                 payload["excerpt"],
@@ -1580,15 +2067,7 @@ class SubmissionEvidence(_JsonModel):
     def to_dict(self) -> Dict[str, Any]:
         return {
             "evidence_id": self.evidence_id,
-            "kind": self.kind.value,
-            "revision": self.revision,
-            "path": self.path,
-            "from_line": self.from_line,
-            "to_line": self.to_line,
-            "command": None if self.command is None else list(self.command),
-            "exit_code": self.exit_code,
-            "stream": None if self.stream is None else self.stream.value,
-            "source_ref": self.source_ref,
+            "source": self.source.to_dict(),
             "content_hash": self.content_hash,
             "excerpt": self.excerpt,
         }
@@ -1774,6 +2253,7 @@ _FAILURE_STATUS_BY_CODE = {
     FailureCode.NON_ZERO_EXIT: SubmissionStatus.FAILED,
     FailureCode.PROCESS_KILLED: SubmissionStatus.FAILED,
     FailureCode.ADAPTER_ERROR: SubmissionStatus.FAILED,
+    FailureCode.HARNESS_MATERIALIZATION_ERROR: SubmissionStatus.FAILED,
     FailureCode.UNKNOWN: SubmissionStatus.FAILED,
     FailureCode.CLARIFICATION_REQUIRED: SubmissionStatus.BLOCKED,
     FailureCode.AGENT_BLOCKED: SubmissionStatus.BLOCKED,
@@ -1804,6 +2284,8 @@ class EvalSubmission(_JsonModel):
     task_id: str
     agent_id: str
     trial_id: str
+    eval_input_digest: str
+    target_materialization_id: str
     status: SubmissionStatus
     intent: Optional[SubmissionIntent]
     review: Optional[SubmissionReview]
@@ -1814,10 +2296,17 @@ class EvalSubmission(_JsonModel):
 
     def __post_init__(self) -> None:
         if self.schema_version != self.SCHEMA_VERSION:
-            raise _error("EvalSubmission has an unknown schema_version")
+            raise UnsupportedProtocolVersionError(
+                expected=self.SCHEMA_VERSION, actual=self.schema_version
+            )
         _identifier(self.task_id, "submission.task_id")
         _identifier(self.agent_id, "submission.agent_id")
         _identifier(self.trial_id, "submission.trial_id")
+        _digest(self.eval_input_digest, "submission.eval_input_digest")
+        _identifier(
+            self.target_materialization_id,
+            "submission.target_materialization_id",
+        )
         _require_enum(SubmissionStatus, self.status, "submission.status")
         if self.intent is not None and not isinstance(self.intent, SubmissionIntent):
             raise _error("submission.intent must be SubmissionIntent or null")
@@ -1830,6 +2319,14 @@ class EvalSubmission(_JsonModel):
             MAX_EVIDENCE_ITEMS,
         )
         _unique_by(evidence, "evidence_id", "submission.evidence")
+        if any(
+            item.source.target_materialization_id
+            != self.target_materialization_id
+            for item in evidence
+        ):
+            raise _error(
+                "evidence source target_materialization_id does not match submission binding"
+            )
         if not isinstance(self.usage, SubmissionUsage):
             raise _error("submission.usage must be a SubmissionUsage")
         if self.trace_ref is not None and not isinstance(self.trace_ref, TraceRef):
@@ -1847,6 +2344,13 @@ class EvalSubmission(_JsonModel):
                 self.failure.code
             ) is not SubmissionStatus.FAILED:
                 raise _error("failed submission has an invalid or missing failure code")
+            if (
+                self.failure.code is FailureCode.HARNESS_MATERIALIZATION_ERROR
+                and (self.intent is not None or self.review is not None)
+            ):
+                raise _error(
+                    "harness_materialization_error requires intent=null and review=null"
+                )
         elif self.status is SubmissionStatus.BLOCKED:
             if self.failure is None or submission_status_for_failure(
                 self.failure.code
@@ -1879,6 +2383,7 @@ class EvalSubmission(_JsonModel):
     @classmethod
     def from_dict(cls, value: Any) -> "EvalSubmission":
         payload = _object(value, "EvalSubmission")
+        _require_root_schema_version(payload, cls.SCHEMA_VERSION, "EvalSubmission")
         _exact_fields(
             payload,
             (
@@ -1886,6 +2391,8 @@ class EvalSubmission(_JsonModel):
                 "task_id",
                 "agent_id",
                 "trial_id",
+                "eval_input_digest",
+                "target_materialization_id",
                 "status",
                 "intent",
                 "review",
@@ -1896,16 +2403,21 @@ class EvalSubmission(_JsonModel):
             ),
             "EvalSubmission",
         )
-        if payload["schema_version"] != cls.SCHEMA_VERSION:
-            raise _error("EvalSubmission has an unknown schema_version")
         evidence = _array(
             payload["evidence"], "submission.evidence", MAX_EVIDENCE_ITEMS
         )
         return cls(
-            schema_version=payload["schema_version"],
+            schema_version=cls.SCHEMA_VERSION,
             task_id=_identifier(payload["task_id"], "submission.task_id"),
             agent_id=_identifier(payload["agent_id"], "submission.agent_id"),
             trial_id=_identifier(payload["trial_id"], "submission.trial_id"),
+            eval_input_digest=_digest(
+                payload["eval_input_digest"], "submission.eval_input_digest"
+            ),
+            target_materialization_id=_identifier(
+                payload["target_materialization_id"],
+                "submission.target_materialization_id",
+            ),
             status=_enum_value(
                 SubmissionStatus, payload["status"], "submission.status"
             ),
@@ -1945,6 +2457,8 @@ class EvalSubmission(_JsonModel):
             "task_id": self.task_id,
             "agent_id": self.agent_id,
             "trial_id": self.trial_id,
+            "eval_input_digest": self.eval_input_digest,
+            "target_materialization_id": self.target_materialization_id,
             "status": self.status.value,
             "intent": None if self.intent is None else self.intent.to_dict(),
             "review": None if self.review is None else self.review.to_dict(),
@@ -2482,12 +2996,93 @@ class EvidenceAnchor(_JsonModel):
 
 
 @dataclass(frozen=True)
+class MetricAuthority(_JsonModel):
+    severity_scorable: bool
+    severity_authority: Optional[MetricAuthoritySource]
+    location_scorable: bool
+    location_authority: Optional[MetricAuthoritySource]
+
+    def __post_init__(self) -> None:
+        _boolean(self.severity_scorable, "metric_authority.severity_scorable")
+        _require_optional_enum(
+            MetricAuthoritySource,
+            self.severity_authority,
+            "metric_authority.severity_authority",
+        )
+        _boolean(self.location_scorable, "metric_authority.location_scorable")
+        _require_optional_enum(
+            MetricAuthoritySource,
+            self.location_authority,
+            "metric_authority.location_authority",
+        )
+        if self.severity_scorable != (self.severity_authority is not None):
+            raise _error(
+                "severity_authority must be present exactly when severity is scorable"
+            )
+        if self.location_scorable != (self.location_authority is not None):
+            raise _error(
+                "location_authority must be present exactly when location is scorable"
+            )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "MetricAuthority":
+        payload = _object(value, "metric_authority")
+        _exact_fields(
+            payload,
+            (
+                "severity_scorable",
+                "severity_authority",
+                "location_scorable",
+                "location_authority",
+            ),
+            "metric_authority",
+        )
+        return cls(
+            severity_scorable=_boolean(
+                payload["severity_scorable"],
+                "metric_authority.severity_scorable",
+            ),
+            severity_authority=_optional_enum(
+                MetricAuthoritySource,
+                payload["severity_authority"],
+                "metric_authority.severity_authority",
+            ),
+            location_scorable=_boolean(
+                payload["location_scorable"],
+                "metric_authority.location_scorable",
+            ),
+            location_authority=_optional_enum(
+                MetricAuthoritySource,
+                payload["location_authority"],
+                "metric_authority.location_authority",
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "severity_scorable": self.severity_scorable,
+            "severity_authority": (
+                None
+                if self.severity_authority is None
+                else self.severity_authority.value
+            ),
+            "location_scorable": self.location_scorable,
+            "location_authority": (
+                None
+                if self.location_authority is None
+                else self.location_authority.value
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class ExpectedFinding(_JsonModel):
     truth_id: str
     claim: str
-    severity: FindingSeverity
+    severity: Optional[FindingSeverity]
     category: str
     required: bool
+    metric_authority: MetricAuthority
     locations: Tuple[TruthLocation, ...]
     evidence_anchors: Tuple[EvidenceAnchor, ...]
     required_context_level: RequiredContextLevel
@@ -2496,9 +3091,15 @@ class ExpectedFinding(_JsonModel):
     def __post_init__(self) -> None:
         _identifier(self.truth_id, "expected finding.truth_id")
         _string(self.claim, "expected finding.claim", MAX_CLAIM_CHARS)
-        _require_enum(FindingSeverity, self.severity, "expected finding.severity")
+        _require_optional_enum(
+            FindingSeverity, self.severity, "expected finding.severity"
+        )
         _string(self.category, "expected finding.category", MAX_IDENTIFIER_CHARS)
         _boolean(self.required, "expected finding.required")
+        if not isinstance(self.metric_authority, MetricAuthority):
+            raise _error(
+                "expected finding.metric_authority must be a MetricAuthority"
+            )
         locations = _model_tuple(
             self.locations,
             TruthLocation,
@@ -2511,6 +3112,17 @@ class ExpectedFinding(_JsonModel):
             "expected finding.evidence_anchors",
             MAX_EVIDENCE_ANCHORS,
         )
+        if self.metric_authority.severity_scorable != (self.severity is not None):
+            raise _error(
+                "expected finding severity must be present exactly when scorable"
+            )
+        if self.metric_authority.location_scorable and not any(
+            location.from_line is not None and location.to_line is not None
+            for location in locations
+        ):
+            raise _error(
+                "location-scorable expected finding requires a complete truth location"
+            )
         _require_enum(
             RequiredContextLevel,
             self.required_context_level,
@@ -2533,6 +3145,7 @@ class ExpectedFinding(_JsonModel):
                 "severity",
                 "category",
                 "required",
+                "metric_authority",
                 "locations",
                 "evidence_anchors",
                 "required_context_level",
@@ -2553,7 +3166,7 @@ class ExpectedFinding(_JsonModel):
             claim=_string(
                 payload["claim"], "expected finding.claim", MAX_CLAIM_CHARS
             ),
-            severity=_enum_value(
+            severity=_optional_enum(
                 FindingSeverity, payload["severity"], "expected finding.severity"
             ),
             category=_string(
@@ -2562,6 +3175,9 @@ class ExpectedFinding(_JsonModel):
                 MAX_IDENTIFIER_CHARS,
             ),
             required=_boolean(payload["required"], "expected finding.required"),
+            metric_authority=MetricAuthority.from_dict(
+                payload["metric_authority"]
+            ),
             locations=tuple(TruthLocation.from_dict(item) for item in locations),
             evidence_anchors=tuple(EvidenceAnchor.from_dict(item) for item in anchors),
             required_context_level=_enum_value(
@@ -2580,9 +3196,10 @@ class ExpectedFinding(_JsonModel):
         return {
             "truth_id": self.truth_id,
             "claim": self.claim,
-            "severity": self.severity.value,
+            "severity": None if self.severity is None else self.severity.value,
             "category": self.category,
             "required": self.required,
+            "metric_authority": self.metric_authority.to_dict(),
             "locations": [item.to_dict() for item in self.locations],
             "evidence_anchors": [item.to_dict() for item in self.evidence_anchors],
             "required_context_level": self.required_context_level.value,
@@ -2766,6 +3383,260 @@ class ReviewTruth(_JsonModel):
 
 
 @dataclass(frozen=True)
+class EvaluatorContextProvenance(_JsonModel):
+    source_role: str
+    source_file_sha256: str
+    record_pointer: str
+    record_sha256: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.source_role, "evaluator context provenance.source_role")
+        _digest(
+            self.source_file_sha256,
+            "evaluator context provenance.source_file_sha256",
+        )
+        _string(
+            self.record_pointer,
+            "evaluator context provenance.record_pointer",
+            MAX_URL_CHARS,
+        )
+        _digest(
+            self.record_sha256,
+            "evaluator context provenance.record_sha256",
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "EvaluatorContextProvenance":
+        payload = _object(value, "evaluator context provenance")
+        _exact_fields(
+            payload,
+            (
+                "source_role",
+                "source_file_sha256",
+                "record_pointer",
+                "record_sha256",
+            ),
+            "evaluator context provenance",
+        )
+        return cls(
+            source_role=_identifier(
+                payload["source_role"],
+                "evaluator context provenance.source_role",
+            ),
+            source_file_sha256=_digest(
+                payload["source_file_sha256"],
+                "evaluator context provenance.source_file_sha256",
+            ),
+            record_pointer=_string(
+                payload["record_pointer"],
+                "evaluator context provenance.record_pointer",
+                MAX_URL_CHARS,
+            ),
+            record_sha256=_digest(
+                payload["record_sha256"],
+                "evaluator context provenance.record_sha256",
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source_role": self.source_role,
+            "source_file_sha256": self.source_file_sha256,
+            "record_pointer": self.record_pointer,
+            "record_sha256": self.record_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class EvaluatorContextSource(_JsonModel):
+    kind: EvaluatorContextSourceKind
+    content: str
+    content_sha256: str
+    provenance: EvaluatorContextProvenance
+
+    def __post_init__(self) -> None:
+        if self.kind is not EvaluatorContextSourceKind.DIFF_HUNK:
+            raise _error("evaluator context source.kind must be diff_hunk")
+        content = _string(
+            self.content,
+            "evaluator context source.content",
+            MAX_EVALUATOR_CONTEXT_CONTENT_BYTES,
+        )
+        if (
+            _utf8_size(content, "evaluator context source.content")
+            > MAX_EVALUATOR_CONTEXT_CONTENT_BYTES
+        ):
+            raise _error(
+                "evaluator context source.content exceeds the UTF-8 byte limit of %d"
+                % MAX_EVALUATOR_CONTEXT_CONTENT_BYTES
+            )
+        content_sha256 = _digest(
+            self.content_sha256,
+            "evaluator context source.content_sha256",
+        )
+        if hashlib.sha256(content.encode("utf-8")).hexdigest() != content_sha256:
+            raise _error(
+                "evaluator context source.content_sha256 must hash exact UTF-8 content"
+            )
+        if not isinstance(self.provenance, EvaluatorContextProvenance):
+            raise _error(
+                "evaluator context source.provenance must be EvaluatorContextProvenance"
+            )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "EvaluatorContextSource":
+        payload = _object(value, "evaluator context source")
+        _exact_fields(
+            payload,
+            ("kind", "content", "content_sha256", "provenance"),
+            "evaluator context source",
+        )
+        return cls(
+            kind=_enum_value(
+                EvaluatorContextSourceKind,
+                payload["kind"],
+                "evaluator context source.kind",
+            ),
+            content=_string(
+                payload["content"],
+                "evaluator context source.content",
+                MAX_EVALUATOR_CONTEXT_CONTENT_BYTES,
+            ),
+            content_sha256=_digest(
+                payload["content_sha256"],
+                "evaluator context source.content_sha256",
+            ),
+            provenance=EvaluatorContextProvenance.from_dict(
+                payload["provenance"]
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "content": self.content,
+            "content_sha256": self.content_sha256,
+            "provenance": self.provenance.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class TruthEvaluatorContext(_JsonModel):
+    truth_id: str
+    allowed_tasks: Tuple[EvaluatorContextTask, ...]
+    sources: Tuple[EvaluatorContextSource, ...]
+
+    def __post_init__(self) -> None:
+        _identifier(self.truth_id, "truth evaluator context.truth_id")
+        raw_tasks = _sequence(
+            self.allowed_tasks,
+            "truth evaluator context.allowed_tasks",
+            MAX_TEXT_LIST_ITEMS,
+        )
+        if not raw_tasks:
+            raise _error("truth evaluator context.allowed_tasks must be non-empty")
+        tasks = tuple(
+            _require_enum(
+                EvaluatorContextTask,
+                item,
+                "truth evaluator context.allowed_tasks[%d]" % index,
+            )
+            for index, item in enumerate(raw_tasks)
+        )
+        if len(tasks) != len(set(tasks)):
+            raise _error("truth evaluator context.allowed_tasks contains duplicates")
+        sources = _model_tuple(
+            self.sources,
+            EvaluatorContextSource,
+            "truth evaluator context.sources",
+            MAX_EVIDENCE_ANCHORS,
+        )
+        object.__setattr__(self, "allowed_tasks", tuple(sorted(tasks, key=lambda item: item.value)))
+        object.__setattr__(self, "sources", _canonical_model_sort(sources))
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "TruthEvaluatorContext":
+        payload = _object(value, "truth evaluator context")
+        _exact_fields(
+            payload,
+            ("truth_id", "allowed_tasks", "sources"),
+            "truth evaluator context",
+        )
+        raw_tasks = _array(
+            payload["allowed_tasks"],
+            "truth evaluator context.allowed_tasks",
+            MAX_TEXT_LIST_ITEMS,
+        )
+        sources = _array(
+            payload["sources"],
+            "truth evaluator context.sources",
+            MAX_EVIDENCE_ANCHORS,
+        )
+        return cls(
+            truth_id=_identifier(
+                payload["truth_id"], "truth evaluator context.truth_id"
+            ),
+            allowed_tasks=tuple(
+                _enum_value(
+                    EvaluatorContextTask,
+                    item,
+                    "truth evaluator context.allowed_tasks[%d]" % index,
+                )
+                for index, item in enumerate(raw_tasks)
+            ),
+            sources=tuple(EvaluatorContextSource.from_dict(item) for item in sources),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "truth_id": self.truth_id,
+            "allowed_tasks": [item.value for item in self.allowed_tasks],
+            "sources": [item.to_dict() for item in self.sources],
+        }
+
+
+@dataclass(frozen=True)
+class ReviewEvaluatorContext(_JsonModel):
+    truth_contexts: Tuple[TruthEvaluatorContext, ...]
+
+    def __post_init__(self) -> None:
+        contexts = _model_tuple(
+            self.truth_contexts,
+            TruthEvaluatorContext,
+            "review evaluator context.truth_contexts",
+            MAX_TRUTH_FINDINGS,
+        )
+        _unique_by(
+            contexts,
+            "truth_id",
+            "review evaluator context.truth_contexts",
+        )
+        object.__setattr__(
+            self, "truth_contexts", _sorted_by(contexts, "truth_id")
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "ReviewEvaluatorContext":
+        payload = _object(value, "review evaluator context")
+        _exact_fields(payload, ("truth_contexts",), "review evaluator context")
+        contexts = _array(
+            payload["truth_contexts"],
+            "review evaluator context.truth_contexts",
+            MAX_TRUTH_FINDINGS,
+        )
+        return cls(
+            truth_contexts=tuple(
+                TruthEvaluatorContext.from_dict(item) for item in contexts
+            )
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "truth_contexts": [item.to_dict() for item in self.truth_contexts]
+        }
+
+
+@dataclass(frozen=True)
 class EvalCase(_JsonModel):
     SCHEMA_VERSION: ClassVar[str] = EVAL_CASE_SCHEMA_VERSION
 
@@ -2777,10 +3648,13 @@ class EvalCase(_JsonModel):
     clarification_script: ClarificationScript
     intent_truth: IntentTruth
     review_truth: ReviewTruth
+    review_evaluator_context: ReviewEvaluatorContext
 
     def __post_init__(self) -> None:
         if self.schema_version != self.SCHEMA_VERSION:
-            raise _error("EvalCase has an unknown schema_version")
+            raise UnsupportedProtocolVersionError(
+                expected=self.SCHEMA_VERSION, actual=self.schema_version
+            )
         _identifier(self.task_id, "eval_case.task_id")
         _integer(
             self.case_version,
@@ -2802,6 +3676,12 @@ class EvalCase(_JsonModel):
             raise _error("eval_case.intent_truth must be IntentTruth")
         if not isinstance(self.review_truth, ReviewTruth):
             raise _error("eval_case.review_truth must be ReviewTruth")
+        if not isinstance(
+            self.review_evaluator_context, ReviewEvaluatorContext
+        ):
+            raise _error(
+                "eval_case.review_evaluator_context must be ReviewEvaluatorContext"
+            )
 
         truth_ids = [item.truth_id for item in self.intent_truth.expected_claims]
         truth_ids.extend(item.truth_id for item in self.intent_truth.forbidden_claims)
@@ -2811,11 +3691,23 @@ class EvalCase(_JsonModel):
         )
         if len(truth_ids) != len(set(truth_ids)):
             raise _error("EvalCase contains duplicate truth_id values")
+        review_truth_ids = {
+            item.truth_id for item in self.review_truth.expected_findings
+        }
+        review_truth_ids.update(
+            item.truth_id for item in self.review_truth.known_invalid_findings
+        )
+        for context in self.review_evaluator_context.truth_contexts:
+            if context.truth_id not in review_truth_ids:
+                raise _error(
+                    "review evaluator context references a truth outside this EvalCase"
+                )
         _check_model_size(self, MAX_EVAL_CASE_BYTES, "EvalCase")
 
     @classmethod
     def from_dict(cls, value: Any) -> "EvalCase":
         payload = _object(value, "EvalCase")
+        _require_root_schema_version(payload, cls.SCHEMA_VERSION, "EvalCase")
         _exact_fields(
             payload,
             (
@@ -2827,13 +3719,12 @@ class EvalCase(_JsonModel):
                 "clarification_script",
                 "intent_truth",
                 "review_truth",
+                "review_evaluator_context",
             ),
             "EvalCase",
         )
-        if payload["schema_version"] != cls.SCHEMA_VERSION:
-            raise _error("EvalCase has an unknown schema_version")
         return cls(
-            schema_version=payload["schema_version"],
+            schema_version=cls.SCHEMA_VERSION,
             task_id=_identifier(payload["task_id"], "eval_case.task_id"),
             case_version=_integer(
                 payload["case_version"],
@@ -2848,6 +3739,9 @@ class EvalCase(_JsonModel):
             ),
             intent_truth=IntentTruth.from_dict(payload["intent_truth"]),
             review_truth=ReviewTruth.from_dict(payload["review_truth"]),
+            review_evaluator_context=ReviewEvaluatorContext.from_dict(
+                payload["review_evaluator_context"]
+            ),
         )
 
     @classmethod
@@ -2875,6 +3769,7 @@ class EvalCase(_JsonModel):
             "clarification_script": self.clarification_script.to_dict(),
             "intent_truth": self.intent_truth.to_dict(),
             "review_truth": self.review_truth.to_dict(),
+            "review_evaluator_context": self.review_evaluator_context.to_dict(),
         }
 
 
@@ -2887,6 +3782,8 @@ def validate_submission_for_case(submission: EvalSubmission, case: EvalCase) -> 
         raise _error("case must be an EvalCase")
     if submission.task_id != case.task_id:
         raise _error("submission task_id does not match EvalCase task_id")
+    if submission.eval_input_digest != case.eval_input().digest():
+        raise _error("submission eval_input_digest does not match EvalCase input digest")
     if submission.intent is None:
         return
     answers = {item.answer_id: item for item in case.clarification_script.answers}
@@ -2948,6 +3845,7 @@ __all__ = [
     "MAX_ANSWER_CHARS",
     "MAX_UNCERTAINTY_CHARS",
     "MAX_EVIDENCE_EXCERPT_BYTES",
+    "MAX_EVALUATOR_CONTEXT_CONTENT_BYTES",
     "MAX_REQUIREMENTS",
     "MAX_PROJECT_RULES",
     "MAX_EXISTING_CI_EVIDENCE",
@@ -2965,7 +3863,9 @@ __all__ = [
     "MAX_LINE_NUMBER",
     "MAX_COUNTER",
     "MAX_JSON_DEPTH",
+    "MAX_JSON_INTEGER_DIGITS",
     "SchemaError",
+    "UnsupportedProtocolVersionError",
     "RepositorySource",
     "TrialStatus",
     "SubmissionStatus",
@@ -2978,6 +3878,7 @@ __all__ = [
     "IntentClaimJudgement",
     "FindingSeverity",
     "DiffSide",
+    "ReviewTargetKind",
     "EvidenceKind",
     "EvidenceStream",
     "TraceType",
@@ -2987,12 +3888,18 @@ __all__ = [
     "TruthCompleteness",
     "NovelFindingPolicy",
     "RequiredContextLevel",
+    "MetricAuthoritySource",
+    "EvaluatorContextTask",
+    "EvaluatorContextSourceKind",
     "IssueJudgement",
     "EvidenceIntegrity",
     "EvidenceSupport",
     "Repository",
     "ExistingCIEvidence",
     "ReviewRequest",
+    "RepositoryReviewTarget",
+    "FrozenContextReviewTarget",
+    "ReviewTargetV2",
     "EvalInput",
     "EvalCaseInput",
     "SubmissionIntentClaim",
@@ -3000,6 +3907,12 @@ __all__ = [
     "SubmissionIntent",
     "SubmissionFinding",
     "SubmissionReview",
+    "RepositoryFileEvidenceSource",
+    "RepositoryDiffEvidenceSource",
+    "FrozenContextEvidenceSource",
+    "CommandOutputEvidenceSource",
+    "ExternalRecordEvidenceSource",
+    "EvidenceSourceV2",
     "SubmissionEvidence",
     "SubmissionUsage",
     "TraceRef",
@@ -3014,9 +3927,14 @@ __all__ = [
     "IntentTruth",
     "TruthLocation",
     "EvidenceAnchor",
+    "MetricAuthority",
     "ExpectedFinding",
     "KnownInvalidFinding",
     "ReviewTruth",
+    "EvaluatorContextProvenance",
+    "EvaluatorContextSource",
+    "TruthEvaluatorContext",
+    "ReviewEvaluatorContext",
     "EvalCase",
     "canonical_json",
     "canonical_json_bytes",

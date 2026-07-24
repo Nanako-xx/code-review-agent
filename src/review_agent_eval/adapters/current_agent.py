@@ -36,8 +36,12 @@ from review_agent.session_store import SessionStore
 
 from ..clarification import ClarificationChannel, ClarificationProtocolError
 from ..config import ClarificationMatcherSnapshot
+from ..config import AdapterCapabilitiesV2
+from ..artifacts import TargetAccess
 from ..models import (
+    EVAL_INPUT_SCHEMA_VERSION,
     EVAL_SUBMISSION_SCHEMA_VERSION,
+    MAX_EVAL_INPUT_BYTES,
     ClarificationAction,
     EvalInput,
     EvalSubmission,
@@ -47,6 +51,10 @@ from ..models import (
     IntentClaimSource,
     IntentDimension,
     IntentResult,
+    ReviewTargetKind,
+    RepositoryDiffEvidenceSource,
+    RepositoryFileEvidenceSource,
+    RepositoryReviewTarget,
     SubmissionClarificationExchange,
     SubmissionEvidence,
     SubmissionFinding,
@@ -56,8 +64,10 @@ from ..models import (
     SubmissionStatus,
     TraceRef,
     TraceType,
+    canonical_json_bytes,
     stable_id,
 )
+from ..repository import repository_from_eval_input
 from ..submission import (
     empty_usage,
     failure_submission,
@@ -68,7 +78,6 @@ from .base import (
     AdapterIncompatibilityReason,
     AgentAdapterError,
     AgentAdapterIncompatibleError,
-    AgentInputCapability,
     AgentRunConfig,
 )
 from .subprocess_agent import (
@@ -79,7 +88,33 @@ from .subprocess_agent import (
 )
 
 
-CURRENT_AGENT_ADAPTER_KIND = "current-agent-cli-v1"
+CURRENT_AGENT_ADAPTER_KIND = "current-agent-cli-v2"
+CURRENT_AGENT_ADAPTER_VERSION = "2"
+
+
+def current_agent_capabilities() -> AdapterCapabilitiesV2:
+    """Return the fixed capability declaration for the product CLI adapter."""
+
+    return AdapterCapabilitiesV2.from_dict(
+        {
+            "schema_version": "eval_adapter_capabilities_v2",
+            "adapter_id": CURRENT_AGENT_ADAPTER_KIND,
+            "adapter_version": CURRENT_AGENT_ADAPTER_VERSION,
+            "input_schema_version": EVAL_INPUT_SCHEMA_VERSION,
+            "submission_schema_version": EVAL_SUBMISSION_SCHEMA_VERSION,
+            "target_kinds": [ReviewTargetKind.REPOSITORY.value],
+            "evidence_kinds": [
+                EvidenceKind.REPOSITORY_FILE.value,
+                EvidenceKind.REPOSITORY_DIFF.value,
+                EvidenceKind.COMMAND_OUTPUT.value,
+                EvidenceKind.EXTERNAL_RECORD.value,
+            ],
+            "clarification_protocol": "canonical-clarification-v2",
+            "trace_protocol": "local-trace-v2",
+            "subprocess_wire_version": None,
+            "isolation_profile": "repository-worktree-v2",
+        }
+    )
 
 _ADAPTER_FIELDS = frozenset(
     {
@@ -97,6 +132,10 @@ _MAX_ARGUMENT_CHARS = 8_192
 _MAX_ENVIRONMENT_KEYS = 128
 _MAX_PRODUCT_JSON_BYTES = 16 * 1024 * 1024
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_CI_EVIDENCE_BUNDLE_SCHEMA_VERSION = "review_agent_ci_evidence_bundle_v1"
+_CI_EVIDENCE_CONTROL_DIRECTORY = PurePosixPath(".review-agent/eval-input")
+_CI_EVIDENCE_BUNDLE_PREFIX = "existing-ci-evidence."
+_CI_EVIDENCE_BUNDLE_SUFFIX = ".v1.json"
 
 _FORBIDDEN_REVIEW_ARGUMENTS = frozenset(
     {
@@ -109,6 +148,8 @@ _FORBIDDEN_REVIEW_ARGUMENTS = frozenset(
         "--description",
         "--requirement",
         "--project-rule",
+        "--ci-evidence",
+        "--ci-evidence-file",
         "--memory-mode",
         "--memory-root",
         "--non-interactive",
@@ -173,7 +214,12 @@ def _configuration(config: AgentRunConfig) -> _CurrentAdapterConfiguration:
     )
     for argument in review_arguments:
         option = argument.split("=", 1)[0]
-        if option in _FORBIDDEN_REVIEW_ARGUMENTS:
+        ci_file_abbreviation = (
+            option.startswith("--")
+            and len(option) > 2
+            and "--ci-evidence-file".startswith(option)
+        )
+        if option in _FORBIDDEN_REVIEW_ARGUMENTS or ci_file_abbreviation:
             raise _CurrentAdapterError(
                 "current Agent fixed arguments override invocation authority"
             )
@@ -210,6 +256,7 @@ def _failure(
     *,
     eval_input: EvalInput,
     config: AgentRunConfig,
+    target_materialization_id: str,
     code: FailureCode,
     elapsed: float,
     retryable: bool,
@@ -230,6 +277,7 @@ def _failure(
     submission = failure_submission(
         eval_input=eval_input,
         config=config,
+        target_materialization_id=target_materialization_id,
         code=code,
         message=messages[code],
         retryable=retryable,
@@ -301,7 +349,7 @@ def _load_session(
 ) -> Tuple[SessionStore, SessionManifest]:
     store = SessionStore(run_dir)
     manifest = store.load()
-    repository = eval_input.repository
+    repository = repository_from_eval_input(eval_input)
     try:
         Path(manifest.repository.git_common_dir).resolve().relative_to(
             workspace.resolve()
@@ -551,14 +599,206 @@ def _answer_input(
     raise _CurrentAdapterError("unsupported clarification action")
 
 
+def _safe_control_directory(path: Path, context: str) -> os.stat_result:
+    try:
+        metadata = os.lstat(path)
+    except OSError as error:
+        raise _CurrentAdapterError("%s could not be inspected" % context) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or getattr(metadata, "st_file_attributes", 0) & _REPARSE_POINT
+    ):
+        raise _CurrentAdapterError("%s is not a safe directory" % context)
+    return metadata
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _read_created_ci_bundle(path: Path) -> bytes:
+    try:
+        before = os.lstat(path)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or getattr(before, "st_file_attributes", 0) & _REPARSE_POINT
+            or before.st_nlink != 1
+            or before.st_size > MAX_EVAL_INPUT_BYTES
+        ):
+            raise _CurrentAdapterError(
+                "current Agent CI evidence bundle is not a bounded regular file"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or not _same_identity(before, opened)
+            ):
+                raise _CurrentAdapterError(
+                    "current Agent CI evidence bundle changed before verification"
+                )
+            chunks: List[bytes] = []
+            remaining = MAX_EVAL_INPUT_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 64 * 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        path_after = os.lstat(path)
+        if (
+            len(data) > MAX_EVAL_INPUT_BYTES
+            or len(data) != after.st_size
+            or not _same_identity(opened, after)
+            or not _same_identity(after, path_after)
+            or path_after.st_nlink != 1
+        ):
+            raise _CurrentAdapterError(
+                "current Agent CI evidence bundle changed during verification"
+            )
+        return data
+    except _CurrentAdapterError:
+        raise
+    except OSError as error:
+        raise _CurrentAdapterError(
+            "current Agent CI evidence bundle could not be verified"
+        ) from error
+
+
+def _write_ci_evidence_bundle(workspace: Path, eval_input: EvalInput) -> Optional[str]:
+    target = eval_input.review_target
+    if not isinstance(target, RepositoryReviewTarget):
+        raise _CurrentAdapterError("current Agent requires a Repository Target")
+    evidence = target.review_request.existing_ci_evidence
+    if not evidence:
+        return None
+    payload = {
+        "schema_version": _CI_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+        "entries": [item.to_dict() for item in evidence],
+    }
+    data = canonical_json_bytes(payload)
+    if len(data) > MAX_EVAL_INPUT_BYTES:
+        raise _CurrentAdapterError(
+            "current Agent CI evidence bundle exceeds the EvalInput byte limit"
+        )
+
+    review_root = workspace / ".review-agent"
+    control_root = review_root / "eval-input"
+    try:
+        if os.path.lexists(review_root):
+            review_metadata = _safe_control_directory(
+                review_root, "current Agent control root"
+            )
+        else:
+            os.mkdir(review_root, 0o700)
+            review_metadata = _safe_control_directory(
+                review_root, "current Agent control root"
+            )
+        if os.path.lexists(control_root):
+            raise _CurrentAdapterError(
+                "current Agent eval-input control root already exists"
+            )
+        os.mkdir(control_root, 0o700)
+        control_metadata = _safe_control_directory(
+            control_root, "current Agent eval-input control root"
+        )
+
+        bundle_digest = hashlib.sha256(data).hexdigest()
+        bundle_name = (
+            _CI_EVIDENCE_BUNDLE_PREFIX
+            + bundle_digest
+            + _CI_EVIDENCE_BUNDLE_SUFFIX
+        )
+        temporary = control_root / ("." + bundle_name + ".tmp")
+        destination = control_root / bundle_name
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+        )
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short write")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+        temporary_data = _read_created_ci_bundle(temporary)
+        if (
+            temporary_data != data
+            or hashlib.sha256(temporary_data).digest()
+            != hashlib.sha256(data).digest()
+        ):
+            raise _CurrentAdapterError(
+                "current Agent CI evidence bundle failed byte verification"
+            )
+        os.link(temporary, destination, follow_symlinks=False)
+        os.unlink(temporary)
+
+        final_data = _read_created_ci_bundle(destination)
+        if (
+            final_data != data
+            or canonical_json_bytes(json.loads(final_data.decode("utf-8"))) != data
+            or hashlib.sha256(final_data).digest() != hashlib.sha256(data).digest()
+        ):
+            raise _CurrentAdapterError(
+                "current Agent CI evidence bundle failed canonical verification"
+            )
+        if (
+            not _same_identity(
+                review_metadata,
+                _safe_control_directory(review_root, "current Agent control root"),
+            )
+            or not _same_identity(
+                control_metadata,
+                _safe_control_directory(
+                    control_root, "current Agent eval-input control root"
+                ),
+            )
+        ):
+            raise _CurrentAdapterError(
+                "current Agent CI evidence control path changed during publication"
+            )
+    except _CurrentAdapterError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError) as error:
+        raise _CurrentAdapterError(
+            "current Agent CI evidence bundle could not be published safely"
+        ) from error
+    return (_CI_EVIDENCE_CONTROL_DIRECTORY / bundle_name).as_posix()
+
+
 def _initial_argv(
     adapter: _CurrentAdapterConfiguration,
     eval_input: EvalInput,
     workspace: Path,
     memory_root: Path,
+    ci_evidence_file: Optional[str] = None,
 ) -> List[str]:
-    request = eval_input.review_request
-    repository = eval_input.repository
+    target = eval_input.review_target
+    if not isinstance(target, RepositoryReviewTarget):
+        raise _CurrentAdapterError("current Agent requires a Repository Target")
+    request = target.review_request
+    repository = repository_from_eval_input(eval_input)
     argv = [
         *adapter.command,
         "review",
@@ -579,6 +819,8 @@ def _initial_argv(
             argv.append(option + value)
     argv.extend("--requirement=" + item for item in request.linked_requirements)
     argv.extend("--project-rule=" + item for item in request.project_rules)
+    if ci_evidence_file is not None:
+        argv.append("--ci-evidence-file=" + ci_evidence_file)
     return argv
 
 
@@ -598,6 +840,9 @@ def _resume_argv(
 class CurrentAgentAdapter:
     """Invoke and convert the current product through its public CLI/artifacts."""
 
+    ADAPTER_KIND = CURRENT_AGENT_ADAPTER_KIND
+    ADAPTER_VERSION = CURRENT_AGENT_ADAPTER_VERSION
+
     def __init__(
         self,
         *,
@@ -614,12 +859,18 @@ class CurrentAgentAdapter:
             config, AgentRunConfig
         ):
             raise TypeError("adapter compatibility requires canonical input/config")
-        unsupported = frozenset(
-            {AgentInputCapability.EXISTING_CI_EVIDENCE}
-            if eval_input.review_request.existing_ci_evidence
-            else ()
-        )
-        return AdapterCompatibility(unsupported=unsupported)
+        if (
+            eval_input.review_target.kind is not ReviewTargetKind.REPOSITORY
+            or eval_input.review_target.kind is not config.target_kind
+        ):
+            raise AgentAdapterIncompatibleError(
+                AdapterIncompatibilityReason.TARGET_KIND
+            )
+        if config.adapter_capabilities != current_agent_capabilities():
+            raise AgentAdapterIncompatibleError(
+                AdapterIncompatibilityReason.CAPABILITY_MISMATCH
+            )
+        return AdapterCompatibility(unsupported=frozenset())
 
     def run(
         self,
@@ -628,27 +879,38 @@ class CurrentAgentAdapter:
         config: AgentRunConfig,
         clarification_channel: ClarificationChannel,
         *,
+        target_access: TargetAccess,
+        target_materialization_id: str,
         cancel_event: Optional[threading.Event] = None,
     ) -> EvalSubmission:
+        if (
+            not isinstance(eval_input, EvalInput)
+            or not isinstance(config, AgentRunConfig)
+            or eval_input.task_id != config.task_id
+            or eval_input.digest() != config.eval_input_digest
+        ):
+            raise AgentAdapterError(
+                FailureCode.SCHEMA_MISMATCH,
+                "current Agent invocation does not match its Trial binding",
+                retryable=False,
+            )
         started = time.monotonic()
         transcript: List[SubmissionClarificationExchange] = []
         run_dir: Optional[Path] = None
         try:
-            if not isinstance(eval_input, EvalInput) or not isinstance(
-                config, AgentRunConfig
-            ) or eval_input.task_id != config.task_id or (
-                eval_input.digest() != config.eval_input_digest
-            ):
-                raise _CurrentAdapterError("current Agent invocation binding is invalid")
             if not isinstance(workspace, Path):
                 raise _CurrentAdapterError("current Agent workspace is invalid")
+            if not isinstance(target_access, TargetAccess):
+                raise _CurrentAdapterError("current Agent TargetAccess is invalid")
+            if target_access.target_materialization_id != target_materialization_id:
+                raise _CurrentAdapterError("current Agent TargetAccess identity drifted")
             resolved_workspace = workspace.resolve(strict=True)
             if not resolved_workspace.is_dir():
                 raise _CurrentAdapterError("current Agent workspace is not a directory")
             adapter = _configuration(config)
             if not self.compatibility(eval_input, config).compatible:
-                raise AgentAdapterIncompatibleError(
-                    AdapterIncompatibilityReason.EXISTING_CI_EVIDENCE
+                raise _CurrentAdapterError(
+                    "current Agent input is incompatible with the product CLI"
                 )
             before = _safe_run_directories(resolved_workspace)
             if before:
@@ -657,6 +919,10 @@ class CurrentAgentAdapter:
                 )
             memory_root = (
                 resolved_workspace / ".review-agent" / "eval-memory" / config.trial_id
+            )
+            ci_evidence_file = _write_ci_evidence_bundle(
+                resolved_workspace,
+                eval_input,
             )
             environment = build_subprocess_environment(
                 adapter.environment_allowlist
@@ -670,6 +936,7 @@ class CurrentAgentAdapter:
                     eval_input,
                     resolved_workspace,
                     memory_root,
+                    ci_evidence_file,
                 ),
                 stdin_bytes=b"",
                 workspace=resolved_workspace,
@@ -683,6 +950,7 @@ class CurrentAgentAdapter:
                 return _failure(
                     eval_input=eval_input,
                     config=config,
+                    target_materialization_id=target_materialization_id,
                     code=result.failure_code,
                     elapsed=time.monotonic() - started,
                     retryable=result.failure_code
@@ -700,6 +968,7 @@ class CurrentAgentAdapter:
                     return _failure(
                         eval_input=eval_input,
                         config=config,
+                        target_materialization_id=target_materialization_id,
                         code=code,
                         elapsed=time.monotonic() - started,
                         retryable=code is FailureCode.PROCESS_KILLED,
@@ -712,9 +981,9 @@ class CurrentAgentAdapter:
             )
 
             revision = (
-                eval_input.repository.base_revision
+                repository_from_eval_input(eval_input).base_revision
                 + ".."
-                + eval_input.repository.head_revision
+                + repository_from_eval_input(eval_input).head_revision
             )
             while manifest.status is RunStatus.AWAITING_USER:
                 claims, questions, uncertainties = _load_intent_discovery(
@@ -756,6 +1025,7 @@ class CurrentAgentAdapter:
                     return _failure(
                         eval_input=eval_input,
                         config=config,
+                        target_materialization_id=target_materialization_id,
                         code=FailureCode.CLARIFICATION_REQUIRED,
                         elapsed=time.monotonic() - started,
                         retryable=False,
@@ -777,6 +1047,7 @@ class CurrentAgentAdapter:
                     return _failure(
                         eval_input=eval_input,
                         config=config,
+                        target_materialization_id=target_materialization_id,
                         code=result.failure_code,
                         elapsed=time.monotonic() - started,
                         retryable=result.failure_code
@@ -804,6 +1075,7 @@ class CurrentAgentAdapter:
                     return _failure(
                         eval_input=eval_input,
                         config=config,
+                        target_materialization_id=target_materialization_id,
                         code=code,
                         elapsed=time.monotonic() - started,
                         retryable=code is FailureCode.PROCESS_KILLED,
@@ -821,6 +1093,7 @@ class CurrentAgentAdapter:
                 submission = self._completed_submission(
                     eval_input=eval_input,
                     config=config,
+                    target_materialization_id=target_materialization_id,
                     run_dir=run_dir,
                     store=store,
                     manifest=manifest,
@@ -842,6 +1115,7 @@ class CurrentAgentAdapter:
                 return _failure(
                     eval_input=eval_input,
                     config=config,
+                    target_materialization_id=target_materialization_id,
                     code=code,
                     elapsed=time.monotonic() - started,
                     retryable=False,
@@ -851,6 +1125,7 @@ class CurrentAgentAdapter:
             return _failure(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.UNKNOWN,
                 elapsed=time.monotonic() - started,
                 retryable=True,
@@ -863,6 +1138,7 @@ class CurrentAgentAdapter:
             return _failure(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.ADAPTER_ERROR,
                 elapsed=time.monotonic() - started,
                 retryable=False,
@@ -871,6 +1147,7 @@ class CurrentAgentAdapter:
             return _failure(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=(
                     exc.code
                     if exc.code
@@ -887,6 +1164,7 @@ class CurrentAgentAdapter:
             return _failure(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.SCHEMA_MISMATCH,
                 elapsed=time.monotonic() - started,
                 retryable=False,
@@ -895,6 +1173,7 @@ class CurrentAgentAdapter:
             return _failure(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.ADAPTER_ERROR,
                 elapsed=time.monotonic() - started,
                 retryable=False,
@@ -903,6 +1182,7 @@ class CurrentAgentAdapter:
             return _failure(
                 eval_input=eval_input,
                 config=config,
+                target_materialization_id=target_materialization_id,
                 code=FailureCode.SCHEMA_MISMATCH if run_dir else FailureCode.ADAPTER_ERROR,
                 elapsed=time.monotonic() - started,
                 retryable=False,
@@ -957,6 +1237,7 @@ class CurrentAgentAdapter:
         *,
         eval_input: EvalInput,
         config: AgentRunConfig,
+        target_materialization_id: str,
         run_dir: Path,
         store: SessionStore,
         manifest: SessionManifest,
@@ -964,10 +1245,11 @@ class CurrentAgentAdapter:
         elapsed: float,
         trace_ref: TraceRef,
     ) -> EvalSubmission:
+        repository = repository_from_eval_input(eval_input)
         revision = (
-            eval_input.repository.base_revision
+            repository.base_revision
             + ".."
-            + eval_input.repository.head_revision
+            + repository.head_revision
         )
         brief_payload = _load_registered_json(
             run_dir=run_dir,
@@ -981,8 +1263,8 @@ class CurrentAgentAdapter:
         brief = review_brief_from_dict(brief_payload)
         if (
             brief.review_id != manifest.review_id
-            or brief.base_revision != eval_input.repository.base_revision
-            or brief.head_revision != eval_input.repository.head_revision
+            or brief.base_revision != repository.base_revision
+            or brief.head_revision != repository.head_revision
         ):
             raise _CurrentArtifactError("review brief identity is invalid")
         intent = _intent_from_brief(brief, transcript)
@@ -1001,12 +1283,15 @@ class CurrentAgentAdapter:
             findings=findings,
             observations=observations,
             eval_input=eval_input,
+            target_materialization_id=target_materialization_id,
         )
         return EvalSubmission(
             schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
             task_id=eval_input.task_id,
             agent_id=config.agent_id,
             trial_id=config.trial_id,
+            eval_input_digest=config.eval_input_digest,
+            target_materialization_id=target_materialization_id,
             status=SubmissionStatus.COMPLETED,
             intent=intent,
             review=SubmissionReview(
@@ -1181,12 +1466,13 @@ def _load_final_observations(
         config.budgets.max_execution_artifact_total_bytes,
         512 * 1024 * 1024,
     )
+    repository = repository_from_eval_input(eval_input)
     loaded = ObservationStore.load(
         run_dir,
         {
             revision,
-            "base@" + eval_input.repository.base_revision,
-            "head@" + eval_input.repository.head_revision,
+            "base@" + repository.base_revision,
+            "head@" + repository.head_revision,
         },
         max_log_bytes=file_budget,
         max_raw_artifact_bytes=file_budget,
@@ -1220,12 +1506,14 @@ def _evidence_from_observations(
     findings: Sequence[SubmissionFinding],
     observations: Mapping[str, Observation],
     eval_input: EvalInput,
+    target_materialization_id: str,
 ) -> Tuple[SubmissionEvidence, ...]:
     referenced = {
         reference for finding in findings for reference in finding.evidence_refs
     }
-    base = eval_input.repository.base_revision
-    head = eval_input.repository.head_revision
+    repository = repository_from_eval_input(eval_input)
+    base = repository.base_revision
+    head = repository.head_revision
     diff_revision = base + ".." + head
     result = []
     for evidence_id in sorted(referenced):
@@ -1243,15 +1531,14 @@ def _evidence_from_observations(
             result.append(
                 SubmissionEvidence(
                     evidence_id=evidence_id,
-                    kind=EvidenceKind.REPOSITORY_FILE,
-                    revision=observation.revision.split("@", 1)[1],
-                    path=observation.path,
-                    from_line=observation.line_start,
-                    to_line=observation.line_end,
-                    command=None,
-                    exit_code=None,
-                    stream=None,
-                    source_ref=None,
+                    source=RepositoryFileEvidenceSource(
+                        kind=EvidenceKind.REPOSITORY_FILE,
+                        target_materialization_id=target_materialization_id,
+                        revision=observation.revision.split("@", 1)[1],
+                        path=observation.path,
+                        from_line=observation.line_start,
+                        to_line=observation.line_end,
+                    ),
                     content_hash=observation.content_hash,
                     excerpt=raw,
                 )
@@ -1266,15 +1553,13 @@ def _evidence_from_observations(
             result.append(
                 SubmissionEvidence(
                     evidence_id=evidence_id,
-                    kind=EvidenceKind.REPOSITORY_DIFF,
-                    revision=diff_revision,
-                    path=observation.path,
-                    from_line=None,
-                    to_line=None,
-                    command=None,
-                    exit_code=None,
-                    stream=None,
-                    source_ref=None,
+                    source=RepositoryDiffEvidenceSource(
+                        kind=EvidenceKind.REPOSITORY_DIFF,
+                        target_materialization_id=target_materialization_id,
+                        base_revision=base,
+                        head_revision=head,
+                        path=observation.path,
+                    ),
                     content_hash=observation.content_hash,
                     excerpt=raw,
                 )
@@ -1286,4 +1571,9 @@ def _evidence_from_observations(
     return tuple(result)
 
 
-__all__ = ["CURRENT_AGENT_ADAPTER_KIND", "CurrentAgentAdapter"]
+__all__ = [
+    "CURRENT_AGENT_ADAPTER_KIND",
+    "CURRENT_AGENT_ADAPTER_VERSION",
+    "CurrentAgentAdapter",
+    "current_agent_capabilities",
+]

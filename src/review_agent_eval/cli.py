@@ -12,6 +12,9 @@ The product command remains ``review-agent``.  This module exposes a separate
 ``inspect``
     print a redacted, source-bound inspection without invoking an Agent or a
     model.
+``prepare-public``
+    verify local public-dataset control files and publish one immutable Suite;
+    this command is deliberately offline and has no acquisition options.
 
 The parser is intentionally boring.  All domain behavior lives in the
 existing CaseBank, Runner, Evaluators, Metrics, ReportBuilder and ArtifactStore
@@ -24,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -142,6 +146,30 @@ def _text_output(command: str, status: str, **payload: Any) -> None:
     sys.stdout.write(str(headline) + "\n")
     if "run_id" in payload:
         sys.stdout.write("run_id: %s\n" % payload["run_id"])
+    if command == "prepare-public" and status == "ok":
+        for key in (
+            "dataset_id",
+            "dataset_version",
+            "source_revision",
+            "source_uri",
+            "license",
+            "source_manifest_digest",
+            "profile_digest",
+            "filter_manifest_digest",
+            "protocol",
+            "protocol_id",
+            "target_kind",
+            "wire_contract_digest",
+            "suite_id",
+            "suite_version",
+            "suite_manifest_digest",
+            "preparation_packet_digest",
+            "preparation_receipt_digest",
+            "preparation_receipt_relative_name",
+            "bundle_id",
+        ):
+            if key in payload:
+                sys.stdout.write("%s: %s\n" % (key, payload[key]))
 
 
 def _emit(args: argparse.Namespace, command: str, status: str, **payload: Any) -> None:
@@ -167,6 +195,33 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Separated, evidence-driven code-review evaluation harness",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    prepare_public = sub.add_parser(
+        "prepare-public",
+        help="prepare one public dataset from already acquired local bytes",
+    )
+    prepare_public.add_argument(
+        "--mode",
+        choices=("local-import",),
+        required=True,
+    )
+    prepare_public.add_argument(
+        "--dataset",
+        choices=("aacr-bench", "swe-prbench"),
+        required=True,
+    )
+    prepare_public.add_argument("--source-root", required=True)
+    prepare_public.add_argument("--source-manifest", required=True)
+    prepare_public.add_argument(
+        "--expected-source-manifest-digest",
+        required=True,
+    )
+    prepare_public.add_argument("--filter-manifest", required=True)
+    prepare_public.add_argument("--expected-profile-digest", required=True)
+    prepare_public.add_argument("--output-root", required=True)
+    prepare_public.add_argument(
+        "--json", action="store_true", help="emit stable JSON"
+    )
 
     prepare = sub.add_parser(
         "prepare",
@@ -379,7 +434,13 @@ def _default_evaluator_config(
 
 
 def _default_agent_snapshot(args: argparse.Namespace):
+    from .adapters.current_agent import CURRENT_AGENT_ADAPTER_KIND
+    from .adapters.subprocess_agent import (
+        SUBPROCESS_JSON_ADAPTER_KIND,
+        subprocess_adapter_capabilities,
+    )
     from .config import AgentConfigSnapshot
+    from .models import ReviewTargetKind
 
     command = list(args.agent_command)
     if not command:
@@ -395,7 +456,7 @@ def _default_agent_snapshot(args: argparse.Namespace):
         if args.agent_base_url:
             review_arguments.append("--reviewer-base-url=" + args.agent_base_url)
         adapter = {
-            "kind": "current-agent-cli-v1",
+            "kind": CURRENT_AGENT_ADAPTER_KIND,
             "command": command,
             "review_arguments": review_arguments,
             "environment_allowlist": [args.agent_api_key_env]
@@ -405,9 +466,12 @@ def _default_agent_snapshot(args: argparse.Namespace):
         }
     else:
         adapter = {
-            "kind": "subprocess-json-v1",
+            "kind": SUBPROCESS_JSON_ADAPTER_KIND,
             "command": command,
             "environment_allowlist": [],
+            "capabilities": subprocess_adapter_capabilities(
+                target_kinds=(ReviewTargetKind.REPOSITORY,),
+            ).to_dict(),
         }
     parameters = {"adapter": adapter}
     return AgentConfigSnapshot(
@@ -482,6 +546,7 @@ def _budgets(args: argparse.Namespace):
 
 
 def _load_run_config_for_prepare(args: argparse.Namespace, bank: Any):
+    from .adapters.agent_factory import adapter_capabilities_from_snapshot
     from .config import EvalRunConfig, SuiteRunConfig
 
     snapshot = bank.snapshot()
@@ -492,12 +557,15 @@ def _load_run_config_for_prepare(args: argparse.Namespace, bank: Any):
         if config.suite != suite:
             raise CliIntegrityError("Run config does not match the verified Suite snapshot")
         return config, snapshot
+    agent = _load_agent_snapshot(args)
+    capabilities = adapter_capabilities_from_snapshot(agent)
     config = EvalRunConfig.create(
         run_instance_key=args.run_instance_key,
-        agent=_load_agent_snapshot(args),
+        agent=agent,
         clarification_matcher=_load_matcher(args),
         evaluator=_load_evaluator_config(args),
         suite=suite,
+        adapter_capabilities=capabilities,
         trial_count=_positive_int(args.trial_count, name="trial_count", maximum=10_000),
         resource_budgets=_budgets(args),
     )
@@ -540,6 +608,86 @@ def _repository_preparer(
         allow_remote=False,
         repository_mode=(RepositoryMode.CACHE_ONLY if cache_only else RepositoryMode.ACQUIRE),
     )
+
+
+def _snapshot_has_target_kind(snapshot: Any, kind: Any) -> bool:
+    return any(case.input.review_target.kind is kind for case in snapshot.cases)
+
+
+def _repository_preparer_context(
+    args: argparse.Namespace,
+    roots: tuple[Path, Path, Path, Path],
+    snapshot: Any,
+    *,
+    cache_only: bool,
+) -> Any:
+    from contextlib import nullcontext
+
+    from .models import ReviewTargetKind
+
+    if _snapshot_has_target_kind(snapshot, ReviewTargetKind.REPOSITORY):
+        return _repository_preparer(args, roots, cache_only=cache_only)
+    return nullcontext(None)
+
+
+def _frozen_target_materializers(
+    snapshot: Any,
+    *,
+    suite_root: Path,
+    workspace_root: Path,
+) -> dict[Any, Any]:
+    from .adapters.swe_prbench import SWE_PRBENCH_FROZEN_SUITE_RELATIVE_ROOT
+    from .frozen_context import FrozenContextTargetMaterializer
+    from .models import ReviewTargetKind
+
+    if not _snapshot_has_target_kind(snapshot, ReviewTargetKind.FROZEN_CONTEXT):
+        return {}
+    return {
+        ReviewTargetKind.FROZEN_CONTEXT: FrozenContextTargetMaterializer(
+            bundle_root=suite_root / SWE_PRBENCH_FROZEN_SUITE_RELATIVE_ROOT,
+            workspace_root=workspace_root,
+        )
+    }
+
+
+def _frozen_target_replay_resolvers(
+    snapshot: Any,
+    *,
+    suite_root: Path,
+) -> dict[Any, Any]:
+    from .adapters.swe_prbench import SWE_PRBENCH_FROZEN_SUITE_RELATIVE_ROOT
+    from .models import ReviewTargetKind
+    from .target_replay import FrozenContextReplayResolver
+
+    if not _snapshot_has_target_kind(snapshot, ReviewTargetKind.FROZEN_CONTEXT):
+        return {}
+    return {
+        ReviewTargetKind.FROZEN_CONTEXT: FrozenContextReplayResolver(
+            bundle_root=suite_root / SWE_PRBENCH_FROZEN_SUITE_RELATIVE_ROOT
+        )
+    }
+
+
+def _prepare_repository_targets(
+    args: argparse.Namespace,
+    roots: tuple[Path, Path, Path, Path],
+    snapshot: Any,
+) -> None:
+    from .models import RepositoryReviewTarget
+    from .repository import repository_from_eval_input
+
+    eval_inputs = tuple(
+        case.input
+        for case in snapshot.cases
+        if isinstance(case.input.review_target, RepositoryReviewTarget)
+    )
+    with _repository_preparer_context(
+        args, roots, snapshot, cache_only=False
+    ) as preparer:
+        if preparer is None:
+            return
+        for eval_input in eval_inputs:
+            preparer.prepare(repository_from_eval_input(eval_input))
 
 
 def _agent_adapter(config: Any):
@@ -868,6 +1016,167 @@ def _judge_for(args: argparse.Namespace, execution: Any):
     return SemanticJudge(adapter_factory=factory, evaluator_execution=execution)
 
 
+def _public_protocol_from_filter(filter_manifest: Any) -> str:
+    values = filter_manifest.values("protocol")
+    if len(values) != 1:
+        raise CliIntegrityError(
+            "public filter manifest must select exactly one protocol"
+        )
+    return values[0]
+
+
+def _public_result_payload(result: Any) -> dict[str, Any]:
+    from .adapters._public import DEFAULT_PREPARATION_RECEIPT_PATH
+    from .models import ReviewTargetKind
+
+    manifest = result.manifest
+    receipt = result.receipt
+    source_manifest = receipt.source_manifest
+    filter_manifest = receipt.filter_manifest
+    protocol_ids = {item.protocol_id for item in manifest.cases}
+    if len(protocol_ids) != 1:
+        raise CliIntegrityError("public Suite cases do not share one protocol")
+    protocols = {
+        dimension.value
+        for item in manifest.cases
+        for dimension in item.dimensions
+        if dimension.name == "protocol"
+    }
+    if len(protocols) != 1:
+        raise CliIntegrityError("public Suite cases do not bind one protocol dimension")
+    protocol = next(iter(protocols))
+    target_kind = manifest.wire_contract.review_target_kind
+    payload: dict[str, Any] = {
+        "message": "public Suite prepared from local source bytes",
+        "mode": "local-import",
+        "dataset_id": source_manifest.dataset_id,
+        "dataset_version": source_manifest.dataset_version,
+        "source_revision": source_manifest.source_revision,
+        "source_uri": source_manifest.source_uri,
+        "license": source_manifest.license,
+        "source_manifest_digest": source_manifest.digest(),
+        "profile_digest": filter_manifest.digest(),
+        "filter_manifest_digest": filter_manifest.digest(),
+        "protocol": protocol,
+        "protocol_id": next(iter(protocol_ids)),
+        "target_kind": target_kind.value,
+        "wire_contract_digest": manifest.wire_contract.digest(),
+        "suite_id": manifest.suite_id,
+        "suite_version": manifest.suite_version,
+        "suite_manifest_digest": manifest.digest(),
+        "preparation_packet_digest": receipt.preparation_packet_digest,
+        "preparation_receipt_digest": receipt.digest(),
+        "preparation_receipt_relative_name": DEFAULT_PREPARATION_RECEIPT_PATH,
+    }
+    if target_kind is ReviewTargetKind.FROZEN_CONTEXT:
+        if result.bundle_id is None:
+            raise CliIntegrityError("Frozen public Suite has no verified bundle ID")
+        payload["bundle_id"] = result.bundle_id
+    elif result.bundle_id is not None:
+        raise CliIntegrityError("Repository public Suite unexpectedly carries a bundle ID")
+    return payload
+
+
+def _handle_prepare_public(args: argparse.Namespace) -> int:
+    """Prepare a public Suite from local, already-acquired bytes only."""
+
+    from .adapters._public import (
+        PublicSourceIntegrityError,
+        PublicSourceManifest,
+        read_public_filter_manifest,
+        read_public_source_manifest,
+    )
+
+    source_root = _path(args.source_root, name="source_root")
+    source_manifest_path = _path(args.source_manifest, name="source_manifest")
+    filter_manifest_path = _path(args.filter_manifest, name="filter_manifest")
+    output_root = _path(args.output_root, name="output_root")
+
+    # These two reads are the sole control-plane boundary.  They happen before
+    # importing either dataset parser, so no dataset bytes can be parsed before
+    # both external trust anchors and canonical JSON checks have succeeded.
+    source_manifest = read_public_source_manifest(
+        source_manifest_path,
+        expected_source_manifest_digest=args.expected_source_manifest_digest,
+    )
+    filter_manifest = read_public_filter_manifest(
+        filter_manifest_path,
+        expected_profile_digest=args.expected_profile_digest,
+    )
+    if source_manifest.dataset_id != filter_manifest.dataset_id:
+        raise PublicSourceIntegrityError(
+            "public source and filter manifests identify different datasets"
+        )
+
+    if args.dataset == "aacr-bench":
+        from .adapters.aacr_bench import (
+            AACR_DATASET_ID,
+            AACR_FIXTURE_DATASET_ID,
+            AACR_PROTOCOL_ID,
+            prepare_aacr_bench,
+        )
+
+        if source_manifest.dataset_id not in {
+            AACR_DATASET_ID,
+            AACR_FIXTURE_DATASET_ID,
+        }:
+            raise PublicSourceIntegrityError(
+                "source manifest does not match the requested AACR dataset"
+            )
+        protocol = AACR_PROTOCOL_ID
+        prepare = lambda: prepare_aacr_bench(
+            source_root,
+            source_manifest,
+            filter_manifest,
+            output_root,
+        )
+    elif args.dataset == "swe-prbench":
+        from .adapters.swe_prbench import (
+            SWE_PRBENCH_DATASET_ID,
+            SWE_PRBENCH_PROTOCOL_FROZEN,
+            SWE_PRBENCH_PROTOCOL_NATIVE,
+            prepare_swe_prbench,
+        )
+
+        if source_manifest.dataset_id != SWE_PRBENCH_DATASET_ID:
+            raise PublicSourceIntegrityError(
+                "source manifest does not match the requested SWE dataset"
+            )
+        protocol = _public_protocol_from_filter(filter_manifest)
+        if protocol not in {
+            SWE_PRBENCH_PROTOCOL_NATIVE,
+            SWE_PRBENCH_PROTOCOL_FROZEN,
+        }:
+            raise PublicSourceIntegrityError(
+                "public filter manifest selects an unsupported SWE protocol"
+            )
+        prepare = lambda: prepare_swe_prbench(
+            source_root,
+            output_root,
+            source_manifest=source_manifest,
+            filter_manifest=filter_manifest,
+            protocol=protocol,
+            expected_source_manifest_digest=source_manifest.digest(),
+        )
+    else:  # argparse choices make this unreachable
+        raise CliUsageError("unsupported public dataset")
+
+    # Preflight the create-only destination after control verification.  This
+    # gives reruns a stable conflict and, importantly, never mutates the prior
+    # bytes.
+    output_lexical = Path(os.path.abspath(os.fspath(output_root)))
+    if os.path.lexists(output_lexical):
+        raise CliConflictError("public Suite output already exists")
+    result = prepare()
+    _emit(
+        args,
+        "prepare-public",
+        "ok",
+        **_public_result_payload(result),
+    )
+    return EXIT_OK
+
+
 def _handle_prepare(args: argparse.Namespace) -> int:
     roots = _roots(args)
     suite_root, runs_root, _data_root, _workspace_root = roots
@@ -896,43 +1205,57 @@ def _handle_prepare(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     store = _artifact_store(runs_root, create=True)
+    adapter_factory, adapter = _agent_adapter(config)
+    from .runner import CapabilityPolicy, CapabilityPreflight, EvalRunner
+
+    policy = CapabilityPolicy(args.capability_policy)
+    runner = EvalRunner(
+        store,
+        None,
+        adapter,
+        case_provider=bank,
+        adapter_factory=adapter_factory,
+        capability_policy=policy,
+        max_workers=config.resource_budgets.max_parallel_trials,
+    )
+    plan = runner.plan_run(config, snapshot, policy=policy)
+    existing = None
     if args.resume:
         from .artifacts import ArtifactStateError
 
         try:
-            existing = store.load_run_config(config.run_id)
+            existing = store.load_run_config(plan.config.run_id)
         except (ArtifactStateError, FileNotFoundError):
             existing = None
         if existing is not None:
-            if existing != config:
-                raise CliConflictError("existing Run ID is bound to different config bytes")
-            # ``prepare`` is the only phase allowed to acquire repository
-            # data.  Resuming an existing immutable plan therefore verifies
-            # (and, if necessary, repairs) its cache here instead of deferring
-            # a missing-cache failure to run-agent/evaluate.
-            with _repository_preparer(args, roots, cache_only=False) as preparer:
-                for case_entry in snapshot.cases:
-                    preparer.prepare(case_entry.input.repository)
-            _emit(args, "prepare", "ok", message="existing immutable Run reused", run_id=config.run_id, resumed=True)
-            return EXIT_OK
-    adapter_factory, adapter = _agent_adapter(config)
-    from .runner import CapabilityPolicy, EvalRunner
+            persisted_snapshot = store.load_case_snapshot(plan.config.run_id)
+            persisted_preflight = CapabilityPreflight.from_dict(
+                store.load_run_preflight(plan.config.run_id)
+            )
+            if (
+                existing != plan.config
+                or persisted_snapshot != plan.case_snapshot
+                or persisted_preflight != plan.preflight
+            ):
+                raise CliConflictError(
+                    "existing Run ID is bound to a different canonical plan"
+                )
 
-    policy = CapabilityPolicy(args.capability_policy)
-    with _repository_preparer(args, roots, cache_only=False) as preparer:
-        # Preparation is the only stage allowed to acquire repository data.
-        for case_entry in snapshot.cases:
-            preparer.prepare(case_entry.input.repository)
-        runner = EvalRunner(
-            store,
-            preparer,
-            adapter,
-            case_provider=bank,
-            adapter_factory=adapter_factory,
-            capability_policy=policy,
-            max_workers=config.resource_budgets.max_parallel_trials,
+    # ``prepare`` is the only phase allowed to acquire repository data.  It
+    # happens after capability preflight and only for compatible Repository
+    # Targets; Frozen Targets have no Repository preparer at all.
+    _prepare_repository_targets(args, roots, plan.case_snapshot)
+    if existing is not None:
+        _emit(
+            args,
+            "prepare",
+            "ok",
+            message="existing immutable Run reused",
+            run_id=plan.config.run_id,
+            resumed=True,
         )
-        setup = runner.create_run(config, snapshot, policy=policy)
+        return EXIT_OK
+    setup = runner.commit_run(plan)
     _emit(
         args,
         "prepare",
@@ -949,7 +1272,7 @@ def _handle_prepare(args: argparse.Namespace) -> int:
 
 def _handle_run_agent(args: argparse.Namespace) -> int:
     roots = _roots(args)
-    suite_root, runs_root, _data_root, _workspace_root = roots
+    suite_root, runs_root, _data_root, workspace_root = roots
     run_id = _run_id(args)
     if args.overwrite:
         raise CliConflictError("run-agent never overwrites immutable Submissions")
@@ -972,12 +1295,20 @@ def _handle_run_agent(args: argparse.Namespace) -> int:
     adapter_factory, adapter = _agent_adapter(config)
     from .runner import EvalRunner
 
-    with _repository_preparer(args, roots, cache_only=True) as preparer:
+    run_snapshot = store.load_case_snapshot(run_id)
+    with _repository_preparer_context(
+        args, roots, run_snapshot, cache_only=True
+    ) as preparer:
         runner = EvalRunner(
             store,
             preparer,
             adapter,
             case_provider=bank,
+            target_materializers=_frozen_target_materializers(
+                run_snapshot,
+                suite_root=suite_root,
+                workspace_root=workspace_root,
+            ),
             adapter_factory=adapter_factory,
             max_workers=args.max_workers,
             retry_incomplete=args.resume,
@@ -1068,12 +1399,19 @@ def _handle_evaluate(args: argparse.Namespace) -> int:
             return judge_holder[0]
 
         judge_factory = build_judge
-    with _repository_preparer(args, roots, cache_only=True) as preparer:
+    run_snapshot = store.load_case_snapshot(run_id)
+    with _repository_preparer_context(
+        args, roots, run_snapshot, cache_only=True
+    ) as preparer:
         orchestrator = EvaluationOrchestrator(
             store,
             bank,
             repository_preparer=preparer,
             judge_factory=judge_factory,
+            target_replay_resolvers=_frozen_target_replay_resolvers(
+                run_snapshot,
+                suite_root=suite_root,
+            ),
         )
         bundle = orchestrator.evaluate_run(
             run_id,
@@ -1392,6 +1730,7 @@ def _render_inspection_markdown(inspection: Mapping[str, Any]) -> str:
 
 def _dispatch(args: argparse.Namespace) -> int:
     handlers = {
+        "prepare-public": _handle_prepare_public,
         "prepare": _handle_prepare,
         "run-agent": _handle_run_agent,
         "evaluate": _handle_evaluate,
@@ -1416,17 +1755,31 @@ def _domain_error_category(exc: BaseException) -> tuple[str, int]:
         RepositoryPreparationError,
         RepositorySecurityError,
     )
+    from .adapters._public import (
+        PublicConflictError,
+        PublicFormatError,
+        PublicOperationalError,
+        PublicPreconditionError,
+        PublicSourceIntegrityError,
+    )
     from .runner import RunIncompatibilityError
+    from .target_replay import TargetReplayIntegrityError
 
-    if isinstance(exc, (CliConflictError, ArtifactConflictError, EvaluationConflictError)):
+    if isinstance(
+        exc,
+        (CliConflictError, PublicConflictError, ArtifactConflictError, EvaluationConflictError),
+    ):
         return "conflict", EXIT_CONFLICT
     if isinstance(
         exc,
         (
             CliIntegrityError,
+            PublicSourceIntegrityError,
+            PublicFormatError,
             ArtifactIntegrityError,
             RepositoryIntegrityError,
             RepositorySecurityError,
+            TargetReplayIntegrityError,
         ),
     ):
         return "integrity", EXIT_INTEGRITY
@@ -1434,6 +1787,7 @@ def _domain_error_category(exc: BaseException) -> tuple[str, int]:
         exc,
         (
             CliPreconditionError,
+            PublicPreconditionError,
             ArtifactStateError,
             EvaluationPreconditionError,
             RepositoryPreparationError,
@@ -1441,6 +1795,10 @@ def _domain_error_category(exc: BaseException) -> tuple[str, int]:
         ),
     ):
         return "precondition", EXIT_PRECONDITION
+    if isinstance(exc, PublicOperationalError):
+        return "operational", EXIT_OPERATIONAL
+    if isinstance(exc, (ValueError, KeyError)):
+        return "integrity", EXIT_INTEGRITY
     return "operational", EXIT_OPERATIONAL
 
 
@@ -1464,8 +1822,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Do not echo provider exceptions, URLs or filesystem paths.  The
         # stable class name is enough for automation and avoids credential
         # leakage in a failed command's stdout.
-        _json_output("cli", "error", error_code="integrity", message=type(exc).__name__)
-        return EXIT_INTEGRITY
+        error_code, exit_code = _domain_error_category(exc)
+        _json_output("cli", "error", error_code=error_code, message=type(exc).__name__)
+        return exit_code
     except (CliPreconditionError, FileNotFoundError) as exc:
         _json_output("cli", "error", error_code="precondition", message=type(exc).__name__)
         return EXIT_PRECONDITION

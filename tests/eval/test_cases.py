@@ -23,13 +23,16 @@ from review_agent_eval.cases import (
     SuiteKind,
     SuiteManifest,
     SuiteSource,
+    is_windows_reserved_path_component,
     validate_case_for_manifest,
 )
 from review_agent_eval.models import (
     MAX_EVAL_CASE_BYTES,
     EvalCase,
     NovelFindingPolicy,
+    ReviewTargetKind,
     SchemaError,
+    UnsupportedProtocolVersionError,
     canonical_json,
     canonical_sha256,
 )
@@ -52,7 +55,7 @@ def case_payload(
     novel_policy: str = "forbid",
 ) -> dict:
     return {
-        "schema_version": "eval_case_v1",
+        "schema_version": "eval_case_v2",
         "task_id": task_id,
         "case_version": 1,
         "source": {
@@ -65,21 +68,24 @@ def case_payload(
             "content_hash": SOURCE_HASH,
         },
         "input": {
-            "repository": {
-                "source": "fixture",
-                "path": "repositories/%s" % task_id,
-                "url": None,
-                "base_revision": BASE,
-                "head_revision": HEAD,
-            },
-            "review_request": {
-                "title": "Review authorization behavior",
-                "description": None,
-                "user_intent": "Keep authorization intact",
-                "review_focus": None,
-                "linked_requirements": ["REQ-1 keeps authorization intact"],
-                "project_rules": [],
-                "existing_ci_evidence": [],
+            "review_target": {
+                "kind": "repository",
+                "repository": {
+                    "source": "fixture",
+                    "path": "repositories/%s" % task_id,
+                    "url": None,
+                    "base_revision": BASE,
+                    "head_revision": HEAD,
+                },
+                "review_request": {
+                    "title": "Review authorization behavior",
+                    "description": None,
+                    "user_intent": "Keep authorization intact",
+                    "review_focus": None,
+                    "linked_requirements": ["REQ-1 keeps authorization intact"],
+                    "project_rules": [],
+                    "existing_ci_evidence": [],
+                },
             },
         },
         "clarification_script": {
@@ -122,6 +128,7 @@ def case_payload(
             "expected_findings": [],
             "known_invalid_findings": [],
         },
+        "review_evaluator_context": {"truth_contexts": []},
     }
 
 
@@ -134,6 +141,30 @@ def source_payload(*, kind: str = "core") -> dict:
         "source_uri": "https://example.test/dataset" if public else None,
         "license": "Apache-2.0" if public else None,
         "content_hash": "e" * 64,
+        "preparation_binding": (
+            {
+                "schema_version": "public_suite_preparation_binding_v2",
+                "source_catalog_digest": "3" * 64,
+                "acquisition_receipt_digest": "4" * 64,
+                "source_manifest_digest": "5" * 64,
+                "filter_manifest_digest": "6" * 64,
+                "preparation_packet_digest": "7" * 64,
+                "repository_catalog_digest": "8" * 64,
+                "frozen_bundle_trust_digest": None,
+            }
+            if public
+            else None
+        ),
+    }
+
+
+def repository_wire_contract_payload() -> dict:
+    return {
+        "case_schema_version": "eval_case_v2",
+        "input_schema_version": "eval_input_v2",
+        "submission_schema_version": "eval_submission_v2",
+        "review_target_kind": "repository",
+        "materializer_protocol": "repository-materializer-v2",
     }
 
 
@@ -152,6 +183,7 @@ def manifest_for_case(
         "schema_version": SUITE_MANIFEST_SCHEMA_VERSION,
         "suite_id": "core-suite",
         "suite_version": "suite-v1",
+        "wire_contract": repository_wire_contract_payload(),
         "source": source_payload(kind=kind),
         "cases": [
             {
@@ -177,6 +209,85 @@ def snapshot_for_case(case: EvalCase, **manifest_kwargs: object) -> RunCaseSnaps
     return RunCaseSnapshot.build(manifest, ((manifest.cases[0], case),))
 
 
+def _manifest_payload_for_cases(cases: list[EvalCase]) -> dict:
+    return {
+        "schema_version": "suite_manifest_v2",
+        "suite_id": "core-suite",
+        "suite_version": "suite-v2",
+        "wire_contract": repository_wire_contract_payload(),
+        "source": source_payload(),
+        "cases": [
+            {
+                "task_id": case.task_id,
+                "case_version": case.case_version,
+                "path": "cases/%s.json" % case.task_id,
+                "split": "regression",
+                "protocol_id": "report-partition-only",
+                "dimensions": [],
+                "raw_file_size_bytes": len(case.to_json().encode("utf-8")),
+                "raw_file_sha256": hashlib.sha256(
+                    case.to_json().encode("utf-8")
+                ).hexdigest(),
+                "canonical_case_digest": canonical_sha256(case),
+                "eval_input_digest": case.eval_input().digest(),
+                "truth_completeness": case.review_truth.completeness.value,
+            }
+            for case in cases
+        ],
+    }
+
+
+def test_v2_manifest_rejects_v1_case_child() -> None:
+    case = EvalCase.from_dict(case_payload())
+    payload = _manifest_payload_for_cases([case])
+    payload["wire_contract"]["case_schema_version"] = "eval_case_v1"
+    payload["cases"][0]["raw_file_size_bytes"] = "malformed-but-deeper"
+
+    with pytest.raises(UnsupportedProtocolVersionError):
+        SuiteManifest.from_dict(payload)
+
+
+def test_v2_snapshot_rejects_v1_children_before_nested_hydration() -> None:
+    case = EvalCase.from_dict(case_payload())
+    snapshot = snapshot_for_case(case)
+
+    wire_child = snapshot.to_dict()
+    wire_child["wire_contract"]["input_schema_version"] = "eval_input_v1"
+    wire_child["manifest"]["cases"][0]["raw_file_size_bytes"] = "malformed"
+    with pytest.raises(UnsupportedProtocolVersionError):
+        RunCaseSnapshot.from_dict(wire_child)
+
+    input_child = snapshot.to_dict()
+    input_child["cases"][0]["input"]["schema_version"] = "eval_input_v1"
+    input_child["cases"][0]["source"]["content_hash"] = "malformed"
+    with pytest.raises(UnsupportedProtocolVersionError):
+        RunCaseSnapshot.from_dict(input_child)
+
+
+def test_snapshot_rejects_repository_and_frozen_case_mix() -> None:
+    repository_case = EvalCase.from_dict(case_payload("task-repository"))
+    frozen_payload = case_payload("task-frozen")
+    frozen_payload["input"]["review_target"] = {
+        "kind": "frozen_context",
+        "bundle_id": "bundle-001",
+        "record_id": "record-001",
+        "context_format": "rendered_text",
+        "rendered_sha256": "f" * 64,
+        "rendered_utf8_bytes": 17,
+        "source_binding_digest": "1" * 64,
+    }
+    frozen_case = EvalCase.from_dict(frozen_payload)
+
+    with pytest.raises(SchemaError, match="single wire contract"):
+        manifest = SuiteManifest.from_dict(
+            _manifest_payload_for_cases([repository_case, frozen_case])
+        )
+        RunCaseSnapshot.build(
+            manifest,
+            tuple(zip(manifest.cases, (repository_case, frozen_case))),
+        )
+
+
 def test_suite_manifest_round_trips_canonical_metadata_and_is_immutable() -> None:
     first = EvalCase.from_dict(case_payload("task-b"))
     second = EvalCase.from_dict(case_payload("task-a"))
@@ -184,6 +295,7 @@ def test_suite_manifest_round_trips_canonical_metadata_and_is_immutable() -> Non
         "schema_version": SUITE_MANIFEST_SCHEMA_VERSION,
         "suite_id": "core-suite",
         "suite_version": "suite-v1",
+        "wire_contract": repository_wire_contract_payload(),
         "source": source_payload(),
         "cases": [
             {
@@ -220,7 +332,7 @@ def test_suite_manifest_round_trips_canonical_metadata_and_is_immutable() -> Non
 
     manifest = SuiteManifest.from_dict(raw)
 
-    assert manifest.schema_version == "suite_manifest_v1"
+    assert manifest.schema_version == "suite_manifest_v2"
     assert manifest.suite_id == "core-suite"
     assert manifest.suite_version == "suite-v1"
     assert manifest.source.source_id == "suite-source"
@@ -269,7 +381,7 @@ def test_suite_manifest_strictly_rejects_missing_unknown_and_invalid_fields(
         SuiteManifest.from_dict(raw)
 
 
-def test_suite_manifest_json_reuses_strict_v1_json_rules() -> None:
+def test_suite_manifest_json_reuses_strict_v2_json_rules() -> None:
     case = EvalCase.from_dict(case_payload())
     text = manifest_for_case(case).to_json()
     duplicated = text.replace(
@@ -333,6 +445,13 @@ def test_manifest_collision_keys_use_unicode_normalization_before_casefold() -> 
         r"cases\escape.json",
         "cases//case.json",
         "cases/CON.json",
+        "cases/COM1 .txt",
+        "cases/COM2 .json",
+        "cases/NUL .json",
+        "cases/AUX .x",
+        "cases/LPT9 .data",
+        "cases/CONIN$.json",
+        "cases/cOnOuT$ .log",
         "cases/COM¹.json",
         "cases/LPT³.txt",
         "cases/case.json.",
@@ -344,6 +463,52 @@ def test_manifest_rejects_unsafe_and_non_portable_case_paths(path: str) -> None:
     raw["cases"][0]["path"] = path
     with pytest.raises(SchemaError, match="path|unsafe|relative|portable"):
         SuiteManifest.from_dict(raw)
+
+
+@pytest.mark.parametrize(
+    ("component", "expected"),
+    (
+        ("COM1 .txt", True),
+        ("COM2 .json", True),
+        ("NUL .json", True),
+        ("AUX .x", True),
+        ("LPT9 .data", True),
+        ("COM\N{SUPERSCRIPT ONE}", True),
+        ("COM\N{SUPERSCRIPT TWO}", True),
+        ("COM\N{SUPERSCRIPT THREE}", True),
+        ("LPT\N{SUPERSCRIPT ONE}", True),
+        ("LPT\N{SUPERSCRIPT TWO}", True),
+        ("LPT\N{SUPERSCRIPT THREE}", True),
+        ("CLOCK$ .txt", True),
+        ("CONIN$", True),
+        ("conout$", True),
+        ("ConIn$.txt", True),
+        ("CONOUT$.log", True),
+        ("CONIN$ .txt", True),
+        ("cOnOuT$ .log", True),
+        ("COM10 .txt", False),
+        ("CONINX$.txt", False),
+        ("CONOUTER$.log", False),
+        ("普通话.txt", False),
+    ),
+)
+def test_windows_reserved_path_component_policy_handles_ignored_stem_suffixes(
+    component: str,
+    expected: bool,
+) -> None:
+    assert is_windows_reserved_path_component(component) is expected
+
+
+def test_manifest_accepts_windows_reserved_near_miss_and_unicode_case_paths() -> None:
+    case = EvalCase.from_dict(case_payload())
+    for path in (
+        "cases/COM10 .txt",
+        "cases/CONINX$.txt",
+        "cases/CONOUTER$.log",
+        "cases/普通话.txt",
+    ):
+        manifest = manifest_for_case(case, path=path)
+        assert manifest.cases[0].path == path
 
 
 def test_case_dimensions_are_strict_generic_grouping_metadata() -> None:
@@ -389,8 +554,7 @@ def test_agent_case_view_has_only_eval_input_in_its_type_and_serialization() -> 
     assert set(view.to_dict()) == {
         "schema_version",
         "task_id",
-        "repository",
-        "review_request",
+        "review_target",
     }
     assert view.to_dict() == case.eval_input().to_dict()
     assert AgentCaseView.from_json(view.to_json()) == view
@@ -407,7 +571,9 @@ def test_agent_case_view_has_only_eval_input_in_its_type_and_serialization() -> 
 
 def test_case_binding_validates_intent_authority_claim_and_policy_combinations() -> None:
     linked = case_payload()
-    linked["input"]["review_request"]["linked_requirements"] = []
+    linked["input"]["review_target"]["review_request"][
+        "linked_requirements"
+    ] = []
     linked_case = EvalCase.from_dict(linked)
     with pytest.raises(SchemaError, match="linked_requirement"):
         validate_case_for_manifest(linked_case, manifest_for_case(linked_case).cases[0], manifest_for_case(linked_case))
@@ -479,6 +645,64 @@ def test_public_suite_source_metadata_is_mandatory_and_complete() -> None:
         SuiteSource.from_dict(raw)
 
 
+def test_public_preparation_binding_is_exact_and_target_specific() -> None:
+    case = EvalCase.from_dict(case_payload())
+    raw = manifest_for_case(case).to_dict()
+    raw["source"] = source_payload(kind="public")
+    manifest = SuiteManifest.from_dict(raw)
+    assert manifest.source.preparation_binding is not None
+    assert manifest.source.preparation_binding.repository_catalog_digest == "8" * 64
+
+    missing = copy.deepcopy(raw)
+    missing["source"]["preparation_binding"][
+        "acquisition_receipt_digest"
+    ] = None
+    with pytest.raises(SchemaError, match="acquisition_receipt_digest"):
+        SuiteManifest.from_dict(missing)
+
+    unknown = copy.deepcopy(raw)
+    unknown["source"]["preparation_binding"]["sidecar"] = "9" * 64
+    with pytest.raises(SchemaError, match="unknown field"):
+        SuiteManifest.from_dict(unknown)
+
+    cross_kind = copy.deepcopy(raw)
+    cross_kind["source"]["preparation_binding"][
+        "frozen_bundle_trust_digest"
+    ] = "9" * 64
+    with pytest.raises(SchemaError, match="Repository Suite preparation"):
+        SuiteManifest.from_dict(cross_kind)
+
+    frozen = copy.deepcopy(raw)
+    frozen["wire_contract"].update(
+        {
+            "review_target_kind": "frozen_context",
+            "materializer_protocol": "frozen-context-materializer-v2",
+        }
+    )
+    frozen["source"]["preparation_binding"]["repository_catalog_digest"] = None
+    frozen["source"]["preparation_binding"][
+        "frozen_bundle_trust_digest"
+    ] = "9" * 64
+    assert SuiteManifest.from_dict(frozen).wire_contract.review_target_kind is (
+        ReviewTargetKind.FROZEN_CONTEXT
+    )
+
+    local = manifest_for_case(case).to_dict()
+    local["source"]["preparation_binding"] = source_payload(kind="public")[
+        "preparation_binding"
+    ]
+    with pytest.raises(SchemaError, match="preparation_binding=null"):
+        SuiteManifest.from_dict(local)
+
+    v1_binding = copy.deepcopy(raw)
+    v1_binding["source"]["preparation_binding"]["schema_version"] = (
+        "public_suite_preparation_binding_v1"
+    )
+    v1_binding["cases"][0]["raw_file_size_bytes"] = "malformed-but-deeper"
+    with pytest.raises(UnsupportedProtocolVersionError):
+        SuiteManifest.from_dict(v1_binding)
+
+
 def test_run_case_snapshot_is_stable_self_contained_and_rejects_split_remap() -> None:
     case = EvalCase.from_dict(case_payload())
     snapshot = snapshot_for_case(case)
@@ -500,6 +724,18 @@ def test_run_case_snapshot_is_stable_self_contained_and_rejects_split_remap() ->
     assert snapshot.cases[0].raw_file_sha256 == FILE_HASH
     assert snapshot.cases[0].canonical_case_digest == case.digest()
     assert snapshot.cases[0].case_source_provenance_hash == SOURCE_HASH
+    assert set(snapshot.to_dict()) == {
+        "schema_version",
+        "snapshot_id",
+        "manifest",
+        "wire_contract",
+        "cases",
+    }
+    assert set(snapshot.to_dict()["cases"][0]) == {
+        "manifest_case",
+        "source",
+        "input",
+    }
     with pytest.raises(FrozenInstanceError):
         snapshot.snapshot_id = "changed"  # type: ignore[misc]
 
@@ -514,7 +750,9 @@ def test_run_case_snapshot_is_stable_self_contained_and_rejects_split_remap() ->
         RunCaseSnapshot.from_dict(changed_id)
 
     changed_input = case.eval_input().to_dict()
-    changed_input["review_request"]["title"] = "Different but valid input"
+    changed_input["review_target"]["review_request"][
+        "title"
+    ] = "Different but valid input"
     with pytest.raises(SchemaError, match="input digest"):
         RunCaseSnapshotEntry.from_dict(
             {
@@ -523,6 +761,26 @@ def test_run_case_snapshot_is_stable_self_contained_and_rejects_split_remap() ->
                 "input": changed_input,
             }
         )
+
+
+def test_snapshot_rejects_wire_and_source_cross_binding_drift() -> None:
+    case = EvalCase.from_dict(case_payload())
+    snapshot = snapshot_for_case(case)
+
+    wire_drift = snapshot.to_dict()
+    wire_drift["wire_contract"].update(
+        {
+            "review_target_kind": "frozen_context",
+            "materializer_protocol": "frozen-context-materializer-v2",
+        }
+    )
+    with pytest.raises(SchemaError, match="wire contract"):
+        RunCaseSnapshot.from_dict(wire_drift)
+
+    content_drift = snapshot.to_dict()
+    content_drift["cases"][0]["source"]["content_hash"] = "0" * 64
+    with pytest.raises(SchemaError, match="canonical identity"):
+        RunCaseSnapshot.from_dict(content_drift)
 
 
 def test_run_snapshot_order_and_id_are_independent_of_requested_case_order() -> None:
@@ -594,6 +852,70 @@ def test_suite_and_snapshot_resource_limits_fail_before_unbounded_consumption(
     with pytest.raises(SchemaError, match="item limit"):
         RunCaseSnapshot.build(manifest, bindings())
     assert consumed == [0, 1, 2, 3]
+
+
+def test_suite_manifest_byte_limit_precedes_child_and_manifest_sorting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = EvalCase.from_dict(case_payload())
+    manifest = manifest_for_case(case)
+    payload = manifest.to_dict()
+
+    def forbidden_sort(*_args, **_kwargs):
+        raise AssertionError("SuiteManifest sorted an oversized payload")
+
+    monkeypatch.setattr(cases_module, "MAX_SUITE_MANIFEST_BYTES", 1)
+    monkeypatch.setattr(cases_module, "sorted", forbidden_sort, raising=False)
+
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        SuiteManifest(
+            schema_version=manifest.schema_version,
+            suite_id=manifest.suite_id,
+            suite_version=manifest.suite_version,
+            wire_contract=manifest.wire_contract,
+            source=manifest.source,
+            cases=manifest.cases,
+        )
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        SuiteManifest.from_dict(payload)
+
+
+def test_snapshot_byte_limit_precedes_hydration_sort_hash_and_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = EvalCase.from_dict(case_payload())
+    snapshot = snapshot_for_case(case)
+    payload = snapshot.to_dict()
+
+    def forbidden_sort(*_args, **_kwargs):
+        raise AssertionError("RunCaseSnapshot sorted an oversized payload")
+
+    def forbidden_hash(*_args, **_kwargs):
+        raise AssertionError("RunCaseSnapshot hashed an oversized payload")
+
+    def forbidden_identity(*_args, **_kwargs):
+        raise AssertionError("RunCaseSnapshot derived an oversized identity")
+
+    monkeypatch.setattr(cases_module, "MAX_RUN_CASE_SNAPSHOT_BYTES", 1)
+    monkeypatch.setattr(cases_module, "sorted", forbidden_sort, raising=False)
+    monkeypatch.setattr(cases_module, "canonical_sha256", forbidden_hash)
+    monkeypatch.setattr(cases_module, "_snapshot_id", forbidden_identity)
+
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        RunCaseSnapshot(
+            schema_version=snapshot.schema_version,
+            snapshot_id=snapshot.snapshot_id,
+            manifest=snapshot.manifest,
+            wire_contract=snapshot.wire_contract,
+            cases=snapshot.cases,
+        )
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        RunCaseSnapshot.from_dict(payload)
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        RunCaseSnapshot.build(
+            snapshot.manifest,
+            ((snapshot.manifest.cases[0], case),),
+        )
 
 
 def test_manifest_canonical_json_matches_task1_json_configuration() -> None:

@@ -359,11 +359,65 @@ def evaluate(
     failures: tuple[IntentSemanticJudgeFailure, ...] = (),
     ungraded: tuple[IntentSemanticJudgeUngraded, ...] = (),
 ) -> IntentEvaluationResult:
-    return IntentEvaluator(evaluator_revision=EVALUATOR_REVISION).evaluate(
+    return _intent_evaluator().evaluate(
         intent,
         truth,
         clarification_script() if script is None else script,
         receipts=receipts,
+        semantic_decisions=decisions,
+        semantic_failures=failures,
+        semantic_ungraded=ungraded,
+    )
+
+
+def _intent_evaluator() -> IntentEvaluator:
+    return IntentEvaluator(evaluator_revision=EVALUATOR_REVISION)
+
+
+def hydrate_dict(
+    value: object,
+    intent: SubmissionIntent | None,
+    truth: IntentTruth,
+    *,
+    script: ClarificationScript | None = None,
+    receipts: tuple[MaterialClaimMatchReceipt, ...] = (),
+    decisions: tuple[IntentSemanticJudgeDecision, ...] = (),
+    failures: tuple[IntentSemanticJudgeFailure, ...] = (),
+    ungraded: tuple[IntentSemanticJudgeUngraded, ...] = (),
+    evaluator: IntentEvaluator | None = None,
+) -> IntentEvaluationResult:
+    return IntentEvaluationResult.from_dict(
+        value,
+        evaluator=_intent_evaluator() if evaluator is None else evaluator,
+        submission_intent=intent,
+        intent_truth=truth,
+        clarification_script=clarification_script() if script is None else script,
+        clarification_match_receipts=receipts,
+        semantic_decisions=decisions,
+        semantic_failures=failures,
+        semantic_ungraded=ungraded,
+    )
+
+
+def hydrate_json(
+    value: object,
+    intent: SubmissionIntent | None,
+    truth: IntentTruth,
+    *,
+    script: ClarificationScript | None = None,
+    receipts: tuple[MaterialClaimMatchReceipt, ...] = (),
+    decisions: tuple[IntentSemanticJudgeDecision, ...] = (),
+    failures: tuple[IntentSemanticJudgeFailure, ...] = (),
+    ungraded: tuple[IntentSemanticJudgeUngraded, ...] = (),
+    evaluator: IntentEvaluator | None = None,
+) -> IntentEvaluationResult:
+    return IntentEvaluationResult.from_json(
+        value,
+        evaluator=_intent_evaluator() if evaluator is None else evaluator,
+        submission_intent=intent,
+        intent_truth=truth,
+        clarification_script=clarification_script() if script is None else script,
+        clarification_match_receipts=receipts,
         semantic_decisions=decisions,
         semantic_failures=failures,
         semantic_ungraded=ungraded,
@@ -758,7 +812,12 @@ def test_judge_execution_failure_is_ungraded_not_pending_or_semantic_unknown() -
     assert IntentReasonCode.JUDGE_FAILED in result.reason_codes
     assert IntentReasonCode.JUDGE_PENDING not in result.reason_codes
     assert IntentReasonCode.JUDGE_UNKNOWN not in result.reason_codes
-    assert IntentEvaluationResult.from_json(result.to_json()) == result
+    assert hydrate_json(
+        result.to_json(),
+        intent,
+        truth,
+        failures=(failure,),
+    ) == result
 
 
 @pytest.mark.parametrize(
@@ -790,7 +849,12 @@ def test_judge_ungraded_is_not_pending_failed_or_semantic_unknown(
     assert IntentReasonCode.JUDGE_PENDING not in result.reason_codes
     assert IntentReasonCode.JUDGE_FAILED not in result.reason_codes
     assert IntentReasonCode.JUDGE_UNKNOWN not in result.reason_codes
-    assert IntentEvaluationResult.from_json(result.to_json()) == result
+    assert hydrate_json(
+        result.to_json(),
+        intent,
+        truth,
+        ungraded=(receipt,),
+    ) == result
 
 
 def test_failure_and_ungraded_receipts_have_strict_codes_and_provenance() -> None:
@@ -856,21 +920,27 @@ def test_failure_ungraded_and_pending_are_distinct_mixed_resolutions() -> None:
         }
     )
 
+    decision = judge_decision(
+        by_dimension[IntentDimension.CONSTRAINT],
+        IntentJudgeRelation.DIFFERENT,
+    )
     resolved = evaluate(
         intent,
         truth,
-        decisions=(
-            judge_decision(
-                by_dimension[IntentDimension.CONSTRAINT],
-                IntentJudgeRelation.DIFFERENT,
-            ),
-        ),
+        decisions=(decision,),
         failures=(failure,),
         ungraded=(ungraded_receipt,),
     )
     assert resolved.status is IntentEvaluationStatus.UNGRADED
     assert IntentReasonCode.JUDGE_PENDING not in resolved.reason_codes
-    assert IntentEvaluationResult.from_json(resolved.to_json()) == resolved
+    assert hydrate_json(
+        resolved.to_json(),
+        intent,
+        truth,
+        decisions=(decision,),
+        failures=(failure,),
+        ungraded=(ungraded_receipt,),
+    ) == resolved
 
 
 def test_duplicate_and_unknown_judge_decisions_are_rejected() -> None:
@@ -1103,6 +1173,8 @@ def test_missing_submission_intent_is_ungraded_and_not_zero_scored() -> None:
     assert result.clarification.decision_correct is None
     assert result.clarification.complete is None
     assert result.reason_codes == (IntentReasonCode.SUBMISSION_INTENT_MISSING,)
+    assert hydrate_dict(result.to_dict(), None, truth) == result
+    assert hydrate_json(result.to_json(), None, truth) == result
 
 
 def test_candidate_cap_returns_ungraded_without_truncating_pairs(
@@ -1643,192 +1715,343 @@ def test_valid_unmatched_receipt_preserves_wrong_question_diagnostic(
     )
 
 
-def decided_semantic_result() -> IntentEvaluationResult:
+def decided_semantic_fixture() -> tuple[
+    SubmissionIntent,
+    IntentTruth,
+    IntentSemanticJudgeDecision,
+    IntentEvaluationResult,
+]:
     intent, truth, pending = semantic_fixture()
-    return evaluate(
+    decision = judge_decision(
+        pending.judge_requests[0],
+        IntentJudgeRelation.EQUIVALENT,
+    )
+    return intent, truth, decision, evaluate(
         intent,
         truth,
-        decisions=(
-            judge_decision(
-                pending.judge_requests[0], IntentJudgeRelation.EQUIVALENT
-            ),
-        ),
+        decisions=(decision,),
     )
 
 
+def decided_semantic_result() -> IntentEvaluationResult:
+    return decided_semantic_fixture()[3]
+
+
 def test_canonical_serialization_and_strict_round_trip_hydration() -> None:
-    result = decided_semantic_result()
+    intent, truth, decision, result = decided_semantic_fixture()
     payload = result.to_dict()
     encoded = result.to_json()
 
     assert result.schema_version == INTENT_EVALUATION_SCHEMA_VERSION
     assert result.normalization_version == INTENT_NORMALIZATION_POLICY_VERSION
-    assert result.submission_intent_digest == canonical_sha256(
-        semantic_fixture()[0].to_dict()
-    )
-    assert result.intent_truth_digest == canonical_sha256(
-        semantic_fixture()[1].to_dict()
-    )
+    assert result.submission_intent_digest == canonical_sha256(intent.to_dict())
+    assert result.intent_truth_digest == canonical_sha256(truth.to_dict())
     assert result.clarification_script_digest == canonical_sha256(
         clarification_script().to_dict()
     )
     assert encoded == canonical_json(payload)
     assert "\n" not in encoded
     assert "\r" not in encoded
-    assert IntentEvaluationResult.from_dict(deepcopy(payload)) == result
-    assert IntentEvaluationResult.from_json(encoded) == result
-    assert IntentEvaluationResult.from_json(encoded.encode("utf-8")) == result
-    assert IntentEvaluationResult.from_json(encoded).digest() == result.digest()
+    assert hydrate_dict(
+        deepcopy(payload), intent, truth, decisions=(decision,)
+    ) == result
+    assert hydrate_json(encoded, intent, truth, decisions=(decision,)) == result
+    assert hydrate_json(
+        encoded.encode("utf-8"), intent, truth, decisions=(decision,)
+    ) == result
+    assert hydrate_json(
+        encoded, intent, truth, decisions=(decision,)
+    ).digest() == result.digest()
+
+
+def test_bound_hydration_rejects_persisted_metrics_claims_and_digest_mutations() -> None:
+    intent, truth, decision, result = decided_semantic_fixture()
+
+    tampered_metrics = deepcopy(result.to_dict())
+    tampered_metrics["metrics"]["supported_claim_count"] = 0
+    with pytest.raises(IntentEvaluationError, match="metric|replay"):
+        hydrate_dict(tampered_metrics, intent, truth, decisions=(decision,))
+
+    tampered_claim = deepcopy(result.to_dict())
+    tampered_claim["truth_claims"][0]["required"] = False
+    tampered_claim["metrics"].update(
+        {
+            "required_truth_count": 0,
+            "required_supported_count": 0,
+            "required_missed_count": 0,
+            "optional_truth_count": 1,
+            "optional_supported_count": 1,
+        }
+    )
+    with pytest.raises(IntentEvaluationError, match="deterministic replay"):
+        hydrate_dict(tampered_claim, intent, truth, decisions=(decision,))
+
+    for digest_field in (
+        "submission_intent_digest",
+        "intent_truth_digest",
+        "clarification_script_digest",
+    ):
+        tampered_digest = deepcopy(result.to_dict())
+        tampered_digest[digest_field] = "0" * 64
+        with pytest.raises(IntentEvaluationError, match="deterministic replay"):
+            hydrate_dict(tampered_digest, intent, truth, decisions=(decision,))
+
+
+def test_bound_hydration_rejects_swapped_truth_script_and_judge_result() -> None:
+    intent, truth, decision, result = decided_semantic_fixture()
+
+    swapped_truth = intent_truth(
+        expected_claim("truth-goal", "Support dry-run mode", required=False)
+    )
+    with pytest.raises(IntentEvaluationError, match="deterministic replay"):
+        hydrate_dict(
+            result.to_dict(),
+            intent,
+            swapped_truth,
+            decisions=(decision,),
+        )
+
+    swapped_script = clarification_script(max_rounds=3)
+    with pytest.raises(IntentEvaluationError, match="deterministic replay"):
+        hydrate_dict(
+            result.to_dict(),
+            intent,
+            truth,
+            script=swapped_script,
+            decisions=(decision,),
+        )
+
+    swapped_decision = judge_decision(
+        semantic_fixture()[2].judge_requests[0],
+        IntentJudgeRelation.DIFFERENT,
+    )
+    with pytest.raises(IntentEvaluationError, match="deterministic replay"):
+        hydrate_dict(
+            result.to_dict(),
+            intent,
+            truth,
+            decisions=(swapped_decision,),
+        )
+
+
+def test_bound_hydration_rejects_a_swapped_clarification_match_receipt() -> None:
+    answer = clarification_answer()
+    script = clarification_script(answer)
+    exchange = clarification_exchange()
+    receipt = match_receipt(exchange, script)
+    intent = submission_intent(
+        goal=exchange.material_claim,
+        transcript=(exchange,),
+    )
+    truth = intent_truth(
+        expected_claim("truth-goal", exchange.material_claim),
+        policy=ClarificationPolicy.REQUIRED,
+    )
+    result = evaluate(
+        intent,
+        truth,
+        script=script,
+        receipts=(receipt,),
+    )
+    swapped_receipt = match_receipt(
+        exchange,
+        script,
+        matcher_digest="b" * 64,
+    )
+
+    with pytest.raises(IntentEvaluationError, match="deterministic replay"):
+        hydrate_dict(
+            result.to_dict(),
+            intent,
+            truth,
+            script=script,
+            receipts=(swapped_receipt,),
+        )
+
+
+def test_bound_hydration_requires_the_real_intent_evaluator() -> None:
+    class DerivedIntentEvaluator(IntentEvaluator):
+        pass
+
+    intent, truth, decision, result = decided_semantic_fixture()
+    derived = DerivedIntentEvaluator(evaluator_revision=EVALUATOR_REVISION)
+
+    with pytest.raises(IntentEvaluationError, match="real IntentEvaluator"):
+        hydrate_dict(
+            result.to_dict(),
+            intent,
+            truth,
+            decisions=(decision,),
+            evaluator=derived,
+        )
+
+
+def test_public_hydrators_require_all_source_bindings() -> None:
+    result = decided_semantic_result()
+
+    with pytest.raises(TypeError, match="required keyword-only"):
+        IntentEvaluationResult.from_dict(result.to_dict())  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="required keyword-only"):
+        IntentEvaluationResult.from_json(result.to_json())  # type: ignore[call-arg]
 
 
 def test_hydration_rejects_tampered_judge_ungraded_resolution_and_provenance() -> None:
     intent, truth, pending = semantic_fixture()
+    receipt = judge_ungraded(pending.judge_requests[0])
     result = evaluate(
         intent,
         truth,
-        ungraded=(judge_ungraded(pending.judge_requests[0]),),
+        ungraded=(receipt,),
     )
 
     tampered_reason = deepcopy(result.to_dict())
     tampered_reason["judge_ungraded"][0]["ungraded_reason"] = "future_ungraded"
     with pytest.raises(IntentEvaluationError, match="unsupported ungraded_reason"):
-        IntentEvaluationResult.from_dict(tampered_reason)
+        hydrate_dict(tampered_reason, intent, truth, ungraded=(receipt,))
 
     tampered_execution = deepcopy(result.to_dict())
     tampered_execution["judge_ungraded"][0]["evaluator_execution_digest"] = "f" * 63
     with pytest.raises(IntentEvaluationError, match="SHA-256"):
-        IntentEvaluationResult.from_dict(tampered_execution)
+        hydrate_dict(tampered_execution, intent, truth, ungraded=(receipt,))
 
     tampered_result = deepcopy(result.to_dict())
     tampered_result["judge_ungraded"][0]["judge_result_digest"] = "f" * 63
     with pytest.raises(IntentEvaluationError, match="SHA-256"):
-        IntentEvaluationResult.from_dict(tampered_result)
+        hydrate_dict(tampered_result, intent, truth, ungraded=(receipt,))
 
     tampered_request = deepcopy(result.to_dict())
     tampered_request["judge_ungraded"][0]["request_id"] = "another-request"
     with pytest.raises(IntentEvaluationError, match="unknown request"):
-        IntentEvaluationResult.from_dict(tampered_request)
+        hydrate_dict(tampered_request, intent, truth, ungraded=(receipt,))
 
     tampered_candidate = deepcopy(result.to_dict())
     tampered_candidate["candidates"][0]["reason_codes"] = [
         IntentReasonCode.JUDGE_PENDING.value
     ]
     with pytest.raises(IntentEvaluationError, match="candidate reason codes"):
-        IntentEvaluationResult.from_dict(tampered_candidate)
+        hydrate_dict(tampered_candidate, intent, truth, ungraded=(receipt,))
 
     tampered_outcome = deepcopy(result.to_dict())
     tampered_outcome["claim_outcomes"][0]["reason_codes"] = [
         IntentReasonCode.JUDGE_PENDING.value
     ]
     with pytest.raises(IntentEvaluationError, match="claim outcome"):
-        IntentEvaluationResult.from_dict(tampered_outcome)
+        hydrate_dict(tampered_outcome, intent, truth, ungraded=(receipt,))
 
     tampered_status = deepcopy(result.to_dict())
     tampered_status["status"] = IntentEvaluationStatus.PENDING_JUDGE.value
     with pytest.raises(IntentEvaluationError, match="pending Judge work|not canonical"):
-        IntentEvaluationResult.from_dict(tampered_status)
+        hydrate_dict(tampered_status, intent, truth, ungraded=(receipt,))
 
     missing_receipt = deepcopy(result.to_dict())
     missing_receipt["judge_ungraded"] = []
     with pytest.raises(IntentEvaluationError, match="candidate reason codes"):
-        IntentEvaluationResult.from_dict(missing_receipt)
+        hydrate_dict(missing_receipt, intent, truth, ungraded=(receipt,))
 
 
 def test_hydration_rejects_tampered_judge_failure_provenance_and_overlap() -> None:
     intent, truth, pending = semantic_fixture()
     request = pending.judge_requests[0]
-    result = evaluate(intent, truth, failures=(judge_failure(request),))
+    failure = judge_failure(request)
+    result = evaluate(intent, truth, failures=(failure,))
 
     unknown_code = deepcopy(result.to_dict())
     unknown_code["judge_failures"][0]["failure_code"] = "future_failure"
     with pytest.raises(IntentEvaluationError, match="unsupported failure_code"):
-        IntentEvaluationResult.from_dict(unknown_code)
+        hydrate_dict(unknown_code, intent, truth, failures=(failure,))
 
     crossed = deepcopy(result.to_dict())
     crossed["judge_failures"][0]["request_id"] = "another-request"
     with pytest.raises(IntentEvaluationError, match="unknown request"):
-        IntentEvaluationResult.from_dict(crossed)
+        hydrate_dict(crossed, intent, truth, failures=(failure,))
 
     overlap = deepcopy(result.to_dict())
     overlap["judge_ungraded"] = [
         judge_ungraded(request).to_dict()
     ]
     with pytest.raises(IntentEvaluationError, match="more than one resolution"):
-        IntentEvaluationResult.from_dict(overlap)
+        hydrate_dict(overlap, intent, truth, failures=(failure,))
 
 
 def test_from_dict_rejects_unknown_missing_and_tampered_fields() -> None:
-    result = decided_semantic_result()
+    intent, truth, decision, result = decided_semantic_fixture()
 
     unknown = deepcopy(result.to_dict())
     unknown["future_field"] = True
     with pytest.raises(IntentEvaluationError, match="unknown or missing fields"):
-        IntentEvaluationResult.from_dict(unknown)
+        hydrate_dict(unknown, intent, truth, decisions=(decision,))
 
     missing = deepcopy(result.to_dict())
     missing.pop("metrics")
     with pytest.raises(IntentEvaluationError, match="unknown or missing fields"):
-        IntentEvaluationResult.from_dict(missing)
+        hydrate_dict(missing, intent, truth, decisions=(decision,))
 
     nested_unknown = deepcopy(result.to_dict())
     nested_unknown["generated_claims"][0]["future_field"] = True
     with pytest.raises(IntentEvaluationError, match="unknown or missing fields"):
-        IntentEvaluationResult.from_dict(nested_unknown)
+        hydrate_dict(nested_unknown, intent, truth, decisions=(decision,))
 
     tampered_metric = deepcopy(result.to_dict())
     tampered_metric["metrics"]["supported_claim_count"] = 99
     with pytest.raises(IntentEvaluationError, match="metric claim counts are inconsistent"):
-        IntentEvaluationResult.from_dict(tampered_metric)
+        hydrate_dict(tampered_metric, intent, truth, decisions=(decision,))
 
     tampered_normalized_text = deepcopy(result.to_dict())
     tampered_normalized_text["generated_claims"][0]["normalized_text"] = "tampered"
     with pytest.raises(IntentEvaluationError, match="does not match text"):
-        IntentEvaluationResult.from_dict(tampered_normalized_text)
+        hydrate_dict(
+            tampered_normalized_text, intent, truth, decisions=(decision,)
+        )
 
     tampered_case_pass = deepcopy(result.to_dict())
     tampered_case_pass["metrics"]["intent_case_pass"] = False
     with pytest.raises(IntentEvaluationError, match="case pass is inconsistent"):
-        IntentEvaluationResult.from_dict(tampered_case_pass)
+        hydrate_dict(tampered_case_pass, intent, truth, decisions=(decision,))
 
     tampered_clarification = deepcopy(result.to_dict())
     tampered_clarification["clarification"]["decision_correct"] = False
     with pytest.raises(IntentEvaluationError, match="does not match its policy"):
-        IntentEvaluationResult.from_dict(tampered_clarification)
+        hydrate_dict(
+            tampered_clarification, intent, truth, decisions=(decision,)
+        )
 
     tampered_binding = deepcopy(result.to_dict())
     tampered_binding["submission_intent_digest"] = "f" * 63
     with pytest.raises(IntentEvaluationError, match="SHA-256"):
-        IntentEvaluationResult.from_dict(tampered_binding)
+        hydrate_dict(tampered_binding, intent, truth, decisions=(decision,))
 
     tampered_candidate_reason = deepcopy(result.to_dict())
     tampered_candidate_reason["candidates"][0]["reason_codes"] = [
         IntentReasonCode.JUDGE_DIFFERENT.value
     ]
     with pytest.raises(IntentEvaluationError, match="candidate reason codes"):
-        IntentEvaluationResult.from_dict(tampered_candidate_reason)
+        hydrate_dict(
+            tampered_candidate_reason, intent, truth, decisions=(decision,)
+        )
 
     tampered_outcome_reason = deepcopy(result.to_dict())
     tampered_outcome_reason["claim_outcomes"][0]["reason_codes"] = [
         IntentReasonCode.JUDGE_DIFFERENT.value
     ]
     with pytest.raises(IntentEvaluationError, match="claim outcome"):
-        IntentEvaluationResult.from_dict(tampered_outcome_reason)
+        hydrate_dict(
+            tampered_outcome_reason, intent, truth, decisions=(decision,)
+        )
 
     tampered_status = deepcopy(result.to_dict())
     tampered_status["status"] = IntentEvaluationStatus.UNGRADED.value
     tampered_status["metrics"]["intent_case_pass"] = None
     with pytest.raises(IntentEvaluationError, match="status is not canonical"):
-        IntentEvaluationResult.from_dict(tampered_status)
+        hydrate_dict(tampered_status, intent, truth, decisions=(decision,))
 
 
 def test_hydration_recomputes_global_assignment_and_canonical_tie_break() -> None:
-    result = evaluate(
-        submission_intent(goal="Exact text"),
-        intent_truth(
-            expected_claim("truth-exact", "Exact text"),
-            expected_claim("truth-normalized", " exact TEXT "),
-        ),
+    intent = submission_intent(goal="Exact text")
+    truth = intent_truth(
+        expected_claim("truth-exact", "Exact text"),
+        expected_claim("truth-normalized", " exact TEXT "),
     )
+    result = evaluate(intent, truth)
     payload = result.to_dict()
     exact = next(
         item for item in payload["candidates"] if item["match_kind"] == "exact"
@@ -1857,41 +2080,39 @@ def test_hydration_recomputes_global_assignment_and_canonical_tie_break() -> Non
     payload["unmatched_expected_truth_ids"] = [exact["truth_id"]]
 
     with pytest.raises(IntentEvaluationError, match="global maximum-weight"):
-        IntentEvaluationResult.from_dict(payload)
+        hydrate_dict(payload, intent, truth)
 
 
 def test_hydration_rejects_a_truncated_deterministic_candidate_graph() -> None:
-    result = evaluate(
-        submission_intent(goal="Exact text"),
-        intent_truth(
-            expected_claim("truth-exact", "Exact text"),
-            expected_claim("truth-normalized", " exact TEXT "),
-        ),
+    intent = submission_intent(goal="Exact text")
+    truth = intent_truth(
+        expected_claim("truth-exact", "Exact text"),
+        expected_claim("truth-normalized", " exact TEXT "),
     )
+    result = evaluate(intent, truth)
     payload = result.to_dict()
     payload["candidates"] = [
         item for item in payload["candidates"] if item["match_kind"] != "normalized"
     ]
 
     with pytest.raises(IntentEvaluationError, match="same-dimension pair"):
-        IntentEvaluationResult.from_dict(payload)
+        hydrate_dict(payload, intent, truth)
 
 
 def test_hydration_rejects_truncated_pending_semantic_work() -> None:
-    _intent, _truth, result = semantic_fixture()
+    intent, truth, result = semantic_fixture()
     payload = result.to_dict()
     payload["candidates"] = []
     payload["judge_requests"] = []
 
     with pytest.raises(IntentEvaluationError, match="same-dimension pair"):
-        IntentEvaluationResult.from_dict(payload)
+        hydrate_dict(payload, intent, truth)
 
 
 def test_hydration_rejects_a_forged_candidate_limit_outcome() -> None:
-    result = evaluate(
-        submission_intent(goal="same"),
-        intent_truth(expected_claim("truth-goal", "same")),
-    )
+    intent = submission_intent(goal="same")
+    truth = intent_truth(expected_claim("truth-goal", "same"))
+    result = evaluate(intent, truth)
     payload = result.to_dict()
     generated_id = payload["generated_claims"][0]["generated_id"]
     payload["status"] = IntentEvaluationStatus.UNGRADED.value
@@ -1919,14 +2140,13 @@ def test_hydration_rejects_a_forged_candidate_limit_outcome() -> None:
     ]
 
     with pytest.raises(IntentEvaluationError, match="candidate-limit outcome"):
-        IntentEvaluationResult.from_dict(payload)
+        hydrate_dict(payload, intent, truth)
 
 
 def test_hydration_rejects_a_forged_not_scorable_truth_outcome() -> None:
-    result = evaluate(
-        submission_intent(goal="same"),
-        intent_truth(expected_claim("truth-goal", "same")),
-    )
+    intent = submission_intent(goal="same")
+    truth = intent_truth(expected_claim("truth-goal", "same"))
+    result = evaluate(intent, truth)
     payload = result.to_dict()
     generated_id = payload["generated_claims"][0]["generated_id"]
     payload["status"] = IntentEvaluationStatus.NOT_SCORABLE.value
@@ -1957,14 +2177,13 @@ def test_hydration_rejects_a_forged_not_scorable_truth_outcome() -> None:
     payload["reason_codes"] = [IntentReasonCode.INTENT_TRUTH_UNSCORABLE.value]
 
     with pytest.raises(IntentEvaluationError, match="empty truth claims"):
-        IntentEvaluationResult.from_dict(payload)
+        hydrate_dict(payload, intent, truth)
 
 
 def test_hydration_rejects_not_scorable_with_deleted_claims_and_old_digest() -> None:
-    result = evaluate(
-        submission_intent(goal="same"),
-        intent_truth(expected_claim("truth-goal", "same")),
-    )
+    intent = submission_intent(goal="same")
+    truth = intent_truth(expected_claim("truth-goal", "same"))
+    result = evaluate(intent, truth)
     payload = result.to_dict()
     generated_id = payload["generated_claims"][0]["generated_id"]
     payload["status"] = IntentEvaluationStatus.NOT_SCORABLE.value
@@ -1996,7 +2215,7 @@ def test_hydration_rejects_not_scorable_with_deleted_claims_and_old_digest() -> 
     payload["reason_codes"] = [IntentReasonCode.INTENT_TRUTH_UNSCORABLE.value]
 
     with pytest.raises(IntentEvaluationError, match="canonical unscorable truth"):
-        IntentEvaluationResult.from_dict(payload)
+        hydrate_dict(payload, intent, truth)
 
 
 @pytest.mark.parametrize(
@@ -2012,22 +2231,26 @@ def test_hydration_revalidates_case_wide_record_byte_budgets(
     budget_name: str,
     error: str,
 ) -> None:
-    result = decided_semantic_result()
+    intent, truth, decision, result = decided_semantic_fixture()
     monkeypatch.setattr(intent_evaluator_module, budget_name, 1)
 
     with pytest.raises(IntentEvaluationError, match=error):
-        IntentEvaluationResult.from_dict(result.to_dict())
+        hydrate_dict(result.to_dict(), intent, truth, decisions=(decision,))
 
 
 def test_from_json_rejects_duplicate_keys_invalid_json_and_non_text() -> None:
+    intent, truth, decision, _result = decided_semantic_fixture()
     with pytest.raises(ValueError, match="duplicate JSON key"):
-        IntentEvaluationResult.from_json(
-            '{"schema_version":"one","schema_version":"two"}'
+        hydrate_json(
+            '{"schema_version":"one","schema_version":"two"}',
+            intent,
+            truth,
+            decisions=(decision,),
         )
     with pytest.raises(ValueError, match="not valid strict JSON"):
-        IntentEvaluationResult.from_json("{")
+        hydrate_json("{", intent, truth, decisions=(decision,))
     with pytest.raises(ValueError, match="only bytes or text"):
-        IntentEvaluationResult.from_json({})
+        hydrate_json({}, intent, truth, decisions=(decision,))
 
 
 def test_evaluation_result_and_nested_records_are_frozen() -> None:

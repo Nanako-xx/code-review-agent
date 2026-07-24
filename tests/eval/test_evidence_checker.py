@@ -11,7 +11,12 @@ from typing import Iterator
 import pytest
 
 from review_agent_eval.artifacts import TrialManifest
-from review_agent_eval.cases import CaseSplit, SuiteCase
+from review_agent_eval.cases import (
+    REPOSITORY_MATERIALIZER_PROTOCOL,
+    CaseSplit,
+    SuiteCase,
+    WireContractV2,
+)
 from review_agent_eval.config import (
     derive_case_path_id,
     derive_trial_id,
@@ -28,17 +33,25 @@ from review_agent_eval.evidence_checker import (
     EvidenceReasonCode,
 )
 from review_agent_eval.models import (
+    EVAL_CASE_SCHEMA_VERSION,
     EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
     DiffSide,
+    CommandOutputEvidenceSource,
     EvalInput,
     EvidenceIntegrity,
     EvidenceKind,
     EvidenceStream,
     ExistingCIEvidence,
+    ExternalRecordEvidenceSource,
     FindingSeverity,
     MAX_EVIDENCE_EXCERPT_BYTES,
     Repository,
+    RepositoryDiffEvidenceSource,
+    RepositoryFileEvidenceSource,
+    RepositoryReviewTarget,
     ReviewRequest,
+    ReviewTargetKind,
     SchemaError,
     SubmissionEvidence,
     SubmissionFinding,
@@ -53,10 +66,12 @@ from review_agent_eval.repository import (
     RepositoryIntegrityError,
     RepositoryPreparer,
     RepositorySecurityError,
+    repository_from_eval_input,
 )
 
 
 TRIAL_ID = "trial-evidence-a"
+TARGET_MATERIALIZATION_ID = "materialization-" + ("1" * 64)
 
 
 def _digest_bytes(value: bytes) -> str:
@@ -144,19 +159,22 @@ def _build_harness(root: Path, *, heavy: bool = True) -> Harness:
     eval_input = EvalInput(
         schema_version=EVAL_INPUT_SCHEMA_VERSION,
         task_id="case-evidence",
-        repository=descriptor,
-        review_request=ReviewRequest(
-            title="Review evidence integrity",
-            description=None,
-            user_intent=None,
-            review_focus=None,
-            linked_requirements=(),
-            project_rules=(),
-            existing_ci_evidence=(
-                ExistingCIEvidence(
-                    source_id="ci-main",
-                    text=ci_text,
-                    content_hash=_digest_text(ci_text),
+        review_target=RepositoryReviewTarget(
+            kind=ReviewTargetKind.REPOSITORY,
+            repository=descriptor,
+            review_request=ReviewRequest(
+                title="Review evidence integrity",
+                description=None,
+                user_intent=None,
+                review_focus=None,
+                linked_requirements=(),
+                project_rules=(),
+                existing_ci_evidence=(
+                    ExistingCIEvidence(
+                        source_id="ci-main",
+                        text=ci_text,
+                        content_hash=_digest_text(ci_text),
+                    ),
                 ),
             ),
         ),
@@ -171,7 +189,9 @@ def _build_harness(root: Path, *, heavy: bool = True) -> Harness:
     try:
         prepared = preparer.prepare(descriptor)
         replay = preparer.open_replay(prepared)
-        checker = EvidenceIntegrityChecker(eval_input, replay, TRIAL_ID)
+        checker = EvidenceIntegrityChecker(
+            eval_input, replay, TRIAL_ID, TARGET_MATERIALIZATION_ID
+        )
     except BaseException:
         preparer.__exit__(None, None, None)
         raise
@@ -196,27 +216,23 @@ def _file_evidence(
     *,
     evidence_id: str = "ev-file",
     revision: str | None = None,
-    path: str | None = "src/app.py",
-    from_line: int | None = 1,
-    to_line: int | None = 1,
+    path: str = "src/app.py",
+    from_line: int = 1,
+    to_line: int = 1,
     excerpt: str = "alpha\n",
     content_hash: str | None = None,
-    command: tuple[str, ...] | None = None,
-    exit_code: int | None = None,
-    stream: EvidenceStream | None = None,
-    source_ref: str | None = None,
 ) -> SubmissionEvidence:
+    repository = repository_from_eval_input(harness.eval_input)
     return SubmissionEvidence(
         evidence_id=evidence_id,
-        kind=EvidenceKind.REPOSITORY_FILE,
-        revision=revision or harness.eval_input.repository.head_revision,
-        path=path,
-        from_line=from_line,
-        to_line=to_line,
-        command=command,
-        exit_code=exit_code,
-        stream=stream,
-        source_ref=source_ref,
+        source=RepositoryFileEvidenceSource(
+            kind=EvidenceKind.REPOSITORY_FILE,
+            target_materialization_id=TARGET_MATERIALIZATION_ID,
+            revision=revision or repository.head_revision,
+            path=path,
+            from_line=from_line,
+            to_line=to_line,
+        ),
         content_hash=content_hash or _digest_text(excerpt),
         excerpt=excerpt,
     )
@@ -226,37 +242,25 @@ def _diff_evidence(
     harness: Harness,
     *,
     evidence_id: str = "ev-diff",
-    path: str | None = "src/app.py",
-    revision: str | None = None,
+    path: str = "src/app.py",
+    base_revision: str | None = None,
+    head_revision: str | None = None,
     excerpt: str | None = None,
     content_hash: str | None = None,
-    from_line: int | None = None,
-    to_line: int | None = None,
-    command: tuple[str, ...] | None = None,
-    exit_code: int | None = None,
-    stream: EvidenceStream | None = None,
-    source_ref: str | None = None,
 ) -> SubmissionEvidence:
     if excerpt is None:
-        assert path is not None
         raw = harness.replay.diff(path, max_bytes=MAX_EVIDENCE_EXCERPT_BYTES)
         excerpt = raw.decode("utf-8")
+    repository = repository_from_eval_input(harness.eval_input)
     return SubmissionEvidence(
         evidence_id=evidence_id,
-        kind=EvidenceKind.REPOSITORY_DIFF,
-        revision=revision
-        or "%s..%s"
-        % (
-            harness.eval_input.repository.base_revision,
-            harness.eval_input.repository.head_revision,
+        source=RepositoryDiffEvidenceSource(
+            kind=EvidenceKind.REPOSITORY_DIFF,
+            target_materialization_id=TARGET_MATERIALIZATION_ID,
+            base_revision=base_revision or repository.base_revision,
+            head_revision=head_revision or repository.head_revision,
+            path=path,
         ),
-        path=path,
-        from_line=from_line,
-        to_line=to_line,
-        command=command,
-        exit_code=exit_code,
-        stream=stream,
-        source_ref=source_ref,
         content_hash=content_hash or _digest_text(excerpt),
         excerpt=excerpt,
     )
@@ -279,7 +283,8 @@ def _attestation(
         schema_version=COMMAND_OUTPUT_ATTESTATION_SCHEMA_VERSION,
         source_ref=source_ref,
         trial_id=trial_id,
-        head_revision=head_revision or harness.eval_input.repository.head_revision,
+        head_revision=head_revision
+        or repository_from_eval_input(harness.eval_input).head_revision,
         argv=argv,
         exit_code=exit_code,
         stream=stream,
@@ -293,25 +298,23 @@ def _command_evidence(
     harness: Harness,
     *,
     evidence_id: str = "ev-command",
-    revision: str | None = None,
-    command: tuple[str, ...] | None = ("pytest", "-q"),
-    exit_code: int | None = 0,
-    stream: EvidenceStream | None = EvidenceStream.COMBINED,
-    source_ref: str | None = "command-main",
+    command: tuple[str, ...] = ("pytest", "-q"),
+    exit_code: int = 0,
+    stream: EvidenceStream = EvidenceStream.COMBINED,
+    source_ref: str = "command-main",
     excerpt: str = "2 passed\n",
     content_hash: str | None = None,
 ) -> SubmissionEvidence:
     return SubmissionEvidence(
         evidence_id=evidence_id,
-        kind=EvidenceKind.COMMAND_OUTPUT,
-        revision=revision or harness.eval_input.repository.head_revision,
-        path=None,
-        from_line=None,
-        to_line=None,
-        command=command,
-        exit_code=exit_code,
-        stream=stream,
-        source_ref=source_ref,
+        source=CommandOutputEvidenceSource(
+            kind=EvidenceKind.COMMAND_OUTPUT,
+            target_materialization_id=TARGET_MATERIALIZATION_ID,
+            command=command,
+            exit_code=exit_code,
+            stream=stream,
+            artifact_ref=source_ref,
+        ),
         content_hash=content_hash or _digest_text(excerpt),
         excerpt=excerpt,
     )
@@ -321,22 +324,17 @@ def _external_evidence(
     harness: Harness,
     *,
     evidence_id: str = "ev-external",
-    source_ref: str | None = "ci-main",
-    revision: str | None = None,
+    source_ref: str = "ci-main",
     excerpt: str = "linux: passed\nwindows: passed\n",
     content_hash: str | None = None,
 ) -> SubmissionEvidence:
     return SubmissionEvidence(
         evidence_id=evidence_id,
-        kind=EvidenceKind.EXTERNAL_RECORD,
-        revision=revision or harness.eval_input.repository.head_revision,
-        path=None,
-        from_line=None,
-        to_line=None,
-        command=None,
-        exit_code=None,
-        stream=None,
-        source_ref=source_ref,
+        source=ExternalRecordEvidenceSource(
+            kind=EvidenceKind.EXTERNAL_RECORD,
+            target_materialization_id=TARGET_MATERIALIZATION_ID,
+            source_ref=source_ref,
+        ),
         content_hash=content_hash or _digest_text(excerpt),
         excerpt=excerpt,
     )
@@ -372,7 +370,10 @@ def test_repository_file_replays_base_head_crlf_and_final_newline_exactly(
     to_line: int,
     excerpt: str,
 ) -> None:
-    revision = getattr(harness.eval_input.repository, "%s_revision" % revision_name)
+    revision = getattr(
+        repository_from_eval_input(harness.eval_input),
+        "%s_revision" % revision_name,
+    )
     evidence = _file_evidence(
         harness,
         revision=revision,
@@ -417,10 +418,8 @@ def test_repository_file_canonicalizes_every_splitlines_boundary_to_lf(
         ({"path": "src/cafe\u0301.py"}, EvidenceReasonCode.PATH_INVALID),
         ({"path": "case.py"}, EvidenceReasonCode.PATH_NOT_FOUND),
         ({"path": "missing.py"}, EvidenceReasonCode.PATH_NOT_FOUND),
-        ({"from_line": 1, "to_line": None}, EvidenceReasonCode.LINE_RANGE_PARTIAL),
         ({"from_line": 2, "to_line": 1}, EvidenceReasonCode.LINE_RANGE_REVERSED),
         ({"from_line": 4, "to_line": 4}, EvidenceReasonCode.LINE_RANGE_OUT_OF_BOUNDS),
-        ({"command": ("self-reported",)}, EvidenceReasonCode.KIND_FIELD_MISMATCH),
     ],
 )
 def test_repository_file_rejects_symbolic_unsafe_case_wrong_and_bad_coordinates(
@@ -539,13 +538,11 @@ def test_repository_diff_treats_metacharacter_path_as_literal(
 @pytest.mark.parametrize(
     ("changes", "reason"),
     [
-        ({"revision": "HEAD"}, EvidenceReasonCode.REVISION_MISMATCH),
-        ({"revision": "a" * 40}, EvidenceReasonCode.REVISION_MISMATCH),
+        ({"head_revision": "HEAD"}, EvidenceReasonCode.REVISION_MISMATCH),
+        ({"base_revision": "c" * 40}, EvidenceReasonCode.REVISION_MISMATCH),
         ({"path": "missing.py", "excerpt": ""}, EvidenceReasonCode.PATH_NOT_FOUND),
         ({"path": "SRC/app.py", "excerpt": ""}, EvidenceReasonCode.PATH_NOT_FOUND),
         ({"path": "../src/app.py", "excerpt": ""}, EvidenceReasonCode.PATH_INVALID),
-        ({"from_line": 1}, EvidenceReasonCode.KIND_FIELD_MISMATCH),
-        ({"source_ref": "self-report"}, EvidenceReasonCode.KIND_FIELD_MISMATCH),
     ],
 )
 def test_repository_diff_rejects_wrong_range_path_and_extra_fields(
@@ -564,6 +561,13 @@ def test_repository_diff_rejects_wrong_range_path_and_extra_fields(
 def _workspace_binding(harness: Harness) -> tuple[TrialManifest, SuiteCase]:
     run_id = stable_id("run", "evidence-workspace-test")
     trial_id = derive_trial_id(run_id, harness.eval_input.task_id, 1)
+    wire_contract = WireContractV2(
+        case_schema_version=EVAL_CASE_SCHEMA_VERSION,
+        input_schema_version=EVAL_INPUT_SCHEMA_VERSION,
+        submission_schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
+        review_target_kind=ReviewTargetKind.REPOSITORY,
+        materializer_protocol=REPOSITORY_MATERIALIZER_PROTOCOL,
+    )
     suite_case = SuiteCase(
         task_id=harness.eval_input.task_id,
         case_version=1,
@@ -584,6 +588,11 @@ def _workspace_binding(harness: Harness) -> tuple[TrialManifest, SuiteCase]:
         case_path_id=derive_case_path_id(harness.eval_input.task_id),
         canonical_case_digest=suite_case.canonical_case_digest,
         eval_input_digest=harness.eval_input.digest(),
+        wire_contract=wire_contract,
+        target_kind=ReviewTargetKind.REPOSITORY,
+        materializer_protocol=REPOSITORY_MATERIALIZER_PROTOCOL,
+        suite_preparation_binding_digest=None,
+        adapter_capabilities_digest="d" * 64,
         trial_id=trial_id,
         trial_index=1,
         seed=derive_trial_seed(run_id, harness.eval_input.task_id, 1),
@@ -650,7 +659,11 @@ def test_command_attestation_is_frozen_hash_bound_and_strictly_round_trips(
 def test_command_output_accepts_only_complete_attested_bytes(harness: Harness) -> None:
     attestation = _attestation(harness)
     checker = EvidenceIntegrityChecker(
-        harness.eval_input, harness.replay, TRIAL_ID, (attestation,)
+        harness.eval_input,
+        harness.replay,
+        TRIAL_ID,
+        TARGET_MATERIALIZATION_ID,
+        (attestation,),
     )
 
     result = checker.check_item(_command_evidence(harness))
@@ -686,10 +699,16 @@ def test_command_output_rejects_wrong_binding_metadata_hash_and_truncation(
 ) -> None:
     changes = dict(attestation_changes)
     if changes.get("head_revision") == "USE_BASE":
-        changes["head_revision"] = harness.eval_input.repository.base_revision
+        changes["head_revision"] = repository_from_eval_input(
+            harness.eval_input
+        ).base_revision
     attestation = _attestation(harness, **changes)  # type: ignore[arg-type]
     checker = EvidenceIntegrityChecker(
-        harness.eval_input, harness.replay, TRIAL_ID, (attestation,)
+        harness.eval_input,
+        harness.replay,
+        TRIAL_ID,
+        TARGET_MATERIALIZATION_ID,
+        (attestation,),
     )
     evidence = _command_evidence(harness, **evidence_changes)  # type: ignore[arg-type]
 
@@ -703,17 +722,20 @@ def test_command_output_rejects_wrong_binding_metadata_hash_and_truncation(
     ("attestations", "source_ref", "reason"),
     [
         ((), "command-main", EvidenceReasonCode.ATTESTATION_NOT_FOUND),
-        ((), None, EvidenceReasonCode.ATTESTATION_NOT_FOUND),
     ],
 )
 def test_command_output_rejects_absent_source_or_attestation(
     harness: Harness,
     attestations: tuple[CommandOutputAttestation, ...],
-    source_ref: str | None,
+    source_ref: str,
     reason: EvidenceReasonCode,
 ) -> None:
     checker = EvidenceIntegrityChecker(
-        harness.eval_input, harness.replay, TRIAL_ID, attestations
+        harness.eval_input,
+        harness.replay,
+        TRIAL_ID,
+        TARGET_MATERIALIZATION_ID,
+        attestations,
     )
 
     result = checker.check_item(
@@ -728,7 +750,11 @@ def test_command_output_rejects_ambiguous_bound_attestations(harness: Harness) -
     first = _attestation(harness)
     second = _attestation(harness, output=b"different\n")
     checker = EvidenceIntegrityChecker(
-        harness.eval_input, harness.replay, TRIAL_ID, (second, first)
+        harness.eval_input,
+        harness.replay,
+        TRIAL_ID,
+        TARGET_MATERIALIZATION_ID,
+        (second, first),
     )
 
     result = checker.check_item(_command_evidence(harness))
@@ -748,10 +774,6 @@ def test_external_record_accepts_exact_agent_visible_ci(harness: Harness) -> Non
     [
         (
             {"source_ref": "missing-ci"},
-            {EvidenceReasonCode.EXTERNAL_RECORD_NOT_FOUND},
-        ),
-        (
-            {"source_ref": None},
             {EvidenceReasonCode.EXTERNAL_RECORD_NOT_FOUND},
         ),
         (
@@ -1072,12 +1094,14 @@ def test_evidence_input_and_attestation_order_do_not_change_results(
         harness.eval_input,
         harness.replay,
         TRIAL_ID,
+        TARGET_MATERIALIZATION_ID,
         (command_attestation, unrelated),
     )
     second_checker = EvidenceIntegrityChecker(
         harness.eval_input,
         harness.replay,
         TRIAL_ID,
+        TARGET_MATERIALIZATION_ID,
         (unrelated, command_attestation),
     )
     file_item = _file_evidence(harness, evidence_id="ev-a")
@@ -1195,7 +1219,7 @@ def test_check_all_caches_file_source_across_distinct_evidence_ids(
 
     assert all(item.integrity is EvidenceIntegrity.VALID for item in results)
     assert calls == [
-        (harness.eval_input.repository.head_revision, "src/app.py")
+        (repository_from_eval_input(harness.eval_input).head_revision, "src/app.py")
     ]
 
 
@@ -1230,7 +1254,12 @@ def test_checker_rejects_any_repository_binding_mismatch(
     mismatched = replace(harness.replay, **{field_name: replacement})
 
     with pytest.raises(ValueError, match="exactly bound"):
-        EvidenceIntegrityChecker(harness.eval_input, mismatched, TRIAL_ID)
+        EvidenceIntegrityChecker(
+            harness.eval_input,
+            mismatched,
+            TRIAL_ID,
+            TARGET_MATERIALIZATION_ID,
+        )
 
 
 def test_repository_integrity_failure_from_tampered_cache_propagates(
@@ -1239,7 +1268,7 @@ def test_repository_integrity_failure_from_tampered_cache_propagates(
     harness = _build_harness(tmp_path, heavy=False)
     try:
         evidence = _diff_evidence(harness)
-        head = harness.eval_input.repository.head_revision
+        head = repository_from_eval_input(harness.eval_input).head_revision
         object_path = harness.prepared.cache_path / "objects" / head[:2] / head[2:]
         assert object_path.is_file()
         object_path.chmod(stat.S_IREAD | stat.S_IWRITE)
@@ -1274,7 +1303,9 @@ def test_repository_security_failure_from_replay_propagates(harness: Harness) ->
         raise RepositorySecurityError("redacted replay boundary failure")
 
     replay = replace(harness.replay, _open_check=fail_closed)
-    checker = EvidenceIntegrityChecker(harness.eval_input, replay, TRIAL_ID)
+    checker = EvidenceIntegrityChecker(
+        harness.eval_input, replay, TRIAL_ID, TARGET_MATERIALIZATION_ID
+    )
 
     with pytest.raises(RepositorySecurityError):
         checker.check_item(_file_evidence(harness))

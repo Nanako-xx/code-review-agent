@@ -19,15 +19,23 @@ from .cases import (
     MAX_SUITE_CASES,
     RunCaseSnapshot,
     SuiteCase,
+    WireContractV2,
     validate_run_case_snapshot_id,
 )
 from .models import (
+    EVAL_CASE_SCHEMA_VERSION,
+    EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
     MAX_IDENTIFIER_CHARS,
+    EvidenceKind,
+    ReviewTargetKind,
     SchemaError,
+    UnsupportedProtocolVersionError,
     _JsonModel,
     _array,
     _check_model_size,
     _digest,
+    _enum_value,
     _exact_fields,
     _identifier,
     _integer,
@@ -41,11 +49,16 @@ from .models import (
 )
 
 
-EVAL_RUN_CONFIG_SCHEMA_VERSION = "eval_run_config_v1"
-EVALUATOR_EXECUTION_CONFIG_SCHEMA_VERSION = "eval_evaluator_execution_config_v1"
+EVAL_RUN_CONFIG_SCHEMA_VERSION = "eval_run_config_v2"
+EVALUATOR_EXECUTION_CONFIG_SCHEMA_VERSION = "eval_evaluator_execution_config_v2"
+ADAPTER_CAPABILITIES_SCHEMA_VERSION = "eval_adapter_capabilities_v2"
 JUDGE_PROFILE_SCHEMA_VERSION = "eval_judge_profile_v1"
 JUDGE_EXECUTION_BUDGETS_SCHEMA_VERSION = "eval_judge_execution_budgets_v1"
 DEFAULT_JUDGE_CACHE_POLICY_VERSION = "semantic-judge-cache-v1"
+DEFAULT_REVIEW_EVALUATOR_CONTEXT_POLICY_VERSION = (
+    "truth-scoped-evaluator-context-v2"
+)
+DEFAULT_METRIC_AUTHORITY_POLICY_VERSION = "metric-authority-v2"
 
 # A Suite Manifest may be 16 MiB and SuiteRunConfig intentionally preserves
 # the selected canonical SuiteCase bindings.  The Run Config therefore needs
@@ -231,20 +244,245 @@ def validate_safe_text(value: Any, context: str = "value") -> str:
     return text
 
 
-def validate_safe_json(value: Any, context: str = "value") -> None:
+_REVIEW_EVALUATION_SAFE_ROOT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "evaluator_revision",
+        "evaluator_execution_digest",
+        "submission_digest",
+        "submission_review_digest",
+        "submission_evidence_digest",
+        "eval_input_digest",
+        "review_truth_digest",
+        "deterministic_context_digest",
+        "review_policy_version",
+        "assignment_policy_version",
+        "location_policy_version",
+        "evidence_integrity_policy_version",
+        "truth_completeness",
+        "novel_finding_policy",
+        "status",
+        "phase",
+        "generated_findings",
+        "expected_truth_findings",
+        "known_invalid_truth_findings",
+        "location_candidates",
+        "known_invalid_candidates",
+        "expected_candidates",
+        "assignments",
+        "finding_outcomes",
+        "unmatched_expected_truth_ids",
+        "judge_requests",
+        "judge_decisions",
+        "judge_failures",
+        "judge_ungraded",
+        "evidence_integrity_results",
+        "coverage",
+        "metrics",
+        "reason_codes",
+        "limit_failure",
+    }
+)
+_EVALUATOR_CONTEXT_POLICIES = {
+    "review_matches": (
+        "eval_review_evaluation_v1",
+        _REVIEW_EVALUATION_SAFE_ROOT_FIELDS,
+        (
+            (
+                "judge_requests",
+                int,
+                "request",
+                "contexts",
+                int,
+                "content",
+            ),
+        ),
+    ),
+    "judge_input": (
+        "eval_judge_input_artifact_v1",
+        frozenset({"schema_version", "evaluator_execution_digest", "requests"}),
+        (("requests", int, "contexts", int, "content"),),
+    ),
+    "judge_output": (
+        "eval_judge_output_artifact_v1",
+        frozenset(
+            {
+                "schema_version",
+                "evaluator_execution_digest",
+                "input_artifact_digest",
+                "intent_evaluation_digest",
+                "results",
+            }
+        ),
+        (
+            ("results", int, "request", "contexts", int, "content"),
+            (
+                "results",
+                int,
+                "model_turn",
+                "messages",
+                int,
+                "content",
+                "context_blocks",
+                int,
+                "content",
+            ),
+        ),
+    ),
+}
+_JUDGE_CONTEXT_BLOCK_FIELDS = frozenset(
+    {"ref_id", "kind", "trust", "content", "metadata", "content_digest"}
+)
+_JUDGE_MODEL_CONTEXT_BLOCK_FIELDS = frozenset(
+    {
+        "ref_id",
+        "kind",
+        "data_boundary",
+        "content",
+        "metadata",
+        "content_digest",
+    }
+)
+
+
+def validate_safe_json(
+    value: Any,
+    context: str = "value",
+    *,
+    evaluator_context_policy: Optional[str] = None,
+) -> None:
     """Validate a JSON tree before it crosses the persistent artifact boundary."""
 
-    def walk(item: Any, item_context: str, depth: int) -> None:
+    if (
+        evaluator_context_policy is not None
+        and evaluator_context_policy not in _EVALUATOR_CONTEXT_POLICIES
+    ):
+        raise SchemaError("%s has an unknown evaluator context policy" % context)
+
+    policy_root = value.to_dict() if isinstance(value, _JsonModel) else value
+    if evaluator_context_policy is not None:
+        schema_version, root_fields, _ = _EVALUATOR_CONTEXT_POLICIES[
+            evaluator_context_policy
+        ]
+        if not (
+            type(policy_root) is dict
+            or isinstance(policy_root, _MAPPING_PROXY_TYPE)
+        ) or (
+            frozenset(policy_root) != root_fields
+            or policy_root.get("schema_version") != schema_version
+        ):
+            raise SchemaError(
+                "%s evaluator context policy cannot bypass the full environment "
+                "dump heuristic for this root artifact" % context
+            )
+
+    def path_matches(
+        path: Tuple[Any, ...],
+        expected: Tuple[Any, ...],
+    ) -> bool:
+        return len(path) == len(expected) and all(
+            type(actual) is int if wanted is int else actual == wanted
+            for actual, wanted in zip(path, expected)
+        )
+
+    def value_at_path(path: Tuple[Any, ...]) -> Any:
+        item = policy_root
+        for part in path:
+            if type(part) is int:
+                if type(item) not in (list, tuple) or not 0 <= part < len(item):
+                    return None
+                item = item[part]
+            else:
+                if not (
+                    type(item) is dict
+                    or isinstance(item, _MAPPING_PROXY_TYPE)
+                ) or part not in item:
+                    return None
+                item = item[part]
+        return item
+
+    def allows_evaluator_context_content(
+        path: Tuple[Any, ...],
+        content: str,
+    ) -> bool:
+        if evaluator_context_policy is None:
+            return False
+        schema_version, root_fields, allowed_paths = _EVALUATOR_CONTEXT_POLICIES[
+            evaluator_context_policy
+        ]
+        if not (
+            type(policy_root) is dict
+            or isinstance(policy_root, _MAPPING_PROXY_TYPE)
+        ):
+            return False
+        if (
+            frozenset(policy_root) != root_fields
+            or policy_root.get("schema_version") != schema_version
+            or not any(path_matches(path, expected) for expected in allowed_paths)
+        ):
+            return False
+        block = value_at_path(path[:-1])
+        if not (type(block) is dict or isinstance(block, _MAPPING_PROXY_TYPE)):
+            return False
+        expected_block_fields = (
+            _JUDGE_MODEL_CONTEXT_BLOCK_FIELDS
+            if "context_blocks" in path
+            else _JUDGE_CONTEXT_BLOCK_FIELDS
+        )
+        return (
+            frozenset(block) == expected_block_fields
+            and block.get("content") == content
+            and block.get("content_digest") == canonical_sha256(content)
+        )
+
+    def walk(
+        item: Any,
+        item_context: str,
+        depth: int,
+        path: Tuple[Any, ...],
+    ) -> None:
         if depth > 128:
             raise SchemaError("%s exceeds the maximum nesting depth" % context)
         if item is None or type(item) in (bool, int, float):
             return
         if type(item) is str:
-            validate_safe_text(item, item_context)
+            evaluator_context_path = (
+                evaluator_context_policy is not None
+                and any(
+                    path_matches(path, expected)
+                    for expected in _EVALUATOR_CONTEXT_POLICIES[
+                        evaluator_context_policy
+                    ][2]
+                )
+            )
+            evaluator_context_content_allowed = (
+                allows_evaluator_context_content(path, item)
+                if evaluator_context_path
+                else False
+            )
+            try:
+                validate_safe_text(item, item_context)
+            except SchemaError as exc:
+                if not (
+                    evaluator_context_content_allowed
+                    and str(exc)
+                    == "%s contains a forbidden full environment dump"
+                    % item_context
+                ):
+                    raise
+            if evaluator_context_path and not evaluator_context_content_allowed:
+                raise SchemaError(
+                    "%s has an invalid evaluator context binding" % item_context
+                )
             return
         if type(item) in (list, tuple):
             for index, child in enumerate(item):
-                walk(child, "%s[%d]" % (item_context, index), depth + 1)
+                walk(
+                    child,
+                    "%s[%d]" % (item_context, index),
+                    depth + 1,
+                    (*path, index),
+                )
             return
         if type(item) is dict or isinstance(item, _MAPPING_PROXY_TYPE):
             environment_keys = {
@@ -266,14 +504,19 @@ def validate_safe_json(value: Any, context: str = "value") -> None:
                         % item_context
                     )
                 validate_safe_text(key, "%s key" % item_context)
-                walk(child, "%s.%s" % (item_context, key), depth + 1)
+                walk(
+                    child,
+                    "%s.%s" % (item_context, key),
+                    depth + 1,
+                    (*path, key),
+                )
             return
         if isinstance(item, _JsonModel):
-            walk(item.to_dict(), item_context, depth + 1)
+            walk(item.to_dict(), item_context, depth + 1, path)
             return
         raise SchemaError("%s contains a non-JSON value" % item_context)
 
-    walk(value, context, 0)
+    walk(value, context, 0, ())
 
 
 def validate_path_segment(value: Any, context: str = "identifier") -> str:
@@ -887,10 +1130,189 @@ class EvaluatorRunConfig(_JsonModel):
         }
 
 
+def _required_protocol_version(actual: Any, expected: str) -> str:
+    if type(actual) is not str:
+        raise SchemaError("protocol version must be a string")
+    if actual != expected:
+        raise UnsupportedProtocolVersionError(expected=expected, actual=actual)
+    return actual
+
+
+@dataclass(frozen=True)
+class AdapterCapabilitiesV2(_JsonModel):
+    """Immutable Adapter capability snapshot bound into one Run identity."""
+
+    SCHEMA_VERSION: ClassVar[str] = ADAPTER_CAPABILITIES_SCHEMA_VERSION
+
+    schema_version: str
+    adapter_id: str
+    adapter_version: str
+    input_schema_version: str
+    submission_schema_version: str
+    target_kinds: Tuple[ReviewTargetKind, ...]
+    evidence_kinds: Tuple[EvidenceKind, ...]
+    clarification_protocol: str
+    trace_protocol: str
+    subprocess_wire_version: Optional[str]
+    isolation_profile: str
+
+    def __post_init__(self) -> None:
+        _required_protocol_version(self.schema_version, self.SCHEMA_VERSION)
+        _identifier(self.adapter_id, "adapter capabilities.adapter_id")
+        _version(self.adapter_version, "adapter capabilities.adapter_version")
+        _required_protocol_version(
+            self.input_schema_version, EVAL_INPUT_SCHEMA_VERSION
+        )
+        _required_protocol_version(
+            self.submission_schema_version, EVAL_SUBMISSION_SCHEMA_VERSION
+        )
+        if type(self.target_kinds) not in (tuple, list) or not self.target_kinds:
+            raise SchemaError(
+                "adapter capabilities.target_kinds must be a non-empty list"
+            )
+        targets = tuple(self.target_kinds)
+        if any(not isinstance(item, ReviewTargetKind) for item in targets):
+            raise SchemaError(
+                "adapter capabilities.target_kinds contains an invalid target kind"
+            )
+        if len(targets) != len(set(targets)):
+            raise SchemaError("adapter capabilities.target_kinds contains duplicates")
+        if type(self.evidence_kinds) not in (tuple, list):
+            raise SchemaError("adapter capabilities.evidence_kinds must be a list")
+        evidence = tuple(self.evidence_kinds)
+        if any(not isinstance(item, EvidenceKind) for item in evidence):
+            raise SchemaError(
+                "adapter capabilities.evidence_kinds contains an invalid evidence kind"
+            )
+        if len(evidence) != len(set(evidence)):
+            raise SchemaError("adapter capabilities.evidence_kinds contains duplicates")
+        _version(
+            self.clarification_protocol,
+            "adapter capabilities.clarification_protocol",
+        )
+        _version(self.trace_protocol, "adapter capabilities.trace_protocol")
+        if self.subprocess_wire_version is not None:
+            _version(
+                self.subprocess_wire_version,
+                "adapter capabilities.subprocess_wire_version",
+            )
+        _version(self.isolation_profile, "adapter capabilities.isolation_profile")
+        object.__setattr__(
+            self, "target_kinds", tuple(sorted(targets, key=lambda item: item.value))
+        )
+        object.__setattr__(
+            self,
+            "evidence_kinds",
+            tuple(sorted(evidence, key=lambda item: item.value)),
+        )
+        validate_safe_json(self.to_dict(), "adapter capabilities")
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "AdapterCapabilitiesV2":
+        payload = _object(value, "AdapterCapabilitiesV2")
+        if "schema_version" in payload:
+            _required_protocol_version(payload["schema_version"], cls.SCHEMA_VERSION)
+        fields = (
+            "schema_version",
+            "adapter_id",
+            "adapter_version",
+            "input_schema_version",
+            "submission_schema_version",
+            "target_kinds",
+            "evidence_kinds",
+            "clarification_protocol",
+            "trace_protocol",
+            "subprocess_wire_version",
+            "isolation_profile",
+        )
+        _exact_fields(payload, fields, "AdapterCapabilitiesV2")
+        targets = _array(
+            payload["target_kinds"],
+            "adapter capabilities.target_kinds",
+            len(ReviewTargetKind),
+        )
+        evidence = _array(
+            payload["evidence_kinds"],
+            "adapter capabilities.evidence_kinds",
+            len(EvidenceKind),
+        )
+        return cls(
+            schema_version=_required_protocol_version(
+                payload["schema_version"], cls.SCHEMA_VERSION
+            ),
+            adapter_id=_identifier(
+                payload["adapter_id"], "adapter capabilities.adapter_id"
+            ),
+            adapter_version=_version(
+                payload["adapter_version"],
+                "adapter capabilities.adapter_version",
+            ),
+            input_schema_version=_required_protocol_version(
+                payload["input_schema_version"], EVAL_INPUT_SCHEMA_VERSION
+            ),
+            submission_schema_version=_required_protocol_version(
+                payload["submission_schema_version"], EVAL_SUBMISSION_SCHEMA_VERSION
+            ),
+            target_kinds=tuple(
+                _enum_value(
+                    ReviewTargetKind,
+                    item,
+                    "adapter capabilities.target_kinds[%d]" % index,
+                )
+                for index, item in enumerate(targets)
+            ),
+            evidence_kinds=tuple(
+                _enum_value(
+                    EvidenceKind,
+                    item,
+                    "adapter capabilities.evidence_kinds[%d]" % index,
+                )
+                for index, item in enumerate(evidence)
+            ),
+            clarification_protocol=_version(
+                payload["clarification_protocol"],
+                "adapter capabilities.clarification_protocol",
+            ),
+            trace_protocol=_version(
+                payload["trace_protocol"],
+                "adapter capabilities.trace_protocol",
+            ),
+            subprocess_wire_version=(
+                None
+                if payload["subprocess_wire_version"] is None
+                else _version(
+                    payload["subprocess_wire_version"],
+                    "adapter capabilities.subprocess_wire_version",
+                )
+            ),
+            isolation_profile=_version(
+                payload["isolation_profile"],
+                "adapter capabilities.isolation_profile",
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "adapter_id": self.adapter_id,
+            "adapter_version": self.adapter_version,
+            "input_schema_version": self.input_schema_version,
+            "submission_schema_version": self.submission_schema_version,
+            "target_kinds": [item.value for item in self.target_kinds],
+            "evidence_kinds": [item.value for item in self.evidence_kinds],
+            "clarification_protocol": self.clarification_protocol,
+            "trace_protocol": self.trace_protocol,
+            "subprocess_wire_version": self.subprocess_wire_version,
+            "isolation_profile": self.isolation_profile,
+        }
+
+
 @dataclass(frozen=True)
 class SuiteRunConfig(_JsonModel):
     suite_id: str
     suite_version: str
+    wire_contract: WireContractV2
+    preparation_binding_digest: Optional[str]
     manifest_digest: str
     case_snapshot_id: str
     case_snapshot_digest: str
@@ -899,6 +1321,13 @@ class SuiteRunConfig(_JsonModel):
     def __post_init__(self) -> None:
         _identifier(self.suite_id, "suite.suite_id")
         _identifier(self.suite_version, "suite.suite_version")
+        if not isinstance(self.wire_contract, WireContractV2):
+            raise SchemaError("suite.wire_contract must be a WireContractV2")
+        if self.preparation_binding_digest is not None:
+            _digest(
+                self.preparation_binding_digest,
+                "suite.preparation_binding_digest",
+            )
         _digest(self.manifest_digest, "suite.manifest_digest")
         validate_run_case_snapshot_id(
             self.case_snapshot_id, "suite.case_snapshot_id"
@@ -926,6 +1355,8 @@ class SuiteRunConfig(_JsonModel):
             (
                 "suite_id",
                 "suite_version",
+                "wire_contract",
+                "preparation_binding_digest",
                 "manifest_digest",
                 "case_snapshot_id",
                 "case_snapshot_digest",
@@ -940,6 +1371,15 @@ class SuiteRunConfig(_JsonModel):
             suite_id=_identifier(payload["suite_id"], "suite.suite_id"),
             suite_version=_identifier(
                 payload["suite_version"], "suite.suite_version"
+            ),
+            wire_contract=WireContractV2.from_dict(payload["wire_contract"]),
+            preparation_binding_digest=(
+                None
+                if payload["preparation_binding_digest"] is None
+                else _digest(
+                    payload["preparation_binding_digest"],
+                    "suite.preparation_binding_digest",
+                )
             ),
             manifest_digest=_digest(
                 payload["manifest_digest"], "suite.manifest_digest"
@@ -962,6 +1402,12 @@ class SuiteRunConfig(_JsonModel):
         return cls(
             suite_id=snapshot.manifest.suite_id,
             suite_version=snapshot.manifest.suite_version,
+            wire_contract=snapshot.wire_contract,
+            preparation_binding_digest=(
+                None
+                if snapshot.manifest.source.preparation_binding is None
+                else snapshot.manifest.source.preparation_binding.digest()
+            ),
             manifest_digest=snapshot.manifest.digest(),
             case_snapshot_id=snapshot.snapshot_id,
             case_snapshot_digest=snapshot.snapshot_digest,
@@ -978,6 +1424,8 @@ class SuiteRunConfig(_JsonModel):
         return {
             "suite_id": self.suite_id,
             "suite_version": self.suite_version,
+            "wire_contract": self.wire_contract.to_dict(),
+            "preparation_binding_digest": self.preparation_binding_digest,
             "manifest_digest": self.manifest_digest,
             "case_snapshot_id": self.case_snapshot_id,
             "case_snapshot_digest": self.case_snapshot_digest,
@@ -1456,15 +1904,14 @@ class EvaluatorExecutionConfig(_JsonModel):
     evaluator_config_digest: str
     judge_budgets: JudgeExecutionBudgets
     cache_policy_version: str
+    review_evaluator_context_policy_version: str
+    metric_authority_policy_version: str
     evaluator_timeout_seconds: Any
     max_execution_artifact_file_bytes: int
     max_execution_artifact_total_bytes: int
 
     def __post_init__(self) -> None:
-        if self.schema_version != self.SCHEMA_VERSION:
-            raise SchemaError(
-                "EvaluatorExecutionConfig has an unknown schema_version"
-            )
+        _required_protocol_version(self.schema_version, self.SCHEMA_VERSION)
         if not isinstance(self.evaluator, EvaluatorRunConfig):
             raise SchemaError(
                 "evaluator execution.evaluator must be an EvaluatorRunConfig"
@@ -1480,6 +1927,14 @@ class EvaluatorExecutionConfig(_JsonModel):
         _version(
             self.cache_policy_version,
             "evaluator execution.cache_policy_version",
+        )
+        _version(
+            self.review_evaluator_context_policy_version,
+            "evaluator execution.review_evaluator_context_policy_version",
+        )
+        _version(
+            self.metric_authority_policy_version,
+            "evaluator execution.metric_authority_policy_version",
         )
         evaluator_timeout = _positive_number(
             self.evaluator_timeout_seconds,
@@ -1547,6 +2002,18 @@ class EvaluatorExecutionConfig(_JsonModel):
             "EvaluatorExecutionConfig",
         )
 
+    def validate_runtime_policy_support(self) -> None:
+        """Reject persisted policy identities this runtime cannot execute."""
+
+        _required_protocol_version(
+            self.review_evaluator_context_policy_version,
+            DEFAULT_REVIEW_EVALUATOR_CONTEXT_POLICY_VERSION,
+        )
+        _required_protocol_version(
+            self.metric_authority_policy_version,
+            DEFAULT_METRIC_AUTHORITY_POLICY_VERSION,
+        )
+
     @classmethod
     def create(
         cls,
@@ -1557,6 +2024,12 @@ class EvaluatorExecutionConfig(_JsonModel):
         max_execution_artifact_total_bytes: int,
         judge_budgets: Optional[JudgeExecutionBudgets] = None,
         cache_policy_version: str = DEFAULT_JUDGE_CACHE_POLICY_VERSION,
+        review_evaluator_context_policy_version: str = (
+            DEFAULT_REVIEW_EVALUATOR_CONTEXT_POLICY_VERSION
+        ),
+        metric_authority_policy_version: str = (
+            DEFAULT_METRIC_AUTHORITY_POLICY_VERSION
+        ),
     ) -> "EvaluatorExecutionConfig":
         if not isinstance(evaluator, EvaluatorRunConfig):
             raise SchemaError("evaluator must be an EvaluatorRunConfig")
@@ -1578,6 +2051,12 @@ class EvaluatorExecutionConfig(_JsonModel):
             evaluator_config_digest=evaluator.digest(),
             judge_budgets=judge_budgets,
             cache_policy_version=cache_policy_version,
+            review_evaluator_context_policy_version=(
+                review_evaluator_context_policy_version
+            ),
+            metric_authority_policy_version=(
+                metric_authority_policy_version
+            ),
             evaluator_timeout_seconds=evaluator_timeout_seconds,
             max_execution_artifact_file_bytes=max_execution_artifact_file_bytes,
             max_execution_artifact_total_bytes=max_execution_artifact_total_bytes,
@@ -1591,6 +2070,12 @@ class EvaluatorExecutionConfig(_JsonModel):
         *,
         judge_budgets: Optional[JudgeExecutionBudgets] = None,
         cache_policy_version: str = DEFAULT_JUDGE_CACHE_POLICY_VERSION,
+        review_evaluator_context_policy_version: str = (
+            DEFAULT_REVIEW_EVALUATOR_CONTEXT_POLICY_VERSION
+        ),
+        metric_authority_policy_version: str = (
+            DEFAULT_METRIC_AUTHORITY_POLICY_VERSION
+        ),
     ) -> "EvaluatorExecutionConfig":
         if not isinstance(resource_budgets, ResourceBudgets):
             raise SchemaError("resource_budgets must be a ResourceBudgets")
@@ -1605,11 +2090,21 @@ class EvaluatorExecutionConfig(_JsonModel):
             ),
             judge_budgets=judge_budgets,
             cache_policy_version=cache_policy_version,
+            review_evaluator_context_policy_version=(
+                review_evaluator_context_policy_version
+            ),
+            metric_authority_policy_version=(
+                metric_authority_policy_version
+            ),
         )
 
     @classmethod
     def from_dict(cls, value: Any) -> "EvaluatorExecutionConfig":
         payload = _object(value, "EvaluatorExecutionConfig")
+        if "schema_version" in payload:
+            _required_protocol_version(
+                payload["schema_version"], cls.SCHEMA_VERSION
+            )
         _exact_fields(
             payload,
             (
@@ -1618,6 +2113,8 @@ class EvaluatorExecutionConfig(_JsonModel):
                 "evaluator_config_digest",
                 "judge_budgets",
                 "cache_policy_version",
+                "review_evaluator_context_policy_version",
+                "metric_authority_policy_version",
                 "evaluator_timeout_seconds",
                 "max_execution_artifact_file_bytes",
                 "max_execution_artifact_total_bytes",
@@ -1637,6 +2134,14 @@ class EvaluatorExecutionConfig(_JsonModel):
             cache_policy_version=_version(
                 payload["cache_policy_version"],
                 "evaluator execution.cache_policy_version",
+            ),
+            review_evaluator_context_policy_version=_version(
+                payload["review_evaluator_context_policy_version"],
+                "evaluator execution.review_evaluator_context_policy_version",
+            ),
+            metric_authority_policy_version=_version(
+                payload["metric_authority_policy_version"],
+                "evaluator execution.metric_authority_policy_version",
             ),
             evaluator_timeout_seconds=_positive_number(
                 payload["evaluator_timeout_seconds"],
@@ -1673,6 +2178,12 @@ class EvaluatorExecutionConfig(_JsonModel):
             "evaluator_config_digest": self.evaluator_config_digest,
             "judge_budgets": self.judge_budgets.to_dict(),
             "cache_policy_version": self.cache_policy_version,
+            "review_evaluator_context_policy_version": (
+                self.review_evaluator_context_policy_version
+            ),
+            "metric_authority_policy_version": (
+                self.metric_authority_policy_version
+            ),
             "evaluator_timeout_seconds": self.evaluator_timeout_seconds,
             "max_execution_artifact_file_bytes": self.max_execution_artifact_file_bytes,
             "max_execution_artifact_total_bytes": self.max_execution_artifact_total_bytes,
@@ -1693,12 +2204,17 @@ class EvalRunConfig(_JsonModel):
     evaluator: EvaluatorRunConfig
     evaluator_config_digest: str
     suite: SuiteRunConfig
+    wire_contract: WireContractV2
+    suite_preparation_binding_digest: Optional[str]
+    adapter_capabilities: AdapterCapabilitiesV2
+    adapter_capabilities_digest: str
+    target_kinds: Tuple[ReviewTargetKind, ...]
+    materializer_protocol: str
     trial_count: int
     resource_budgets: ResourceBudgets
 
     def __post_init__(self) -> None:
-        if self.schema_version != self.SCHEMA_VERSION:
-            raise SchemaError("EvalRunConfig has an unknown schema_version")
+        _required_protocol_version(self.schema_version, self.SCHEMA_VERSION)
         validate_run_id(self.run_id)
         _identifier(self.run_instance_key, "run_config.run_instance_key")
         validate_safe_text(self.run_instance_key, "run_config.run_instance_key")
@@ -1717,6 +2233,42 @@ class EvalRunConfig(_JsonModel):
             raise SchemaError("run_config.evaluator must be an EvaluatorRunConfig")
         if not isinstance(self.suite, SuiteRunConfig):
             raise SchemaError("run_config.suite must be a SuiteRunConfig")
+        if self.wire_contract != self.suite.wire_contract:
+            raise SchemaError("run_config.wire_contract does not match suite")
+        if (
+            self.suite_preparation_binding_digest
+            != self.suite.preparation_binding_digest
+        ):
+            raise SchemaError(
+                "run_config.suite_preparation_binding_digest does not match suite"
+            )
+        if not isinstance(self.adapter_capabilities, AdapterCapabilitiesV2):
+            raise SchemaError(
+                "run_config.adapter_capabilities must be an AdapterCapabilitiesV2"
+            )
+        if self.adapter_capabilities_digest != self.adapter_capabilities.digest():
+            raise SchemaError(
+                "adapter_capabilities_digest does not match adapter capabilities"
+            )
+        if type(self.target_kinds) not in (tuple, list):
+            raise SchemaError("run_config.target_kinds must be a list")
+        targets = tuple(self.target_kinds)
+        if targets != (self.wire_contract.review_target_kind,):
+            raise SchemaError(
+                "run_config.target_kinds must contain the suite wire target kind"
+            )
+        object.__setattr__(self, "target_kinds", targets)
+        if (
+            self.adapter_capabilities.input_schema_version
+            != self.wire_contract.input_schema_version
+            or self.adapter_capabilities.submission_schema_version
+            != self.wire_contract.submission_schema_version
+        ):
+            raise SchemaError("adapter capabilities do not match the wire contract")
+        if self.materializer_protocol != self.wire_contract.materializer_protocol:
+            raise SchemaError(
+                "run_config.materializer_protocol does not match the wire contract"
+            )
         if not isinstance(self.resource_budgets, ResourceBudgets):
             raise SchemaError(
                 "run_config.resource_budgets must be a ResourceBudgets"
@@ -1755,6 +2307,7 @@ class EvalRunConfig(_JsonModel):
                 self.clarification_matcher_config_digest
             ),
             suite=self.suite,
+            adapter_capabilities_digest=self.adapter_capabilities_digest,
             trial_count=self.trial_count,
             resource_budgets=self.resource_budgets,
         )
@@ -1770,6 +2323,7 @@ class EvalRunConfig(_JsonModel):
         agent_config_digest: str,
         clarification_matcher_config_digest: str,
         suite: SuiteRunConfig,
+        adapter_capabilities_digest: str,
         trial_count: int,
         resource_budgets: ResourceBudgets,
     ) -> Dict[str, Any]:
@@ -1791,6 +2345,7 @@ class EvalRunConfig(_JsonModel):
                 "max_parallel_trials": resource_budgets.max_parallel_trials,
             },
             "suite": suite.to_dict(),
+            "adapter_capabilities_digest": adapter_capabilities_digest,
             "trial_count": trial_count,
         }
 
@@ -1802,6 +2357,7 @@ class EvalRunConfig(_JsonModel):
         agent_config_digest: str,
         clarification_matcher_config_digest: str,
         suite: SuiteRunConfig,
+        adapter_capabilities_digest: str,
         trial_count: int,
         resource_budgets: ResourceBudgets,
     ) -> str:
@@ -1814,6 +2370,7 @@ class EvalRunConfig(_JsonModel):
                     clarification_matcher_config_digest
                 ),
                 suite=suite,
+                adapter_capabilities_digest=adapter_capabilities_digest,
                 trial_count=trial_count,
                 resource_budgets=resource_budgets,
             ),
@@ -1828,6 +2385,7 @@ class EvalRunConfig(_JsonModel):
         clarification_matcher: ClarificationMatcherSnapshot,
         evaluator: EvaluatorRunConfig,
         suite: SuiteRunConfig,
+        adapter_capabilities: AdapterCapabilitiesV2,
         trial_count: int,
         resource_budgets: ResourceBudgets,
     ) -> "EvalRunConfig":
@@ -1843,16 +2401,20 @@ class EvalRunConfig(_JsonModel):
             raise SchemaError("evaluator must be an EvaluatorRunConfig")
         if not isinstance(suite, SuiteRunConfig):
             raise SchemaError("suite must be a SuiteRunConfig")
+        if not isinstance(adapter_capabilities, AdapterCapabilitiesV2):
+            raise SchemaError("adapter_capabilities must be an AdapterCapabilitiesV2")
         if not isinstance(resource_budgets, ResourceBudgets):
             raise SchemaError("resource_budgets must be a ResourceBudgets")
         agent_digest = agent.digest()
         matcher_digest = clarification_matcher.digest()
         evaluator_digest = evaluator.digest()
+        adapter_capabilities_digest = adapter_capabilities.digest()
         run_id = cls.derive_run_id(
             run_instance_key=run_instance_key,
             agent_config_digest=agent_digest,
             clarification_matcher_config_digest=matcher_digest,
             suite=suite,
+            adapter_capabilities_digest=adapter_capabilities_digest,
             trial_count=trial_count,
             resource_budgets=resource_budgets,
         )
@@ -1867,6 +2429,14 @@ class EvalRunConfig(_JsonModel):
             evaluator=evaluator,
             evaluator_config_digest=evaluator_digest,
             suite=suite,
+            wire_contract=suite.wire_contract,
+            suite_preparation_binding_digest=(
+                suite.preparation_binding_digest
+            ),
+            adapter_capabilities=adapter_capabilities,
+            adapter_capabilities_digest=adapter_capabilities_digest,
+            target_kinds=(suite.wire_contract.review_target_kind,),
+            materializer_protocol=suite.wire_contract.materializer_protocol,
             trial_count=trial_count,
             resource_budgets=resource_budgets,
         )
@@ -1874,6 +2444,9 @@ class EvalRunConfig(_JsonModel):
     @classmethod
     def from_dict(cls, value: Any) -> "EvalRunConfig":
         payload = _object(value, "EvalRunConfig")
+        if "schema_version" not in payload:
+            raise SchemaError("EvalRunConfig has missing field(s): schema_version")
+        _required_protocol_version(payload["schema_version"], cls.SCHEMA_VERSION)
         _exact_fields(
             payload,
             (
@@ -1887,13 +2460,51 @@ class EvalRunConfig(_JsonModel):
                 "evaluator",
                 "evaluator_config_digest",
                 "suite",
+                "wire_contract",
+                "suite_preparation_binding_digest",
+                "adapter_capabilities",
+                "adapter_capabilities_digest",
+                "target_kinds",
+                "materializer_protocol",
                 "trial_count",
                 "resource_budgets",
             ),
             "EvalRunConfig",
         )
-        if payload["schema_version"] != cls.SCHEMA_VERSION:
-            raise SchemaError("EvalRunConfig has an unknown schema_version")
+        if "wire_contract" in payload:
+            wire_payload = _object(
+                payload["wire_contract"], "run_config.wire_contract"
+            )
+            for field_name, expected in (
+                ("case_schema_version", EVAL_CASE_SCHEMA_VERSION),
+                ("input_schema_version", EVAL_INPUT_SCHEMA_VERSION),
+                ("submission_schema_version", EVAL_SUBMISSION_SCHEMA_VERSION),
+            ):
+                if field_name in wire_payload:
+                    _required_protocol_version(wire_payload[field_name], expected)
+        if "suite" in payload:
+            suite_payload = _object(payload["suite"], "run_config.suite")
+            if "wire_contract" in suite_payload:
+                suite_wire = _object(
+                    suite_payload["wire_contract"], "run_config.suite.wire_contract"
+                )
+                for field_name, expected in (
+                    ("case_schema_version", EVAL_CASE_SCHEMA_VERSION),
+                    ("input_schema_version", EVAL_INPUT_SCHEMA_VERSION),
+                    ("submission_schema_version", EVAL_SUBMISSION_SCHEMA_VERSION),
+                ):
+                    if field_name in suite_wire:
+                        _required_protocol_version(suite_wire[field_name], expected)
+        if "adapter_capabilities" in payload:
+            capability_payload = _object(
+                payload["adapter_capabilities"],
+                "run_config.adapter_capabilities",
+            )
+            if "schema_version" in capability_payload:
+                _required_protocol_version(
+                    capability_payload["schema_version"],
+                    AdapterCapabilitiesV2.SCHEMA_VERSION,
+                )
         return cls(
             schema_version=payload["schema_version"],
             run_id=validate_run_id(payload["run_id"]),
@@ -1917,6 +2528,40 @@ class EvalRunConfig(_JsonModel):
                 "run_config.evaluator_config_digest",
             ),
             suite=SuiteRunConfig.from_dict(payload["suite"]),
+            wire_contract=WireContractV2.from_dict(payload["wire_contract"]),
+            suite_preparation_binding_digest=(
+                None
+                if payload["suite_preparation_binding_digest"] is None
+                else _digest(
+                    payload["suite_preparation_binding_digest"],
+                    "run_config.suite_preparation_binding_digest",
+                )
+            ),
+            adapter_capabilities=AdapterCapabilitiesV2.from_dict(
+                payload["adapter_capabilities"]
+            ),
+            adapter_capabilities_digest=_digest(
+                payload["adapter_capabilities_digest"],
+                "run_config.adapter_capabilities_digest",
+            ),
+            target_kinds=tuple(
+                _enum_value(
+                    ReviewTargetKind,
+                    item,
+                    "run_config.target_kinds[%d]" % index,
+                )
+                for index, item in enumerate(
+                    _array(
+                        payload["target_kinds"],
+                        "run_config.target_kinds",
+                        len(ReviewTargetKind),
+                    )
+                )
+            ),
+            materializer_protocol=_version(
+                payload["materializer_protocol"],
+                "run_config.materializer_protocol",
+            ),
             trial_count=_integer(
                 payload["trial_count"],
                 "run_config.trial_count",
@@ -1954,6 +2599,14 @@ class EvalRunConfig(_JsonModel):
             "evaluator": self.evaluator.to_dict(),
             "evaluator_config_digest": self.evaluator_config_digest,
             "suite": self.suite.to_dict(),
+            "wire_contract": self.wire_contract.to_dict(),
+            "suite_preparation_binding_digest": (
+                self.suite_preparation_binding_digest
+            ),
+            "adapter_capabilities": self.adapter_capabilities.to_dict(),
+            "adapter_capabilities_digest": self.adapter_capabilities_digest,
+            "target_kinds": [item.value for item in self.target_kinds],
+            "materializer_protocol": self.materializer_protocol,
             "trial_count": self.trial_count,
             "resource_budgets": self.resource_budgets.to_dict(),
         }
@@ -2030,9 +2683,12 @@ def load_eval_run_config(data: Any) -> EvalRunConfig:
 __all__ = [
     "EVAL_RUN_CONFIG_SCHEMA_VERSION",
     "EVALUATOR_EXECUTION_CONFIG_SCHEMA_VERSION",
+    "ADAPTER_CAPABILITIES_SCHEMA_VERSION",
     "JUDGE_PROFILE_SCHEMA_VERSION",
     "JUDGE_EXECUTION_BUDGETS_SCHEMA_VERSION",
     "DEFAULT_JUDGE_CACHE_POLICY_VERSION",
+    "DEFAULT_REVIEW_EVALUATOR_CONTEXT_POLICY_VERSION",
+    "DEFAULT_METRIC_AUTHORITY_POLICY_VERSION",
     "MAX_EVAL_RUN_CONFIG_BYTES",
     "MAX_PARAMETER_BYTES",
     "MAX_SUITE_CASES",
@@ -2048,6 +2704,7 @@ __all__ = [
     "JudgeKind",
     "JudgeProfileSnapshot",
     "EvaluatorRunConfig",
+    "AdapterCapabilitiesV2",
     "SuiteCase",
     "SuiteRunConfig",
     "ResourceBudgets",

@@ -14,6 +14,8 @@ from review_agent_eval.clarification import (
     canonical_material_claim_matcher_snapshot,
 )
 from review_agent_eval.adapters.base import AgentRunConfig
+from review_agent_eval.adapters.current_agent import current_agent_capabilities
+from review_agent_eval.cases import REPOSITORY_MATERIALIZER_PROTOCOL, WireContractV2
 from review_agent_eval.config import (
     AgentConfigSnapshot,
     ClarificationMatcherSnapshot,
@@ -21,12 +23,16 @@ from review_agent_eval.config import (
     derive_trial_id,
 )
 from review_agent_eval.models import (
+    EVAL_CASE_SCHEMA_VERSION,
+    EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
     MAX_CLARIFICATION_QUESTIONS,
     MAX_QUESTION_CHARS,
     ClarificationAction,
     ClarificationAnswer,
     ClarificationScript,
     IntentDimension,
+    ReviewTargetKind,
     SchemaError,
     SubmissionClarificationExchange,
     stable_id,
@@ -121,10 +127,20 @@ def run_binding(
         prompt_config_digest="b" * 64,
     )
     run_id = stable_id("run", "clarification-session-tests", snapshot.digest())
+    capabilities = current_agent_capabilities()
     return AgentRunConfig._from_verified_binding(
         run_id=run_id,
         task_id=task_id,
         eval_input_digest="c" * 64,
+        wire_contract=WireContractV2(
+            case_schema_version=EVAL_CASE_SCHEMA_VERSION,
+            input_schema_version=EVAL_INPUT_SCHEMA_VERSION,
+            submission_schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
+            review_target_kind=ReviewTargetKind.REPOSITORY,
+            materializer_protocol=REPOSITORY_MATERIALIZER_PROTOCOL,
+        ),
+        adapter_capabilities=capabilities,
+        adapter_capabilities_digest=capabilities.digest(),
         clarification_matcher=snapshot,
         clarification_matcher_config_digest=(
             snapshot.digest() if matcher_digest is None else matcher_digest

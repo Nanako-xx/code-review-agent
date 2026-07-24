@@ -16,10 +16,12 @@ import json
 import os
 import re
 import stat
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import islice
 from pathlib import Path
 from typing import (
     Any,
@@ -28,11 +30,17 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Mapping,
     Optional,
     Tuple,
 )
 
-from .cases import MAX_RUN_CASE_SNAPSHOT_BYTES, RunCaseSnapshot
+from .cases import (
+    MAX_RUN_CASE_SNAPSHOT_BYTES,
+    PublicSuitePreparationBindingV2,
+    RunCaseSnapshot,
+    WireContractV2,
+)
 from .config import (
     MAX_EVAL_RUN_CONFIG_BYTES,
     EvalRunConfig,
@@ -51,21 +59,26 @@ from .config import (
     validate_safe_text,
     validate_trial_id,
     validate_trial_id_shape,
+    _EVALUATOR_CONTEXT_POLICIES,
 )
 from .models import (
     EVAL_SUBMISSION_SCHEMA_VERSION,
     MAX_COUNTER,
     MAX_EVAL_INPUT_BYTES,
     MAX_EVAL_SUBMISSION_BYTES,
+    MAX_JSON_DEPTH,
+    MAX_JSON_INTEGER_DIGITS,
     EvalInput,
     EvalSubmission,
     FailureCode,
+    ReviewTargetKind,
     SchemaError,
     SubmissionFailure,
     SubmissionStatus,
     SubmissionUsage,
     TraceType,
     TrialStatus,
+    UnsupportedProtocolVersionError,
     _JsonModel,
     _array,
     _check_model_size,
@@ -82,24 +95,30 @@ from .models import (
 )
 
 
-EVAL_RUN_MANIFEST_SCHEMA_VERSION = "eval_run_manifest_v1"
-EVAL_TRIAL_MANIFEST_SCHEMA_VERSION = "eval_trial_manifest_v1"
-EVAL_STAGE_RECEIPT_SCHEMA_VERSION = "eval_stage_receipt_v1"
-EVAL_RUN_PREFLIGHT_SCHEMA_VERSION = "eval_run_capability_preflight_v1"
-EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION = "eval_preflight_candidate_v1"
+EVAL_RUN_MANIFEST_SCHEMA_VERSION = "eval_run_manifest_v2"
+EVAL_TRIAL_MANIFEST_SCHEMA_VERSION = "eval_trial_manifest_v2"
+EVAL_STAGE_RECEIPT_SCHEMA_VERSION = "eval_stage_receipt_v2"
+EVAL_RUN_PREFLIGHT_SCHEMA_VERSION = "eval_capability_preflight_v2"
+EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION = "eval_preflight_candidate_v2"
+EVAL_TRIAL_MATERIALIZATION_SCHEMA_VERSION = "eval_trial_materialization_v2"
+PRE_MATERIALIZATION_FAILURE_BINDING_VERSION = (
+    "eval_pre_materialization_failure_binding_v2"
+)
 EVAL_RUN_EVALUATION_NAMESPACE_SCHEMA_VERSION = (
-    "eval_run_evaluation_namespace_v1"
+    "eval_run_evaluation_namespace_v2"
 )
 
 MAX_RUN_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_TRIAL_MANIFEST_BYTES = 1024 * 1024
 MAX_STAGE_RECEIPT_BYTES = 2 * 1024 * 1024
+MAX_TRIAL_MATERIALIZATION_BYTES = 64 * 1024 * 1024
 MAX_RUN_PREFLIGHT_BYTES = MAX_RUN_CASE_SNAPSHOT_BYTES
 MAX_PREFLIGHT_CANDIDATE_BYTES = MAX_RUN_CASE_SNAPSHOT_BYTES
 MAX_MANIFEST_TRIALS = 100_000
 MAX_RECEIPT_ARTIFACTS = 128
 MAX_ARTIFACT_PATH_CHARS = 2_048
 MAX_TRIAL_ATTEMPTS = 10_000
+MAX_AGENT_VISIBLE_FILES = 65_536
 DEFAULT_MAX_FILE_BYTES = MAX_RUN_CASE_SNAPSHOT_BYTES
 DEFAULT_MAX_TOTAL_READ_BYTES = 512 * 1024 * 1024
 # Runner-owned execution metadata is deliberately a small, named surface.
@@ -138,6 +157,36 @@ _EVALUATION_JSON_ARTIFACT_NAMES = (
     "judge_output.json",
     "score.json",
 )
+_EVALUATOR_CONTEXT_POLICY_BY_ARTIFACT = {
+    "review_matches.json": "review_matches",
+    "judge_input.json": "judge_input",
+    "judge_output.json": "judge_output",
+}
+_EVALUATOR_CONTEXT_POLICY_BY_BUNDLE_FIELD = {
+    "_review_matches_json": "review_matches",
+    "_judge_input_json": "judge_input",
+    "_judge_output_json": "judge_output",
+}
+
+
+def _evaluator_context_policy_for_payload(
+    value: Any,
+    candidate_policy: Optional[str],
+) -> Optional[str]:
+    if candidate_policy is None:
+        return None
+    policy = _EVALUATOR_CONTEXT_POLICIES.get(candidate_policy)
+    if policy is None:
+        return candidate_policy
+    payload = value.to_dict() if isinstance(value, _JsonModel) else value
+    if (
+        isinstance(payload, Mapping)
+        and payload.get("schema_version") == policy[0]
+    ):
+        return candidate_policy
+    return None
+
+
 _EVALUATION_OPTIONAL_ARTIFACT_NAMES = ("report.md",)
 _EVALUATION_NAMESPACE_FILENAMES = frozenset(
     (
@@ -153,10 +202,33 @@ DIRECTORY_FSYNC_SUPPORTED = os.name != "nt"
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _ATTEMPT_RE = re.compile(r"^attempt-[0-9]{4,5}$")
+_MATERIALIZATION_ID_RE = re.compile(r"^materialization-[0-9a-f]{64}$")
 _TEMP_FILE_RE = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
 _INTERNAL_DIRECTORIES = frozenset(
-    {".locks", "cases", "trials", "receipts", "evaluations", "preflights"}
+    {
+        ".locks",
+        "cases",
+        "trials",
+        "receipts",
+        "evaluations",
+        "preflights",
+        "materializations",
+    }
 )
+
+
+def _bounded_tuple(
+    values: Iterable[Any], context: str, maximum: int
+) -> Tuple[Any, ...]:
+    try:
+        items = tuple(islice(iter(values), maximum + 1))
+    except TypeError as exc:
+        raise SchemaError("%s must be iterable" % context) from exc
+    if len(items) > maximum:
+        raise SchemaError("%s exceeds its item limit" % context)
+    return items
+
+
 _TERMINAL_STATUSES = frozenset(
     {
         TrialStatus.COMPLETED,
@@ -214,6 +286,18 @@ def _require_enum(enum_type: Any, value: Any, context: str) -> Any:
     return value
 
 
+def _require_protocol_version(actual: Any, expected: str, context: str) -> str:
+    if type(actual) is not str:
+        raise SchemaError("%s must be a string" % context)
+    if actual != expected:
+        raise UnsupportedProtocolVersionError(expected=expected, actual=actual)
+    return actual
+
+
+def _portable_artifact_key(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
 def _relative_artifact_path(value: Any, context: str = "artifact path") -> str:
     if type(value) is not str or not value or len(value) > MAX_ARTIFACT_PATH_CHARS:
         raise SchemaError("%s must be a bounded non-empty relative path" % context)
@@ -249,6 +333,160 @@ def _required_runner_artifact_names(submission: EvalSubmission) -> frozenset[str
     if submission.trace_ref is not None and submission.trace_ref.type is TraceType.LOCAL_PATH:
         names.update(_MANDATORY_EXECUTION_RUNNER_ARTIFACT_NAMES)
     return frozenset(names)
+
+
+def _check_bounded_canonical_payload_size(
+    value: Any,
+    maximum: int,
+    context: str,
+) -> None:
+    """Measure canonical JSON incrementally and stop at the byte boundary."""
+
+    size = 0
+    active_containers: set[int] = set()
+
+    def add(amount: int) -> None:
+        nonlocal size
+        size += amount
+        if size > maximum:
+            raise SchemaError(
+                "%s exceeds the canonical byte limit of %d"
+                % (context, maximum)
+            )
+
+    def add_string(value: str) -> None:
+        add(2)
+        for offset in range(0, len(value), 4096):
+            encoded = json.dumps(
+                value[offset : offset + 4096],
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8", "strict")
+            add(len(encoded) - 2)
+
+    def visit(value: Any, depth: int) -> None:
+        if depth > MAX_JSON_DEPTH:
+            raise SchemaError("%s exceeds the maximum JSON depth" % context)
+        if value is None:
+            add(4)
+            return
+        if type(value) is bool:
+            add(4 if value else 5)
+            return
+        if type(value) is int:
+            bit_length = abs(value).bit_length()
+            approximate_digits = (bit_length * 30103) // 100000 + 1
+            if approximate_digits > MAX_JSON_INTEGER_DIGITS:
+                raise SchemaError("%s contains an oversized integer" % context)
+            add(len(str(value)))
+            return
+        if type(value) is float:
+            add(
+                len(
+                    json.dumps(
+                        value,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8", "strict")
+                )
+            )
+            return
+        if type(value) is str:
+            add_string(value)
+            return
+        if type(value) in (list, tuple):
+            identity = id(value)
+            if identity in active_containers:
+                raise SchemaError("%s contains a circular value" % context)
+            active_containers.add(identity)
+            try:
+                add(2)
+                for index, item in enumerate(value):
+                    if index:
+                        add(1)
+                    visit(item, depth + 1)
+            finally:
+                active_containers.remove(identity)
+            return
+        if type(value) is dict:
+            identity = id(value)
+            if identity in active_containers:
+                raise SchemaError("%s contains a circular value" % context)
+            active_containers.add(identity)
+            try:
+                add(2)
+                for index, (key, item) in enumerate(value.items()):
+                    if type(key) is not str:
+                        raise SchemaError(
+                            "%s contains a non-string object key" % context
+                        )
+                    if index:
+                        add(1)
+                    add_string(key)
+                    add(1)
+                    visit(item, depth + 1)
+            finally:
+                active_containers.remove(identity)
+            return
+        raise SchemaError("%s contains a non-JSON value" % context)
+
+    try:
+        visit(value, 0)
+    except SchemaError:
+        raise
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise SchemaError("%s is not canonical JSON" % context) from exc
+
+
+def _validate_materialization_path_coverage(
+    file_paths: Iterable[str],
+    readable_paths: Iterable[str],
+) -> None:
+    """Validate readable-path coverage with one indexed component walk."""
+
+    files = _bounded_tuple(
+        file_paths,
+        "materialization file paths",
+        MAX_AGENT_VISIBLE_FILES,
+    )
+    readable = _bounded_tuple(
+        readable_paths,
+        "materialization readable paths",
+        MAX_AGENT_VISIBLE_FILES,
+    )
+    terminal = object()
+    trie: Dict[Any, Any] = {}
+    covered = [False] * len(readable)
+    for index, path in enumerate(readable):
+        node = trie
+        for component in path.split("/"):
+            child = node.get(component)
+            if child is None:
+                child = {}
+                node[component] = child
+            node = child
+        node.setdefault(terminal, []).append(index)
+
+    for path in files:
+        node = trie
+        authorized = False
+        for component in path.split("/"):
+            child = node.get(component)
+            if child is None:
+                break
+            node = child
+            for index in node.get(terminal, ()):
+                covered[index] = True
+                authorized = True
+        if not authorized:
+            raise SchemaError("materialization file is outside TargetAccess")
+
+    if not all(covered):
+        raise SchemaError(
+            "TargetAccess path has no Agent-visible file binding"
+        )
 
 
 @dataclass(frozen=True)
@@ -291,6 +529,635 @@ class ArtifactRef(_JsonModel):
 
 
 @dataclass(frozen=True)
+class TargetAccess(_JsonModel):
+    """The exact relative, read-only Target projection granted to an Agent."""
+
+    target_materialization_id: str
+    readable_relative_paths: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.target_materialization_id) is not str
+            or _MATERIALIZATION_ID_RE.fullmatch(
+                self.target_materialization_id
+            )
+            is None
+        ):
+            raise SchemaError(
+                "target_access.target_materialization_id is invalid"
+            )
+        if type(self.readable_relative_paths) not in (tuple, list):
+            raise SchemaError(
+                "target_access.readable_relative_paths must be a list or tuple"
+            )
+        if not self.readable_relative_paths or (
+            len(self.readable_relative_paths) > MAX_AGENT_VISIBLE_FILES
+        ):
+            raise SchemaError(
+                "target_access.readable_relative_paths must contain between 1 and %d paths"
+                % MAX_AGENT_VISIBLE_FILES
+            )
+        paths = tuple(
+            _relative_artifact_path(
+                item,
+                "target_access.readable_relative_paths[%d]" % index,
+            )
+            for index, item in enumerate(self.readable_relative_paths)
+        )
+        keys = [_portable_artifact_key(item) for item in paths]
+        if len(keys) != len(set(keys)):
+            raise SchemaError(
+                "target_access.readable_relative_paths contains a portable path collision"
+            )
+        object.__setattr__(self, "readable_relative_paths", tuple(sorted(paths)))
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "TargetAccess":
+        payload = _object(value, "TargetAccess")
+        _exact_fields(
+            payload,
+            ("target_materialization_id", "readable_relative_paths"),
+            "TargetAccess",
+        )
+        paths = _array(
+            payload["readable_relative_paths"],
+            "target_access.readable_relative_paths",
+            MAX_AGENT_VISIBLE_FILES,
+        )
+        return cls(
+            target_materialization_id=_identifier(
+                payload["target_materialization_id"],
+                "target_access.target_materialization_id",
+            ),
+            readable_relative_paths=tuple(paths),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "target_materialization_id": self.target_materialization_id,
+            "readable_relative_paths": list(self.readable_relative_paths),
+        }
+
+
+@dataclass(frozen=True)
+class AgentVisibleFileBinding(_JsonModel):
+    """One content-addressed file exposed through ``TargetAccess``."""
+
+    role: str
+    relative_path: str
+    size_bytes: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.role, "agent-visible file.role")
+        _relative_artifact_path(
+            self.relative_path, "agent-visible file.relative_path"
+        )
+        _integer(
+            self.size_bytes,
+            "agent-visible file.size_bytes",
+            minimum=0,
+            maximum=MAX_COUNTER,
+        )
+        _digest(self.sha256, "agent-visible file.sha256")
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "AgentVisibleFileBinding":
+        payload = _object(value, "AgentVisibleFileBinding")
+        _exact_fields(
+            payload,
+            ("role", "relative_path", "size_bytes", "sha256"),
+            "AgentVisibleFileBinding",
+        )
+        return cls(
+            role=_identifier(payload["role"], "agent-visible file.role"),
+            relative_path=_relative_artifact_path(
+                payload["relative_path"],
+                "agent-visible file.relative_path",
+            ),
+            size_bytes=_integer(
+                payload["size_bytes"],
+                "agent-visible file.size_bytes",
+                minimum=0,
+                maximum=MAX_COUNTER,
+            ),
+            sha256=_digest(payload["sha256"], "agent-visible file.sha256"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "role": self.role,
+            "relative_path": self.relative_path,
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
+        }
+
+
+_MATERIALIZATION_ID_SIZE_PLACEHOLDER = "materialization-" + ("0" * 64)
+
+
+def _preflight_trial_materialization_size(
+    *,
+    schema_version: str,
+    run_id: str,
+    task_id: str,
+    trial_id: str,
+    attempt: int,
+    eval_input_digest: str,
+    review_target_digest: str,
+    wire_contract: WireContractV2,
+    suite_preparation_binding_digest: Optional[str],
+    prepared_source_id: str,
+    adapter_capabilities_digest: str,
+    readable_relative_paths: Tuple[str, ...],
+    files: Tuple[AgentVisibleFileBinding, ...],
+    replay_binding_digest: str,
+    materialization_id: str,
+) -> None:
+    """Gate exact canonical bytes without sorting or deriving identity."""
+
+    payload = {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "task_id": task_id,
+        "trial_id": trial_id,
+        "attempt": attempt,
+        "eval_input_digest": eval_input_digest,
+        "review_target_digest": review_target_digest,
+        "wire_contract": wire_contract.to_dict(),
+        "suite_preparation_binding_digest": (
+            suite_preparation_binding_digest
+        ),
+        "prepared_source_id": prepared_source_id,
+        "adapter_capabilities_digest": adapter_capabilities_digest,
+        "target_access": {
+            "target_materialization_id": materialization_id,
+            "readable_relative_paths": list(readable_relative_paths),
+        },
+        "files": [item.to_dict() for item in files],
+        "replay_binding_digest": replay_binding_digest,
+        "materialization_id": materialization_id,
+    }
+    _check_bounded_canonical_payload_size(
+        payload,
+        MAX_TRIAL_MATERIALIZATION_BYTES,
+        "TrialMaterializationManifest",
+    )
+
+
+@dataclass(frozen=True)
+class TrialMaterializationManifest(_JsonModel):
+    """Immutable per-attempt Target materialization identity and access grant."""
+
+    SCHEMA_VERSION: ClassVar[str] = EVAL_TRIAL_MATERIALIZATION_SCHEMA_VERSION
+
+    schema_version: str
+    run_id: str
+    task_id: str
+    trial_id: str
+    attempt: int
+    eval_input_digest: str
+    review_target_digest: str
+    wire_contract: WireContractV2
+    suite_preparation_binding_digest: Optional[str]
+    prepared_source_id: str
+    adapter_capabilities_digest: str
+    target_access: TargetAccess
+    files: Tuple[AgentVisibleFileBinding, ...]
+    replay_binding_digest: str
+    materialization_id: str
+
+    def __post_init__(self) -> None:
+        _require_protocol_version(
+            self.schema_version,
+            self.SCHEMA_VERSION,
+            "TrialMaterializationManifest.schema_version",
+        )
+        validate_run_id(self.run_id)
+        _identifier(self.task_id, "materialization.task_id")
+        validate_trial_id_shape(self.trial_id)
+        _integer(
+            self.attempt,
+            "materialization.attempt",
+            minimum=1,
+            maximum=MAX_TRIAL_ATTEMPTS,
+        )
+        _digest(self.eval_input_digest, "materialization.eval_input_digest")
+        _digest(
+            self.review_target_digest,
+            "materialization.review_target_digest",
+        )
+        if not isinstance(self.wire_contract, WireContractV2):
+            raise SchemaError(
+                "materialization.wire_contract must be a WireContractV2"
+            )
+        if self.suite_preparation_binding_digest is not None:
+            _digest(
+                self.suite_preparation_binding_digest,
+                "materialization.suite_preparation_binding_digest",
+            )
+        _identifier(self.prepared_source_id, "materialization.prepared_source_id")
+        _digest(
+            self.adapter_capabilities_digest,
+            "materialization.adapter_capabilities_digest",
+        )
+        if not isinstance(self.target_access, TargetAccess):
+            raise SchemaError(
+                "materialization.target_access must be a TargetAccess"
+            )
+        if type(self.files) not in (tuple, list):
+            raise SchemaError("materialization.files must be a list or tuple")
+        if not self.files or len(self.files) > MAX_AGENT_VISIBLE_FILES:
+            raise SchemaError(
+                "materialization.files must contain between 1 and %d entries"
+                % MAX_AGENT_VISIBLE_FILES
+            )
+        files = tuple(self.files)
+        if any(not isinstance(item, AgentVisibleFileBinding) for item in files):
+            raise SchemaError(
+                "materialization.files must contain AgentVisibleFileBinding values"
+            )
+        file_keys = [_portable_artifact_key(item.relative_path) for item in files]
+        if len(file_keys) != len(set(file_keys)):
+            raise SchemaError(
+                "materialization.files contains a portable path collision"
+            )
+        readable = self.target_access.readable_relative_paths
+        _digest(
+            self.replay_binding_digest,
+            "materialization.replay_binding_digest",
+        )
+        if (
+            type(self.materialization_id) is not str
+            or _MATERIALIZATION_ID_RE.fullmatch(self.materialization_id) is None
+        ):
+            raise SchemaError("materialization.materialization_id is invalid")
+        if (
+            self.target_access.target_materialization_id
+            != self.materialization_id
+        ):
+            raise SchemaError(
+                "TargetAccess target_materialization_id does not match materialization"
+            )
+        _preflight_trial_materialization_size(
+            schema_version=self.schema_version,
+            run_id=self.run_id,
+            task_id=self.task_id,
+            trial_id=self.trial_id,
+            attempt=self.attempt,
+            eval_input_digest=self.eval_input_digest,
+            review_target_digest=self.review_target_digest,
+            wire_contract=self.wire_contract,
+            suite_preparation_binding_digest=(
+                self.suite_preparation_binding_digest
+            ),
+            prepared_source_id=self.prepared_source_id,
+            adapter_capabilities_digest=self.adapter_capabilities_digest,
+            readable_relative_paths=readable,
+            files=files,
+            replay_binding_digest=self.replay_binding_digest,
+            materialization_id=self.materialization_id,
+        )
+        _validate_materialization_path_coverage(
+            (item.relative_path for item in files),
+            readable,
+        )
+        ordered_files = tuple(sorted(files, key=lambda item: item.relative_path))
+        object.__setattr__(self, "files", ordered_files)
+        expected_id = self.derive_materialization_id(
+            run_id=self.run_id,
+            task_id=self.task_id,
+            trial_id=self.trial_id,
+            attempt=self.attempt,
+            eval_input_digest=self.eval_input_digest,
+            review_target_digest=self.review_target_digest,
+            wire_contract=self.wire_contract,
+            suite_preparation_binding_digest=(
+                self.suite_preparation_binding_digest
+            ),
+            prepared_source_id=self.prepared_source_id,
+            adapter_capabilities_digest=self.adapter_capabilities_digest,
+            readable_relative_paths=self.target_access.readable_relative_paths,
+            files=ordered_files,
+            replay_binding_digest=self.replay_binding_digest,
+        )
+        if self.materialization_id != expected_id:
+            raise SchemaError(
+                "materialization_id does not match its canonical identity"
+            )
+        validate_safe_json(self.to_dict(), "materialization")
+
+    @classmethod
+    def derive_materialization_id(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        attempt: int,
+        eval_input_digest: str,
+        review_target_digest: str,
+        wire_contract: WireContractV2,
+        suite_preparation_binding_digest: Optional[str],
+        prepared_source_id: str,
+        adapter_capabilities_digest: str,
+        readable_relative_paths: Iterable[str],
+        files: Iterable[AgentVisibleFileBinding],
+        replay_binding_digest: str,
+    ) -> str:
+        if not isinstance(wire_contract, WireContractV2):
+            raise SchemaError(
+                "materialization.wire_contract must be a WireContractV2"
+            )
+        raw_paths = _bounded_tuple(
+            readable_relative_paths,
+            "materialization.readable_relative_paths",
+            MAX_AGENT_VISIBLE_FILES,
+        )
+        paths = tuple(
+            _relative_artifact_path(
+                item,
+                "materialization.readable_relative_paths[%d]" % index,
+            )
+            for index, item in enumerate(raw_paths)
+        )
+        raw_files = _bounded_tuple(
+            files,
+            "materialization.files",
+            MAX_AGENT_VISIBLE_FILES,
+        )
+        if any(
+            not isinstance(item, AgentVisibleFileBinding)
+            for item in raw_files
+        ):
+            raise SchemaError(
+                "materialization.files must contain AgentVisibleFileBinding values"
+            )
+        _preflight_trial_materialization_size(
+            schema_version=cls.SCHEMA_VERSION,
+            run_id=run_id,
+            task_id=task_id,
+            trial_id=trial_id,
+            attempt=attempt,
+            eval_input_digest=eval_input_digest,
+            review_target_digest=review_target_digest,
+            wire_contract=wire_contract,
+            suite_preparation_binding_digest=suite_preparation_binding_digest,
+            prepared_source_id=prepared_source_id,
+            adapter_capabilities_digest=adapter_capabilities_digest,
+            readable_relative_paths=paths,
+            files=raw_files,
+            replay_binding_digest=replay_binding_digest,
+            materialization_id=_MATERIALIZATION_ID_SIZE_PLACEHOLDER,
+        )
+        paths = tuple(sorted(paths))
+        ordered_files = tuple(
+            sorted(raw_files, key=lambda item: item.relative_path)
+        )
+        return stable_id(
+            "materialization",
+            {
+                "schema_version": cls.SCHEMA_VERSION,
+                "run_id": run_id,
+                "task_id": task_id,
+                "trial_id": trial_id,
+                "attempt": attempt,
+                "eval_input_digest": eval_input_digest,
+                "review_target_digest": review_target_digest,
+                "wire_contract": wire_contract.to_dict(),
+                "suite_preparation_binding_digest": (
+                    suite_preparation_binding_digest
+                ),
+                "prepared_source_id": prepared_source_id,
+                "adapter_capabilities_digest": adapter_capabilities_digest,
+                "readable_relative_paths": list(paths),
+                "files": [item.to_dict() for item in ordered_files],
+                "replay_binding_digest": replay_binding_digest,
+            },
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+        attempt: int,
+        eval_input_digest: str,
+        review_target_digest: str,
+        wire_contract: WireContractV2,
+        suite_preparation_binding_digest: Optional[str],
+        prepared_source_id: str,
+        adapter_capabilities_digest: str,
+        readable_relative_paths: Iterable[str],
+        files: Iterable[AgentVisibleFileBinding],
+        replay_binding_digest: str,
+    ) -> "TrialMaterializationManifest":
+        raw_paths = _bounded_tuple(
+            readable_relative_paths,
+            "materialization.readable_relative_paths",
+            MAX_AGENT_VISIBLE_FILES,
+        )
+        paths = tuple(
+            _relative_artifact_path(
+                item, "materialization.readable_relative_paths"
+            )
+            for item in raw_paths
+        )
+        file_bindings = _bounded_tuple(
+            files,
+            "materialization.files",
+            MAX_AGENT_VISIBLE_FILES,
+        )
+        if any(
+            not isinstance(item, AgentVisibleFileBinding)
+            for item in file_bindings
+        ):
+            raise SchemaError(
+                "materialization.files must contain AgentVisibleFileBinding values"
+            )
+        if not isinstance(wire_contract, WireContractV2):
+            raise SchemaError(
+                "materialization.wire_contract must be a WireContractV2"
+            )
+        _preflight_trial_materialization_size(
+            schema_version=cls.SCHEMA_VERSION,
+            run_id=run_id,
+            task_id=task_id,
+            trial_id=trial_id,
+            attempt=attempt,
+            eval_input_digest=eval_input_digest,
+            review_target_digest=review_target_digest,
+            wire_contract=wire_contract,
+            suite_preparation_binding_digest=suite_preparation_binding_digest,
+            prepared_source_id=prepared_source_id,
+            adapter_capabilities_digest=adapter_capabilities_digest,
+            readable_relative_paths=paths,
+            files=file_bindings,
+            replay_binding_digest=replay_binding_digest,
+            materialization_id=_MATERIALIZATION_ID_SIZE_PLACEHOLDER,
+        )
+        materialization_id = cls.derive_materialization_id(
+            run_id=run_id,
+            task_id=task_id,
+            trial_id=trial_id,
+            attempt=attempt,
+            eval_input_digest=eval_input_digest,
+            review_target_digest=review_target_digest,
+            wire_contract=wire_contract,
+            suite_preparation_binding_digest=suite_preparation_binding_digest,
+            prepared_source_id=prepared_source_id,
+            adapter_capabilities_digest=adapter_capabilities_digest,
+            readable_relative_paths=paths,
+            files=file_bindings,
+            replay_binding_digest=replay_binding_digest,
+        )
+        return cls(
+            schema_version=cls.SCHEMA_VERSION,
+            run_id=run_id,
+            task_id=task_id,
+            trial_id=trial_id,
+            attempt=attempt,
+            eval_input_digest=eval_input_digest,
+            review_target_digest=review_target_digest,
+            wire_contract=wire_contract,
+            suite_preparation_binding_digest=suite_preparation_binding_digest,
+            prepared_source_id=prepared_source_id,
+            adapter_capabilities_digest=adapter_capabilities_digest,
+            target_access=TargetAccess(
+                target_materialization_id=materialization_id,
+                readable_relative_paths=paths,
+            ),
+            files=file_bindings,
+            replay_binding_digest=replay_binding_digest,
+            materialization_id=materialization_id,
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "TrialMaterializationManifest":
+        payload = _object(value, "TrialMaterializationManifest")
+        if "schema_version" in payload:
+            _require_protocol_version(
+                payload["schema_version"],
+                cls.SCHEMA_VERSION,
+                "TrialMaterializationManifest.schema_version",
+            )
+        _exact_fields(
+            payload,
+            (
+                "schema_version",
+                "run_id",
+                "task_id",
+                "trial_id",
+                "attempt",
+                "eval_input_digest",
+                "review_target_digest",
+                "wire_contract",
+                "suite_preparation_binding_digest",
+                "prepared_source_id",
+                "adapter_capabilities_digest",
+                "target_access",
+                "files",
+                "replay_binding_digest",
+                "materialization_id",
+            ),
+            "TrialMaterializationManifest",
+        )
+        _check_bounded_canonical_payload_size(
+            payload,
+            MAX_TRIAL_MATERIALIZATION_BYTES,
+            "TrialMaterializationManifest",
+        )
+        wire_contract = WireContractV2.from_dict(payload["wire_contract"])
+        raw_files = _array(
+            payload["files"],
+            "materialization.files",
+            MAX_AGENT_VISIBLE_FILES,
+        )
+        return cls(
+            schema_version=payload["schema_version"],
+            run_id=validate_run_id(payload["run_id"]),
+            task_id=_identifier(payload["task_id"], "materialization.task_id"),
+            trial_id=validate_trial_id_shape(payload["trial_id"]),
+            attempt=_integer(
+                payload["attempt"],
+                "materialization.attempt",
+                minimum=1,
+                maximum=MAX_TRIAL_ATTEMPTS,
+            ),
+            eval_input_digest=_digest(
+                payload["eval_input_digest"],
+                "materialization.eval_input_digest",
+            ),
+            review_target_digest=_digest(
+                payload["review_target_digest"],
+                "materialization.review_target_digest",
+            ),
+            wire_contract=wire_contract,
+            suite_preparation_binding_digest=(
+                None
+                if payload["suite_preparation_binding_digest"] is None
+                else _digest(
+                    payload["suite_preparation_binding_digest"],
+                    "materialization.suite_preparation_binding_digest",
+                )
+            ),
+            prepared_source_id=_identifier(
+                payload["prepared_source_id"],
+                "materialization.prepared_source_id",
+            ),
+            adapter_capabilities_digest=_digest(
+                payload["adapter_capabilities_digest"],
+                "materialization.adapter_capabilities_digest",
+            ),
+            target_access=TargetAccess.from_dict(payload["target_access"]),
+            files=tuple(
+                AgentVisibleFileBinding.from_dict(item) for item in raw_files
+            ),
+            replay_binding_digest=_digest(
+                payload["replay_binding_digest"],
+                "materialization.replay_binding_digest",
+            ),
+            materialization_id=_identifier(
+                payload["materialization_id"],
+                "materialization.materialization_id",
+            ),
+        )
+
+    @classmethod
+    def from_json(cls, data: Any) -> "TrialMaterializationManifest":
+        return cls.from_dict(
+            _strict_json_loads(
+                data,
+                MAX_TRIAL_MATERIALIZATION_BYTES,
+                "TrialMaterializationManifest JSON",
+            )
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "trial_id": self.trial_id,
+            "attempt": self.attempt,
+            "eval_input_digest": self.eval_input_digest,
+            "review_target_digest": self.review_target_digest,
+            "wire_contract": self.wire_contract.to_dict(),
+            "suite_preparation_binding_digest": (
+                self.suite_preparation_binding_digest
+            ),
+            "prepared_source_id": self.prepared_source_id,
+            "adapter_capabilities_digest": self.adapter_capabilities_digest,
+            "target_access": self.target_access.to_dict(),
+            "files": [item.to_dict() for item in self.files],
+            "replay_binding_digest": self.replay_binding_digest,
+            "materialization_id": self.materialization_id,
+        }
+
+
+@dataclass(frozen=True)
 class TrialManifest(_JsonModel):
     """Immutable Trial plan; it deliberately contains no execution status."""
 
@@ -302,6 +1169,11 @@ class TrialManifest(_JsonModel):
     case_path_id: str
     canonical_case_digest: str
     eval_input_digest: str
+    wire_contract: WireContractV2
+    target_kind: ReviewTargetKind
+    materializer_protocol: str
+    suite_preparation_binding_digest: Optional[str]
+    adapter_capabilities_digest: str
     trial_id: str
     trial_index: int
     seed: int
@@ -309,8 +1181,11 @@ class TrialManifest(_JsonModel):
     initial_evaluator_execution_digest: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != self.SCHEMA_VERSION:
-            raise SchemaError("TrialManifest has an unknown schema_version")
+        _require_protocol_version(
+            self.schema_version,
+            self.SCHEMA_VERSION,
+            "TrialManifest.schema_version",
+        )
         validate_run_id(self.run_id)
         _identifier(self.task_id, "trial_manifest.task_id")
         validate_case_path_id(self.case_path_id)
@@ -321,6 +1196,36 @@ class TrialManifest(_JsonModel):
             "trial_manifest.canonical_case_digest",
         )
         _digest(self.eval_input_digest, "trial_manifest.eval_input_digest")
+        if not isinstance(self.wire_contract, WireContractV2):
+            raise SchemaError(
+                "trial_manifest.wire_contract must be a WireContractV2"
+            )
+        _require_enum(
+            ReviewTargetKind,
+            self.target_kind,
+            "trial_manifest.target_kind",
+        )
+        if self.target_kind is not self.wire_contract.review_target_kind:
+            raise SchemaError(
+                "trial_manifest.target_kind does not match wire contract"
+            )
+        _identifier(
+            self.materializer_protocol,
+            "trial_manifest.materializer_protocol",
+        )
+        if self.materializer_protocol != self.wire_contract.materializer_protocol:
+            raise SchemaError(
+                "trial_manifest.materializer_protocol does not match wire contract"
+            )
+        if self.suite_preparation_binding_digest is not None:
+            _digest(
+                self.suite_preparation_binding_digest,
+                "trial_manifest.suite_preparation_binding_digest",
+            )
+        _digest(
+            self.adapter_capabilities_digest,
+            "trial_manifest.adapter_capabilities_digest",
+        )
         validate_trial_id(self.trial_id, self.run_id, self.task_id, self.trial_index)
         _integer(
             self.trial_index,
@@ -341,6 +1246,12 @@ class TrialManifest(_JsonModel):
     @classmethod
     def from_dict(cls, value: Any) -> "TrialManifest":
         payload = _object(value, "TrialManifest")
+        if "schema_version" in payload:
+            _require_protocol_version(
+                payload["schema_version"],
+                cls.SCHEMA_VERSION,
+                "TrialManifest.schema_version",
+            )
         _exact_fields(
             payload,
             (
@@ -350,6 +1261,11 @@ class TrialManifest(_JsonModel):
                 "case_path_id",
                 "canonical_case_digest",
                 "eval_input_digest",
+                "wire_contract",
+                "target_kind",
+                "materializer_protocol",
+                "suite_preparation_binding_digest",
+                "adapter_capabilities_digest",
                 "trial_id",
                 "trial_index",
                 "seed",
@@ -358,8 +1274,7 @@ class TrialManifest(_JsonModel):
             ),
             "TrialManifest",
         )
-        if payload["schema_version"] != cls.SCHEMA_VERSION:
-            raise SchemaError("TrialManifest has an unknown schema_version")
+        wire_contract = WireContractV2.from_dict(payload["wire_contract"])
         return cls(
             schema_version=payload["schema_version"],
             run_id=validate_run_id(payload["run_id"]),
@@ -371,6 +1286,28 @@ class TrialManifest(_JsonModel):
             ),
             eval_input_digest=_digest(
                 payload["eval_input_digest"], "trial_manifest.eval_input_digest"
+            ),
+            wire_contract=wire_contract,
+            target_kind=_enum_value(
+                ReviewTargetKind,
+                payload["target_kind"],
+                "trial_manifest.target_kind",
+            ),
+            materializer_protocol=_identifier(
+                payload["materializer_protocol"],
+                "trial_manifest.materializer_protocol",
+            ),
+            suite_preparation_binding_digest=(
+                None
+                if payload["suite_preparation_binding_digest"] is None
+                else _digest(
+                    payload["suite_preparation_binding_digest"],
+                    "trial_manifest.suite_preparation_binding_digest",
+                )
+            ),
+            adapter_capabilities_digest=_digest(
+                payload["adapter_capabilities_digest"],
+                "trial_manifest.adapter_capabilities_digest",
             ),
             trial_id=validate_trial_id_shape(payload["trial_id"]),
             trial_index=_integer(
@@ -409,6 +1346,13 @@ class TrialManifest(_JsonModel):
             "case_path_id": self.case_path_id,
             "canonical_case_digest": self.canonical_case_digest,
             "eval_input_digest": self.eval_input_digest,
+            "wire_contract": self.wire_contract.to_dict(),
+            "target_kind": self.target_kind.value,
+            "materializer_protocol": self.materializer_protocol,
+            "suite_preparation_binding_digest": (
+                self.suite_preparation_binding_digest
+            ),
+            "adapter_capabilities_digest": self.adapter_capabilities_digest,
             "trial_id": self.trial_id,
             "trial_index": self.trial_index,
             "seed": self.seed,
@@ -511,13 +1455,19 @@ class RunManifest(_JsonModel):
     run_id: str
     run_config: ArtifactRef
     case_snapshot: ArtifactRef
+    wire_contract: WireContractV2
+    suite_preparation_binding_digest: Optional[str]
+    adapter_capabilities_digest: str
     agent_config_digest: str
     initial_evaluator_execution_digest: str
     trials: Tuple[RunTrialPlan, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != self.SCHEMA_VERSION:
-            raise SchemaError("RunManifest has an unknown schema_version")
+        _require_protocol_version(
+            self.schema_version,
+            self.SCHEMA_VERSION,
+            "RunManifest.schema_version",
+        )
         validate_run_id(self.run_id)
         if not isinstance(self.run_config, ArtifactRef):
             raise SchemaError("run_manifest.run_config must be an ArtifactRef")
@@ -531,6 +1481,19 @@ class RunManifest(_JsonModel):
             raise SchemaError(
                 "run_manifest.case_snapshot must reference case_snapshot.json"
             )
+        if not isinstance(self.wire_contract, WireContractV2):
+            raise SchemaError(
+                "run_manifest.wire_contract must be a WireContractV2"
+            )
+        if self.suite_preparation_binding_digest is not None:
+            _digest(
+                self.suite_preparation_binding_digest,
+                "run_manifest.suite_preparation_binding_digest",
+            )
+        _digest(
+            self.adapter_capabilities_digest,
+            "run_manifest.adapter_capabilities_digest",
+        )
         _digest(self.agent_config_digest, "run_manifest.agent_config_digest")
         _digest(
             self.initial_evaluator_execution_digest,
@@ -571,6 +1534,12 @@ class RunManifest(_JsonModel):
     @classmethod
     def from_dict(cls, value: Any) -> "RunManifest":
         payload = _object(value, "RunManifest")
+        if "schema_version" in payload:
+            _require_protocol_version(
+                payload["schema_version"],
+                cls.SCHEMA_VERSION,
+                "RunManifest.schema_version",
+            )
         _exact_fields(
             payload,
             (
@@ -578,14 +1547,16 @@ class RunManifest(_JsonModel):
                 "run_id",
                 "run_config",
                 "case_snapshot",
+                "wire_contract",
+                "suite_preparation_binding_digest",
+                "adapter_capabilities_digest",
                 "agent_config_digest",
                 "initial_evaluator_execution_digest",
                 "trials",
             ),
             "RunManifest",
         )
-        if payload["schema_version"] != cls.SCHEMA_VERSION:
-            raise SchemaError("RunManifest has an unknown schema_version")
+        wire_contract = WireContractV2.from_dict(payload["wire_contract"])
         trials = _array(payload["trials"], "run_manifest.trials", MAX_MANIFEST_TRIALS)
         if not trials:
             raise SchemaError("run_manifest.trials must not be empty")
@@ -594,6 +1565,19 @@ class RunManifest(_JsonModel):
             run_id=validate_run_id(payload["run_id"]),
             run_config=ArtifactRef.from_dict(payload["run_config"]),
             case_snapshot=ArtifactRef.from_dict(payload["case_snapshot"]),
+            wire_contract=wire_contract,
+            suite_preparation_binding_digest=(
+                None
+                if payload["suite_preparation_binding_digest"] is None
+                else _digest(
+                    payload["suite_preparation_binding_digest"],
+                    "run_manifest.suite_preparation_binding_digest",
+                )
+            ),
+            adapter_capabilities_digest=_digest(
+                payload["adapter_capabilities_digest"],
+                "run_manifest.adapter_capabilities_digest",
+            ),
             agent_config_digest=_digest(
                 payload["agent_config_digest"], "run_manifest.agent_config_digest"
             ),
@@ -616,6 +1600,11 @@ class RunManifest(_JsonModel):
             "run_id": self.run_id,
             "run_config": self.run_config.to_dict(),
             "case_snapshot": self.case_snapshot.to_dict(),
+            "wire_contract": self.wire_contract.to_dict(),
+            "suite_preparation_binding_digest": (
+                self.suite_preparation_binding_digest
+            ),
+            "adapter_capabilities_digest": self.adapter_capabilities_digest,
             "agent_config_digest": self.agent_config_digest,
             "initial_evaluator_execution_digest": self.initial_evaluator_execution_digest,
             "trials": [item.to_dict() for item in self.trials],
@@ -681,6 +1670,48 @@ def derive_receipt_id(
     )
 
 
+def derive_pre_materialization_failure_binding(
+    *,
+    run_id: str,
+    task_id: str,
+    trial_id: str,
+    attempt: int,
+    eval_input_digest: str,
+    review_target_digest: str,
+) -> str:
+    """Derive the sole target binding allowed before a Prepare commit."""
+
+    validate_run_id(run_id)
+    _identifier(task_id, "pre-materialization failure.task_id")
+    validate_trial_id_shape(trial_id)
+    normalized_attempt = _integer(
+        attempt,
+        "pre-materialization failure.attempt",
+        minimum=1,
+        maximum=MAX_TRIAL_ATTEMPTS,
+    )
+    _digest(
+        eval_input_digest,
+        "pre-materialization failure.eval_input_digest",
+    )
+    _digest(
+        review_target_digest,
+        "pre-materialization failure.review_target_digest",
+    )
+    return stable_id(
+        "pre-materialization-failure",
+        {
+            "schema_version": PRE_MATERIALIZATION_FAILURE_BINDING_VERSION,
+            "run_id": run_id,
+            "task_id": task_id,
+            "trial_id": trial_id,
+            "attempt": normalized_attempt,
+            "eval_input_digest": eval_input_digest,
+            "review_target_digest": review_target_digest,
+        },
+    )
+
+
 @dataclass(frozen=True)
 class StageReceipt(_JsonModel):
     SCHEMA_VERSION: ClassVar[str] = EVAL_STAGE_RECEIPT_SCHEMA_VERSION
@@ -696,12 +1727,24 @@ class StageReceipt(_JsonModel):
     evaluation_id: Optional[str]
     evaluation_revision: Optional[str]
     artifacts: Tuple[ArtifactRef, ...]
+    materialization_manifest: Optional[ArtifactRef]
+    materialization_manifest_digest: Optional[str]
+    materialization_id: Optional[str]
+    eval_input_digest: Optional[str]
+    review_target_digest: Optional[str]
+    prepared_source_id: Optional[str]
+    agent_visible_files: Tuple[AgentVisibleFileBinding, ...]
+    adapter_capabilities_digest: Optional[str]
+    target_access: Optional[TargetAccess]
     terminal_status: Optional[TrialStatus]
     failure_code: Optional[FailureCode]
 
     def __post_init__(self) -> None:
-        if self.schema_version != self.SCHEMA_VERSION:
-            raise SchemaError("StageReceipt has an unknown schema_version")
+        _require_protocol_version(
+            self.schema_version,
+            self.SCHEMA_VERSION,
+            "StageReceipt.schema_version",
+        )
         validate_run_id(self.run_id)
         _identifier(self.task_id, "receipt.task_id")
         validate_trial_id_shape(self.trial_id)
@@ -742,6 +1785,52 @@ class StageReceipt(_JsonModel):
         paths = [item.relative_path for item in artifacts]
         if len(paths) != len(set(paths)):
             raise SchemaError("receipt.artifacts contains duplicate paths")
+        if self.materialization_manifest is not None and not isinstance(
+            self.materialization_manifest, ArtifactRef
+        ):
+            raise SchemaError(
+                "receipt.materialization_manifest must be an ArtifactRef or null"
+            )
+        if self.materialization_manifest_digest is not None:
+            _digest(
+                self.materialization_manifest_digest,
+                "receipt.materialization_manifest_digest",
+            )
+        if self.materialization_id is not None and (
+            type(self.materialization_id) is not str
+            or _MATERIALIZATION_ID_RE.fullmatch(self.materialization_id) is None
+        ):
+            raise SchemaError("receipt.materialization_id is invalid")
+        for field_name in (
+            "eval_input_digest",
+            "review_target_digest",
+            "adapter_capabilities_digest",
+        ):
+            field_value = getattr(self, field_name)
+            if field_value is not None:
+                _digest(field_value, "receipt.%s" % field_name)
+        if self.prepared_source_id is not None:
+            _identifier(
+                self.prepared_source_id, "receipt.prepared_source_id"
+            )
+        if type(self.agent_visible_files) not in (tuple, list):
+            raise SchemaError(
+                "receipt.agent_visible_files must be a list or tuple"
+            )
+        visible_files = tuple(self.agent_visible_files)
+        if len(visible_files) > MAX_AGENT_VISIBLE_FILES or any(
+            not isinstance(item, AgentVisibleFileBinding)
+            for item in visible_files
+        ):
+            raise SchemaError(
+                "receipt.agent_visible_files contains invalid bindings"
+            )
+        if self.target_access is not None and not isinstance(
+            self.target_access, TargetAccess
+        ):
+            raise SchemaError(
+                "receipt.target_access must be a TargetAccess or null"
+            )
         if self.terminal_status is not None:
             _require_enum(TrialStatus, self.terminal_status, "receipt.terminal_status")
         if self.failure_code is not None:
@@ -759,14 +1848,43 @@ class StageReceipt(_JsonModel):
                 raise SchemaError("lifecycle receipt has an invalid field combination")
         elif self.stage is StageName.PREPARE:
             if (
-                self.attempt is not None
+                self.attempt is None
                 or self.evaluation_id is not None
                 or self.evaluation_revision is not None
                 or self.terminal_status is not None
-                or len(artifacts) != 1
-                or not artifacts[0].relative_path.endswith("/input.json")
+                or len(artifacts) != 2
+                or sum(
+                    item.relative_path.endswith("/input.json")
+                    for item in artifacts
+                )
+                != 1
+                or self.materialization_manifest is None
+                or self.materialization_manifest not in artifacts
+                or self.materialization_manifest_digest
+                != self.materialization_manifest.sha256
+                or self.materialization_id is None
+                or self.eval_input_digest is None
+                or self.review_target_digest is None
+                or self.prepared_source_id is None
+                or not visible_files
+                or self.adapter_capabilities_digest is None
+                or self.target_access is None
+                or self.target_access.target_materialization_id
+                != self.materialization_id
             ):
-                raise SchemaError("prepare receipt must bind exactly input.json")
+                raise SchemaError(
+                    "prepare receipt must bind EvalInput and TrialMaterializationManifest"
+                )
+            expected_suffix = (
+                "/materializations/attempt-%04d/materialization_manifest.json"
+                % self.attempt
+            )
+            if not self.materialization_manifest.relative_path.endswith(
+                expected_suffix
+            ):
+                raise SchemaError(
+                    "prepare receipt materialization path has the wrong attempt"
+                )
         elif self.stage is StageName.AGENT:
             submission_count = sum(
                 item.relative_path.endswith("/submission.json")
@@ -795,8 +1913,27 @@ class StageReceipt(_JsonModel):
                 self.config_digest,
                 self.evaluation_revision,
             )
+        if self.stage is not StageName.PREPARE and (
+            self.materialization_manifest is not None
+            or self.materialization_manifest_digest is not None
+            or self.materialization_id is not None
+            or self.eval_input_digest is not None
+            or self.review_target_digest is not None
+            or self.prepared_source_id is not None
+            or visible_files
+            or self.adapter_capabilities_digest is not None
+            or self.target_access is not None
+        ):
+            raise SchemaError(
+                "non-prepare receipt may not carry materialization bindings"
+            )
         object.__setattr__(
             self, "artifacts", tuple(sorted(artifacts, key=lambda item: item.relative_path))
+        )
+        object.__setattr__(
+            self,
+            "agent_visible_files",
+            tuple(sorted(visible_files, key=lambda item: item.relative_path)),
         )
         validate_safe_json(self.to_dict(), "stage_receipt")
         _check_model_size(self, MAX_STAGE_RECEIPT_BYTES, "StageReceipt")
@@ -814,6 +1951,15 @@ class StageReceipt(_JsonModel):
         attempt: Optional[int] = None,
         evaluation_id: Optional[str] = None,
         evaluation_revision: Optional[str] = None,
+        materialization_manifest: Optional[ArtifactRef] = None,
+        materialization_manifest_digest: Optional[str] = None,
+        materialization_id: Optional[str] = None,
+        eval_input_digest: Optional[str] = None,
+        review_target_digest: Optional[str] = None,
+        prepared_source_id: Optional[str] = None,
+        agent_visible_files: Iterable[AgentVisibleFileBinding] = (),
+        adapter_capabilities_digest: Optional[str] = None,
+        target_access: Optional[TargetAccess] = None,
         terminal_status: Optional[TrialStatus] = None,
         failure_code: Optional[FailureCode] = None,
     ) -> "StageReceipt":
@@ -837,7 +1983,24 @@ class StageReceipt(_JsonModel):
             attempt=attempt,
             evaluation_id=evaluation_id,
             evaluation_revision=evaluation_revision,
-            artifacts=tuple(artifacts),
+            artifacts=_bounded_tuple(
+                artifacts,
+                "receipt.artifacts",
+                MAX_RECEIPT_ARTIFACTS,
+            ),
+            materialization_manifest=materialization_manifest,
+            materialization_manifest_digest=materialization_manifest_digest,
+            materialization_id=materialization_id,
+            eval_input_digest=eval_input_digest,
+            review_target_digest=review_target_digest,
+            prepared_source_id=prepared_source_id,
+            agent_visible_files=_bounded_tuple(
+                agent_visible_files,
+                "receipt.agent_visible_files",
+                MAX_AGENT_VISIBLE_FILES,
+            ),
+            adapter_capabilities_digest=adapter_capabilities_digest,
+            target_access=target_access,
             terminal_status=terminal_status,
             failure_code=failure_code,
         )
@@ -845,6 +2008,12 @@ class StageReceipt(_JsonModel):
     @classmethod
     def from_dict(cls, value: Any) -> "StageReceipt":
         payload = _object(value, "StageReceipt")
+        if "schema_version" in payload:
+            _require_protocol_version(
+                payload["schema_version"],
+                cls.SCHEMA_VERSION,
+                "StageReceipt.schema_version",
+            )
         _exact_fields(
             payload,
             (
@@ -859,15 +2028,27 @@ class StageReceipt(_JsonModel):
                 "evaluation_id",
                 "evaluation_revision",
                 "artifacts",
+                "materialization_manifest",
+                "materialization_manifest_digest",
+                "materialization_id",
+                "eval_input_digest",
+                "review_target_digest",
+                "prepared_source_id",
+                "agent_visible_files",
+                "adapter_capabilities_digest",
+                "target_access",
                 "terminal_status",
                 "failure_code",
             ),
             "StageReceipt",
         )
-        if payload["schema_version"] != cls.SCHEMA_VERSION:
-            raise SchemaError("StageReceipt has an unknown schema_version")
         artifacts = _array(
             payload["artifacts"], "receipt.artifacts", MAX_RECEIPT_ARTIFACTS
+        )
+        visible_files = _array(
+            payload["agent_visible_files"],
+            "receipt.agent_visible_files",
+            MAX_AGENT_VISIBLE_FILES,
         )
         return cls(
             schema_version=payload["schema_version"],
@@ -903,6 +2084,68 @@ class StageReceipt(_JsonModel):
                 )
             ),
             artifacts=tuple(ArtifactRef.from_dict(item) for item in artifacts),
+            materialization_manifest=(
+                None
+                if payload["materialization_manifest"] is None
+                else ArtifactRef.from_dict(payload["materialization_manifest"])
+            ),
+            materialization_manifest_digest=(
+                None
+                if payload["materialization_manifest_digest"] is None
+                else _digest(
+                    payload["materialization_manifest_digest"],
+                    "receipt.materialization_manifest_digest",
+                )
+            ),
+            materialization_id=(
+                None
+                if payload["materialization_id"] is None
+                else _identifier(
+                    payload["materialization_id"],
+                    "receipt.materialization_id",
+                )
+            ),
+            eval_input_digest=(
+                None
+                if payload["eval_input_digest"] is None
+                else _digest(
+                    payload["eval_input_digest"],
+                    "receipt.eval_input_digest",
+                )
+            ),
+            review_target_digest=(
+                None
+                if payload["review_target_digest"] is None
+                else _digest(
+                    payload["review_target_digest"],
+                    "receipt.review_target_digest",
+                )
+            ),
+            prepared_source_id=(
+                None
+                if payload["prepared_source_id"] is None
+                else _identifier(
+                    payload["prepared_source_id"],
+                    "receipt.prepared_source_id",
+                )
+            ),
+            agent_visible_files=tuple(
+                AgentVisibleFileBinding.from_dict(item)
+                for item in visible_files
+            ),
+            adapter_capabilities_digest=(
+                None
+                if payload["adapter_capabilities_digest"] is None
+                else _digest(
+                    payload["adapter_capabilities_digest"],
+                    "receipt.adapter_capabilities_digest",
+                )
+            ),
+            target_access=(
+                None
+                if payload["target_access"] is None
+                else TargetAccess.from_dict(payload["target_access"])
+            ),
             terminal_status=(
                 None
                 if payload["terminal_status"] is None
@@ -940,6 +2183,29 @@ class StageReceipt(_JsonModel):
             "evaluation_id": self.evaluation_id,
             "evaluation_revision": self.evaluation_revision,
             "artifacts": [item.to_dict() for item in self.artifacts],
+            "materialization_manifest": (
+                None
+                if self.materialization_manifest is None
+                else self.materialization_manifest.to_dict()
+            ),
+            "materialization_manifest_digest": (
+                self.materialization_manifest_digest
+            ),
+            "materialization_id": self.materialization_id,
+            "eval_input_digest": self.eval_input_digest,
+            "review_target_digest": self.review_target_digest,
+            "prepared_source_id": self.prepared_source_id,
+            "agent_visible_files": [
+                item.to_dict() for item in self.agent_visible_files
+            ],
+            "adapter_capabilities_digest": (
+                self.adapter_capabilities_digest
+            ),
+            "target_access": (
+                None
+                if self.target_access is None
+                else self.target_access.to_dict()
+            ),
             "terminal_status": (
                 None if self.terminal_status is None else self.terminal_status.value
             ),
@@ -958,6 +2224,54 @@ class TrialState:
 
 
 @dataclass(frozen=True)
+class VerifiedTrialMaterialization:
+    """Receipt-bound inputs for replaying one active Trial materialization.
+
+    This is the public trust boundary for evaluator composition roots.  The
+    path-bearing ArtifactStore internals stay private; consumers receive only
+    strictly hydrated canonical values whose Run, Trial, active attempt, and
+    committed PREPARE projections have already been cross-checked.
+    """
+
+    eval_input: EvalInput
+    manifest: TrialMaterializationManifest
+    trial_manifest: TrialManifest
+    prepare_receipt: StageReceipt
+    active_attempt: int
+    suite_preparation_binding: Optional[PublicSuitePreparationBindingV2]
+
+    def __post_init__(self) -> None:
+        if type(self.eval_input) is not EvalInput:
+            raise TypeError("verified materialization requires EvalInput")
+        if type(self.manifest) is not TrialMaterializationManifest:
+            raise TypeError(
+                "verified materialization requires TrialMaterializationManifest"
+            )
+        if type(self.trial_manifest) is not TrialManifest:
+            raise TypeError("verified materialization requires TrialManifest")
+        if type(self.prepare_receipt) is not StageReceipt:
+            raise TypeError("verified materialization requires StageReceipt")
+        if (
+            self.suite_preparation_binding is not None
+            and type(self.suite_preparation_binding)
+            is not PublicSuitePreparationBindingV2
+        ):
+            raise TypeError("verified materialization preparation binding is invalid")
+        if (
+            self.active_attempt != self.manifest.attempt
+            or self.prepare_receipt.stage is not StageName.PREPARE
+            or self.prepare_receipt.attempt != self.active_attempt
+            or self.prepare_receipt.materialization_id
+            != self.manifest.materialization_id
+            or self.eval_input.digest() != self.manifest.eval_input_digest
+            or self.trial_manifest.eval_input_digest
+            != self.manifest.eval_input_digest
+        ):
+            raise ArtifactIntegrityError(
+                "verified Trial materialization binding is inconsistent"
+            )
+
+@dataclass(frozen=True)
 class RunState:
     run_id: str
     status: RunStatus
@@ -973,8 +2287,20 @@ class ResumePlan:
     terminal: bool
 
 
-def _canonical_payload_text(value: Any, context: str) -> str:
-    validate_safe_json(value, context)
+def _canonical_payload_text(
+    value: Any,
+    context: str,
+    *,
+    evaluator_context_policy: Optional[str] = None,
+) -> str:
+    validate_safe_json(
+        value,
+        context,
+        evaluator_context_policy=_evaluator_context_policy_for_payload(
+            value,
+            evaluator_context_policy,
+        ),
+    )
     return canonical_json_bytes(value).decode("utf-8", "strict")
 
 
@@ -1140,7 +2466,13 @@ class EvaluationArtifactBundle:
             if type(value) is not str:
                 raise TypeError("evaluation bundle payload snapshots must be strings")
             decoded = _decoded_payload(value)
-            if _canonical_payload_text(decoded, "evaluation bundle payload") != value:
+            if _canonical_payload_text(
+                decoded,
+                "evaluation bundle payload",
+                evaluator_context_policy=(
+                    _EVALUATOR_CONTEXT_POLICY_BY_BUNDLE_FIELD.get(name)
+                ),
+            ) != value:
                 raise ArtifactIntegrityError(
                     "evaluation bundle payload is not canonical"
                 )
@@ -1229,8 +2561,11 @@ class RunEvaluationNamespace:
     report: ArtifactRef
 
     def __post_init__(self) -> None:
-        if self.schema_version != EVAL_RUN_EVALUATION_NAMESPACE_SCHEMA_VERSION:
-            raise SchemaError("Run evaluation namespace has an unknown schema")
+        _require_protocol_version(
+            self.schema_version,
+            EVAL_RUN_EVALUATION_NAMESPACE_SCHEMA_VERSION,
+            "RunEvaluationNamespace.schema_version",
+        )
         validate_run_id(self.run_id)
         validate_evaluation_id(
             self.evaluation_id,
@@ -2386,6 +3721,7 @@ class ArtifactStore:
         expected: Optional[ArtifactRef] = None,
         budget: Optional[_ReadBudget] = None,
         maximum: Optional[int] = None,
+        evaluator_context_policy: Optional[str] = None,
     ) -> Any:
         active_budget = budget or _ReadBudget(self.max_total_read_bytes)
         data = self._read_bytes(
@@ -2402,7 +3738,14 @@ class ArtifactStore:
         )
         if canonical_json_bytes(value) != data:
             raise ArtifactIntegrityError("JSON artifact is not canonical UTF-8 JSON")
-        validate_safe_json(value, "artifact")
+        validate_safe_json(
+            value,
+            "artifact",
+            evaluator_context_policy=_evaluator_context_policy_for_payload(
+                value,
+                evaluator_context_policy,
+            ),
+        )
         return value
 
     def _read_text(
@@ -2461,8 +3804,16 @@ class ArtifactStore:
         value: Any,
         *,
         maximum: Optional[int] = None,
+        evaluator_context_policy: Optional[str] = None,
     ) -> ArtifactRef:
-        validate_safe_json(value, "artifact")
+        validate_safe_json(
+            value,
+            "artifact",
+            evaluator_context_policy=_evaluator_context_policy_for_payload(
+                value,
+                evaluator_context_policy,
+            ),
+        )
         data = canonical_json_bytes(value)
         if len(data) > min(self.max_file_bytes, maximum or self.max_file_bytes):
             raise ArtifactIntegrityError("JSON artifact exceeds its byte limit")
@@ -2614,6 +3965,15 @@ class ArtifactStore:
                     case_path_id=case_path_id,
                     canonical_case_digest=case.canonical_case_digest,
                     eval_input_digest=case.eval_input_digest,
+                    wire_contract=config.wire_contract,
+                    target_kind=config.wire_contract.review_target_kind,
+                    materializer_protocol=config.materializer_protocol,
+                    suite_preparation_binding_digest=(
+                        config.suite_preparation_binding_digest
+                    ),
+                    adapter_capabilities_digest=(
+                        config.adapter_capabilities_digest
+                    ),
                     trial_id=trial_id,
                     trial_index=trial_index,
                     seed=derive_trial_seed(config.run_id, case.task_id, trial_index),
@@ -2652,6 +4012,11 @@ class ArtifactStore:
             run_id=config.run_id,
             run_config=config_ref,
             case_snapshot=snapshot_ref,
+            wire_contract=config.wire_contract,
+            suite_preparation_binding_digest=(
+                config.suite_preparation_binding_digest
+            ),
+            adapter_capabilities_digest=config.adapter_capabilities_digest,
             agent_config_digest=config.agent_config_digest,
             initial_evaluator_execution_digest=(
                 initial_evaluator_execution_digest
@@ -2667,11 +4032,10 @@ class ArtifactStore:
             + len(preflight_bytes)
             + len(manifest_data)
             + sum(len(item[2]) for item in trial_payloads)
-            + config.resource_budgets.max_execution_artifact_total_bytes
         )
         if read_floor > self.max_total_read_bytes:
             raise ArtifactIntegrityError(
-                "Run plan and execution budget exceed ArtifactStore read capacity"
+                "Run control plane exceeds ArtifactStore read capacity"
             )
         run_dir = self._run_dir(config.run_id)
         self._assert_directory(self.root)
@@ -2712,7 +4076,12 @@ class ArtifactStore:
                 "Run plan input artifact identity changed before publication"
             )
         for relative_base, trial_manifest, trial_data, manifest_ref in trial_payloads:
-            for suffix in (".locks", "receipts", "evaluations"):
+            for suffix in (
+                ".locks",
+                "receipts",
+                "evaluations",
+                "materializations",
+            ):
                 self._ensure_directory(
                     self._target(config.run_id, relative_base) / suffix
                 )
@@ -2754,6 +4123,12 @@ class ArtifactStore:
             "run_id": config.run_id,
             "run_manifest_digest": manifest.digest(),
             "run_config_digest": config.digest(),
+            "wire_contract": config.wire_contract.to_dict(),
+            "adapter_capabilities_digest": (
+                config.adapter_capabilities_digest
+            ),
+            "target_kinds": [item.value for item in config.target_kinds],
+            "materializer_protocol": config.materializer_protocol,
             "preflight_digest": hashlib.sha256(preflight_bytes).hexdigest(),
             "preflight": preflight,
         }
@@ -2831,6 +4206,12 @@ class ArtifactStore:
         )
         if type(payload) is not dict:
             raise ArtifactIntegrityError("preflight candidate is not an object")
+        if "schema_version" in payload:
+            _require_protocol_version(
+                payload["schema_version"],
+                EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION,
+                "preflight candidate.schema_version",
+            )
         expected_fields = {
             "schema_version",
             "run_id",
@@ -2841,8 +4222,6 @@ class ArtifactStore:
         }
         if (
             set(payload) != expected_fields
-            or payload.get("schema_version")
-            != EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION
             or payload.get("run_id") != run_id
             or "preflight" not in payload
         ):
@@ -2879,11 +4258,37 @@ class ArtifactStore:
         )
         if not isinstance(payload, dict):
             raise ArtifactIntegrityError("Run capability preflight is not an object")
+        if "schema_version" in payload:
+            _require_protocol_version(
+                payload["schema_version"],
+                EVAL_RUN_PREFLIGHT_SCHEMA_VERSION,
+                "capability preflight.schema_version",
+            )
+        expected_fields = {
+            "schema_version",
+            "run_id",
+            "run_manifest_digest",
+            "run_config_digest",
+            "wire_contract",
+            "adapter_capabilities_digest",
+            "target_kinds",
+            "materializer_protocol",
+            "preflight_digest",
+            "preflight",
+        }
         if (
-            payload.get("schema_version") != EVAL_RUN_PREFLIGHT_SCHEMA_VERSION
+            set(payload) != expected_fields
             or payload.get("run_id") != run_id
             or payload.get("run_manifest_digest") != bundle.manifest.digest()
             or payload.get("run_config_digest") != bundle.config.digest()
+            or payload.get("wire_contract")
+            != bundle.config.wire_contract.to_dict()
+            or payload.get("adapter_capabilities_digest")
+            != bundle.config.adapter_capabilities_digest
+            or payload.get("target_kinds")
+            != [item.value for item in bundle.config.target_kinds]
+            or payload.get("materializer_protocol")
+            != bundle.config.materializer_protocol
             or "preflight" not in payload
         ):
             raise ArtifactIntegrityError("Run capability preflight binding is invalid")
@@ -2924,6 +4329,11 @@ class ArtifactStore:
             raise ArtifactIntegrityError("Run Config identity does not match its path")
         if (
             config.agent_config_digest != manifest.agent_config_digest
+            or config.wire_contract != manifest.wire_contract
+            or config.suite_preparation_binding_digest
+            != manifest.suite_preparation_binding_digest
+            or config.adapter_capabilities_digest
+            != manifest.adapter_capabilities_digest
             or EvaluatorExecutionConfig.from_resource_budgets(
                 config.evaluator, config.resource_budgets
             ).digest()
@@ -3037,6 +4447,15 @@ class ArtifactStore:
             or trial.canonical_case_digest != plan.canonical_case_digest
             or trial.eval_input_digest != plan.eval_input_digest
             or trial.trial_index != plan.trial_index
+            or trial.wire_contract != bundle.config.wire_contract
+            or trial.target_kind
+            is not bundle.config.wire_contract.review_target_kind
+            or trial.materializer_protocol
+            != bundle.config.materializer_protocol
+            or trial.suite_preparation_binding_digest
+            != bundle.config.suite_preparation_binding_digest
+            or trial.adapter_capabilities_digest
+            != bundle.config.adapter_capabilities_digest
             or trial.agent_config_digest
             != bundle.config.agent_config_digest
             or trial.initial_evaluator_execution_digest
@@ -3079,13 +4498,29 @@ class ArtifactStore:
             plan.case_path_id,
             plan.trial_id,
         )
-        if stage is StageName.PREPARE:
-            return "%s/prepare.json" % base
+        if stage is StageName.PREPARE and attempt is not None:
+            return "%s/attempt-%04d/prepare.json" % (base, attempt)
         if stage is StageName.AGENT:
             return "%s/terminal.json" % base
         if stage in {StageName.START, StageName.INCOMPLETE} and attempt is not None:
             return "%s/attempt-%04d/%s.json" % (base, attempt, stage.value)
         raise ArtifactStateError("receipt path requires a legal stage/attempt")
+
+    @staticmethod
+    def _materialization_manifest_path(
+        plan: TrialManifest, attempt: int
+    ) -> str:
+        _integer(
+            attempt,
+            "attempt",
+            minimum=1,
+            maximum=MAX_TRIAL_ATTEMPTS,
+        )
+        return (
+            "cases/%s/trials/%s/materializations/attempt-%04d/"
+            "materialization_manifest.json"
+            % (plan.case_path_id, plan.trial_id, attempt)
+        )
 
     def _load_receipt(
         self,
@@ -3103,8 +4538,8 @@ class ArtifactStore:
         )
         return StageReceipt.from_dict(payload)
 
-    @staticmethod
     def _validate_receipt_binding(
+        self,
         receipt: StageReceipt,
         plan: TrialManifest,
         *,
@@ -3122,7 +4557,24 @@ class ArtifactStore:
             if not artifact.relative_path.startswith(prefix):
                 raise ArtifactIntegrityError("receipt artifact escapes its Trial namespace")
         if receipt.stage is StageName.PREPARE:
-            if receipt.artifacts[0].relative_path != prefix + "input.json":
+            if receipt.attempt is None:
+                raise ArtifactIntegrityError(
+                    "prepare receipt has no attempt lease"
+                )
+            expected_materialization = self._materialization_manifest_path(
+                plan, receipt.attempt
+            )
+            expected_paths = {
+                prefix + "input.json",
+                expected_materialization,
+            }
+            if (
+                {item.relative_path for item in receipt.artifacts}
+                != expected_paths
+                or receipt.materialization_manifest is None
+                or receipt.materialization_manifest.relative_path
+                != expected_materialization
+            ):
                 raise ArtifactIntegrityError("prepare receipt binds the wrong input path")
         elif receipt.stage is StageName.AGENT:
             submission_paths = [
@@ -3161,11 +4613,322 @@ class ArtifactStore:
                 maximum_bytes=maximum_bytes,
             )
 
+    def _load_prepare_materialization(
+        self,
+        bundle: _VerifiedRunBundle,
+        plan: TrialManifest,
+        receipt: StageReceipt,
+        *,
+        budget: _ReadBudget,
+    ) -> Tuple[EvalInput, TrialMaterializationManifest]:
+        if receipt.stage is not StageName.PREPARE or receipt.attempt is None:
+            raise ArtifactIntegrityError(
+                "prepare receipt has an invalid stage/attempt binding"
+            )
+        self._validate_receipt_binding(
+            receipt,
+            plan,
+            config_digest=plan.agent_config_digest,
+        )
+        base = "cases/%s/trials/%s" % (
+            plan.case_path_id,
+            plan.trial_id,
+        )
+        expected_input_path = base + "/input.json"
+        input_refs = tuple(
+            item
+            for item in receipt.artifacts
+            if item.relative_path == expected_input_path
+        )
+        if len(input_refs) != 1 or receipt.materialization_manifest is None:
+            raise ArtifactIntegrityError(
+                "prepare receipt artifact projection is incomplete"
+            )
+        input_payload = self._read_json(
+            self._target(plan.run_id, expected_input_path),
+            expected=input_refs[0],
+            budget=budget,
+            maximum=MAX_EVAL_INPUT_BYTES,
+        )
+        materialization_payload = self._read_json(
+            self._target(
+                plan.run_id,
+                receipt.materialization_manifest.relative_path,
+            ),
+            expected=receipt.materialization_manifest,
+            budget=budget,
+            maximum=MAX_TRIAL_MATERIALIZATION_BYTES,
+        )
+        try:
+            eval_input = EvalInput.from_dict(input_payload)
+            materialization = TrialMaterializationManifest.from_dict(
+                materialization_payload
+            )
+        except UnsupportedProtocolVersionError:
+            raise
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "prepare receipt child failed strict hydration"
+            ) from exc
+        if (
+            eval_input.task_id != plan.task_id
+            or eval_input.digest() != plan.eval_input_digest
+            or eval_input.review_target.kind is not plan.target_kind
+            or materialization.run_id != plan.run_id
+            or materialization.task_id != plan.task_id
+            or materialization.trial_id != plan.trial_id
+            or materialization.attempt != receipt.attempt
+            or materialization.eval_input_digest != eval_input.digest()
+            or materialization.review_target_digest
+            != eval_input.review_target.digest()
+            or materialization.wire_contract != plan.wire_contract
+            or materialization.suite_preparation_binding_digest
+            != plan.suite_preparation_binding_digest
+            or materialization.adapter_capabilities_digest
+            != plan.adapter_capabilities_digest
+        ):
+            raise ArtifactIntegrityError(
+                "prepare materialization differs from immutable Run/Trial plan"
+            )
+        if (
+            receipt.materialization_manifest_digest
+            != receipt.materialization_manifest.sha256
+            or receipt.materialization_id
+            != materialization.materialization_id
+            or receipt.eval_input_digest != materialization.eval_input_digest
+            or receipt.review_target_digest
+            != materialization.review_target_digest
+            or receipt.prepared_source_id
+            != materialization.prepared_source_id
+            or receipt.agent_visible_files != materialization.files
+            or receipt.adapter_capabilities_digest
+            != materialization.adapter_capabilities_digest
+            or receipt.target_access != materialization.target_access
+        ):
+            raise ArtifactIntegrityError(
+                "prepare receipt projection differs from materialization manifest"
+            )
+        return eval_input, materialization
+
+    def _verified_prepare_for_terminal(
+        self,
+        bundle: _VerifiedRunBundle,
+        plan: TrialManifest,
+        *,
+        attempt: int,
+        candidate: Optional[StageReceipt],
+        budget: _ReadBudget,
+    ) -> Tuple[
+        Optional[StageReceipt],
+        Optional[EvalInput],
+        Optional[TrialMaterializationManifest],
+    ]:
+        """Resolve and fully verify the Prepare binding for one active attempt."""
+
+        prepare_path = self._receipt_path(plan, StageName.PREPARE, attempt)
+        committed: Optional[StageReceipt] = None
+        if self._exists_regular(self._target(plan.run_id, prepare_path)):
+            committed = self._load_receipt(
+                plan.run_id,
+                prepare_path,
+                budget=budget,
+            )
+        if candidate is not None and not isinstance(candidate, StageReceipt):
+            raise ArtifactIntegrityError(
+                "terminal prepare candidate is not a StageReceipt"
+            )
+        if committed is not None and candidate is not None and committed != candidate:
+            raise ArtifactIntegrityError(
+                "terminal prepare candidate differs from committed receipt"
+            )
+        prepare = committed if committed is not None else candidate
+        if prepare is None:
+            materialization_path = self._materialization_manifest_path(
+                plan,
+                attempt,
+            )
+            if self._exists_regular(
+                self._target(plan.run_id, materialization_path)
+            ):
+                raise ArtifactIntegrityError(
+                    "materialization exists without a committed prepare receipt"
+                )
+            return None, None, None
+        if prepare.stage is not StageName.PREPARE or prepare.attempt != attempt:
+            raise ArtifactIntegrityError(
+                "terminal prepare receipt does not bind the active attempt"
+            )
+        eval_input, materialization = self._load_prepare_materialization(
+            bundle,
+            plan,
+            prepare,
+            budget=budget,
+        )
+        return prepare, eval_input, materialization
+
+    def _terminal_target_binding(
+        self,
+        bundle: _VerifiedRunBundle,
+        plan: TrialManifest,
+        *,
+        attempt: int,
+        prepare: Optional[StageReceipt],
+        budget: _ReadBudget,
+    ) -> Tuple[str, bool]:
+        _prepare, _eval_input, materialization = self._verified_prepare_for_terminal(
+            bundle,
+            plan,
+            attempt=attempt,
+            candidate=prepare,
+            budget=budget,
+        )
+        if materialization is not None:
+            return materialization.materialization_id, True
+        eval_input = bundle.case_snapshot.eval_input(plan.task_id)
+        if eval_input.digest() != plan.eval_input_digest:
+            raise ArtifactIntegrityError(
+                "Case Snapshot EvalInput differs from immutable Trial plan"
+            )
+        return (
+            derive_pre_materialization_failure_binding(
+                run_id=plan.run_id,
+                task_id=plan.task_id,
+                trial_id=plan.trial_id,
+                attempt=attempt,
+                eval_input_digest=plan.eval_input_digest,
+                review_target_digest=eval_input.review_target.digest(),
+            ),
+            False,
+        )
+
+    def _verify_existing_terminal_input(
+        self,
+        bundle: _VerifiedRunBundle,
+        plan: TrialManifest,
+        *,
+        budget: _ReadBudget,
+    ) -> None:
+        input_path = "cases/%s/trials/%s/input.json" % (
+            plan.case_path_id,
+            plan.trial_id,
+        )
+        target = self._target(plan.run_id, input_path)
+        if not self._exists_regular(target):
+            return
+        payload = self._read_json(
+            target,
+            budget=budget,
+            maximum=MAX_EVAL_INPUT_BYTES,
+        )
+        try:
+            eval_input = EvalInput.from_dict(payload)
+        except UnsupportedProtocolVersionError:
+            raise
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "terminal EvalInput failed strict hydration"
+            ) from exc
+        if (
+            eval_input.task_id != plan.task_id
+            or eval_input.digest() != plan.eval_input_digest
+            or eval_input.review_target.kind is not plan.target_kind
+        ):
+            raise ArtifactIntegrityError(
+                "terminal EvalInput differs from immutable Trial plan"
+            )
+
+    def _validate_terminal_submission_binding(
+        self,
+        bundle: _VerifiedRunBundle,
+        plan: TrialManifest,
+        submission: EvalSubmission,
+        *,
+        attempt: int,
+        prepare: Optional[StageReceipt],
+        budget: _ReadBudget,
+        error_type: type[Exception] = ArtifactIntegrityError,
+    ) -> None:
+        """Enforce one terminal binding matrix before publication or adoption."""
+
+        def reject(message: str) -> None:
+            raise error_type(message)
+
+        if (
+            submission.task_id != plan.task_id
+            or submission.trial_id != plan.trial_id
+            or submission.agent_id != bundle.config.agent.agent_id
+        ):
+            reject("Submission identity does not match immutable Run/Trial plan")
+        if submission.eval_input_digest != plan.eval_input_digest:
+            reject("Submission EvalInput digest differs from immutable Trial plan")
+
+        target_binding, has_prepare = self._terminal_target_binding(
+            bundle,
+            plan,
+            attempt=attempt,
+            prepare=prepare,
+            budget=budget,
+        )
+        if not has_prepare:
+            self._verify_existing_terminal_input(
+                bundle,
+                plan,
+                budget=budget,
+            )
+        failure_code = (
+            None if submission.failure is None else submission.failure.code
+        )
+        if failure_code is FailureCode.HARNESS_MATERIALIZATION_ERROR and (
+            submission.failure is None
+            or submission.failure.retryable
+            or submission.trace_ref is not None
+            or submission.usage.input_tokens is not None
+            or submission.usage.output_tokens is not None
+            or submission.usage.total_tokens is not None
+            or submission.usage.tool_calls is not None
+            or submission.usage.cost_amount is not None
+            or submission.usage.cost_currency is not None
+        ):
+            reject(
+                "Harness-owned materialization failure contains Agent-owned metadata"
+            )
+        if has_prepare:
+            if submission.target_materialization_id != target_binding:
+                reject(
+                    "Submission target differs from active materialization binding"
+                )
+            if failure_code is FailureCode.HARNESS_MATERIALIZATION_ERROR and (
+                submission.status is not SubmissionStatus.FAILED
+                or submission.intent is not None
+                or submission.review is not None
+                or submission.evidence
+            ):
+                reject(
+                    "post-Prepare materialization failure contains Agent output"
+                )
+            return
+
+        if (
+            submission.status is not SubmissionStatus.FAILED
+            or failure_code is not FailureCode.HARNESS_MATERIALIZATION_ERROR
+            or submission.intent is not None
+            or submission.review is not None
+            or submission.evidence
+        ):
+            reject(
+                "terminal Submission requires a committed prepare receipt"
+            )
+        if submission.target_materialization_id != target_binding:
+            reject(
+                "Submission pre-materialization failure binding is not canonical"
+            )
+
     def _load_terminal_submission(
         self,
         bundle: _VerifiedRunBundle,
         plan: TrialManifest,
         receipt: StageReceipt,
+        prepare: Optional[StageReceipt],
         *,
         budget: _ReadBudget,
     ) -> EvalSubmission:
@@ -3228,15 +4991,24 @@ class ArtifactStore:
             None if submission.failure is None else submission.failure.code
         )
         if (
-            submission.task_id != plan.task_id
-            or submission.trial_id != plan.trial_id
-            or submission.agent_id != bundle.config.agent.agent_id
-            or submission.status.value != receipt.terminal_status.value
+            submission.status.value != receipt.terminal_status.value
             or expected_failure is not receipt.failure_code
         ):
             raise ArtifactIntegrityError(
-                "Submission does not match its terminal receipt or verified Run"
+                "Submission does not match its terminal receipt"
             )
+        if receipt.attempt is None:
+            raise ArtifactIntegrityError(
+                "terminal receipt has no active attempt binding"
+            )
+        self._validate_terminal_submission_binding(
+            bundle,
+            plan,
+            submission,
+            attempt=receipt.attempt,
+            prepare=prepare,
+            budget=budget,
+        )
         return submission
 
     def _recoverable_runner_artifacts(
@@ -3340,7 +5112,7 @@ class ArtifactStore:
                     "Trial receipts contain a special file"
                 )
             elif (
-                entry.name not in {"prepare.json", "terminal.json"}
+                entry.name != "terminal.json"
                 and _TEMP_FILE_RE.fullmatch(entry.name) is None
             ):
                 raise ArtifactIntegrityError(
@@ -3373,31 +5145,20 @@ class ArtifactStore:
                 raise ArtifactIntegrityError("terminal receipt has the wrong stage")
 
         completed: List[StageName] = []
-        prepare_path = self._receipt_path(plan, StageName.PREPARE)
-        if self._exists_regular(self._target(plan.run_id, prepare_path)):
-            prepare = self._load_receipt(plan.run_id, prepare_path, budget=budget)
-            self._validate_receipt_binding(
-                prepare, plan, config_digest=plan.agent_config_digest
-            )
-            if prepare.stage is not StageName.PREPARE:
-                raise ArtifactIntegrityError("prepare receipt has the wrong stage")
-            self._verify_receipt(
-                plan.run_id,
-                prepare,
-                budget=budget,
-                maximum_bytes=MAX_EVAL_INPUT_BYTES,
-            )
-            completed.append(StageName.PREPARE)
-
         attempt_indices = self._attempt_indices(plan)
         latest_attempt: Optional[int] = None
         latest_incomplete = False
+        latest_prepare: Optional[StageReceipt] = None
         for attempt in attempt_indices:
             start_path = self._receipt_path(plan, StageName.START, attempt)
             incomplete_path = self._receipt_path(plan, StageName.INCOMPLETE, attempt)
+            prepare_path = self._receipt_path(plan, StageName.PREPARE, attempt)
             has_start = self._exists_regular(self._target(plan.run_id, start_path))
             has_incomplete = self._exists_regular(
                 self._target(plan.run_id, incomplete_path)
+            )
+            has_prepare = self._exists_regular(
+                self._target(plan.run_id, prepare_path)
             )
             if not has_start:
                 if has_incomplete:
@@ -3415,6 +5176,25 @@ class ArtifactStore:
                 raise ArtifactIntegrityError("start receipt has invalid attempt binding")
             latest_attempt = attempt
             latest_incomplete = has_incomplete
+            latest_prepare = None
+            if has_prepare:
+                prepare = self._load_receipt(
+                    plan.run_id, prepare_path, budget=budget
+                )
+                if (
+                    prepare.stage is not StageName.PREPARE
+                    or prepare.attempt != attempt
+                ):
+                    raise ArtifactIntegrityError(
+                        "prepare receipt has invalid attempt binding"
+                    )
+                self._load_prepare_materialization(
+                    bundle,
+                    plan,
+                    prepare,
+                    budget=budget,
+                )
+                latest_prepare = prepare
             if has_incomplete:
                 incomplete = self._load_receipt(
                     plan.run_id, incomplete_path, budget=budget
@@ -3436,6 +5216,8 @@ class ArtifactStore:
                         "new attempt starts before prior attempt is incomplete"
                     )
 
+        if latest_prepare is not None:
+            completed.append(StageName.PREPARE)
         terminal_submission: Optional[EvalSubmission] = None
         if terminal is not None:
             if terminal.attempt is None or latest_attempt is None:
@@ -3453,14 +5235,14 @@ class ArtifactStore:
                     "completed terminal receipt lacks committed prepare stage"
                 )
             terminal_submission = self._load_terminal_submission(
-                bundle, plan, terminal, budget=budget
+                bundle,
+                plan,
+                terminal,
+                latest_prepare,
+                budget=budget,
             )
             completed.append(StageName.AGENT)
         elif latest_attempt is None:
-            if StageName.PREPARE in completed:
-                raise ArtifactIntegrityError(
-                    "prepare receipt exists without a started Trial attempt"
-                )
             status = TrialStatus.PENDING
         elif latest_incomplete:
             status = TrialStatus.INCOMPLETE
@@ -3490,6 +5272,68 @@ class ArtifactStore:
             bundle, plan, budget=budget
         )
         return state
+
+    def load_trial_materialization(
+        self,
+        run_id: str,
+        task_id: str,
+        trial_id: str,
+    ) -> VerifiedTrialMaterialization:
+        """Load the active committed PREPARE projection through one trust root.
+
+        A pre-materialization terminal failure intentionally has no value at
+        this boundary and raises ``ArtifactStateError``.  Evaluator callers
+        must therefore request it only when a Review replay is required.
+        """
+
+        budget = _ReadBudget(self.max_total_read_bytes)
+        bundle = self._load_verified_run_bundle(run_id, budget=budget)
+        plan = self._load_trial_manifest(
+            bundle,
+            task_id,
+            trial_id,
+            budget=budget,
+        )
+        state, _submission = self._load_trial_state(
+            bundle,
+            plan,
+            budget=budget,
+        )
+        attempt = state.active_attempt
+        if attempt is None:
+            raise ArtifactStateError("Trial has no active materialization attempt")
+        receipt, eval_input, materialization = self._verified_prepare_for_terminal(
+            bundle,
+            plan,
+            attempt=attempt,
+            candidate=None,
+            budget=budget,
+        )
+        if receipt is None or eval_input is None or materialization is None:
+            raise ArtifactStateError(
+                "Trial active attempt has no committed PREPARE materialization"
+            )
+        snapshot_input = bundle.case_snapshot.eval_input(task_id)
+        preparation = bundle.case_snapshot.manifest.source.preparation_binding
+        preparation_digest = (
+            None if preparation is None else preparation.digest()
+        )
+        if (
+            eval_input != snapshot_input
+            or preparation_digest
+            != materialization.suite_preparation_binding_digest
+        ):
+            raise ArtifactIntegrityError(
+                "PREPARE input or Suite preparation differs from verified Run bundle"
+            )
+        return VerifiedTrialMaterialization(
+            eval_input=eval_input,
+            manifest=materialization,
+            trial_manifest=plan,
+            prepare_receipt=receipt,
+            active_attempt=attempt,
+            suite_preparation_binding=preparation,
+        )
 
     def load_run_state(self, run_id: str) -> RunState:
         budget = _ReadBudget(self.max_total_read_bytes)
@@ -3597,11 +5441,16 @@ class ArtifactStore:
         task_id: str,
         trial_id: str,
         eval_input: EvalInput,
+        materialization: TrialMaterializationManifest,
         *,
         attempt: int,
     ) -> StageReceipt:
         if not isinstance(eval_input, EvalInput):
             raise TypeError("eval_input must be an EvalInput")
+        if not isinstance(materialization, TrialMaterializationManifest):
+            raise TypeError(
+                "materialization must be a TrialMaterializationManifest"
+            )
         _integer(attempt, "attempt", minimum=1, maximum=MAX_TRIAL_ATTEMPTS)
         budget = _ReadBudget(self.max_total_read_bytes)
         bundle = self._load_verified_run_bundle(run_id, budget=budget)
@@ -3625,25 +5474,121 @@ class ArtifactStore:
                 raise SchemaError("EvalInput task_id does not match Trial plan")
             if eval_input.digest() != plan.eval_input_digest:
                 raise SchemaError("EvalInput digest does not match immutable Trial plan")
+            if eval_input.review_target.kind is not plan.target_kind:
+                raise SchemaError(
+                    "EvalInput target kind does not match immutable Trial plan"
+                )
+            if (
+                materialization.run_id != run_id
+                or materialization.task_id != task_id
+                or materialization.trial_id != trial_id
+                or materialization.attempt != attempt
+            ):
+                raise SchemaError(
+                    "materialization identity does not match active Trial attempt"
+                )
+            if (
+                materialization.eval_input_digest != plan.eval_input_digest
+                or materialization.eval_input_digest != eval_input.digest()
+                or materialization.review_target_digest
+                != eval_input.review_target.digest()
+            ):
+                raise SchemaError(
+                    "materialization input/target content binding drift"
+                )
+            if (
+                materialization.wire_contract != plan.wire_contract
+                or materialization.wire_contract != bundle.config.wire_contract
+                or materialization.wire_contract.review_target_kind
+                is not eval_input.review_target.kind
+            ):
+                raise SchemaError(
+                    "materialization wire/target binding drift"
+                )
+            if (
+                materialization.suite_preparation_binding_digest
+                != plan.suite_preparation_binding_digest
+                or materialization.adapter_capabilities_digest
+                != plan.adapter_capabilities_digest
+            ):
+                raise SchemaError(
+                    "materialization preparation/capability binding drift"
+                )
             base = "cases/%s/trials/%s" % (plan.case_path_id, trial_id)
-            input_ref = self._write_json(
-                run_id,
-                "%s/input.json" % base,
-                eval_input,
-                maximum=MAX_EVAL_INPUT_BYTES,
+            input_path = "%s/input.json" % base
+            if self._exists_regular(self._target(run_id, input_path)):
+                adopted_input, input_ref = self._adopt_json(
+                    run_id,
+                    input_path,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                    maximum=MAX_EVAL_INPUT_BYTES,
+                )
+                if EvalInput.from_dict(adopted_input) != eval_input:
+                    raise ArtifactIntegrityError(
+                        "existing Trial EvalInput differs from immutable plan"
+                    )
+            else:
+                input_ref = self._write_json(
+                    run_id,
+                    input_path,
+                    eval_input,
+                    maximum=MAX_EVAL_INPUT_BYTES,
+                )
+            materialization_path = self._materialization_manifest_path(
+                plan, attempt
             )
+            self._ensure_directory(
+                self._target(run_id, materialization_path).parent
+            )
+            if self._exists_regular(
+                self._target(run_id, materialization_path)
+            ):
+                adopted_materialization, materialization_ref = self._adopt_json(
+                    run_id,
+                    materialization_path,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                    maximum=MAX_TRIAL_MATERIALIZATION_BYTES,
+                )
+                if (
+                    TrialMaterializationManifest.from_dict(
+                        adopted_materialization
+                    )
+                    != materialization
+                ):
+                    raise ArtifactIntegrityError(
+                        "existing Trial materialization differs from active attempt"
+                    )
+            else:
+                materialization_ref = self._write_json(
+                    run_id,
+                    materialization_path,
+                    materialization,
+                    maximum=MAX_TRIAL_MATERIALIZATION_BYTES,
+                )
             receipt = StageReceipt.create(
                 run_id=run_id,
                 task_id=task_id,
                 trial_id=trial_id,
                 stage=StageName.PREPARE,
                 config_digest=plan.agent_config_digest,
-                artifacts=(input_ref,),
+                artifacts=(input_ref, materialization_ref),
+                attempt=attempt,
+                materialization_manifest=materialization_ref,
+                materialization_manifest_digest=materialization_ref.sha256,
+                materialization_id=materialization.materialization_id,
+                eval_input_digest=materialization.eval_input_digest,
+                review_target_digest=materialization.review_target_digest,
+                prepared_source_id=materialization.prepared_source_id,
+                agent_visible_files=materialization.files,
+                adapter_capabilities_digest=(
+                    materialization.adapter_capabilities_digest
+                ),
+                target_access=materialization.target_access,
             )
             # Receipt is the stage commit marker and is published last.
             self._write_json(
                 run_id,
-                self._receipt_path(plan, StageName.PREPARE),
+                self._receipt_path(plan, StageName.PREPARE, attempt),
                 receipt,
                 maximum=MAX_STAGE_RECEIPT_BYTES,
             )
@@ -3708,6 +5653,35 @@ class ArtifactStore:
                     total += metadata.st_size
         return total
 
+    def _validate_execution_artifact_total_precommit(
+        self,
+        run_id: str,
+        *,
+        maximum_total_bytes: int,
+        mandatory_additional_bytes: int = 0,
+        optional_additional_bytes: int = 0,
+    ) -> None:
+        """Fail before publication when committed plus planned bytes exceed budget."""
+
+        current_bytes = self._execution_artifact_total_bytes(run_id)
+        if current_bytes > maximum_total_bytes:
+            raise ExecutionArtifactBudgetError(
+                "execution artifacts exceed the configured cumulative byte limit"
+            )
+        if current_bytes + mandatory_additional_bytes > maximum_total_bytes:
+            raise RequiredExecutionArtifactBudgetError(
+                "required trace exceeds the cumulative execution budget"
+            )
+        if (
+            current_bytes
+            + mandatory_additional_bytes
+            + optional_additional_bytes
+            > maximum_total_bytes
+        ):
+            raise ExecutionArtifactBudgetError(
+                "Runner artifacts exceed the configured cumulative byte limit"
+            )
+
     def _planned_artifact_ref(
         self, run_id: str, relative_path: str, data: bytes
     ) -> ArtifactRef:
@@ -3748,6 +5722,7 @@ class ArtifactStore:
     ) -> TrialState:
         if not isinstance(submission, EvalSubmission):
             raise TypeError("submission must be an EvalSubmission")
+        normalized_runner_artifacts: Dict[str, Any] = {}
         if runner_artifacts is not None:
             if type(runner_artifacts) is not dict:
                 raise TypeError("runner_artifacts must be a dict or None")
@@ -3755,12 +5730,11 @@ class ArtifactStore:
                 raise ExecutionArtifactBudgetError(
                     "Runner artifact count exceeds its bounded limit"
                 )
-            normalized_runner_artifacts = {}
             for name, value in runner_artifacts.items():
                 normalized_name = _runner_artifact_name(name)
                 validate_safe_json(value, "Runner artifact")
                 normalized_runner_artifacts[normalized_name] = value
-            runner_artifacts = normalized_runner_artifacts
+        runner_artifacts = normalized_runner_artifacts
         _integer(attempt, "attempt", minimum=1, maximum=MAX_TRIAL_ATTEMPTS)
         budget = _ReadBudget(self.max_total_read_bytes)
         bundle = self._load_verified_run_bundle(run_id, budget=budget)
@@ -3783,20 +5757,24 @@ class ArtifactStore:
                 raise ArtifactConflictError(
                     "stale Trial attempt cannot commit a terminal Submission"
                 )
-            if (
-                submission.task_id != task_id
-                or submission.trial_id != trial_id
-                or submission.agent_id != bundle.config.agent.agent_id
-            ):
-                raise SchemaError("Submission identity does not match Run/Trial")
-            terminal_status = self._submission_status(submission)
-            if (
-                terminal_status is TrialStatus.COMPLETED
-                and StageName.PREPARE not in state.completed_stages
-            ):
-                raise ArtifactStateError(
-                    "completed Submission requires committed prepare stage"
+            self._validate_terminal_submission_binding(
+                bundle,
+                plan,
+                submission,
+                attempt=attempt,
+                prepare=None,
+                budget=_ReadBudget(self.max_total_read_bytes),
+                error_type=SchemaError,
+            )
+            missing_required = _required_runner_artifact_names(
+                submission
+            ).difference(runner_artifacts)
+            if missing_required:
+                raise ArtifactIntegrityError(
+                    "terminal Submission lacks required Runner artifacts: %s"
+                    % sorted(missing_required)
                 )
+            terminal_status = self._submission_status(submission)
             base = "cases/%s/trials/%s" % (plan.case_path_id, trial_id)
             planned_control: List[Tuple[str, Any, bytes, ArtifactRef]] = []
             planned_mandatory: List[Tuple[str, Any, bytes, ArtifactRef]] = []
@@ -3839,6 +5817,72 @@ class ArtifactStore:
                     planned_mandatory.append(planned)
                 else:
                     planned_optional.append(planned)
+
+            submission_path = "%s/submission.json" % base
+            submission_data = canonical_json_bytes(submission)
+            if len(submission_data) > min(
+                self.max_file_bytes,
+                MAX_EVAL_SUBMISSION_BYTES,
+            ):
+                raise ArtifactIntegrityError(
+                    "Submission exceeds its control-plane byte limit"
+                )
+            submission_ref = self._planned_artifact_ref(
+                run_id,
+                submission_path,
+                submission_data,
+            )
+            trace_plan: Optional[Tuple[str, Any, bytes, ArtifactRef]] = None
+            artifacts: List[ArtifactRef] = [submission_ref]
+            artifacts.extend(item[3] for item in planned_control)
+            artifacts.extend(item[3] for item in planned_mandatory)
+            artifacts.extend(item[3] for item in planned_optional)
+            if submission.trace_ref is not None:
+                trace_path = "%s/trace_ref.json" % base
+                trace_data = canonical_json_bytes(submission.trace_ref)
+                if len(trace_data) > self.max_file_bytes:
+                    raise ArtifactIntegrityError(
+                        "trace_ref exceeds its control-plane byte limit"
+                    )
+                trace_ref = self._planned_artifact_ref(
+                    run_id,
+                    trace_path,
+                    trace_data,
+                )
+                trace_plan = (
+                    trace_path,
+                    submission.trace_ref,
+                    trace_data,
+                    trace_ref,
+                )
+                artifacts.append(trace_ref)
+            receipt = StageReceipt.create(
+                run_id=run_id,
+                task_id=task_id,
+                trial_id=trial_id,
+                stage=StageName.AGENT,
+                config_digest=plan.agent_config_digest,
+                artifacts=artifacts,
+                attempt=attempt,
+                terminal_status=terminal_status,
+                failure_code=(
+                    None if submission.failure is None else submission.failure.code
+                ),
+            )
+            receipt_data = canonical_json_bytes(receipt)
+            if len(receipt_data) > min(
+                self.max_file_bytes,
+                MAX_STAGE_RECEIPT_BYTES,
+            ):
+                raise ArtifactIntegrityError(
+                    "terminal receipt exceeds its control-plane byte limit"
+                )
+            receipt_path = self._receipt_path(plan, StageName.AGENT)
+            receipt_ref = self._planned_artifact_ref(
+                run_id,
+                receipt_path,
+                receipt_data,
+            )
 
             # Optional Runner metadata is execution-plane data.  Reserve its
             # missing bytes under the run-wide lock so parallel Trials cannot
@@ -3896,21 +5940,33 @@ class ArtifactStore:
                     else:
                         missing_optional.append(item)
                         optional_bytes += len(data)
-                current_bytes = self._execution_artifact_total_bytes(run_id)
-                if (
-                    current_bytes + mandatory_bytes
-                    > bundle.config.resource_budgets.max_execution_artifact_total_bytes
+                if self._exists_regular(
+                    self._target(run_id, submission_path)
                 ):
-                    raise RequiredExecutionArtifactBudgetError(
-                        "required trace exceeds the cumulative execution budget"
+                    raise ArtifactConflictError(
+                        "submission.json already exists; use recover_trial"
                     )
-                if (
-                    current_bytes + mandatory_bytes + optional_bytes
-                    > bundle.config.resource_budgets.max_execution_artifact_total_bytes
+                existing_trace_path = "%s/trace_ref.json" % base
+                if self._exists_regular(
+                    self._target(run_id, existing_trace_path)
                 ):
-                    raise ExecutionArtifactBudgetError(
-                        "Runner artifacts exceed the configured cumulative byte limit"
+                    raise ArtifactConflictError(
+                        "trace_ref.json already exists; use recover_trial"
                     )
+                if self._exists_regular(
+                    self._target(run_id, receipt_path)
+                ):
+                    raise ArtifactConflictError(
+                        "terminal receipt already exists"
+                    )
+                self._validate_execution_artifact_total_precommit(
+                    run_id,
+                    maximum_total_bytes=(
+                        bundle.config.resource_budgets.max_execution_artifact_total_bytes
+                    ),
+                    mandatory_additional_bytes=mandatory_bytes,
+                    optional_additional_bytes=optional_bytes,
+                )
                 for relative_path, value, _data, expected_ref in missing_control:
                     written = self._write_json(
                         run_id,
@@ -3945,44 +6001,39 @@ class ArtifactStore:
                             "Runner artifact publication changed its planned identity"
                         )
 
-                submission_ref = self._write_json(
+                written_submission = self._write_json(
                     run_id,
-                    "%s/submission.json" % base,
+                    submission_path,
                     submission,
                     maximum=MAX_EVAL_SUBMISSION_BYTES,
                 )
-                artifacts: List[ArtifactRef] = [submission_ref]
-                artifacts.extend(item[3] for item in planned_control)
-                artifacts.extend(item[3] for item in planned_mandatory)
-                artifacts.extend(item[3] for item in planned_optional)
-                if submission.trace_ref is not None:
-                    artifacts.append(
-                        self._write_json(
-                            run_id,
-                            "%s/trace_ref.json" % base,
-                            submission.trace_ref,
-                        )
+                if written_submission != submission_ref:
+                    raise ArtifactIntegrityError(
+                        "Submission publication changed its planned identity"
                     )
-                receipt = StageReceipt.create(
-                    run_id=run_id,
-                    task_id=task_id,
-                    trial_id=trial_id,
-                    stage=StageName.AGENT,
-                    config_digest=plan.agent_config_digest,
-                    artifacts=artifacts,
-                    attempt=attempt,
-                    terminal_status=terminal_status,
-                    failure_code=(
-                        None if submission.failure is None else submission.failure.code
-                    ),
-                )
+                if trace_plan is not None:
+                    trace_path, trace_value, _trace_data, trace_ref = trace_plan
+                    written_trace = self._write_json(
+                        run_id,
+                        trace_path,
+                        trace_value,
+                        maximum=self.max_file_bytes,
+                    )
+                    if written_trace != trace_ref:
+                        raise ArtifactIntegrityError(
+                            "trace_ref publication changed its planned identity"
+                        )
                 # Unique terminal receipt is always the final create-only write.
-                self._write_json(
+                written_receipt = self._write_json(
                     run_id,
-                    self._receipt_path(plan, StageName.AGENT),
+                    receipt_path,
                     receipt,
                     maximum=MAX_STAGE_RECEIPT_BYTES,
                 )
+                if written_receipt != receipt_ref:
+                    raise ArtifactIntegrityError(
+                        "terminal receipt publication changed its planned identity"
+                    )
         return self.load_trial_state(run_id, task_id, trial_id)
 
     def abandon_trial(
@@ -4003,17 +6054,44 @@ class ArtifactStore:
         if failure_status is not SubmissionStatus.FAILED:
             raise SchemaError("abandonment requires a stable failed failure code")
         validate_safe_text(message, "abandonment failure message")
-        config = self.load_run_config(run_id)
-        state = self.load_trial_state(run_id, task_id, trial_id)
+        bundle = self._load_verified_run_bundle(
+            run_id,
+            budget=_ReadBudget(self.max_total_read_bytes),
+        )
+        plan = self._load_trial_manifest(
+            bundle,
+            task_id,
+            trial_id,
+            budget=_ReadBudget(self.max_total_read_bytes),
+        )
+        state, _existing_submission = self._load_trial_state(
+            bundle,
+            plan,
+            budget=_ReadBudget(self.max_total_read_bytes),
+        )
         if state.active_attempt is None:
             raise ArtifactStateError(
                 "abandonment requires a started Trial attempt"
             )
+        target_binding, has_prepare = self._terminal_target_binding(
+            bundle,
+            plan,
+            attempt=state.active_attempt,
+            prepare=None,
+            budget=_ReadBudget(self.max_total_read_bytes),
+        )
+        effective_failure_code = (
+            failure_code
+            if has_prepare
+            else FailureCode.HARNESS_MATERIALIZATION_ERROR
+        )
         submission = EvalSubmission(
             schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
             task_id=task_id,
-            agent_id=config.agent.agent_id,
+            agent_id=bundle.config.agent.agent_id,
             trial_id=trial_id,
+            eval_input_digest=plan.eval_input_digest,
+            target_materialization_id=target_binding,
             status=SubmissionStatus.FAILED,
             intent=None,
             review=None,
@@ -4029,7 +6107,7 @@ class ArtifactStore:
             ),
             trace_ref=None,
             failure=SubmissionFailure(
-                code=failure_code,
+                code=effective_failure_code,
                 message=message,
                 retryable=False,
             ),
@@ -4044,7 +6122,7 @@ class ArtifactStore:
             "clarification_match_receipts.json": {
                 "schema_version": "eval_clarification_match_receipts_v1",
                 "trial_id": trial_id,
-                "matcher_digest": config.clarification_matcher.digest(),
+                "matcher_digest": bundle.config.clarification_matcher.digest(),
                 "receipts": [],
             },
             "terminal_summary.json": {
@@ -4054,7 +6132,7 @@ class ArtifactStore:
                 "trial_id": trial_id,
                 "attempt": state.active_attempt,
                 "status": submission.status.value,
-                "failure_code": failure_code.value,
+                "failure_code": effective_failure_code.value,
                 "elapsed_seconds": None,
                 "stdout": {
                     "bytes": 0,
@@ -4260,6 +6338,8 @@ class ArtifactStore:
             evaluator_execution = EvaluatorExecutionConfig.from_dict(
                 config_payload
             )
+        except UnsupportedProtocolVersionError:
+            raise
         except (SchemaError, TypeError, ValueError) as exc:
             raise ArtifactIntegrityError(
                 "evaluation execution config failed strict hydration"
@@ -4287,14 +6367,20 @@ class ArtifactStore:
 
         payloads: Dict[str, str] = {}
         for filename in _EVALUATION_JSON_ARTIFACT_NAMES[1:]:
+            evaluator_context_policy = (
+                _EVALUATOR_CONTEXT_POLICY_BY_ARTIFACT.get(filename)
+            )
             payload = self._read_json(
                 self._target(plan.run_id, expected_prefix + filename),
                 expected=refs[filename],
                 budget=budget,
                 maximum=evaluation_limit,
+                evaluator_context_policy=evaluator_context_policy,
             )
             payloads[filename] = _canonical_payload_text(
-                payload, "evaluation artifact"
+                payload,
+                "evaluation artifact",
+                evaluator_context_policy=evaluator_context_policy,
             )
         report = None
         if "report.md" in refs:
@@ -4463,100 +6549,193 @@ class ArtifactStore:
                     missing_stages=(),
                     terminal=True,
                 )
-            if state.status is TrialStatus.RUNNING and state.active_attempt is not None:
-                incomplete = StageReceipt.create(
-                    run_id=run_id,
-                    task_id=task_id,
-                    trial_id=trial_id,
-                    stage=StageName.INCOMPLETE,
-                    config_digest=plan.agent_config_digest,
-                    attempt=state.active_attempt,
-                )
-                self._write_json(
-                    run_id,
-                    self._receipt_path(
-                        plan, StageName.INCOMPLETE, state.active_attempt
-                    ),
-                    incomplete,
-                    maximum=MAX_STAGE_RECEIPT_BYTES,
-                )
-                state, _submission = self._load_trial_state(
-                    bundle,
-                    plan,
-                    budget=_ReadBudget(self.max_total_read_bytes),
-                )
-
             base = "cases/%s/trials/%s" % (plan.case_path_id, trial_id)
-            prepare_path = self._receipt_path(plan, StageName.PREPARE)
             input_path = "%s/input.json" % base
+            terminal_path = self._receipt_path(plan, StageName.AGENT)
+            submission_path = "%s/submission.json" % base
             prepare_committed = StageName.PREPARE in state.completed_stages
-            if (
-                not prepare_committed
-                and self._exists_regular(self._target(run_id, input_path))
-            ):
+            prepare_receipt: Optional[StageReceipt] = None
+            if state.active_attempt is not None:
+                prepare_path = self._receipt_path(
+                    plan, StageName.PREPARE, state.active_attempt
+                )
+                materialization_path = self._materialization_manifest_path(
+                    plan, state.active_attempt
+                )
+            else:
+                prepare_path = ""
+                materialization_path = ""
+            if prepare_committed:
                 if state.active_attempt is None:
                     raise ArtifactIntegrityError(
-                        "orphan EvalInput has no started Trial attempt"
+                        "committed prepare receipt has no active attempt"
                     )
+                prepare_receipt = self._load_receipt(
+                    run_id,
+                    prepare_path,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                )
+            input_exists = self._exists_regular(
+                self._target(run_id, input_path)
+            )
+            materialization_exists = bool(materialization_path) and (
+                self._exists_regular(
+                    self._target(run_id, materialization_path)
+                )
+            )
+            terminal_exists = self._exists_regular(
+                self._target(run_id, terminal_path)
+            )
+            submission_exists = self._exists_regular(
+                self._target(run_id, submission_path)
+            )
+            input_ref: Optional[ArtifactRef] = None
+            eval_input: Optional[EvalInput] = None
+            if input_exists:
                 payload, input_ref = self._adopt_json(
                     run_id,
                     input_path,
                     budget=_ReadBudget(self.max_total_read_bytes),
                     maximum=MAX_EVAL_INPUT_BYTES,
                 )
-                eval_input = EvalInput.from_dict(payload)
+                try:
+                    eval_input = EvalInput.from_dict(payload)
+                except UnsupportedProtocolVersionError:
+                    raise
+                except (SchemaError, TypeError, ValueError) as exc:
+                    raise ArtifactIntegrityError(
+                        "orphan EvalInput failed strict hydration"
+                    ) from exc
                 if eval_input.task_id != task_id:
                     raise ArtifactIntegrityError("orphan EvalInput has wrong task_id")
                 if eval_input.digest() != plan.eval_input_digest:
                     raise ArtifactIntegrityError(
                         "orphan EvalInput digest does not match Trial plan"
                     )
-                prepare = StageReceipt.create(
+                if state.active_attempt is None:
+                    raise ArtifactIntegrityError(
+                        "orphan EvalInput has no started Trial attempt"
+                    )
+
+            materialization_ref: Optional[ArtifactRef] = None
+            materialization: Optional[TrialMaterializationManifest] = None
+            if materialization_exists:
+                materialization_payload, materialization_ref = self._adopt_json(
+                    run_id,
+                    materialization_path,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                    maximum=MAX_TRIAL_MATERIALIZATION_BYTES,
+                )
+                try:
+                    materialization = TrialMaterializationManifest.from_dict(
+                        materialization_payload
+                    )
+                except UnsupportedProtocolVersionError:
+                    raise
+                except (SchemaError, TypeError, ValueError) as exc:
+                    raise ArtifactIntegrityError(
+                        "orphan materialization failed strict hydration"
+                    ) from exc
+                if state.active_attempt is None:
+                    raise ArtifactIntegrityError(
+                        "orphan materialization has no started Trial attempt"
+                    )
+                if (
+                    materialization.run_id != plan.run_id
+                    or materialization.task_id != plan.task_id
+                    or materialization.trial_id != plan.trial_id
+                    or materialization.attempt != state.active_attempt
+                    or materialization.eval_input_digest != plan.eval_input_digest
+                    or materialization.wire_contract != plan.wire_contract
+                    or materialization.suite_preparation_binding_digest
+                    != plan.suite_preparation_binding_digest
+                    or materialization.adapter_capabilities_digest
+                    != plan.adapter_capabilities_digest
+                ):
+                    raise ArtifactIntegrityError(
+                        "orphan materialization differs from immutable Trial plan"
+                    )
+                if eval_input is not None and (
+                    materialization.review_target_digest
+                    != eval_input.review_target.digest()
+                ):
+                    raise ArtifactIntegrityError(
+                        "orphan materialization differs from EvalInput target"
+                    )
+
+            orphan_prepare: Optional[StageReceipt] = None
+            if (
+                not prepare_committed
+                and input_ref is not None
+                and eval_input is not None
+                and materialization_ref is not None
+                and materialization is not None
+            ):
+                if state.active_attempt is None:
+                    raise ArtifactIntegrityError(
+                        "orphan materialization has no started Trial attempt"
+                    )
+                orphan_prepare = StageReceipt.create(
                     run_id=run_id,
                     task_id=task_id,
                     trial_id=trial_id,
                     stage=StageName.PREPARE,
                     config_digest=plan.agent_config_digest,
-                    artifacts=(input_ref,),
+                    artifacts=(input_ref, materialization_ref),
+                    attempt=state.active_attempt,
+                    materialization_manifest=materialization_ref,
+                    materialization_manifest_digest=(
+                        materialization_ref.sha256
+                    ),
+                    materialization_id=materialization.materialization_id,
+                    eval_input_digest=materialization.eval_input_digest,
+                    review_target_digest=(
+                        materialization.review_target_digest
+                    ),
+                    prepared_source_id=materialization.prepared_source_id,
+                    agent_visible_files=materialization.files,
+                    adapter_capabilities_digest=(
+                        materialization.adapter_capabilities_digest
+                    ),
+                    target_access=materialization.target_access,
                 )
-                self._write_json(
-                    run_id,
-                    prepare_path,
-                    prepare,
-                    maximum=MAX_STAGE_RECEIPT_BYTES,
+                self._load_prepare_materialization(
+                    bundle,
+                    plan,
+                    orphan_prepare,
+                    budget=_ReadBudget(self.max_total_read_bytes),
                 )
+                prepare_receipt = orphan_prepare
                 prepare_committed = True
 
-            terminal_path = self._receipt_path(plan, StageName.AGENT)
-            submission_path = "%s/submission.json" % base
-            if (
-                not self._exists_regular(self._target(run_id, terminal_path))
-                and self._exists_regular(self._target(run_id, submission_path))
-            ):
-                if state.active_attempt is None:
-                    raise ArtifactIntegrityError(
-                        "orphan Submission has no started Trial attempt"
-                    )
+            terminal: Optional[StageReceipt] = None
+            if not terminal_exists and submission_exists:
                 payload, submission_ref = self._adopt_json(
                     run_id,
                     submission_path,
                     budget=_ReadBudget(self.max_total_read_bytes),
                     maximum=MAX_EVAL_SUBMISSION_BYTES,
                 )
-                submission = EvalSubmission.from_dict(payload)
-                if (
-                    submission.task_id != task_id
-                    or submission.trial_id != trial_id
-                    or submission.agent_id != bundle.config.agent.agent_id
-                ):
-                    raise ArtifactIntegrityError("orphan Submission has wrong identity")
-                if (
-                    self._submission_status(submission) is TrialStatus.COMPLETED
-                    and not prepare_committed
-                ):
+                try:
+                    submission = EvalSubmission.from_dict(payload)
+                except UnsupportedProtocolVersionError:
+                    raise
+                except (SchemaError, TypeError, ValueError) as exc:
                     raise ArtifactIntegrityError(
-                        "orphan completed Submission lacks committed prepare stage"
+                        "orphan Submission failed strict hydration"
+                    ) from exc
+                if state.active_attempt is None:
+                    raise ArtifactIntegrityError(
+                        "orphan Submission has no started Trial attempt"
                     )
+                self._validate_terminal_submission_binding(
+                    bundle,
+                    plan,
+                    submission,
+                    attempt=state.active_attempt,
+                    prepare=prepare_receipt,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                )
                 runner_refs = self._recoverable_runner_artifacts(
                     run_id,
                     plan,
@@ -4592,14 +6771,78 @@ class ArtifactStore:
                         None if submission.failure is None else submission.failure.code
                     ),
                 )
-                # Recovery never rewrites Submission; it only writes the missing
-                # unique terminal commit marker, and does so last.
-                self._write_json(
-                    run_id,
-                    terminal_path,
+
+                self._validate_receipt_binding(
                     terminal,
-                    maximum=MAX_STAGE_RECEIPT_BYTES,
+                    plan,
+                    config_digest=plan.agent_config_digest,
                 )
+                self._load_terminal_submission(
+                    bundle,
+                    plan,
+                    terminal,
+                    prepare_receipt,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                )
+
+            # All candidate roots and projections are fully validated before
+            # recovery publishes any missing receipt.  The run-wide execution
+            # total is checked while holding the same lock as normal writers,
+            # so orphan execution files cannot be blessed over budget.
+            budget_lock = (
+                self._run_dir(run_id) / ".locks" / "execution-budget.lock"
+            )
+            with self._lock(budget_lock):
+                self._validate_execution_artifact_total_precommit(
+                    run_id,
+                    maximum_total_bytes=(
+                        bundle.config.resource_budgets.max_execution_artifact_total_bytes
+                    ),
+                )
+                if (
+                    state.status is TrialStatus.RUNNING
+                    and state.active_attempt is not None
+                ):
+                    incomplete = StageReceipt.create(
+                        run_id=run_id,
+                        task_id=task_id,
+                        trial_id=trial_id,
+                        stage=StageName.INCOMPLETE,
+                        config_digest=plan.agent_config_digest,
+                        attempt=state.active_attempt,
+                    )
+                    self._write_json(
+                        run_id,
+                        self._receipt_path(
+                            plan, StageName.INCOMPLETE, state.active_attempt
+                        ),
+                        incomplete,
+                        maximum=MAX_STAGE_RECEIPT_BYTES,
+                    )
+                    state, _submission = self._load_trial_state(
+                        bundle,
+                        plan,
+                        budget=_ReadBudget(self.max_total_read_bytes),
+                    )
+
+                if orphan_prepare is not None:
+                    self._write_json(
+                        run_id,
+                        prepare_path,
+                        orphan_prepare,
+                        maximum=MAX_STAGE_RECEIPT_BYTES,
+                    )
+                    prepare_committed = True
+
+                if terminal is not None:
+                    # Recovery never rewrites Submission; it only writes the missing
+                    # unique terminal commit marker, and does so last.
+                    self._write_json(
+                        run_id,
+                        terminal_path,
+                        terminal,
+                        maximum=MAX_STAGE_RECEIPT_BYTES,
+                    )
         state = self.load_trial_state(run_id, task_id, trial_id)
         missing = () if state.status in _TERMINAL_STATUSES else tuple(
             stage
@@ -4683,7 +6926,14 @@ class ArtifactStore:
         artifacts: List[ArtifactRef] = []
         for filename, value in values:
             relative_path = "%s/%s" % (base, filename)
-            validate_safe_json(value, "evaluation artifact")
+            validate_safe_json(
+                value,
+                "evaluation artifact",
+                evaluator_context_policy=_evaluator_context_policy_for_payload(
+                    value,
+                    _EVALUATOR_CONTEXT_POLICY_BY_ARTIFACT.get(filename),
+                ),
+            )
             data = canonical_json_bytes(value)
             if len(data) > min(self.max_file_bytes, evaluation_limit):
                 raise ArtifactIntegrityError(
@@ -4732,16 +6982,16 @@ class ArtifactStore:
         with self._lock(budget_lock):
             with self._lock(evaluation_lock):
                 if self._exists_regular(self._target(run_id, receipt_path)):
-                    if not resume:
-                        raise ArtifactConflictError(
-                            "evaluation version is already committed"
-                        )
                     existing = self._load_evaluation_bundle(
                         bundle,
                         plan,
                         evaluation_id,
                         budget=_ReadBudget(self.max_total_read_bytes),
                     )
+                    if not resume:
+                        raise ArtifactConflictError(
+                            "evaluation version is already committed"
+                        )
                     expected_values = (
                         intent_matches,
                         review_matches,
@@ -4832,6 +7082,11 @@ class ArtifactStore:
                         relative_path,
                         value,
                         maximum=evaluation_limit,
+                        evaluator_context_policy=(
+                            _EVALUATOR_CONTEXT_POLICY_BY_ARTIFACT.get(
+                                relative_path.rsplit("/", 1)[-1]
+                            )
+                        ),
                     )
                     if written != expected_ref:
                         raise ArtifactIntegrityError(
@@ -5272,6 +7527,7 @@ class ArtifactStore:
                     )
         return self.load_run_evaluation(run_id, evaluation_id)
 
+
 def load_existing_submission(
     runs_root: os.PathLike[str] | str,
     run_id: str,
@@ -5297,10 +7553,13 @@ __all__ = [
     "EVAL_STAGE_RECEIPT_SCHEMA_VERSION",
     "EVAL_RUN_PREFLIGHT_SCHEMA_VERSION",
     "EVAL_PREFLIGHT_CANDIDATE_SCHEMA_VERSION",
+    "EVAL_TRIAL_MATERIALIZATION_SCHEMA_VERSION",
+    "PRE_MATERIALIZATION_FAILURE_BINDING_VERSION",
     "EVAL_RUN_EVALUATION_NAMESPACE_SCHEMA_VERSION",
     "MAX_RUN_MANIFEST_BYTES",
     "MAX_TRIAL_MANIFEST_BYTES",
     "MAX_STAGE_RECEIPT_BYTES",
+    "MAX_TRIAL_MATERIALIZATION_BYTES",
     "MAX_RUN_PREFLIGHT_BYTES",
     "MAX_PREFLIGHT_CANDIDATE_BYTES",
     "MAX_RUNNER_ARTIFACTS",
@@ -5318,11 +7577,15 @@ __all__ = [
     "RunStatus",
     "StageName",
     "ArtifactRef",
+    "TargetAccess",
+    "AgentVisibleFileBinding",
+    "TrialMaterializationManifest",
     "TrialManifest",
     "RunTrialPlan",
     "RunManifest",
     "StageReceipt",
     "TrialState",
+    "VerifiedTrialMaterialization",
     "RunState",
     "ResumePlan",
     "EvaluationNamespace",
@@ -5330,6 +7593,7 @@ __all__ = [
     "RunEvaluationNamespace",
     "RunEvaluationBundle",
     "derive_receipt_id",
+    "derive_pre_materialization_failure_binding",
     "ArtifactStore",
     "load_existing_submission",
 ]

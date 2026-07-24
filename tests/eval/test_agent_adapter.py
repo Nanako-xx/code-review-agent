@@ -13,8 +13,24 @@ from typing import Any, Dict, Iterable, Mapping, Sequence
 
 import pytest
 
-from review_agent_eval.adapters.base import AgentRunConfig, AgentUnderTestAdapter
-from review_agent_eval.adapters.subprocess_agent import SubprocessAgentAdapter
+from review_agent_eval.adapters.agent_factory import (
+    AgentAdapterConfigError,
+    build_agent_adapter_factory,
+)
+from review_agent_eval.adapters.base import (
+    AgentAdapterError,
+    AgentRunConfig,
+    AgentUnderTestAdapter,
+)
+from review_agent_eval.adapters.subprocess_agent import (
+    SubprocessAgentAdapter,
+    subprocess_adapter_capabilities,
+)
+from review_agent_eval.artifacts import TargetAccess
+from review_agent_eval.cases import (
+    REPOSITORY_MATERIALIZER_PROTOCOL,
+    WireContractV2,
+)
 from review_agent_eval.clarification import (
     ClarificationSession,
     canonical_material_claim_matcher_snapshot,
@@ -25,6 +41,9 @@ from review_agent_eval.config import (
     derive_trial_id,
 )
 from review_agent_eval.models import (
+    EVAL_CASE_SCHEMA_VERSION,
+    EVAL_INPUT_SCHEMA_VERSION,
+    EVAL_SUBMISSION_SCHEMA_VERSION,
     EvalInput,
     EvalSubmission,
     FailureCode,
@@ -32,9 +51,6 @@ from review_agent_eval.models import (
     ClarificationAnswer,
     ClarificationScript,
     IntentDimension,
-    Repository,
-    RepositorySource,
-    ReviewRequest,
     SchemaError,
     SubmissionStatus,
     stable_id,
@@ -56,10 +72,12 @@ import time
 
 def completed(agent_id, task_id, trial_id):
     return {
-        "schema_version": "eval_submission_v1",
+        "schema_version": "eval_submission_v2",
         "task_id": task_id,
         "agent_id": agent_id,
         "trial_id": trial_id,
+        "eval_input_digest": eval_input_digest,
+        "target_materialization_id": target_materialization_id,
         "status": "completed",
         "intent": {
             "status": "sufficient",
@@ -111,6 +129,10 @@ if mode == "block-stdin":
     raise SystemExit(0)
 
 raw_input = sys.stdin.buffer.read()
+invocation = json.loads(raw_input.decode("utf-8"))
+trial_binding = invocation["trial_binding"]
+eval_input_digest = trial_binding["eval_input_digest"]
+target_materialization_id = invocation["materialization_id"]
 
 if mode == "capture":
     capture_path = Path(extra[0])
@@ -177,6 +199,10 @@ elif mode == "wrong-agent":
     emit(completed("agent-substituted", task_id, trial_id))
 elif mode == "wrong-trial":
     emit(completed(agent_id, task_id, "trial-" + "f" * 64))
+elif mode == "wrong-materialization":
+    value = completed(agent_id, task_id, trial_id)
+    value["target_materialization_id"] = "materialization-" + "f" * 64
+    emit(value)
 elif mode == "forged-clarification":
     value = completed(agent_id, task_id, trial_id)
     value["intent"]["clarification_questions"] = [
@@ -255,6 +281,7 @@ def test_failure_code_to_submission_status_mapping_is_exhaustive() -> None:
         FailureCode.NON_ZERO_EXIT: SubmissionStatus.FAILED,
         FailureCode.PROCESS_KILLED: SubmissionStatus.FAILED,
         FailureCode.ADAPTER_ERROR: SubmissionStatus.FAILED,
+        FailureCode.HARNESS_MATERIALIZATION_ERROR: SubmissionStatus.FAILED,
         FailureCode.UNKNOWN: SubmissionStatus.FAILED,
         FailureCode.CLARIFICATION_REQUIRED: SubmissionStatus.BLOCKED,
         FailureCode.AGENT_BLOCKED: SubmissionStatus.BLOCKED,
@@ -290,25 +317,30 @@ def workspace(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def eval_input() -> EvalInput:
-    return EvalInput(
-        schema_version=EvalInput.SCHEMA_VERSION,
-        task_id="task-adapter",
-        repository=Repository(
-            source=RepositorySource.FIXTURE,
-            path="fixtures/adapter-repository",
-            url=None,
-            base_revision="a" * 40,
-            head_revision="b" * 40,
-        ),
-        review_request=ReviewRequest(
-            title="Review adapter behavior",
-            description="Only public input belongs on stdin.",
-            user_intent="Return a canonical review.",
-            review_focus=None,
-            linked_requirements=("REQ-ADAPTER",),
-            project_rules=("Do not expose private truth.",),
-            existing_ci_evidence=(),
-        ),
+    return EvalInput.from_dict(
+        {
+            "schema_version": EVAL_INPUT_SCHEMA_VERSION,
+            "task_id": "task-adapter",
+            "review_target": {
+                "kind": "repository",
+                "repository": {
+                    "source": "fixture",
+                    "path": "fixtures/adapter-repository",
+                    "url": None,
+                    "base_revision": "a" * 40,
+                    "head_revision": "b" * 40,
+                },
+                "review_request": {
+                    "title": "Review adapter behavior",
+                    "description": "Only public input belongs on stdin.",
+                    "user_intent": "Return a canonical review.",
+                    "review_focus": None,
+                    "linked_requirements": ["REQ-ADAPTER"],
+                    "project_rules": ["Do not expose private truth."],
+                    "existing_ci_evidence": [],
+                },
+            },
+        }
     )
 
 
@@ -338,9 +370,10 @@ def _snapshot(
     adapter: object
     if adapter_override is ...:
         adapter = {
-            "kind": "subprocess-json-v1",
+            "kind": "subprocess-json-v2",
             "command": list(command),
             "environment_allowlist": list(environment_allowlist),
+            "capabilities": subprocess_adapter_capabilities().to_dict(),
         }
     else:
         adapter = adapter_override
@@ -354,6 +387,38 @@ def _snapshot(
         parameters={"temperature": 0, "adapter": adapter},
         prompt_config_digest="d" * 64,
     )
+
+
+def _capabilities_dict() -> dict[str, object]:
+    return subprocess_adapter_capabilities().to_dict()
+
+
+@pytest.mark.parametrize(
+    ("field", "unsupported"),
+    [
+        ("clarification_protocol", "canonical-clarification-v2"),
+        ("trace_protocol", "none-v2"),
+        ("isolation_profile", "repository-worktree-v2"),
+    ],
+)
+def test_subprocess_factory_rejects_unimplemented_capability_protocols(
+    field: str,
+    unsupported: str,
+) -> None:
+    capabilities = _capabilities_dict()
+    capabilities[field] = unsupported
+    snapshot = _snapshot(
+        (str(Path(sys.executable).resolve()),),
+        adapter_override={
+            "kind": "subprocess-json-v2",
+            "command": [str(Path(sys.executable).resolve())],
+            "environment_allowlist": [],
+            "capabilities": capabilities,
+        },
+    )
+
+    with pytest.raises(AgentAdapterConfigError, match="capabilities"):
+        build_agent_adapter_factory(snapshot)
 
 
 def _config(
@@ -376,10 +441,21 @@ def _config(
     trial_id = derive_trial_id(run_id, eval_input.task_id, 1)
     total = max(max_output_bytes, 16 * 1024)
     matcher = canonical_material_claim_matcher_snapshot()
+    capabilities = subprocess_adapter_capabilities()
+    wire = WireContractV2(
+        case_schema_version=EVAL_CASE_SCHEMA_VERSION,
+        input_schema_version=EVAL_INPUT_SCHEMA_VERSION,
+        submission_schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
+        review_target_kind=eval_input.review_target.kind,
+        materializer_protocol=REPOSITORY_MATERIALIZER_PROTOCOL,
+    )
     return AgentRunConfig._from_verified_binding(
         run_id=run_id,
         task_id=eval_input.task_id,
         eval_input_digest=eval_input.digest(),
+        wire_contract=wire,
+        adapter_capabilities=capabilities,
+        adapter_capabilities_digest=capabilities.digest(),
         clarification_matcher=matcher,
         clarification_matcher_config_digest=matcher.digest(),
         trial_index=1,
@@ -397,17 +473,40 @@ def _config(
     )
 
 
+def _target_binding(
+    workspace: Path,
+    eval_input: EvalInput,
+) -> tuple[TargetAccess, str]:
+    target = workspace / "target" / "input.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(eval_input.to_json().encode("utf-8"))
+    materialization_id = stable_id(
+        "materialization",
+        "subprocess-adapter-test",
+    )
+    return (
+        TargetAccess(
+            target_materialization_id=materialization_id,
+            readable_relative_paths=("target/input.json",),
+        ),
+        materialization_id,
+    )
+
+
 def _run(
     adapter: SubprocessAgentAdapter,
     eval_input: EvalInput,
     workspace: Path,
     config: AgentRunConfig,
 ) -> EvalSubmission:
+    target_access, materialization_id = _target_binding(workspace, eval_input)
     return adapter.run(
         eval_input,
         workspace,
         config,
         _ForbiddenClarificationChannel(),  # type: ignore[arg-type]
+        target_access=target_access,
+        target_materialization_id=materialization_id,
     )
 
 
@@ -481,18 +580,29 @@ def test_argv_is_not_a_shell_cwd_is_workspace_and_stdin_is_only_canonical_input(
     assert second.status is SubmissionStatus.COMPLETED
     first_capture = json.loads(capture_one.read_text(encoding="utf-8"))
     second_capture = json.loads(capture_two.read_text(encoding="utf-8"))
-    assert first_capture["stdin"] == eval_input.to_json()
-    assert second_capture["stdin"] == eval_input.to_json()
-    assert json.loads(first_capture["stdin"]) == eval_input.to_dict()
-    assert set(json.loads(first_capture["stdin"])) == {
+    first_invocation = json.loads(first_capture["stdin"])
+    second_invocation = json.loads(second_capture["stdin"])
+    assert second_invocation["eval_input"] == eval_input.to_dict()
+    assert set(first_invocation) == {
         "schema_version",
-        "task_id",
-        "repository",
-        "review_request",
+        "eval_input",
+        "trial_binding",
+        "target_access",
+        "materialization_id",
     }
-    assert "agent_id" not in json.loads(first_capture["stdin"])
-    assert "trial_id" not in json.loads(first_capture["stdin"])
-    assert "subprocess-json-v1" not in first_capture["stdin"]
+    assert first_invocation["schema_version"] == "eval_subprocess_invocation_v2"
+    assert first_invocation["eval_input"] == eval_input.to_dict()
+    assert first_invocation["trial_binding"]["trial_id"] == config_one.trial_id
+    assert first_invocation["trial_binding"]["eval_input_digest"] == (
+        eval_input.digest()
+    )
+    assert first_invocation["target_access"]["readable_relative_paths"] == [
+        "target/input.json"
+    ]
+    assert first_invocation["materialization_id"] == (
+        first_invocation["target_access"]["target_materialization_id"]
+    )
+    assert str(workspace.resolve()) not in first_capture["stdin"]
     assert "private-case-truth-sentinel" not in first_capture["stdin"]
     assert first_capture["argv"] == [
         str(workspace.resolve()),
@@ -557,60 +667,71 @@ def test_environment_inherits_only_fixed_runtime_keys_and_explicit_allowlist(
             "environment_allowlist": [],
         },
         {
-            "kind": "subprocess-json-v1",
+            "kind": "subprocess-json-v2",
             "command": [str(Path(sys.executable).resolve())],
             "environment_allowlist": [],
+            "capabilities": _capabilities_dict(),
             "unknown": True,
         },
         {
-            "kind": "subprocess-json-v1",
+            "kind": "subprocess-json-v2",
             "command": "not-an-array",
             "environment_allowlist": [],
+            "capabilities": _capabilities_dict(),
         },
         {
-            "kind": "subprocess-json-v1",
+            "kind": "subprocess-json-v2",
             "command": [],
             "environment_allowlist": [],
+            "capabilities": _capabilities_dict(),
         },
         {
-            "kind": "subprocess-json-v1",
+            "kind": "subprocess-json-v2",
             "command": [str(Path(sys.executable).resolve()), 7],
             "environment_allowlist": [],
+            "capabilities": _capabilities_dict(),
         },
         {
-            "kind": "subprocess-json-v1",
+            "kind": "subprocess-json-v2",
             "command": ["relative-python"],
             "environment_allowlist": [],
+            "capabilities": _capabilities_dict(),
         },
         {
-            "kind": "subprocess-json-v1",
+            "kind": "subprocess-json-v2",
             "command": ["{workspace}"],
             "environment_allowlist": [],
+            "capabilities": _capabilities_dict(),
         },
         {
-            "kind": "subprocess-json-v1",
+            "kind": "subprocess-json-v2",
             "command": [str(Path(sys.executable).resolve()), "{unknown}"],
             "environment_allowlist": [],
+            "capabilities": _capabilities_dict(),
         },
         {
-            "kind": "subprocess-json-v1",
+            "kind": "subprocess-json-v2",
             "command": [str(Path(sys.executable).resolve()), "bad-{trial_id"],
             "environment_allowlist": [],
+            "capabilities": _capabilities_dict(),
         },
         {
-            "kind": "subprocess-json-v1",
+            "kind": "subprocess-json-v2",
             "command": [str(Path(sys.executable).resolve())],
             "environment_allowlist": "PATH",
+            "capabilities": _capabilities_dict(),
         },
         {
-            "kind": "subprocess-json-v1",
+            "kind": "subprocess-json-v2",
             "command": [str(Path(sys.executable).resolve())],
             "environment_allowlist": ["BAD-KEY"],
+            "capabilities": _capabilities_dict(),
         },
         {
-            "kind": "subprocess-json-v1",
+            "kind": "subprocess-json-v2",
             "command": [str(Path(sys.executable).resolve())],
             "environment_allowlist": ["Path", "PATH"],
+            "capabilities": _capabilities_dict(),
         },
     ],
 )
@@ -645,15 +766,12 @@ def test_run_config_rejects_same_task_id_with_substituted_input_content(
     substituted = EvalInput(
         schema_version=eval_input.schema_version,
         task_id=eval_input.task_id,
-        repository=eval_input.repository,
-        review_request=ReviewRequest(
-            title=eval_input.review_request.title,
-            description="Substituted after AgentRunConfig binding",
-            user_intent=eval_input.review_request.user_intent,
-            review_focus=eval_input.review_request.review_focus,
-            linked_requirements=eval_input.review_request.linked_requirements,
-            project_rules=eval_input.review_request.project_rules,
-            existing_ci_evidence=eval_input.review_request.existing_ci_evidence,
+        review_target=replace(
+            eval_input.review_target,
+            review_request=replace(
+                eval_input.review_target.review_request,
+                description="Substituted after AgentRunConfig binding",
+            ),
         ),
     )
 
@@ -661,8 +779,9 @@ def test_run_config_rejects_same_task_id_with_substituted_input_content(
         raise AssertionError("substituted input reached subprocess launch")
 
     monkeypatch.setattr(adapter_module.subprocess, "Popen", forbidden_launch)
-    result = _run(SubprocessAgentAdapter(), substituted, workspace, config)
-    _assert_failure(result, SubmissionStatus.FAILED, FailureCode.ADAPTER_ERROR)
+    with pytest.raises(AgentAdapterError) as raised:
+        _run(SubprocessAgentAdapter(), substituted, workspace, config)
+    assert raised.value.code is FailureCode.SCHEMA_MISMATCH
 
 
 def test_agent_run_config_rejects_matcher_digest_not_bound_to_snapshot(
@@ -678,6 +797,9 @@ def test_agent_run_config_rejects_matcher_digest_not_bound_to_snapshot(
             run_id=config.run_id,
             task_id=config.task_id,
             eval_input_digest=config.eval_input_digest,
+            wire_contract=config.wire_contract,
+            adapter_capabilities=config.adapter_capabilities,
+            adapter_capabilities_digest=config.adapter_capabilities_digest,
             clarification_matcher=config.clarification_matcher,
             clarification_matcher_config_digest="f" * 64,
             trial_index=config.trial_index,
@@ -822,10 +944,14 @@ def test_timeout_cannot_be_defeated_by_a_child_that_never_reads_large_stdin(
 ) -> None:
     large_input = replace(
         eval_input,
-        review_request=replace(
-            eval_input.review_request,
-            project_rules=tuple(
-                "rule-%03d-%s" % (index, "x" * 7000) for index in range(200)
+        review_target=replace(
+            eval_input.review_target,
+            review_request=replace(
+                eval_input.review_target.review_request,
+                project_rules=tuple(
+                    "rule-%03d-%s" % (index, "x" * 7000)
+                    for index in range(200)
+                ),
             ),
         ),
     )
@@ -1077,6 +1203,7 @@ def test_cancellation_terminates_descendant_process_tree(
     )
     cancelled = threading.Event()
     result_holder: Dict[str, EvalSubmission] = {}
+    target_access, materialization_id = _target_binding(workspace, eval_input)
 
     worker = threading.Thread(
         target=lambda: result_holder.setdefault(
@@ -1086,6 +1213,8 @@ def test_cancellation_terminates_descendant_process_tree(
                 workspace,
                 config,
                 _ForbiddenClarificationChannel(),  # type: ignore[arg-type]
+                target_access=target_access,
+                target_materialization_id=materialization_id,
                 cancel_event=cancelled,
             ),
         ),
@@ -1128,6 +1257,7 @@ def test_cancellation_terminates_nested_detached_setsid_descendants(
     cancelled = threading.Event()
     result_holder: Dict[str, EvalSubmission] = {}
     pids: tuple[int, ...] = ()
+    target_access, materialization_id = _target_binding(workspace, eval_input)
     worker = threading.Thread(
         target=lambda: result_holder.setdefault(
             "result",
@@ -1136,6 +1266,8 @@ def test_cancellation_terminates_nested_detached_setsid_descendants(
                 workspace,
                 config,
                 _ForbiddenClarificationChannel(),  # type: ignore[arg-type]
+                target_access=target_access,
+                target_materialization_id=materialization_id,
                 cancel_event=cancelled,
             ),
         ),
@@ -1215,6 +1347,7 @@ def test_signal_or_control_kill_is_process_killed(
         ("wrong-task", FailureCode.SCHEMA_MISMATCH),
         ("wrong-agent", FailureCode.SCHEMA_MISMATCH),
         ("wrong-trial", FailureCode.SCHEMA_MISMATCH),
+        ("wrong-materialization", FailureCode.SCHEMA_MISMATCH),
         ("forged-clarification", FailureCode.SCHEMA_MISMATCH),
     ],
 )

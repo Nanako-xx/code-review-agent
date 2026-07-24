@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import stat
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 
 import review_agent_eval.artifacts as artifact_module
 from review_agent_eval.artifacts import (
+    AgentVisibleFileBinding,
     ArtifactConflictError,
     ArtifactIntegrityError,
     ArtifactRef,
@@ -20,14 +22,16 @@ from review_agent_eval.artifacts import (
     ArtifactStateError,
     ArtifactStore,
     MAX_RUN_MANIFEST_BYTES,
+    RunManifest,
     RunStatus,
     StageName,
     StageReceipt,
+    TrialMaterializationManifest,
     TrialManifest,
     derive_receipt_id,
     load_existing_submission,
 )
-from review_agent_eval.cases import RunCaseSnapshot, SuiteManifest
+from review_agent_eval.cases import RunCaseSnapshot, SuiteManifest, WireContractV2
 from review_agent_eval.config import (
     EvalRunConfig,
     EvaluatorExecutionConfig,
@@ -43,11 +47,22 @@ from review_agent_eval.models import (
     FailureCode,
     SchemaError,
     SubmissionStatus,
+    TraceType,
     TrialStatus,
+    UnsupportedProtocolVersionError,
     canonical_json_bytes,
 )
 
-from .test_config import agent_config, budgets, evaluator_config, matcher_config
+from .test_config import (
+    _judge_input_context_payload,
+    _model_turn_context_block_payload,
+    _review_context_payload,
+    adapter_capabilities,
+    agent_config,
+    budgets,
+    evaluator_config,
+    matcher_config,
+)
 
 
 TASK_ID = "../../private/case:with/slashes"
@@ -60,7 +75,7 @@ def make_case_snapshot(*, suite_version: str = "suite-v1") -> RunCaseSnapshot:
     input_payload = eval_input.to_dict()
     case = EvalCase.from_dict(
         {
-            "schema_version": "eval_case_v1",
+            "schema_version": "eval_case_v2",
             "task_id": TASK_ID,
             "case_version": 1,
             "source": {
@@ -73,8 +88,7 @@ def make_case_snapshot(*, suite_version: str = "suite-v1") -> RunCaseSnapshot:
                 "content_hash": "3" * 64,
             },
             "input": {
-                "repository": input_payload["repository"],
-                "review_request": input_payload["review_request"],
+                "review_target": input_payload["review_target"],
             },
             "clarification_script": {"max_rounds": 1, "answers": []},
             "intent_truth": {
@@ -97,14 +111,22 @@ def make_case_snapshot(*, suite_version: str = "suite-v1") -> RunCaseSnapshot:
                 "expected_findings": [],
                 "known_invalid_findings": [],
             },
+            "review_evaluator_context": {"truth_contexts": []},
         }
     )
     raw = case.to_json().encode("utf-8")
     manifest = SuiteManifest.from_dict(
         {
-            "schema_version": "suite_manifest_v1",
+            "schema_version": "suite_manifest_v2",
             "suite_id": "artifact-suite",
             "suite_version": suite_version,
+            "wire_contract": {
+                "case_schema_version": "eval_case_v2",
+                "input_schema_version": "eval_input_v2",
+                "submission_schema_version": "eval_submission_v2",
+                "review_target_kind": "repository",
+                "materializer_protocol": "repository-materializer-v2",
+            },
             "source": {
                 "kind": "core",
                 "source_id": "artifact-suite-source",
@@ -112,6 +134,7 @@ def make_case_snapshot(*, suite_version: str = "suite-v1") -> RunCaseSnapshot:
                 "source_uri": None,
                 "license": None,
                 "content_hash": "4" * 64,
+                "preparation_binding": None,
             },
             "cases": [
                 {
@@ -152,6 +175,7 @@ def make_config(
         clarification_matcher=matcher_config(),
         evaluator=evaluator or evaluator_config(),
         suite=SuiteRunConfig.from_case_snapshot(snapshot),
+        adapter_capabilities=adapter_capabilities(),
         trial_count=trial_count,
         resource_budgets=resource_budgets or budgets(parallel=1),
     )
@@ -160,35 +184,105 @@ def make_config(
 def make_input() -> EvalInput:
     return EvalInput.from_dict(
         {
-            "schema_version": "eval_input_v1",
+            "schema_version": "eval_input_v2",
             "task_id": TASK_ID,
-            "repository": {
-                "source": "fixture",
-                "path": "fixtures/repository",
-                "url": None,
-                "base_revision": BASE,
-                "head_revision": HEAD,
-            },
-            "review_request": {
-                "title": "Review the authorization change",
-                "description": None,
-                "user_intent": "Preserve access control",
-                "review_focus": None,
-                "linked_requirements": [],
-                "project_rules": [],
-                "existing_ci_evidence": [],
+            "review_target": {
+                "kind": "repository",
+                "repository": {
+                    "source": "fixture",
+                    "path": "fixtures/repository",
+                    "url": None,
+                    "base_revision": BASE,
+                    "head_revision": HEAD,
+                },
+                "review_request": {
+                    "title": "Review the authorization change",
+                    "description": None,
+                    "user_intent": "Preserve access control",
+                    "review_focus": None,
+                    "linked_requirements": [],
+                    "project_rules": [],
+                    "existing_ci_evidence": [],
+                },
             },
         }
     )
 
 
-def completed_submission(trial_id: str) -> EvalSubmission:
+def make_materialization(
+    config: EvalRunConfig,
+    plan,
+    *,
+    attempt: int,
+    eval_input: EvalInput | None = None,
+) -> TrialMaterializationManifest:
+    bound_input = eval_input or make_input()
+    visible = AgentVisibleFileBinding(
+        role="repository_file",
+        relative_path="target/repository/app.py",
+        size_bytes=17,
+        sha256=hashlib.sha256(b"print('review')\n").hexdigest(),
+    )
+    return TrialMaterializationManifest.create(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=attempt,
+        eval_input_digest=bound_input.digest(),
+        review_target_digest=bound_input.review_target.digest(),
+        wire_contract=config.wire_contract,
+        suite_preparation_binding_digest=(
+            config.suite_preparation_binding_digest
+        ),
+        prepared_source_id="prepared-repository-001",
+        adapter_capabilities_digest=config.adapter_capabilities_digest,
+        readable_relative_paths=(visible.relative_path,),
+        files=(visible,),
+        replay_binding_digest="7" * 64,
+    )
+
+
+def write_orphan_materialization(
+    store: ArtifactStore,
+    config: EvalRunConfig,
+    plan,
+    trial: TrialManifest,
+    *,
+    attempt: int,
+) -> TrialMaterializationManifest:
+    materialization = make_materialization(
+        config,
+        plan,
+        attempt=attempt,
+    )
+    relative_path = (
+        "cases/%s/trials/%s/materializations/attempt-%04d/"
+        "materialization_manifest.json"
+        % (trial.case_path_id, plan.trial_id, attempt)
+    )
+    target = store.root / config.run_id / Path(*relative_path.split("/"))
+    store._ensure_directory(target.parent)
+    store._write_json(
+        config.run_id,
+        relative_path,
+        materialization,
+    )
+    return materialization
+
+
+def completed_submission(
+    trial_id: str,
+    *,
+    target_materialization_id: str = "materialization-unbound",
+) -> EvalSubmission:
     return EvalSubmission.from_dict(
         {
-            "schema_version": "eval_submission_v1",
+            "schema_version": "eval_submission_v2",
             "task_id": TASK_ID,
             "agent_id": "agent-current",
             "trial_id": trial_id,
+            "eval_input_digest": make_input().digest(),
+            "target_materialization_id": target_materialization_id,
             "status": "completed",
             "intent": {
                 "status": "sufficient",
@@ -217,13 +311,20 @@ def completed_submission(trial_id: str) -> EvalSubmission:
     )
 
 
-def failed_submission(trial_id: str, message: str) -> EvalSubmission:
+def failed_submission(
+    trial_id: str,
+    message: str,
+    *,
+    target_materialization_id: str = "materialization-unbound",
+) -> EvalSubmission:
     return EvalSubmission.from_dict(
         {
-            "schema_version": "eval_submission_v1",
+            "schema_version": "eval_submission_v2",
             "task_id": TASK_ID,
             "agent_id": "agent-current",
             "trial_id": trial_id,
+            "eval_input_digest": make_input().digest(),
+            "target_materialization_id": target_materialization_id,
             "status": "failed",
             "intent": None,
             "review": None,
@@ -247,6 +348,67 @@ def failed_submission(trial_id: str, message: str) -> EvalSubmission:
     )
 
 
+TERMINAL_SUBMISSION_STATUSES = (
+    SubmissionStatus.COMPLETED,
+    SubmissionStatus.FAILED,
+    SubmissionStatus.BLOCKED,
+    SubmissionStatus.INVALID_OUTPUT,
+)
+
+
+def terminal_submission(
+    trial_id: str,
+    status: SubmissionStatus,
+    *,
+    target_materialization_id: str,
+    eval_input_digest: str | None = None,
+    failure_code: FailureCode | None = None,
+    include_trace: bool = False,
+) -> EvalSubmission:
+    if status is SubmissionStatus.COMPLETED:
+        payload = completed_submission(
+            trial_id,
+            target_materialization_id=target_materialization_id,
+        ).to_dict()
+    else:
+        payload = failed_submission(
+            trial_id,
+            "terminal failure",
+            target_materialization_id=target_materialization_id,
+        ).to_dict()
+        default_code = {
+            SubmissionStatus.FAILED: FailureCode.PROCESS_KILLED,
+            SubmissionStatus.BLOCKED: FailureCode.AGENT_BLOCKED,
+            SubmissionStatus.INVALID_OUTPUT: FailureCode.INVALID_JSON,
+        }[status]
+        payload["status"] = status.value
+        payload["failure"]["code"] = (failure_code or default_code).value
+    if eval_input_digest is not None:
+        payload["eval_input_digest"] = eval_input_digest
+    if include_trace:
+        payload["trace_ref"] = {
+            "type": "opaque_id",
+            "value": "trace-terminal-binding",
+        }
+    return EvalSubmission.from_dict(payload)
+
+
+def local_trace_submission(
+    trial_id: str,
+    *,
+    target_materialization_id: str,
+) -> EvalSubmission:
+    payload = completed_submission(
+        trial_id,
+        target_materialization_id=target_materialization_id,
+    ).to_dict()
+    payload["trace_ref"] = {
+        "type": "local_path",
+        "value": "traces/attempt.jsonl",
+    }
+    return EvalSubmission.from_dict(payload)
+
+
 def make_store(tmp_path: Path):
     store = ArtifactStore(tmp_path / ".eval-runs")
     snapshot = make_case_snapshot()
@@ -260,10 +422,16 @@ def make_store(tmp_path: Path):
 def required_runner_artifacts(submission: EvalSubmission):
     """Minimal control-plane artifacts required by a terminal Agent receipt."""
 
-    return {
+    artifacts = {
         "clarification_match_receipts.json": {"receipts": []},
         "terminal_summary.json": {"status": submission.status.value},
     }
+    if (
+        submission.trace_ref is not None
+        and submission.trace_ref.type is TraceType.LOCAL_PATH
+    ):
+        artifacts["trace_capture.json"] = {"events": []}
+    return artifacts
 
 
 def write_required_runner_artifacts(
@@ -285,17 +453,88 @@ def write_required_runner_artifacts(
     return tuple(refs)
 
 
-def complete_trial(store, config, plan):
+def write_orphan_submission_artifacts(
+    store,
+    config,
+    plan,
+    submission: EvalSubmission,
+    *,
+    attempt: int,
+):
+    base = "cases/%s/trials/%s" % (plan.case_path_id, plan.trial_id)
+    store._write_json(
+        config.run_id,
+        base + "/submission.json",
+        submission,
+    )
+    write_required_runner_artifacts(
+        store,
+        config,
+        plan,
+        submission,
+        attempt=attempt,
+    )
+    return store._target(
+        config.run_id,
+        base + "/receipts/terminal.json",
+    )
+
+
+def trial_artifact_snapshot(store, config, plan):
+    root = (
+        store.root
+        / config.run_id
+        / "cases"
+        / plan.case_path_id
+        / "trials"
+        / plan.trial_id
+    )
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and ".locks" not in path.relative_to(root).parts
+    }
+
+
+def prepare_active_trial(store, config, plan):
     running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
     assert running.active_attempt is not None
+    materialization = make_materialization(
+        config,
+        plan,
+        attempt=running.active_attempt,
+    )
     store.write_prepare_stage(
         config.run_id,
         TASK_ID,
         plan.trial_id,
         make_input(),
+        materialization,
         attempt=running.active_attempt,
     )
-    submission = completed_submission(plan.trial_id)
+    return running, materialization
+
+
+def complete_trial(store, config, plan):
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert running.active_attempt is not None
+    materialization = make_materialization(
+        config,
+        plan,
+        attempt=running.active_attempt,
+    )
+    store.write_prepare_stage(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        make_input(),
+        materialization,
+        attempt=running.active_attempt,
+    )
+    submission = completed_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
     state = store.finalize_submission(
         config.run_id,
         TASK_ID,
@@ -314,8 +553,20 @@ def test_final_layout_uses_immutable_plan_manifests_and_hashed_case_path(tmp_pat
         run_dir / "cases" / plan.case_path_id / "trials" / plan.trial_id
     )
 
-    assert manifest.schema_version == "eval_run_manifest_v1"
-    assert trial.schema_version == "eval_trial_manifest_v1"
+    assert manifest.schema_version == "eval_run_manifest_v2"
+    assert trial.schema_version == "eval_trial_manifest_v2"
+    assert manifest.wire_contract == config.wire_contract
+    assert manifest.suite_preparation_binding_digest is None
+    assert manifest.adapter_capabilities_digest == (
+        config.adapter_capabilities_digest
+    )
+    assert trial.wire_contract == config.wire_contract
+    assert trial.target_kind is config.wire_contract.review_target_kind
+    assert trial.materializer_protocol == config.materializer_protocol
+    assert trial.suite_preparation_binding_digest is None
+    assert trial.adapter_capabilities_digest == (
+        config.adapter_capabilities_digest
+    )
     expected_evaluator_execution_digest = (
         EvaluatorExecutionConfig.from_resource_budgets(
             config.evaluator, config.resource_budgets
@@ -364,6 +615,28 @@ def test_final_layout_uses_immutable_plan_manifests_and_hashed_case_path(tmp_pat
 
     with pytest.raises(FrozenInstanceError):
         trial.seed = 0
+
+
+def test_v2_artifact_parents_reject_v1_wire_before_deeper_hydration(tmp_path):
+    store, config, manifest, plan, trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert running.active_attempt is not None
+    materialization = make_materialization(
+        config,
+        plan,
+        attempt=running.active_attempt,
+    )
+
+    for model, value in (
+        (RunManifest, manifest),
+        (TrialManifest, trial),
+        (TrialMaterializationManifest, materialization),
+    ):
+        payload = value.to_dict()
+        payload["wire_contract"]["case_schema_version"] = "eval_case_v1"
+        payload["run_id"] = "malformed-but-deeper"
+        with pytest.raises(UnsupportedProtocolVersionError):
+            model.from_dict(payload)
 
 
 def test_run_creation_requires_the_exact_verified_case_snapshot(tmp_path):
@@ -436,6 +709,32 @@ def test_directory_fsync_capability_is_explicit(tmp_path):
     assert artifact_module.DIRECTORY_FSYNC_SUPPORTED is (os.name != "nt")
 
 
+def test_capability_preflight_v2_binds_wire_and_rejects_v1_root(tmp_path):
+    store, config, manifest, _plan, _trial = make_store(tmp_path)
+    ref = store.write_run_preflight(
+        config.run_id,
+        {"compatible": True, "checked_cases": [TASK_ID]},
+    )
+    path = store.root / config.run_id / Path(*ref.relative_path.split("/"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == "eval_capability_preflight_v2"
+    assert payload["run_manifest_digest"] == manifest.digest()
+    assert payload["wire_contract"] == config.wire_contract.to_dict()
+    assert payload["adapter_capabilities_digest"] == (
+        config.adapter_capabilities_digest
+    )
+    assert payload["target_kinds"] == ["repository"]
+    assert payload["materializer_protocol"] == config.materializer_protocol
+    assert store.load_run_preflight(config.run_id) == payload["preflight"]
+
+    payload["schema_version"] = "eval_run_capability_preflight_v1"
+    payload["legacy_unknown"] = True
+    path.write_bytes(canonical_json_bytes(payload))
+    with pytest.raises(UnsupportedProtocolVersionError):
+        store.load_run_preflight(config.run_id)
+
+
 def test_control_plane_snapshot_is_not_limited_by_agent_artifact_budget(tmp_path):
     store = ArtifactStore(tmp_path / ".eval-runs")
     snapshot = make_case_snapshot()
@@ -456,6 +755,28 @@ def test_control_plane_snapshot_is_not_limited_by_agent_artifact_budget(tmp_path
     manifest = store.create_run(config, snapshot)
     assert manifest.case_snapshot.size_bytes > 1
     assert store.load_case_snapshot(config.run_id) == snapshot
+
+
+def test_execution_budget_does_not_reduce_control_plane_capacity(tmp_path):
+    store = ArtifactStore(tmp_path / ".eval-runs")
+    snapshot = make_case_snapshot()
+    large_execution_budget = ResourceBudgets(
+        agent_timeout_seconds=900,
+        evaluator_timeout_seconds=300,
+        max_agent_output_bytes=1024,
+        max_trace_bytes=1024,
+        max_execution_artifact_file_bytes=16 * 1024 * 1024,
+        max_execution_artifact_total_bytes=1 << 40,
+        max_parallel_trials=1,
+    )
+    config = make_config(
+        case_snapshot=snapshot,
+        resource_budgets=large_execution_budget,
+    )
+
+    manifest = store.create_run(config, snapshot)
+    assert manifest.run_config.relative_path == "run_config.json"
+    assert store.load_run_config(config.run_id) == config
 
 
 def test_atomic_create_if_absent_fsync_hash_and_parallel_conflict(tmp_path, monkeypatch):
@@ -525,15 +846,39 @@ def test_receipts_derive_pending_running_incomplete_and_terminal_state(tmp_path)
     resumed = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
     assert resumed.status is TrialStatus.RUNNING
     assert resumed.active_attempt == 2
+    materialization = make_materialization(
+        config,
+        plan,
+        attempt=resumed.active_attempt,
+    )
     prepare = store.write_prepare_stage(
         config.run_id,
         TASK_ID,
         plan.trial_id,
         make_input(),
+        materialization,
         attempt=resumed.active_attempt,
     )
     assert prepare.stage is StageName.PREPARE
-    submission = completed_submission(plan.trial_id)
+    assert prepare.attempt == resumed.active_attempt
+    assert prepare.materialization_id == materialization.materialization_id
+    assert prepare.eval_input_digest == make_input().digest()
+    assert prepare.review_target_digest == make_input().review_target.digest()
+    assert prepare.prepared_source_id == materialization.prepared_source_id
+    assert prepare.agent_visible_files == materialization.files
+    assert prepare.adapter_capabilities_digest == (
+        config.adapter_capabilities_digest
+    )
+    assert prepare.target_access == materialization.target_access
+    assert prepare.materialization_manifest is not None
+    assert prepare.materialization_manifest_digest == (
+        prepare.materialization_manifest.sha256
+    )
+    assert len(prepare.artifacts) == 2
+    submission = completed_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
     terminal = store.finalize_submission(
         config.run_id,
         TASK_ID,
@@ -574,6 +919,20 @@ def test_stale_attempt_cannot_commit_as_the_current_retry(tmp_path):
     second = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
     assert second.active_attempt == 2
 
+    with pytest.raises(ArtifactStateError, match="running Trial|active"):
+        store.write_prepare_stage(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            make_input(),
+            make_materialization(
+                config,
+                plan,
+                attempt=first.active_attempt,
+            ),
+            attempt=first.active_attempt,
+        )
+
     with pytest.raises(ArtifactConflictError, match="stale"):
         store.finalize_submission(
             config.run_id,
@@ -585,6 +944,891 @@ def test_stale_attempt_cannot_commit_as_the_current_retry(tmp_path):
     assert store.load_trial_state(
         config.run_id, TASK_ID, plan.trial_id
     ).active_attempt == 2
+
+
+@pytest.mark.parametrize(
+    "status",
+    TERMINAL_SUBMISSION_STATUSES,
+    ids=lambda status: status.value,
+)
+def test_finalize_rejects_wrong_input_digest_without_terminal_mutation(
+    tmp_path, status
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = terminal_submission(
+        plan.trial_id,
+        status,
+        target_materialization_id=materialization.materialization_id,
+        eval_input_digest="0" * 64,
+        include_trace=True,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises((SchemaError, ArtifactIntegrityError, ArtifactStateError)):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+@pytest.mark.parametrize(
+    "status",
+    TERMINAL_SUBMISSION_STATUSES,
+    ids=lambda status: status.value,
+)
+def test_finalize_rejects_wrong_materialization_without_terminal_mutation(
+    tmp_path, status
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, _materialization = prepare_active_trial(store, config, plan)
+    submission = terminal_submission(
+        plan.trial_id,
+        status,
+        target_materialization_id="materialization-wrong",
+        include_trace=True,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises((SchemaError, ArtifactIntegrityError, ArtifactStateError)):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+@pytest.mark.parametrize(
+    "missing_name",
+    (
+        "clarification_match_receipts.json",
+        "terminal_summary.json",
+    ),
+)
+def test_finalize_missing_control_artifact_rejects_before_any_publication(
+    tmp_path, missing_name
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = completed_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    runner_artifacts = required_runner_artifacts(submission)
+    runner_artifacts.pop(missing_name)
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="required Runner"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=runner_artifacts,
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_does_not_adopt_unpassed_orphan_required_runner_artifact(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = completed_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    artifacts = required_runner_artifacts(submission)
+    orphan_name = "terminal_summary.json"
+    orphan_value = artifacts.pop(orphan_name)
+    runner_base = "cases/%s/trials/%s/runner/attempt-%04d" % (
+        plan.case_path_id,
+        plan.trial_id,
+        running.active_attempt,
+    )
+    store._write_json(
+        config.run_id,
+        "%s/%s" % (runner_base, orphan_name),
+        orphan_value,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="required Runner"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=artifacts,
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_local_trace_requires_capture_before_any_publication(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = local_trace_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    artifacts = required_runner_artifacts(submission)
+    artifacts.pop("trace_capture.json")
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="required Runner"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=artifacts,
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_rejects_malformed_mandatory_trace_without_mutation(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = local_trace_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    artifacts = required_runner_artifacts(submission)
+    artifacts["trace_capture.json"] = {"raw_reasoning": "hidden"}
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(SchemaError):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=artifacts,
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_preflights_mandatory_trace_file_budget_without_mutation(
+    tmp_path,
+):
+    constrained = ResourceBudgets(
+        agent_timeout_seconds=900,
+        evaluator_timeout_seconds=300,
+        max_agent_output_bytes=64,
+        max_trace_bytes=64,
+        max_execution_artifact_file_bytes=64,
+        max_execution_artifact_total_bytes=512,
+        max_parallel_trials=1,
+    )
+    store = ArtifactStore(tmp_path / ".eval-runs")
+    snapshot = make_case_snapshot()
+    config = make_config(
+        case_snapshot=snapshot,
+        resource_budgets=constrained,
+    )
+    manifest = store.create_run(config, snapshot)
+    plan = manifest.trials[0]
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = local_trace_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    artifacts = required_runner_artifacts(submission)
+    artifacts["trace_capture.json"] = {"events": ["x" * 128]}
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="required trace"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=artifacts,
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_preflights_trace_ref_create_only_conflict_without_mutation(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = local_trace_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    base = "cases/%s/trials/%s" % (plan.case_path_id, plan.trial_id)
+    store._write_json(
+        config.run_id,
+        "%s/trace_ref.json" % base,
+        submission.trace_ref,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactConflictError, match="trace_ref"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+@pytest.mark.parametrize(
+    "status",
+    TERMINAL_SUBMISSION_STATUSES,
+    ids=lambda status: status.value,
+)
+def test_finalize_without_prepare_rejects_ordinary_terminal_without_mutation(
+    tmp_path, status
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    submission = terminal_submission(
+        plan.trial_id,
+        status,
+        target_materialization_id="materialization-unbound",
+        include_trace=True,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises((SchemaError, ArtifactIntegrityError, ArtifactStateError)):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_without_prepare_accepts_only_canonical_harness_binding(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    expected_binding = artifact_module.derive_pre_materialization_failure_binding(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=running.active_attempt,
+        eval_input_digest=plan.eval_input_digest,
+        review_target_digest=make_input().review_target.digest(),
+    )
+    submission = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id=expected_binding,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    )
+
+    state = store.finalize_submission(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        submission,
+        attempt=running.active_attempt,
+        runner_artifacts=required_runner_artifacts(submission),
+    )
+
+    assert state.status is TrialStatus.FAILED
+    assert store.load_existing_submission(
+        config.run_id, TASK_ID, plan.trial_id
+    ) == submission
+
+
+def test_pre_materialization_harness_failure_rejects_evidence_without_mutation(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    eval_input = make_input()
+    expected_binding = artifact_module.derive_pre_materialization_failure_binding(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=running.active_attempt,
+        eval_input_digest=plan.eval_input_digest,
+        review_target_digest=eval_input.review_target.digest(),
+    )
+    payload = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id=expected_binding,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    ).to_dict()
+    excerpt = "Agent-supplied evidence"
+    payload["evidence"] = [
+        {
+            "evidence_id": "evidence-forged-harness",
+            "source": {
+                "kind": "repository_file",
+                "target_materialization_id": expected_binding,
+                "revision": eval_input.review_target.repository.head_revision,
+                "path": "app.py",
+                "from_line": 1,
+                "to_line": 1,
+            },
+            "content_hash": hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+            "excerpt": excerpt,
+        }
+    ]
+    submission = EvalSubmission.from_dict(payload)
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(SchemaError, match="requires a committed prepare receipt"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_rejects_arbitrary_pre_materialization_binding_without_mutation(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    submission = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id="materialization-arbitrary",
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+        include_trace=True,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises((SchemaError, ArtifactIntegrityError, ArtifactStateError)):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_rejects_loose_materialization_without_prepare(tmp_path):
+    store, config, _, plan, trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    write_orphan_materialization(
+        store,
+        config,
+        plan,
+        trial,
+        attempt=running.active_attempt,
+    )
+    expected_binding = artifact_module.derive_pre_materialization_failure_binding(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=running.active_attempt,
+        eval_input_digest=plan.eval_input_digest,
+        review_target_digest=make_input().review_target.digest(),
+    )
+    submission = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id=expected_binding,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="without"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_finalize_rejects_drifted_pre_prepare_input_without_mutation(tmp_path):
+    store, config, _, plan, trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    drifted_payload = make_input().to_dict()
+    drifted_payload["review_target"]["repository"]["head_revision"] = "3" * 40
+    drifted_input = EvalInput.from_dict(drifted_payload)
+    input_path = (
+        "cases/%s/trials/%s/input.json" % (trial.case_path_id, plan.trial_id)
+    )
+    store._write_json(config.run_id, input_path, drifted_input)
+    expected_binding = artifact_module.derive_pre_materialization_failure_binding(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=running.active_attempt,
+        eval_input_digest=plan.eval_input_digest,
+        review_target_digest=make_input().review_target.digest(),
+    )
+    submission = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id=expected_binding,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="EvalInput"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ("wire_target", "preparation", "capability", "target_content"),
+)
+def test_prepare_rejects_materialization_contract_drift(tmp_path, drift):
+    store, config, _, plan, _trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert running.active_attempt is not None
+    baseline = make_materialization(
+        config,
+        plan,
+        attempt=running.active_attempt,
+    )
+    wire_contract = baseline.wire_contract
+    preparation_digest = baseline.suite_preparation_binding_digest
+    capability_digest = baseline.adapter_capabilities_digest
+    target_digest = baseline.review_target_digest
+    if drift == "wire_target":
+        wire_contract = WireContractV2.from_dict(
+            {
+                "case_schema_version": "eval_case_v2",
+                "input_schema_version": "eval_input_v2",
+                "submission_schema_version": "eval_submission_v2",
+                "review_target_kind": "frozen_context",
+                "materializer_protocol": "frozen-context-materializer-v2",
+            }
+        )
+    elif drift == "preparation":
+        preparation_digest = "0" * 64
+    elif drift == "capability":
+        capability_digest = "0" * 64
+    else:
+        target_digest = "0" * 64
+    changed = TrialMaterializationManifest.create(
+        run_id=baseline.run_id,
+        task_id=baseline.task_id,
+        trial_id=baseline.trial_id,
+        attempt=baseline.attempt,
+        eval_input_digest=baseline.eval_input_digest,
+        review_target_digest=target_digest,
+        wire_contract=wire_contract,
+        suite_preparation_binding_digest=preparation_digest,
+        prepared_source_id=baseline.prepared_source_id,
+        adapter_capabilities_digest=capability_digest,
+        readable_relative_paths=(
+            baseline.target_access.readable_relative_paths
+        ),
+        files=baseline.files,
+        replay_binding_digest=baseline.replay_binding_digest,
+    )
+
+    with pytest.raises(SchemaError, match="drift"):
+        store.write_prepare_stage(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            make_input(),
+            changed,
+            attempt=running.active_attempt,
+        )
+
+
+@pytest.mark.parametrize("unbounded_field", ("readable_relative_paths", "files"))
+def test_materialization_create_bounds_input_iterables(
+    tmp_path, monkeypatch, unbounded_field
+):
+    _store, config, _manifest, plan, _trial = make_store(tmp_path)
+    baseline = make_materialization(config, plan, attempt=1)
+    monkeypatch.setattr(artifact_module, "MAX_AGENT_VISIBLE_FILES", 2)
+    consumed = []
+
+    def over_limit_values():
+        for index in range(3):
+            consumed.append(index)
+            if unbounded_field == "readable_relative_paths":
+                yield "target/repository/file-%d.py" % index
+            else:
+                body = ("file-%d" % index).encode("utf-8")
+                yield AgentVisibleFileBinding(
+                    role="repository_file",
+                    relative_path="target/repository/file-%d.py" % index,
+                    size_bytes=len(body),
+                    sha256=hashlib.sha256(body).hexdigest(),
+                )
+        raise AssertionError("materialization consumed beyond its item limit")
+
+    values = {
+        "readable_relative_paths": (
+            over_limit_values()
+            if unbounded_field == "readable_relative_paths"
+            else baseline.target_access.readable_relative_paths
+        ),
+        "files": (
+            over_limit_values()
+            if unbounded_field == "files"
+            else baseline.files
+        ),
+    }
+    with pytest.raises(SchemaError, match="item limit"):
+        TrialMaterializationManifest.create(
+            run_id=baseline.run_id,
+            task_id=baseline.task_id,
+            trial_id=baseline.trial_id,
+            attempt=baseline.attempt,
+            eval_input_digest=baseline.eval_input_digest,
+            review_target_digest=baseline.review_target_digest,
+            wire_contract=baseline.wire_contract,
+            suite_preparation_binding_digest=(
+                baseline.suite_preparation_binding_digest
+            ),
+            prepared_source_id=baseline.prepared_source_id,
+            adapter_capabilities_digest=(
+                baseline.adapter_capabilities_digest
+            ),
+            readable_relative_paths=values["readable_relative_paths"],
+            files=values["files"],
+            replay_binding_digest=baseline.replay_binding_digest,
+        )
+    assert consumed == [0, 1, 2]
+
+
+def test_materialization_create_size_gate_precedes_sort_and_identity(
+    tmp_path, monkeypatch
+):
+    _store, config, _manifest, plan, _trial = make_store(tmp_path)
+    baseline = make_materialization(config, plan, attempt=1)
+    monkeypatch.setattr(
+        artifact_module,
+        "MAX_TRIAL_MATERIALIZATION_BYTES",
+        len(canonical_json_bytes(baseline)) - 1,
+    )
+
+    def forbidden_identity(cls, **_kwargs):
+        raise AssertionError("identity derivation ran before the size gate")
+
+    monkeypatch.setattr(
+        TrialMaterializationManifest,
+        "derive_materialization_id",
+        classmethod(forbidden_identity),
+    )
+
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        TrialMaterializationManifest.create(
+            run_id=baseline.run_id,
+            task_id=baseline.task_id,
+            trial_id=baseline.trial_id,
+            attempt=baseline.attempt,
+            eval_input_digest=baseline.eval_input_digest,
+            review_target_digest=baseline.review_target_digest,
+            wire_contract=baseline.wire_contract,
+            suite_preparation_binding_digest=(
+                baseline.suite_preparation_binding_digest
+            ),
+            prepared_source_id=baseline.prepared_source_id,
+            adapter_capabilities_digest=(
+                baseline.adapter_capabilities_digest
+            ),
+            readable_relative_paths=(
+                baseline.target_access.readable_relative_paths
+            ),
+            files=baseline.files,
+            replay_binding_digest=baseline.replay_binding_digest,
+        )
+
+
+def test_bounded_canonical_size_preflight_matches_exact_json_bytes():
+    payload = {
+        "unicode": ["café", "line\nfeed", "quote\"slash\\"],
+        "scalars": {"bool": True, "float": 1.25, "none": None},
+    }
+    exact_size = len(canonical_json_bytes(payload))
+
+    artifact_module._check_bounded_canonical_payload_size(
+        payload,
+        exact_size,
+        "test payload",
+    )
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        artifact_module._check_bounded_canonical_payload_size(
+            payload,
+            exact_size - 1,
+            "test payload",
+        )
+
+
+def test_materialization_direct_size_gate_precedes_file_sort(
+    tmp_path, monkeypatch
+):
+    _store, config, _manifest, plan, _trial = make_store(tmp_path)
+    baseline = make_materialization(config, plan, attempt=1)
+    monkeypatch.setattr(
+        artifact_module,
+        "MAX_TRIAL_MATERIALIZATION_BYTES",
+        len(canonical_json_bytes(baseline)) - 1,
+    )
+
+    def forbidden_sort(*_args, **_kwargs):
+        raise AssertionError("sorting ran before the size gate")
+
+    monkeypatch.setattr(
+        artifact_module,
+        "sorted",
+        forbidden_sort,
+        raising=False,
+    )
+
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        TrialMaterializationManifest(**vars(baseline))
+
+
+def test_materialization_from_dict_size_gate_precedes_nested_hydration(
+    tmp_path, monkeypatch
+):
+    _store, config, _manifest, plan, _trial = make_store(tmp_path)
+    baseline = make_materialization(config, plan, attempt=1)
+    payload = baseline.to_dict()
+    monkeypatch.setattr(
+        artifact_module,
+        "MAX_TRIAL_MATERIALIZATION_BYTES",
+        len(canonical_json_bytes(payload)) - 1,
+    )
+
+    def forbidden_target_access(cls, _value):
+        raise AssertionError("nested hydration ran before the size gate")
+
+    monkeypatch.setattr(
+        artifact_module.TargetAccess,
+        "from_dict",
+        classmethod(forbidden_target_access),
+    )
+
+    with pytest.raises(SchemaError, match="canonical byte limit"):
+        TrialMaterializationManifest.from_dict(payload)
+
+
+def test_materialization_path_coverage_uses_indexed_component_walk():
+    count = 20_000
+    readable = tuple(
+        "target/repository/roots/%05d" % index for index in range(count)
+    )
+    files = tuple("%s/file.py" % path for path in readable)
+
+    artifact_module._validate_materialization_path_coverage(files, readable)
+
+
+def test_materialization_path_coverage_rejects_unauthorized_file():
+    with pytest.raises(SchemaError, match="outside TargetAccess"):
+        artifact_module._validate_materialization_path_coverage(
+            ("target/private/secret.py",),
+            ("target/public",),
+        )
+
+
+def test_materialization_path_coverage_rejects_uncovered_readable_path():
+    with pytest.raises(SchemaError, match="no Agent-visible file binding"):
+        artifact_module._validate_materialization_path_coverage(
+            ("target/public/app.py",),
+            ("target/public", "target/empty"),
+        )
+
+
+@pytest.mark.parametrize("unbounded_field", ("artifacts", "agent_visible_files"))
+def test_stage_receipt_create_bounds_input_iterables(
+    monkeypatch, unbounded_field
+):
+    maximum_name = (
+        "MAX_RECEIPT_ARTIFACTS"
+        if unbounded_field == "artifacts"
+        else "MAX_AGENT_VISIBLE_FILES"
+    )
+    monkeypatch.setattr(artifact_module, maximum_name, 2)
+    consumed = []
+
+    def over_limit_values():
+        for index in range(3):
+            consumed.append(index)
+            body = ("receipt-%d" % index).encode("utf-8")
+            if unbounded_field == "artifacts":
+                yield ArtifactRef(
+                    relative_path="receipt/file-%d.json" % index,
+                    size_bytes=len(body),
+                    sha256=hashlib.sha256(body).hexdigest(),
+                )
+            else:
+                yield AgentVisibleFileBinding(
+                    role="repository_file",
+                    relative_path="target/repository/file-%d.py" % index,
+                    size_bytes=len(body),
+                    sha256=hashlib.sha256(body).hexdigest(),
+                )
+        raise AssertionError("StageReceipt consumed beyond its item limit")
+
+    values = {
+        "artifacts": (
+            over_limit_values() if unbounded_field == "artifacts" else ()
+        ),
+        "agent_visible_files": (
+            over_limit_values()
+            if unbounded_field == "agent_visible_files"
+            else ()
+        ),
+    }
+    with pytest.raises(SchemaError, match="item limit"):
+        StageReceipt.create(
+            run_id="run-" + "0" * 64,
+            task_id="task-001",
+            trial_id="trial-" + "0" * 64,
+            stage=StageName.START,
+            config_digest="1" * 64,
+            attempt=1,
+            artifacts=values["artifacts"],
+            agent_visible_files=values["agent_visible_files"],
+        )
+    assert consumed == [0, 1, 2]
+
+
+def test_materialization_schema_and_persisted_content_drift_fail_closed(tmp_path):
+    store, config, _, plan, _trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert running.active_attempt is not None
+    materialization = make_materialization(
+        config,
+        plan,
+        attempt=running.active_attempt,
+    )
+    v1_payload = materialization.to_dict()
+    v1_payload["schema_version"] = "eval_trial_materialization_v1"
+    v1_payload["legacy_unknown"] = True
+    with pytest.raises(UnsupportedProtocolVersionError):
+        TrialMaterializationManifest.from_dict(v1_payload)
+
+    prepare = store.write_prepare_stage(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        make_input(),
+        materialization,
+        attempt=running.active_attempt,
+    )
+    assert prepare.materialization_manifest is not None
+    path = (
+        store.root
+        / config.run_id
+        / Path(*prepare.materialization_manifest.relative_path.split("/"))
+    )
+    path.write_bytes(path.read_bytes() + b" ")
+    with pytest.raises(ArtifactIntegrityError, match="size|hash|canonical"):
+        store.load_trial_state(config.run_id, TASK_ID, plan.trial_id)
+
+
+def test_v2_prepare_receipt_rejects_v1_materialization_before_hydration(tmp_path):
+    store, config, _, plan, trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert running.active_attempt is not None
+    materialization = make_materialization(
+        config,
+        plan,
+        attempt=running.active_attempt,
+    )
+    prepare = store.write_prepare_stage(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        make_input(),
+        materialization,
+        attempt=running.active_attempt,
+    )
+    assert prepare.materialization_manifest is not None
+    materialization_path = (
+        store.root
+        / config.run_id
+        / Path(*prepare.materialization_manifest.relative_path.split("/"))
+    )
+    materialization_payload = json.loads(
+        materialization_path.read_text(encoding="utf-8")
+    )
+    materialization_payload["schema_version"] = (
+        "eval_trial_materialization_v1"
+    )
+    materialization_payload["legacy_unknown"] = True
+    materialization_bytes = canonical_json_bytes(materialization_payload)
+    materialization_path.write_bytes(materialization_bytes)
+    changed_hash = hashlib.sha256(materialization_bytes).hexdigest()
+
+    receipt_path = (
+        store.root
+        / config.run_id
+        / "cases"
+        / trial.case_path_id
+        / "trials"
+        / plan.trial_id
+        / "receipts"
+        / ("attempt-%04d" % running.active_attempt)
+        / "prepare.json"
+    )
+    receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt_payload["materialization_manifest"]["sha256"] = changed_hash
+    receipt_payload["materialization_manifest"]["size_bytes"] = len(
+        materialization_bytes
+    )
+    receipt_payload["materialization_manifest_digest"] = changed_hash
+    for artifact in receipt_payload["artifacts"]:
+        if artifact["relative_path"] == prepare.materialization_manifest.relative_path:
+            artifact["sha256"] = changed_hash
+            artifact["size_bytes"] = len(materialization_bytes)
+    receipt_path.write_bytes(canonical_json_bytes(receipt_payload))
+
+    with pytest.raises(UnsupportedProtocolVersionError):
+        store.load_trial_state(config.run_id, TASK_ID, plan.trial_id)
 
 
 def test_disk_replay_rejects_completed_terminal_without_prepare(tmp_path):
@@ -619,15 +1863,25 @@ def test_disk_replay_rejects_completed_terminal_without_prepare(tmp_path):
 def test_disk_replay_hydrates_and_binds_terminal_submission(tmp_path):
     store, config, _, plan, trial = make_store(tmp_path)
     running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    materialization = make_materialization(
+        config,
+        plan,
+        attempt=running.active_attempt,
+    )
     store.write_prepare_stage(
         config.run_id,
         TASK_ID,
         plan.trial_id,
         make_input(),
+        materialization,
         attempt=running.active_attempt,
     )
     base = "cases/%s/trials/%s" % (trial.case_path_id, plan.trial_id)
-    failed = failed_submission(plan.trial_id, "process stopped")
+    failed = failed_submission(
+        plan.trial_id,
+        "process stopped",
+        target_materialization_id=materialization.materialization_id,
+    )
     submission_ref = store._write_json(
         config.run_id, "%s/submission.json" % base, failed
     )
@@ -692,14 +1946,35 @@ def test_resume_only_commits_missing_legal_receipts_and_never_rewrites_submissio
     )
     input_path = store.root / config.run_id / Path(*input_ref.relative_path.split("/"))
     input_bytes = input_path.read_bytes()
+    first_materialization = write_orphan_materialization(
+        store,
+        config,
+        plan,
+        trial,
+        attempt=running.active_attempt,
+    )
     first_plan = store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
     assert first_plan.status is TrialStatus.INCOMPLETE
     assert first_plan.completed_stages == (StageName.PREPARE,)
     assert first_plan.missing_stages == (StageName.AGENT,)
     assert input_path.read_bytes() == input_bytes
 
-    store.start_trial(config.run_id, TASK_ID, plan.trial_id)
-    submission = completed_submission(plan.trial_id)
+    retry = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert retry.active_attempt == 2
+    second_materialization = write_orphan_materialization(
+        store,
+        config,
+        plan,
+        trial,
+        attempt=retry.active_attempt,
+    )
+    assert first_materialization.materialization_id != (
+        second_materialization.materialization_id
+    )
+    submission = completed_submission(
+        plan.trial_id,
+        target_materialization_id=second_materialization.materialization_id,
+    )
     submission_ref = store._write_json(
         config.run_id, "%s/submission.json" % base, submission
     )
@@ -724,20 +1999,395 @@ def test_resume_only_commits_missing_legal_receipts_and_never_rewrites_submissio
     assert store.load_existing_submission(config.run_id, TASK_ID, plan.trial_id) == submission
 
 
-def test_abandonment_atomically_commits_failed_process_killed_submission(tmp_path):
+def test_recovery_checks_cumulative_execution_budget_under_lock_before_mutation(
+    tmp_path, monkeypatch
+):
+    constrained = ResourceBudgets(
+        agent_timeout_seconds=900,
+        evaluator_timeout_seconds=300,
+        max_agent_output_bytes=64,
+        max_trace_bytes=64,
+        max_execution_artifact_file_bytes=256,
+        max_execution_artifact_total_bytes=300,
+        max_parallel_trials=1,
+    )
+    store = ArtifactStore(tmp_path / ".eval-runs")
+    snapshot = make_case_snapshot()
+    config = make_config(
+        case_snapshot=snapshot,
+        resource_budgets=constrained,
+    )
+    manifest = store.create_run(config, snapshot)
+    plan = manifest.trials[0]
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = completed_submission(
+        plan.trial_id,
+        target_materialization_id=materialization.materialization_id,
+    )
+    terminal_path = write_orphan_submission_artifacts(
+        store,
+        config,
+        plan,
+        submission,
+        attempt=running.active_attempt,
+    )
+    runner_base = "cases/%s/trials/%s/runner/attempt-%04d" % (
+        plan.case_path_id,
+        plan.trial_id,
+        running.active_attempt,
+    )
+    for name in ("workspace_manifest.json", "command_attestations.json"):
+        ref = store._write_json(
+            config.run_id,
+            "%s/%s" % (runner_base, name),
+            {"payload": "x" * 180},
+        )
+        assert ref.size_bytes <= constrained.max_execution_artifact_file_bytes
+    assert store._execution_artifact_total_bytes(config.run_id) > (
+        constrained.max_execution_artifact_total_bytes
+    )
+
+    real_lock = store._lock
+    real_total = store._execution_artifact_total_bytes
+    budget_lock_held = False
+    total_checked_under_lock = False
+
+    @contextmanager
+    def tracked_lock(path):
+        nonlocal budget_lock_held
+        with real_lock(path):
+            is_budget_lock = path.name == "execution-budget.lock"
+            if is_budget_lock:
+                budget_lock_held = True
+            try:
+                yield
+            finally:
+                if is_budget_lock:
+                    budget_lock_held = False
+
+    def checked_total(run_id):
+        nonlocal total_checked_under_lock
+        assert budget_lock_held
+        total_checked_under_lock = True
+        return real_total(run_id)
+
+    monkeypatch.setattr(store, "_lock", tracked_lock)
+    monkeypatch.setattr(store, "_execution_artifact_total_bytes", checked_total)
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="cumulative"):
+        store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+
+    assert total_checked_under_lock is True
+    assert not terminal_path.exists()
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+@pytest.mark.parametrize("orphan_kind", ("input", "materialization", "submission"))
+def test_recovery_rejects_v1_orphans_before_committing_incomplete(
+    tmp_path, orphan_kind
+):
+    store, config, _manifest, plan, trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert running.active_attempt == 1
+    base = "cases/%s/trials/%s" % (trial.case_path_id, plan.trial_id)
+
+    if orphan_kind == "input":
+        payload = make_input().to_dict()
+        payload["schema_version"] = "eval_input_v1"
+        payload["legacy_unknown"] = True
+        relative_path = base + "/input.json"
+    elif orphan_kind == "materialization":
+        materialization = make_materialization(
+            config,
+            plan,
+            attempt=running.active_attempt,
+        )
+        payload = materialization.to_dict()
+        payload["schema_version"] = "eval_trial_materialization_v1"
+        payload["legacy_unknown"] = True
+        relative_path = (
+            base
+            + "/materializations/attempt-%04d/materialization_manifest.json"
+            % running.active_attempt
+        )
+        store._ensure_directory(
+            store._target(config.run_id, relative_path).parent
+        )
+    else:
+        payload = failed_submission(plan.trial_id, "orphan").to_dict()
+        payload["schema_version"] = "eval_submission_v1"
+        payload["legacy_unknown"] = True
+        relative_path = base + "/submission.json"
+
+    store._write_json(config.run_id, relative_path, payload)
+    incomplete_path = store._target(
+        config.run_id,
+        base + "/receipts/attempt-%04d/incomplete.json" % running.active_attempt,
+    )
+
+    with pytest.raises(UnsupportedProtocolVersionError):
+        store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert not incomplete_path.exists()
+
+
+@pytest.mark.parametrize(
+    "status",
+    TERMINAL_SUBMISSION_STATUSES,
+    ids=lambda status: status.value,
+)
+def test_recovery_revalidates_submission_input_digest_before_commit(
+    tmp_path, status
+):
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    submission = terminal_submission(
+        plan.trial_id,
+        status,
+        target_materialization_id=materialization.materialization_id,
+        eval_input_digest="0" * 64,
+    )
+    terminal_path = write_orphan_submission_artifacts(
+        store,
+        config,
+        plan,
+        submission,
+        attempt=running.active_attempt,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="EvalInput digest"):
+        store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+
+    assert not terminal_path.exists()
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+@pytest.mark.parametrize(
+    "status",
+    TERMINAL_SUBMISSION_STATUSES,
+    ids=lambda status: status.value,
+)
+def test_recovery_rejects_wrong_materialization_before_terminal_commit(
+    tmp_path, status
+):
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
+    running, _materialization = prepare_active_trial(store, config, plan)
+    submission = terminal_submission(
+        plan.trial_id,
+        status,
+        target_materialization_id="materialization-wrong",
+    )
+    terminal_path = write_orphan_submission_artifacts(
+        store,
+        config,
+        plan,
+        submission,
+        attempt=running.active_attempt,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="materialization"):
+        store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+
+    assert not terminal_path.exists()
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+@pytest.mark.parametrize(
+    "status",
+    TERMINAL_SUBMISSION_STATUSES,
+    ids=lambda status: status.value,
+)
+def test_recovery_without_prepare_rejects_ordinary_terminal_without_mutation(
+    tmp_path, status
+):
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    submission = terminal_submission(
+        plan.trial_id,
+        status,
+        target_materialization_id="materialization-unbound",
+    )
+    terminal_path = write_orphan_submission_artifacts(
+        store,
+        config,
+        plan,
+        submission,
+        attempt=running.active_attempt,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="prepare"):
+        store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+
+    assert not terminal_path.exists()
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_recovery_without_prepare_requires_canonical_harness_binding(tmp_path):
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    arbitrary = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id="materialization-arbitrary",
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    )
+    terminal_path = write_orphan_submission_artifacts(
+        store,
+        config,
+        plan,
+        arbitrary,
+        attempt=running.active_attempt,
+    )
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(ArtifactIntegrityError, match="pre-materialization"):
+        store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+
+    assert not terminal_path.exists()
+    assert trial_artifact_snapshot(store, config, plan) == before
+
+
+def test_recovery_adopts_canonical_pre_materialization_harness_failure(tmp_path):
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    expected_binding = artifact_module.derive_pre_materialization_failure_binding(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=running.active_attempt,
+        eval_input_digest=plan.eval_input_digest,
+        review_target_digest=make_input().review_target.digest(),
+    )
+    submission = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id=expected_binding,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    )
+    terminal_path = write_orphan_submission_artifacts(
+        store,
+        config,
+        plan,
+        submission,
+        attempt=running.active_attempt,
+    )
+
+    recovery = store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
+
+    assert recovery.status is TrialStatus.FAILED
+    assert recovery.terminal is True
+    assert terminal_path.is_file()
+    assert store.load_existing_submission(
+        config.run_id, TASK_ID, plan.trial_id
+    ) == submission
+
+
+def test_abandonment_without_prepare_uses_canonical_harness_failure(tmp_path):
     store, config, _, plan, _ = make_store(tmp_path)
-    store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
     recovery = store.recover_trial(config.run_id, TASK_ID, plan.trial_id)
     assert recovery.status is TrialStatus.INCOMPLETE
+    expected_binding = artifact_module.derive_pre_materialization_failure_binding(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=running.active_attempt,
+        eval_input_digest=plan.eval_input_digest,
+        review_target_digest=make_input().review_target.digest(),
+    )
 
     state = store.abandon_trial(config.run_id, TASK_ID, plan.trial_id)
     submission = store.load_existing_submission(config.run_id, TASK_ID, plan.trial_id)
     assert state.status is TrialStatus.FAILED
     assert submission.status is SubmissionStatus.FAILED
     assert submission.failure is not None
-    assert submission.failure.code is FailureCode.PROCESS_KILLED
+    assert submission.failure.code is FailureCode.HARNESS_MATERIALIZATION_ERROR
+    assert submission.target_materialization_id == expected_binding
     assert state.terminal_receipt is not None
-    assert state.terminal_receipt.failure_code is FailureCode.PROCESS_KILLED
+    assert state.terminal_receipt.failure_code is (
+        FailureCode.HARNESS_MATERIALIZATION_ERROR
+    )
+
+
+def test_abandonment_after_prepare_uses_committed_materialization_binding(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    _running, materialization = prepare_active_trial(store, config, plan)
+
+    state = store.abandon_trial(config.run_id, TASK_ID, plan.trial_id)
+    submission = store.load_existing_submission(
+        config.run_id, TASK_ID, plan.trial_id
+    )
+
+    assert state.status is TrialStatus.FAILED
+    assert submission.target_materialization_id == materialization.materialization_id
+    assert submission.failure is not None
+    assert submission.failure.code is FailureCode.PROCESS_KILLED
+
+
+def test_abandonment_allows_harness_failure_after_prepare_with_bound_identity(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    _running, materialization = prepare_active_trial(store, config, plan)
+
+    state = store.abandon_trial(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+    )
+    submission = store.load_existing_submission(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+    )
+
+    assert state.status is TrialStatus.FAILED
+    assert submission.target_materialization_id == materialization.materialization_id
+    assert submission.failure is not None
+    assert submission.failure.code is FailureCode.HARNESS_MATERIALIZATION_ERROR
+
+
+def test_harness_materialization_failure_rejects_agent_owned_metadata(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    running, materialization = prepare_active_trial(store, config, plan)
+    payload = terminal_submission(
+        plan.trial_id,
+        SubmissionStatus.FAILED,
+        target_materialization_id=materialization.materialization_id,
+        failure_code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+        include_trace=True,
+    ).to_dict()
+    payload["failure"]["retryable"] = True
+    payload["usage"].update(
+        {
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "total_tokens": 3,
+            "tool_calls": 1,
+            "cost_amount": 1,
+            "cost_currency": "USD",
+        }
+    )
+    submission = EvalSubmission.from_dict(payload)
+    before = trial_artifact_snapshot(store, config, plan)
+
+    with pytest.raises(SchemaError, match="Agent-owned metadata"):
+        store.finalize_submission(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            submission,
+            attempt=running.active_attempt,
+            runner_artifacts=required_runner_artifacts(submission),
+        )
+
+    assert trial_artifact_snapshot(store, config, plan) == before
 
 
 def test_load_existing_submission_is_strictly_read_only(tmp_path):
@@ -908,17 +2558,188 @@ def test_evaluator_outputs_and_reports_are_versioned_without_mutating_submission
         )
 
 
+def test_evaluation_typed_context_artifacts_round_trip_env_like_code(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator_config(), config.resource_budgets
+    )
+    content = "count = len(items)\naffinity = score(item)"
+    review_payload = _review_context_payload(content)
+    input_payload = _judge_input_context_payload(content)
+    output_payload = _model_turn_context_block_payload(content)
+
+    receipt = store.write_evaluation(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        evaluator_execution=execution,
+        revision="typed-context-round-trip",
+        intent_matches={},
+        review_matches=review_payload,
+        judge_input=input_payload,
+        judge_output=output_payload,
+        score={"total": 1},
+    )
+    assert receipt.evaluation_id is not None
+
+    bundle = store.load_evaluation_bundle(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        receipt.evaluation_id,
+    )
+    assert bundle.intent_matches == {}
+    assert bundle.review_matches == review_payload
+    assert bundle.judge_input == input_payload
+    assert bundle.judge_output == output_payload
+
+
+def _safe_evaluation_context_payloads() -> dict:
+    return {
+        "review_matches": _review_context_payload("ordinary context"),
+        "judge_input": _judge_input_context_payload("ordinary context"),
+        "judge_output": _model_turn_context_block_payload("ordinary context"),
+    }
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "count = len(items)\napi_key=ordinary-secret",
+        "<think>private intermediate steps</think>",
+    ],
+)
+def test_evaluation_judge_output_context_still_rejects_sensitive_content(
+    tmp_path,
+    content,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator_config(), config.resource_budgets
+    )
+    payload = _model_turn_context_block_payload(content)
+    safe_payloads = _safe_evaluation_context_payloads()
+
+    with pytest.raises(SchemaError):
+        store.write_evaluation(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            evaluator_execution=execution,
+            revision="typed-context-sensitive",
+            intent_matches={},
+            review_matches=safe_payloads["review_matches"],
+            judge_input=safe_payloads["judge_input"],
+            judge_output=payload,
+            score={},
+        )
+
+
+def test_evaluation_score_does_not_enable_typed_context_exception(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator_config(), config.resource_budgets
+    )
+    score = _model_turn_context_block_payload(
+        "count = len(items)\naffinity = score(item)"
+    )
+    safe_payloads = _safe_evaluation_context_payloads()
+
+    with pytest.raises(SchemaError, match="full environment dump"):
+        store.write_evaluation(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            evaluator_execution=execution,
+            revision="typed-context-rejected-score",
+            intent_matches={},
+            review_matches=safe_payloads["review_matches"],
+            judge_input=safe_payloads["judge_input"],
+            judge_output=safe_payloads["judge_output"],
+            score=score,
+        )
+
+
+@pytest.mark.parametrize("artifact_name", ["intent_matches", "judge_output"])
+def test_evaluation_context_policy_rejects_untyped_or_wrong_schema_payloads(
+    tmp_path,
+    artifact_name,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator_config(), config.resource_budgets
+    )
+    payload = _model_turn_context_block_payload(
+        "count = len(items)\naffinity = score(item)"
+    )
+    if artifact_name == "intent_matches":
+        payload = {"not_a_judge_schema": payload}
+    else:
+        payload["schema_version"] = "unknown"
+    safe_payloads = _safe_evaluation_context_payloads()
+    values = {
+        "intent_matches": {},
+        "review_matches": safe_payloads["review_matches"],
+        "judge_input": safe_payloads["judge_input"],
+        "judge_output": safe_payloads["judge_output"],
+        "score": {},
+    }
+    values[artifact_name] = payload
+
+    with pytest.raises(SchemaError, match="full environment dump"):
+        store.write_evaluation(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            evaluator_execution=execution,
+            revision="typed-context-policy-rejected-" + artifact_name,
+            **values,
+        )
+
+
+def test_evaluation_context_policy_rejects_typed_schema_with_wrong_root_fields(
+    tmp_path,
+):
+    store, config, _, plan, _ = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator_config(), config.resource_budgets
+    )
+    safe_payloads = _safe_evaluation_context_payloads()
+
+    with pytest.raises(SchemaError):
+        store.write_evaluation(
+            config.run_id,
+            TASK_ID,
+            plan.trial_id,
+            evaluator_execution=execution,
+            revision="typed-context-invalid-root",
+            intent_matches={},
+            review_matches=safe_payloads["review_matches"],
+            judge_input={
+                "schema_version": "eval_judge_input_artifact_v1",
+                "claims": [],
+            },
+            judge_output=safe_payloads["judge_output"],
+            score={},
+        )
+
+
 def test_evaluation_total_budget_is_preflighted_before_artifacts_publish(tmp_path):
     constrained = ResourceBudgets(
         agent_timeout_seconds=900,
         evaluator_timeout_seconds=300,
         max_agent_output_bytes=256,
         max_trace_bytes=256,
-        # The final v1 Judge execution config is larger than the old
-        # scalar-Judge fixture.  Leave enough per-file room for it while
+        # The v2 evaluator execution config is larger than the old
+        # scalar-Judge fixture. Leave enough per-file room for it while
         # keeping the cumulative budget intentionally too small.
-        max_execution_artifact_file_bytes=5_100,
-        max_execution_artifact_total_bytes=5_100,
+        max_execution_artifact_file_bytes=5_200,
+        max_execution_artifact_total_bytes=5_200,
         max_parallel_trials=1,
     )
     snapshot = make_case_snapshot()

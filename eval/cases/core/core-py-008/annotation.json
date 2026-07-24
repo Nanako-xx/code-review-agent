@@ -1,0 +1,104 @@
+{
+  "annotation_rationale": "The legacy eval is intentionally unchanged so reporting it as introduced is a known-invalid finding.",
+  "authoring": {
+    "author_id": null,
+    "kind": "ai_assisted",
+    "source_version": "core-2026-07-21-v3",
+    "status": "draft_requires_independent_re_review",
+    "truth_frozen_at": null
+  },
+  "case_binding": {
+    "canonical_case_digest": "e4b4b87c67687ceb59285c333d1d848a5c8ce042a21ea6d7a2c42e9661a30b5d",
+    "case_source_content_hash": "18ed00eb63da1eb87e58414fd629c3ea956a44c6b74134b451d783501781c65d",
+    "eval_input_digest": "79b0b4d3f265845a507f9150247e2112f5d4ebb5efa6e165ab79407ba2ab0841"
+  },
+  "case_version": 3,
+  "checklist": {
+    "agent_input_contains_no_truth": true,
+    "atomic_findings_reviewed": false,
+    "base_head_binding_reproduced": true,
+    "evidence_anchors_are_non_exclusive": false,
+    "fixture_contains_no_vcs_metadata": true,
+    "human_review_completed": false,
+    "known_invalid_traps_reviewed": false,
+    "semantic_truth_leakage_reviewed": false,
+    "severity_category_context_reviewed": false,
+    "truth_completeness_reviewed": false
+  },
+  "coverage": [
+    "clean_pr",
+    "fabrication_guard",
+    "known_invalid",
+    "preexisting_trap"
+  ],
+  "disagreements": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "items": [],
+    "status": "requires_independent_re_review"
+  },
+  "human_review": {
+    "adjudication_digest": null,
+    "adjudicator_id": null,
+    "annotation_protocol_version": "core-annotation-v2",
+    "approval_identity_status": "requires_re_review",
+    "author_id": null,
+    "base_revision": "a54aaf9cf78f3e73b24adf6c80e1d24729aca90a",
+    "base_tree": "81780185010c447c4b8188cb235fa055fc664476",
+    "blind_review_completed_at": null,
+    "blind_review_packet_digest": "0f93aa722ffc3f4baeefff22920d9be01e597496b2fd7cf92566ce00e242a836",
+    "blind_review_started_at": null,
+    "canonical_case_digest": "e4b4b87c67687ceb59285c333d1d848a5c8ce042a21ea6d7a2c42e9661a30b5d",
+    "case_version": 3,
+    "eval_input_digest": "79b0b4d3f265845a507f9150247e2112f5d4ebb5efa6e165ab79407ba2ab0841",
+    "final_decision": null,
+    "head_revision": "1f86c4d87ff72f6b761ef89dfe8de0e5c134a055",
+    "head_tree": "2edef4d0446fbda38ff1263130f6cbeafc693355",
+    "independent_annotation_digest": null,
+    "leakage_review_completed": false,
+    "prior_approval_carried_forward": false,
+    "review_batch_id": null,
+    "reviewer_id": null,
+    "schema_version": "core_human_review_record_v2",
+    "status": "requires_independent_re_review",
+    "task_id": "core-py-008"
+  },
+  "intent_expectation": {
+    "clarification_decision": "must_not_ask",
+    "final_source": "explicit",
+    "final_status": "sufficient",
+    "initial_source": "explicit",
+    "initial_status": "sufficient"
+  },
+  "provenance_binding": {
+    "annotation_protocol_version": "core-annotation-v2",
+    "content_hash": "18ed00eb63da1eb87e58414fd629c3ea956a44c6b74134b451d783501781c65d",
+    "schema_version": "core_case_provenance_v2"
+  },
+  "repository_binding": {
+    "base_revision": "a54aaf9cf78f3e73b24adf6c80e1d24729aca90a",
+    "base_tree": "81780185010c447c4b8188cb235fa055fc664476",
+    "head_revision": "1f86c4d87ff72f6b761ef89dfe8de0e5c134a055",
+    "head_tree": "2edef4d0446fbda38ff1263130f6cbeafc693355",
+    "source_digest": "db2ef8a8ebe66540d30dd432c289f9453672244b8ff4783bb9c360660f9089a1"
+  },
+  "schema_version": "core_annotation_record_v2",
+  "suite_assignment": {
+    "promotion_evidence": null,
+    "split": "regression",
+    "status": "pending_current_agent_baseline"
+  },
+  "suite_id": "core-regression",
+  "task_id": "core-py-008",
+  "truth_summary": {
+    "expected_finding_ids": [],
+    "expected_intent_ids": [
+      "intent-0018"
+    ],
+    "forbidden_intent_ids": [],
+    "known_invalid_finding_ids": [
+      "invalid-0001"
+    ],
+    "truth_completeness": "closed_world"
+  }
+}

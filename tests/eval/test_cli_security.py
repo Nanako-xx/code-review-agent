@@ -11,12 +11,18 @@ import review_agent_eval.cli as cli_module
 from review_agent_eval.artifacts import ArtifactStore
 from review_agent_eval.cli import EXIT_OK, EXIT_USAGE, main
 from review_agent_eval.config import EvaluatorExecutionConfig
-from review_agent_eval.models import TraceRef, TraceType
+from review_agent_eval.judge import (
+    JudgeContextBlock,
+    JudgeContextKind,
+    JudgeContextTrust,
+)
+from review_agent_eval.models import TraceRef, TraceType, canonical_sha256
 
 from .test_artifacts import (
     TASK_ID,
     completed_submission,
     make_input,
+    make_materialization,
     make_store,
     required_runner_artifacts,
 )
@@ -101,17 +107,28 @@ def _security_fixture(
     store, config, _manifest, plan, _trial = make_store(tmp_path)
     running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
     assert running.active_attempt is not None
+    eval_input = make_input()
+    materialization = make_materialization(
+        config,
+        plan,
+        attempt=running.active_attempt,
+        eval_input=eval_input,
+    )
     store.write_prepare_stage(
         config.run_id,
         TASK_ID,
         plan.trial_id,
-        make_input(),
+        eval_input,
+        materialization,
         attempt=running.active_attempt,
     )
 
     trace_value = "opaque-trace-ref-security-sentinel"
     submission = replace(
-        completed_submission(plan.trial_id),
+        completed_submission(
+            plan.trial_id,
+            target_materialization_id=materialization.materialization_id,
+        ),
         trace_ref=TraceRef(TraceType.OPAQUE_ID, trace_value),
     )
     store.finalize_submission(
@@ -136,13 +153,28 @@ def _security_fixture(
         f"{raw_context} at {absolute_path} with opaque-value {api_key_value}"
     )
 
-    # These are intentionally shaped like the persisted Judge artifacts.  The
-    # context is present in both the request and result so the test proves the
-    # inspect projection, rather than merely relying on a missing field.
+    context_block = JudgeContextBlock.create(
+        ref_id="judge-context-security-1",
+        kind=JudgeContextKind.CODE,
+        trust=JudgeContextTrust.UNTRUSTED_REPOSITORY_DATA,
+        content=context_text,
+        metadata={
+            "revision": "security-fixture",
+            "path": "private/raw-judge-context.txt",
+            "side": None,
+            "from_line": None,
+            "to_line": None,
+        },
+    ).to_dict()
+
+    # These use the exact persisted Judge aggregate roots and a model-built
+    # context binding.  The context is present in both the request and result
+    # so the test proves the inspect projection, rather than merely relying on
+    # a missing field.
     judge_request = {
         "request_id": "judge-request-security-1",
         "task": "review_finding_equivalence",
-        "context_blocks": [{"content": context_text}],
+        "contexts": [context_block],
     }
     judge_input = {
         "schema_version": "eval_judge_input_artifact_v1",
@@ -151,6 +183,9 @@ def _security_fixture(
     }
     judge_output = {
         "schema_version": "eval_judge_output_artifact_v1",
+        "evaluator_execution_digest": execution.digest(),
+        "input_artifact_digest": canonical_sha256(judge_input),
+        "intent_evaluation_digest": None,
         "results": [
             {
                 "request": judge_request,
@@ -172,11 +207,9 @@ def _security_fixture(
             "status": "graded",
             "reason_codes": [],
         },
-        review_matches={
-            "schema_version": "eval_review_evaluation_v1",
-            "status": "graded",
-            "reason_codes": [],
-        },
+        # This security fixture does not model a complete Review evaluation
+        # aggregate, so its unrelated status snapshot is explicitly untyped.
+        review_matches={"status": "graded", "reason_codes": []},
         judge_input=judge_input,
         judge_output=judge_output,
         score={
@@ -199,10 +232,12 @@ def _security_fixture(
     )
     # Assert the source fixture really contains the values that must not cross
     # the public inspection boundary.
-    assert (
-        loaded.judge_input["requests"][0]["context_blocks"][0]["content"]
-        == context_text
+    assert loaded.judge_input["requests"][0]["contexts"][0]["content"] == (
+        context_text
     )
+    assert loaded.judge_output["results"][0]["request"]["contexts"][0][
+        "content"
+    ] == context_text
     assert trace_value == store.load_existing_submission(
         config.run_id,
         TASK_ID,
@@ -329,6 +364,7 @@ def test_inspect_json_is_a_redacted_projection_of_trace_and_judge_artifacts(
     # context and trace-ref payload fields must not be projected under a new
     # nesting shape either.
     assert "judge_input" not in inspection
+    assert "contexts" not in set(_keys(inspection))
     assert "context_blocks" not in set(_keys(inspection))
     assert "content" not in set(_keys(inspection))
     assert "request" not in set(_keys(inspection["judge"]))

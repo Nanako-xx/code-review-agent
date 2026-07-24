@@ -54,7 +54,7 @@
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-baseline'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-baseline'
 ```
 
 ## 3. 依赖图
@@ -129,7 +129,7 @@ Wave C2                 Task 16 E2E/hardening/docs
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_models.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-models'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_models.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-models'
 ```
 
 **提交边界：** `feat(memory): add canonical memory models and stable identities`
@@ -167,7 +167,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_identity.py tests/test_revision.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-identity'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_identity.py tests/test_revision.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-identity'
 ```
 
 **提交边界：** `feat(memory): isolate repository memory namespaces outside worktrees`
@@ -211,7 +211,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_store.py tests/test_architecture_boundaries.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-store'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_store.py tests/test_architecture_boundaries.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-store'
 ```
 
 **提交边界：** `feat(memory): add transactional sqlite event and blob store`
@@ -257,7 +257,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_sources.py tests/test_memory_lifecycle.py tests/test_session_store.py tests/test_observations.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-sources'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_sources.py tests/test_memory_lifecycle.py tests/test_session_store.py tests/test_observations.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-sources'
 ```
 
 **提交边界：** `feat(memory): validate sources and enforce human-owned lifecycle`
@@ -294,7 +294,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_repository_cache.py tests/test_repository_intelligence.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-repository-cache'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_repository_cache.py tests/test_repository_intelligence.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-repository-cache'
 ```
 
 **提交边界：** `feat(memory): add exact-revision repository knowledge cache`
@@ -334,7 +334,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_cli.py tests/test_cli_smoke.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-cli-a'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_cli.py tests/test_cli_smoke.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-cli-a'
 ```
 
 **提交边界：** `feat(memory): add explicit local memory approval workflow`
@@ -348,7 +348,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 - [x] 运行 Batch A 合集：
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_models.py tests/test_memory_identity.py tests/test_memory_store.py tests/test_memory_sources.py tests/test_memory_lifecycle.py tests/test_repository_cache.py tests/test_memory_cli.py tests/test_architecture_boundaries.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-batch-a'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_models.py tests/test_memory_identity.py tests/test_memory_store.py tests/test_memory_sources.py tests/test_memory_lifecycle.py tests/test_repository_cache.py tests/test_memory_cli.py tests/test_architecture_boundaries.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-batch-a'
 ```
 
 ---
@@ -399,7 +399,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_session.py tests/test_session_store.py tests/test_artifacts.py tests/test_hydration.py tests/test_attempts.py tests/test_run_state.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-session-v5'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_session.py tests/test_session_store.py tests/test_artifacts.py tests/test_hydration.py tests/test_attempts.py tests/test_run_state.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-session-v5'
 ```
 
 **提交边界：** `feat(memory): add schema v5 memory phases and artifacts`
@@ -440,7 +440,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_retrieval.py tests/test_memory_policy.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-retrieval'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_retrieval.py tests/test_memory_policy.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-retrieval'
 ```
 
 **提交边界：** `feat(memory): add deterministic snapshots and policy compiler`
@@ -478,7 +478,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_curator.py tests/test_model_adapter_factory.py tests/test_architecture_boundaries.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-curator'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_curator.py tests/test_model_adapter_factory.py tests/test_architecture_boundaries.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-curator'
 ```
 
 **提交边界：** `feat(memory): add proposal-only local and model curator`
@@ -513,7 +513,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_feedback.py tests/test_evidence.py tests/test_reconciler.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-feedback'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_feedback.py tests/test_evidence.py tests/test_reconciler.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-feedback'
 ```
 
 **提交边界：** `feat(memory): add non-suppressive review feedback memory`
@@ -558,7 +558,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_context.py tests/test_tool_gateway.py tests/test_reviewer_task_executor.py tests/test_agent_loop.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-context'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_context.py tests/test_tool_gateway.py tests/test_reviewer_task_executor.py tests/test_agent_loop.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-context'
 ```
 
 **提交边界：** `feat(memory): inject bounded approved memory into reviewer context`
@@ -611,7 +611,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_intent_inference.py tests/test_risk.py tests/test_model_risk.py tests/test_portfolio.py tests/test_review_contract.py tests/test_completion.py tests/test_final_risk.py tests/test_models.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-stage-policy'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_intent_inference.py tests/test_risk.py tests/test_model_risk.py tests/test_portfolio.py tests/test_review_contract.py tests/test_completion.py tests/test_final_risk.py tests/test_models.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-stage-policy'
 ```
 
 **提交边界：** `feat(memory): compile approved memory into bounded review policy`
@@ -651,7 +651,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_cli.py tests/test_cli_smoke.py tests/test_cli_resume.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-cli-b'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_cli.py tests/test_cli_smoke.py tests/test_cli_resume.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-cli-b'
 ```
 
 **提交边界：** `feat(memory): expose final memory and curator cli configuration`
@@ -691,7 +691,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_evidence.py tests/test_reconciler.py tests/test_brief.py tests/test_checkpoint_reporting.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-brief'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_evidence.py tests/test_reconciler.py tests/test_brief.py tests/test_checkpoint_reporting.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-brief'
 ```
 
 **提交边界：** `feat(memory): expose auditable memory use in review briefs`
@@ -753,7 +753,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **验证：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_pipeline.py tests/test_pipeline.py tests/test_resume.py tests/test_incremental.py tests/test_intent_pipeline.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-pipeline'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_pipeline.py tests/test_pipeline.py tests/test_resume.py tests/test_incremental.py tests/test_intent_pipeline.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-pipeline'
 ```
 
 **提交边界：** `feat(memory): integrate durable memory into resumable review pipeline`
@@ -803,16 +803,16 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 **定向回归：**
 
 ```powershell
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_models.py tests/test_memory_identity.py tests/test_memory_store.py tests/test_memory_sources.py tests/test_memory_lifecycle.py tests/test_repository_cache.py tests/test_memory_retrieval.py tests/test_memory_policy.py tests/test_memory_curator.py tests/test_memory_feedback.py tests/test_memory_cli.py tests/test_memory_pipeline.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-final-targeted'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_memory_models.py tests/test_memory_identity.py tests/test_memory_store.py tests/test_memory_sources.py tests/test_memory_lifecycle.py tests/test_repository_cache.py tests/test_memory_retrieval.py tests/test_memory_policy.py tests/test_memory_curator.py tests/test_memory_feedback.py tests/test_memory_cli.py tests/test_memory_pipeline.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-final-targeted'
 
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_session.py tests/test_session_store.py tests/test_hydration.py tests/test_context.py tests/test_tool_gateway.py tests/test_pipeline.py tests/test_resume.py tests/test_completion.py tests/test_final_risk.py tests/test_brief.py tests/test_checkpoint_reporting.py tests/test_architecture_boundaries.py -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-final-integration'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest tests/test_session.py tests/test_session_store.py tests/test_hydration.py tests/test_context.py tests/test_tool_gateway.py tests/test_pipeline.py tests/test_resume.py tests/test_completion.py tests/test_final_risk.py tests/test_brief.py tests/test_checkpoint_reporting.py tests/test_architecture_boundaries.py -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-final-integration'
 ```
 
 **全量回归：**
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
-& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest -q -p no:cacheprovider --basetemp 'C:\tmp\review-agent-memory-full'
+& 'D:\Anaconda\envs\MINIST\python.exe' -m pytest -q -p no:cacheprovider --basetemp 'D:\tmp\code-review-agent\review-agent-memory-full'
 git diff --check
 ```
 
