@@ -239,6 +239,15 @@ def _validate_metric_value(
         raise _error(f"{context}.direction is not canonical")
     if type(status) is not StatisticsMetricStatus:
         raise _error(f"{context}.status is invalid")
+    if (
+        metric is CoreMetric.ISSUE_F1
+        and status is StatisticsMetricStatus.ZERO_DENOMINATOR
+        and numerator is None
+        and denominator is None
+    ):
+        if value is not None:
+            raise _error(f"{context} zero-denominator value is not canonical")
+        return
     if status in {
         StatisticsMetricStatus.AVAILABLE,
         StatisticsMetricStatus.ZERO_DENOMINATOR,
@@ -825,10 +834,14 @@ def _derive_f1(
         )
     p_num, p_den, _p_value, p_status = source_results[CoreMetric.ISSUE_PRECISION]
     r_num, r_den, _r_value, r_status = source_results[CoreMetric.ISSUE_RECALL]
-    if p_num is None:
-        return None, None, None, p_status
-    if r_num is None:
-        return None, None, None, r_status
+    if p_num is None or r_num is None:
+        if p_status is not StatisticsMetricStatus.AVAILABLE:
+            status = p_status
+        elif r_status is not StatisticsMetricStatus.AVAILABLE:
+            status = r_status
+        else:  # pragma: no cover - guarded by source aggregation
+            status = StatisticsMetricStatus.MISSING
+        return None, None, None, status
     if p_den == 0 or r_den == 0:
         return 0, 0, None, StatisticsMetricStatus.ZERO_DENOMINATOR
     numerator = 2 * p_num * r_num

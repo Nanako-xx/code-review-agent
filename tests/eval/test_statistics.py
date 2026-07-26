@@ -12,6 +12,10 @@ from review_agent_eval.intent_evaluator import IntentEvaluator, IntentJudgeRelat
 from review_agent_eval.judge import JudgeUngradedReason, SemanticJudge
 from review_agent_eval.metrics import (
     CoreMetric,
+    MetricAggregate,
+    MetricCoverage,
+    MetricKind,
+    MetricNullReason,
     MetricsAggregator,
     TrialScore,
     TrialScorer,
@@ -34,9 +38,12 @@ import review_agent_eval.statistics as statistics_module
 from review_agent_eval.statistics import (
     STATISTICS_ALGORITHM_VERSION,
     ConfidenceIntervalStatus,
+    DerivedCaseContributionV1,
     MetricDirection,
+    MetricSourceCoverageV1,
     RunStatisticsV1,
     StatisticsError,
+    StatisticsMetricV1,
     StatisticsMetricStatus,
     StatisticsPolicyV1,
     TrialMetricProjectionV1,
@@ -421,6 +428,170 @@ def test_statistics_marks_missing_authority_not_scorable_not_zero(
     assert metric.denominator is None
     assert metric.value is None
     assert metric.coverage.metric_sources[0].not_scorable_count == 2
+
+
+def _f1_source_aggregate(
+    metric: CoreMetric,
+    status: StatisticsMetricStatus,
+    numerator: int | None,
+    denominator: int | None,
+    *,
+    trial_count: int,
+) -> MetricAggregate:
+    unavailable_counts = {
+        StatisticsMetricStatus.NOT_SCORABLE: "not_scorable_count",
+        StatisticsMetricStatus.UNGRADED: "ungraded_count",
+        StatisticsMetricStatus.FAILURE_EXCLUDED: "failure_excluded_count",
+        StatisticsMetricStatus.MISSING: "missing_count",
+    }
+    coverage_counts = {
+        "total_trial_count": trial_count,
+        "included_trial_count": 0,
+        "failure_as_miss_count": 0,
+        "zero_denominator_count": 0,
+        "not_scorable_count": 0,
+        "ungraded_count": 0,
+        "failure_excluded_count": 0,
+        "missing_count": 0,
+    }
+    if status in {
+        StatisticsMetricStatus.AVAILABLE,
+        StatisticsMetricStatus.ZERO_DENOMINATOR,
+    }:
+        coverage_counts["included_trial_count"] = trial_count
+        if status is StatisticsMetricStatus.ZERO_DENOMINATOR:
+            coverage_counts["zero_denominator_count"] = trial_count
+    else:
+        coverage_counts[unavailable_counts[status]] = trial_count
+    null_reason = {
+        StatisticsMetricStatus.AVAILABLE: None,
+        StatisticsMetricStatus.ZERO_DENOMINATOR: MetricNullReason.ZERO_DENOMINATOR,
+        StatisticsMetricStatus.NOT_SCORABLE: MetricNullReason.NOT_SCORABLE,
+        StatisticsMetricStatus.UNGRADED: MetricNullReason.UNGRADED,
+        StatisticsMetricStatus.FAILURE_EXCLUDED: MetricNullReason.FAILURE_EXCLUDED,
+        StatisticsMetricStatus.MISSING: MetricNullReason.MISSING,
+    }[status]
+    value = (
+        statistics_module._ratio_ppm(numerator, denominator)
+        if numerator is not None and denominator
+        else None
+    )
+    return MetricAggregate(
+        metric=metric,
+        kind=MetricKind.RATE,
+        numerator=numerator,
+        denominator=denominator,
+        value_ppm=value,
+        null_reason=null_reason,
+        coverage=MetricCoverage(**coverage_counts),
+    )
+
+
+@pytest.mark.parametrize(
+    ("precision_fields", "recall_fields", "expected_status"),
+    (
+        (
+            (StatisticsMetricStatus.ZERO_DENOMINATOR, 0, 0),
+            (StatisticsMetricStatus.NOT_SCORABLE, None, None),
+            StatisticsMetricStatus.ZERO_DENOMINATOR,
+        ),
+        (
+            (StatisticsMetricStatus.NOT_SCORABLE, None, None),
+            (StatisticsMetricStatus.ZERO_DENOMINATOR, 0, 0),
+            StatisticsMetricStatus.NOT_SCORABLE,
+        ),
+        (
+            (StatisticsMetricStatus.MISSING, None, None),
+            (StatisticsMetricStatus.UNGRADED, None, None),
+            StatisticsMetricStatus.MISSING,
+        ),
+        (
+            (StatisticsMetricStatus.AVAILABLE, 1, 2),
+            (StatisticsMetricStatus.FAILURE_EXCLUDED, None, None),
+            StatisticsMetricStatus.FAILURE_EXCLUDED,
+        ),
+    ),
+)
+def test_statistics_f1_null_precedence_matches_metrics_aggregator(
+    ratio_statistics: Any,
+    precision_fields: tuple[StatisticsMetricStatus, int | None, int | None],
+    recall_fields: tuple[StatisticsMetricStatus, int | None, int | None],
+    expected_status: StatisticsMetricStatus,
+) -> None:
+    metric = ratio_statistics.metric(CoreMetric.ISSUE_F1)
+    base_contribution = metric.case_contributions[0]
+    trial_count = base_contribution.coverage.total_trial_count
+    precision = _f1_source_aggregate(
+        CoreMetric.ISSUE_PRECISION,
+        *precision_fields,
+        trial_count=trial_count,
+    )
+    recall = _f1_source_aggregate(
+        CoreMetric.ISSUE_RECALL,
+        *recall_fields,
+        trial_count=trial_count,
+    )
+    expected = MetricsAggregator._f1(precision, recall)
+    expected_value = statistics_module._metric_value(expected)
+    expected_statistics_status = statistics_module._metric_status(expected)
+    coverage = replace(
+        base_contribution.coverage,
+        metric_sources=(
+            MetricSourceCoverageV1.from_metric_coverage(
+                CoreMetric.ISSUE_PRECISION,
+                precision.coverage,
+            ),
+            MetricSourceCoverageV1.from_metric_coverage(
+                CoreMetric.ISSUE_RECALL,
+                recall.coverage,
+            ),
+        ),
+    )
+    contribution = replace(
+        base_contribution,
+        status=expected_statistics_status,
+        numerator=expected.numerator,
+        denominator=expected.denominator,
+        value=expected_value,
+        coverage=coverage,
+        derived_contributions=(
+            DerivedCaseContributionV1(
+                metric=CoreMetric.ISSUE_PRECISION,
+                status=precision_fields[0],
+                numerator=precision_fields[1],
+                denominator=precision_fields[2],
+            ),
+            DerivedCaseContributionV1(
+                metric=CoreMetric.ISSUE_RECALL,
+                status=recall_fields[0],
+                numerator=recall_fields[1],
+                denominator=recall_fields[2],
+            ),
+        ),
+    )
+    aggregate = replace(
+        metric,
+        status=expected_statistics_status,
+        numerator=expected.numerator,
+        denominator=expected.denominator,
+        value=expected_value,
+        coverage=coverage,
+        case_contributions=(contribution,),
+    )
+
+    assert expected_statistics_status is expected_status
+    assert (
+        contribution.numerator,
+        contribution.denominator,
+        contribution.value,
+        contribution.status,
+    ) == (
+        expected.numerator,
+        expected.denominator,
+        expected_value,
+        expected_status,
+    )
+    assert StatisticsMetricV1.from_dict(aggregate.to_dict()) == aggregate
 
 
 def test_statistics_bootstrap_is_deterministic_for_fixed_policy(
