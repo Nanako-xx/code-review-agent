@@ -18,6 +18,7 @@ STATISTICS_PUBLIC_NAMES = (
     "MAX_BOOTSTRAP_SEED",
     "MAX_BOOTSTRAP_ITERATIONS",
     "MAX_BOOTSTRAP_CASES",
+    "MAX_RUN_BOOTSTRAP_DRAWS",
     "StatisticsError",
     "MetricUnit",
     "MetricDirection",

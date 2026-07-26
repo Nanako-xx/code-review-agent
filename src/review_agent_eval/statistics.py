@@ -42,6 +42,7 @@ MAX_BOOTSTRAP_SEED = (1 << 63) - 1
 MAX_BOOTSTRAP_ITERATIONS = 100_000
 MAX_BOOTSTRAP_CASES = 16_384
 MAX_BOOTSTRAP_DRAWS = 50_000_000
+MAX_RUN_BOOTSTRAP_DRAWS = 50_000_000
 
 
 class StatisticsError(ValueError):
@@ -553,6 +554,11 @@ class CaseContributionV1(_JsonModel):
         if tuple(item.metric for item in self.coverage.metric_sources) != expected_sources:
             raise _error("Case contribution coverage sources differ from its metric")
         object.__setattr__(self, "derived_contributions", derived)
+        _validate_reaggregated_fields(
+            self,
+            (self,),
+            context="CaseContributionV1",
+        )
 
     def _identity_dict(self) -> Dict[str, Any]:
         return {
@@ -627,6 +633,295 @@ class CaseContributionV1(_JsonModel):
         if payload["contribution_id"] != result.contribution_id:
             raise _error("CaseContributionV1 contribution_id is not canonical")
         return result
+
+
+@dataclass(frozen=True)
+class _ReaggregatedMetric:
+    numerator: Optional[int]
+    denominator: Optional[int]
+    value: Optional[int]
+    status: StatisticsMetricStatus
+    coverage: StatisticsCoverageV1
+
+
+def _unavailable_status(
+    coverage: MetricSourceCoverageV1,
+) -> StatisticsMetricStatus:
+    if coverage.ungraded_count:
+        return StatisticsMetricStatus.UNGRADED
+    if coverage.failure_excluded_count:
+        return StatisticsMetricStatus.FAILURE_EXCLUDED
+    if coverage.not_scorable_count:
+        return StatisticsMetricStatus.NOT_SCORABLE
+    return StatisticsMetricStatus.MISSING
+
+
+def _validate_source_piece(
+    *,
+    status: StatisticsMetricStatus,
+    numerator: Optional[int],
+    denominator: Optional[int],
+    kind: MetricKind,
+    coverage: MetricSourceCoverageV1,
+    context: str,
+) -> None:
+    if coverage.included_trial_count == 0:
+        if (
+            numerator is not None
+            or denominator is not None
+            or status is not _unavailable_status(coverage)
+        ):
+            raise _error(f"{context} differs from its source coverage")
+        return
+    if numerator is None or denominator is None:
+        raise _error(f"{context} omits included source contributions")
+    expected = (
+        StatisticsMetricStatus.ZERO_DENOMINATOR
+        if kind is not MetricKind.COUNT and denominator == 0
+        else StatisticsMetricStatus.AVAILABLE
+    )
+    if status is not expected:
+        raise _error(f"{context} status differs from its source coverage/value")
+
+
+def _sum_source_coverages(
+    metric: CoreMetric,
+    values: Sequence[MetricSourceCoverageV1],
+) -> MetricSourceCoverageV1:
+    if not values or any(item.metric is not metric for item in values):
+        raise _error("Case contribution source coverages are incompatible")
+    numeric_fields = tuple(
+        name
+        for name in MetricSourceCoverageV1.__dataclass_fields__
+        if name != "metric"
+    )
+    return MetricSourceCoverageV1(
+        metric=metric,
+        **{
+            name: sum(getattr(item, name) for item in values)
+            for name in numeric_fields
+        },
+    )
+
+
+def _sum_statistics_coverages(
+    values: Sequence[StatisticsCoverageV1],
+) -> StatisticsCoverageV1:
+    if not values:
+        raise _error("Case contribution coverage is empty")
+    source_metrics = tuple(item.metric for item in values[0].metric_sources)
+    if any(
+        tuple(item.metric for item in coverage.metric_sources) != source_metrics
+        for coverage in values
+    ):
+        raise _error("Case contribution coverage source metrics differ")
+    source_maps = [
+        {item.metric: item for item in coverage.metric_sources}
+        for coverage in values
+    ]
+    return StatisticsCoverageV1(
+        total_trial_count=sum(item.total_trial_count for item in values),
+        completed_trial_count=sum(item.completed_trial_count for item in values),
+        agent_failure_count=sum(item.agent_failure_count for item in values),
+        judge_request_count=sum(item.judge_request_count for item in values),
+        judge_graded_count=sum(item.judge_graded_count for item in values),
+        judge_failure_count=sum(item.judge_failure_count for item in values),
+        judge_ungraded_count=sum(item.judge_ungraded_count for item in values),
+        judge_semantic_unknown_count=sum(
+            item.judge_semantic_unknown_count for item in values
+        ),
+        metric_sources=tuple(
+            _sum_source_coverages(
+                metric,
+                tuple(source_map[metric] for source_map in source_maps),
+            )
+            for metric in source_metrics
+        ),
+    )
+
+
+def _aggregate_direct_source(
+    *,
+    metric: CoreMetric,
+    kind: MetricKind,
+    pieces: Sequence[
+        tuple[
+            StatisticsMetricStatus,
+            Optional[int],
+            Optional[int],
+            MetricSourceCoverageV1,
+        ]
+    ],
+    context: str,
+) -> tuple[Optional[int], Optional[int], Optional[int], StatisticsMetricStatus]:
+    for status, numerator, denominator, coverage in pieces:
+        _validate_source_piece(
+            status=status,
+            numerator=numerator,
+            denominator=denominator,
+            kind=kind,
+            coverage=coverage,
+            context=context,
+        )
+    aggregate_coverage = _sum_source_coverages(
+        metric,
+        tuple(piece[3] for piece in pieces),
+    )
+    included = tuple(piece for piece in pieces if piece[3].included_trial_count)
+    if not included:
+        return None, None, None, _unavailable_status(aggregate_coverage)
+    numerator = sum(int(piece[1]) for piece in included)
+    denominator = sum(int(piece[2]) for piece in included)
+    if kind is MetricKind.COUNT:
+        return numerator, denominator, numerator, StatisticsMetricStatus.AVAILABLE
+    if denominator == 0:
+        return (
+            numerator,
+            denominator,
+            None,
+            StatisticsMetricStatus.ZERO_DENOMINATOR,
+        )
+    return (
+        numerator,
+        denominator,
+        _ratio_ppm(numerator, denominator),
+        StatisticsMetricStatus.AVAILABLE,
+    )
+
+
+def _derive_f1(
+    values: Sequence[CaseContributionV1],
+) -> tuple[Optional[int], Optional[int], Optional[int], StatisticsMetricStatus]:
+    source_results: Dict[
+        CoreMetric,
+        tuple[Optional[int], Optional[int], Optional[int], StatisticsMetricStatus],
+    ] = {}
+    for source_metric in (CoreMetric.ISSUE_PRECISION, CoreMetric.ISSUE_RECALL):
+        pieces = []
+        for item in values:
+            component = next(
+                component
+                for component in item.derived_contributions
+                if component.metric is source_metric
+            )
+            source_coverage = next(
+                coverage
+                for coverage in item.coverage.metric_sources
+                if coverage.metric is source_metric
+            )
+            pieces.append(
+                (
+                    component.status,
+                    component.numerator,
+                    component.denominator,
+                    source_coverage,
+                )
+            )
+        source_results[source_metric] = _aggregate_direct_source(
+            metric=source_metric,
+            kind=MetricKind.RATE,
+            pieces=tuple(pieces),
+            context=f"F1 {source_metric.value} contribution",
+        )
+    p_num, p_den, _p_value, p_status = source_results[CoreMetric.ISSUE_PRECISION]
+    r_num, r_den, _r_value, r_status = source_results[CoreMetric.ISSUE_RECALL]
+    if p_num is None:
+        return None, None, None, p_status
+    if r_num is None:
+        return None, None, None, r_status
+    if p_den == 0 or r_den == 0:
+        return 0, 0, None, StatisticsMetricStatus.ZERO_DENOMINATOR
+    numerator = 2 * p_num * r_num
+    denominator = p_num * r_den + r_num * p_den
+    if denominator == 0:
+        numerator, denominator = 0, 1
+    return (
+        numerator,
+        denominator,
+        _ratio_ppm(numerator, denominator),
+        StatisticsMetricStatus.AVAILABLE,
+    )
+
+
+def _reaggregate_case_contributions(
+    values: Sequence[CaseContributionV1],
+) -> _ReaggregatedMetric:
+    contributions = tuple(values)
+    if not contributions or any(
+        type(item) is not CaseContributionV1 for item in contributions
+    ):
+        raise _error("Case contributions are empty or invalid")
+    first = contributions[0]
+    if any(
+        item.metric is not first.metric
+        or item.kind is not first.kind
+        or item.unit is not first.unit
+        or item.direction is not first.direction
+        for item in contributions
+    ):
+        raise _error("Case contributions are not metric-compatible")
+    coverage = _sum_statistics_coverages(
+        tuple(item.coverage for item in contributions)
+    )
+    if first.metric is CoreMetric.ISSUE_F1:
+        for item in contributions:
+            local = _derive_f1((item,))
+            if (
+                item.numerator,
+                item.denominator,
+                item.value,
+                item.status,
+            ) != local:
+                raise _error("F1 Case contribution differs from derived sources")
+        numerator, denominator, value, status = _derive_f1(contributions)
+    else:
+        pieces = tuple(
+            (
+                item.status,
+                item.numerator,
+                item.denominator,
+                item.coverage.metric_sources[0],
+            )
+            for item in contributions
+        )
+        numerator, denominator, value, status = _aggregate_direct_source(
+            metric=first.metric,
+            kind=first.kind,
+            pieces=pieces,
+            context=f"{first.metric.value} Case contribution",
+        )
+    return _ReaggregatedMetric(
+        numerator=numerator,
+        denominator=denominator,
+        value=value,
+        status=status,
+        coverage=coverage,
+    )
+
+
+def _validate_reaggregated_fields(
+    value: Any,
+    contributions: Sequence[CaseContributionV1],
+    *,
+    context: str,
+) -> None:
+    expected = _reaggregate_case_contributions(contributions)
+    actual = (
+        value.numerator,
+        value.denominator,
+        value.value,
+        value.status,
+        value.coverage,
+    )
+    reaggregated = (
+        expected.numerator,
+        expected.denominator,
+        expected.value,
+        expected.status,
+        expected.coverage,
+    )
+    if actual != reaggregated:
+        raise _error(f"{context} differs from reaggregated Case contributions")
 
 
 @dataclass(frozen=True)
@@ -974,6 +1269,38 @@ def paired_bootstrap_interval(
     )
 
 
+def _validate_run_bootstrap_budget(
+    *,
+    case_count: int,
+    iterations: int,
+    metric_count: int,
+) -> int:
+    """Fail before per-metric bootstrap can multiply work beyond its budget."""
+
+    cases = _integer(
+        case_count,
+        "run bootstrap case_count",
+        minimum=1,
+        maximum=MAX_BOOTSTRAP_CASES,
+    )
+    draws = _integer(
+        iterations,
+        "run bootstrap iterations",
+        minimum=1,
+        maximum=MAX_BOOTSTRAP_ITERATIONS,
+    )
+    metrics = _integer(
+        metric_count,
+        "run bootstrap metric_count",
+        minimum=1,
+        maximum=len(CoreMetric),
+    )
+    total = cases * draws * metrics
+    if total > MAX_RUN_BOOTSTRAP_DRAWS:
+        raise _error("total bootstrap work exceeds the Run resource budget")
+    return total
+
+
 @dataclass(frozen=True)
 class DispersionCoverageV1(_JsonModel):
     total_replicate_count: int
@@ -1214,6 +1541,11 @@ class TrialMetricProjectionV1(_JsonModel):
         ):
             raise _error("Trial metric Case contributions are not canonical")
         object.__setattr__(self, "case_contributions", contributions)
+        _validate_reaggregated_fields(
+            self,
+            contributions,
+            context="TrialMetricProjectionV1",
+        )
 
     def _identity_dict(self) -> Dict[str, Any]:
         return {
@@ -1354,6 +1686,11 @@ class StatisticsMetricV1(_JsonModel):
         if interval.coverage.total_case_count != len(contributions):
             raise _error("Statistics metric interval Case coverage differs")
         object.__setattr__(self, "case_contributions", contributions)
+        _validate_reaggregated_fields(
+            self,
+            contributions,
+            context="StatisticsMetricV1",
+        )
 
     def _identity_dict(self) -> Dict[str, Any]:
         return {
@@ -1644,6 +1981,47 @@ def _statistics_coverage(
     )
 
 
+@dataclass(frozen=True)
+class _ProjectionCaseAggregate:
+    """One Case aggregate whose population is one selected Trial index."""
+
+    source: Any
+    planned_trial_count: int
+    terminal_trial_count: int
+
+    @property
+    def compatibility(self) -> Any:
+        return self.source.compatibility
+
+    @property
+    def task_id(self) -> str:
+        return self.source.task_id
+
+    @property
+    def case_version(self) -> int:
+        return self.source.case_version
+
+    @property
+    def canonical_case_digest(self) -> str:
+        return self.source.canonical_case_digest
+
+    def metric(self, metric: CoreMetric) -> MetricAggregate:
+        return self.source.metric(metric)
+
+
+@dataclass(frozen=True)
+class _ProjectionRunAggregate:
+    """MetricsAggregator output with projection-local population counts."""
+
+    compatibility: Any
+    planned_trial_count: int
+    terminal_trial_count: int
+    metrics: Tuple[MetricAggregate, ...]
+
+    def metric(self, metric: CoreMetric) -> MetricAggregate:
+        return next(item for item in self.metrics if item.metric is metric)
+
+
 def _aggregate_scores(
     scores: Sequence[TrialScore], *, planned_trial_count: int
 ) -> tuple[Any, Tuple[Any, ...], Dict[str, Tuple[TrialScore, ...]]]:
@@ -1655,14 +2033,41 @@ def _aggregate_scores(
         task_id: tuple(items) for task_id, items in sorted(by_task.items())
     }
     aggregator = MetricsAggregator()
-    cases = tuple(
-        aggregator.aggregate_case(
-            items,
-            planned_trial_count=planned_trial_count,
-        )
+    source_cases = tuple(
+        aggregator.aggregate_case(items)
         for items in frozen_by_task.values()
     )
-    aggregate = aggregator.aggregate_cases(cases, source_trials=ordered)
+    source_trial_count = ordered[0].compatibility.trial_count
+    if planned_trial_count == source_trial_count:
+        cases: Tuple[Any, ...] = source_cases
+        aggregate: Any = aggregator.aggregate_cases(cases, source_trials=ordered)
+    else:
+        _integer(
+            planned_trial_count,
+            "projection planned_trial_count",
+            minimum=1,
+            maximum=source_trial_count,
+        )
+        if any(len(items) != planned_trial_count for items in frozen_by_task.values()):
+            raise _error("projection Case terminal count differs from its plan")
+        validated = aggregator._validate_trials(ordered)
+        compatibility = validated[0].compatibility
+        if any(case.compatibility != compatibility for case in source_cases):
+            raise _error("projection Case scores have incompatible source policies")
+        cases = tuple(
+            _ProjectionCaseAggregate(
+                source=case,
+                planned_trial_count=planned_trial_count,
+                terminal_trial_count=len(frozen_by_task[case.task_id]),
+            )
+            for case in source_cases
+        )
+        aggregate = _ProjectionRunAggregate(
+            compatibility=compatibility,
+            planned_trial_count=sum(item.planned_trial_count for item in cases),
+            terminal_trial_count=len(validated),
+            metrics=aggregator._aggregate_metrics(validated),
+        )
     return aggregate, cases, frozen_by_task
 
 
@@ -1763,21 +2168,41 @@ def compute_run_statistics(
     if type(policy) is not StatisticsPolicyV1:
         raise TypeError("policy must be StatisticsPolicyV1")
     canonical_policy = StatisticsPolicyV1.from_dict(policy.to_dict())
-    scores = tuple(
-        sorted(
-            (item.trial_score for item in bundle.trials),
-            key=lambda item: (item.task_id, item.trial_index),
+    try:
+        scores = tuple(
+            sorted(
+                (item.trial_score for item in tuple(bundle.trials)),
+                key=lambda item: (item.task_id, item.trial_index),
+            )
         )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise _error("bound TrialScore population changed after source validation") from exc
+    slots = tuple((item.task_id, item.trial_index) for item in scores)
+    if (
+        any(type(item) is not TrialScore for item in scores)
+        or len(slots) != len(set(slots))
+    ):
+        raise _error("bound TrialScore slots changed after source validation")
+    try:
+        current_digests = tuple(
+            sorted(_digest(item.digest(), "post-binding TrialScore digest") for item in scores)
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise _error("post-binding TrialScore digests are invalid") from exc
+    if current_digests != source_binding.trial_score_digests:
+        raise _error("post-binding TrialScore digests differ from the source binding")
+    _validate_run_bootstrap_budget(
+        case_count=len({item.task_id for item in scores}),
+        iterations=canonical_policy.bootstrap_iterations,
+        metric_count=len(CoreMetric),
     )
-    if len(scores) != len(source_binding.trial_score_digests):
-        raise _error("bound TrialScore population changed after source validation")
 
     projection_values: list[TrialMetricProjectionV1] = []
     for trial_index in range(1, run_config.trial_count + 1):
         index_scores = tuple(item for item in scores if item.trial_index == trial_index)
         aggregate, cases, by_task = _aggregate_scores(
             index_scores,
-            planned_trial_count=run_config.trial_count,
+            planned_trial_count=1,
         )
         for metric in sorted(CoreMetric, key=lambda item: item.value):
             projection_values.append(
@@ -1847,6 +2272,7 @@ __all__ = [
     "MAX_BOOTSTRAP_SEED",
     "MAX_BOOTSTRAP_ITERATIONS",
     "MAX_BOOTSTRAP_CASES",
+    "MAX_RUN_BOOTSTRAP_DRAWS",
     "StatisticsError",
     "MetricUnit",
     "MetricDirection",

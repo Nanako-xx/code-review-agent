@@ -1,26 +1,32 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from review_agent_eval.analysis_artifacts import AnalysisSourceBinding
 from review_agent_eval.config import EvalRunConfig
 from review_agent_eval.intent_evaluator import IntentEvaluator, IntentJudgeRelation
+from review_agent_eval.judge import JudgeUngradedReason, SemanticJudge
 from review_agent_eval.metrics import (
     CoreMetric,
     MetricsAggregator,
+    TrialScore,
     TrialScorer,
 )
 from review_agent_eval.models import (
+    ClarificationPolicy,
+    ExpectedIntentClaim,
+    IntentAuthority,
+    IntentClaimSource,
+    IntentDimension,
     IntentTruth,
+    SubmissionIntentClaim,
     ReviewTruth,
     TruthCompleteness,
     NovelFindingPolicy,
-    canonical_sha256,
     stable_id,
 )
 from review_agent_eval.review_evaluator import ReviewEvaluator
@@ -30,14 +36,16 @@ from review_agent_eval.statistics import (
     ConfidenceIntervalStatus,
     MetricDirection,
     RunStatisticsV1,
+    StatisticsError,
     StatisticsMetricStatus,
     StatisticsPolicyV1,
+    TrialMetricProjectionV1,
     compute_run_statistics,
     paired_bootstrap_interval,
 )
 
 from .test_intent_evaluator import judge_decision, judge_failure
-from .test_judge import _execution
+from .test_judge import _Factory, _execution
 from .test_metrics import (
     TARGET_MATERIALIZATION_ID,
     _completed_submission,
@@ -46,7 +54,6 @@ from .test_metrics import (
     _score_sources,
 )
 from .test_orchestrator_target_replay_v2 import (
-    _CountingJudge,
     _FrozenRun,
     _FrozenSuccessAdapter,
     _case_bank,
@@ -66,6 +73,55 @@ POLICY = StatisticsPolicyV1(
 )
 
 
+class _JudgeRateAdapter(_FrozenSuccessAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.slot = 0
+
+    def run(self, *args: Any, **kwargs: Any):
+        self.slot += 1
+        submission = super().run(*args, **kwargs)
+        assert submission.intent is not None
+        claim_count = 2 if self.slot == 1 else 100
+        claims = tuple(
+            SubmissionIntentClaim(
+                claim_id=f"candidate-{index:03d}",
+                dimension=IntentDimension.SCOPE,
+                text=f"Candidate scope {index:03d}",
+                source=IntentClaimSource.EXPLICIT,
+            )
+            for index in range(1, claim_count + 1)
+        )
+        return replace(
+            submission,
+            intent=replace(submission.intent, goal=None, claims=claims),
+        )
+
+
+class _JudgeFailureRatio:
+    def __init__(self, execution: Any) -> None:
+        self.execution = execution
+        self.calls = 0
+
+    def execute(self, request: Any):
+        self.calls += 1
+        failure = self.calls == 1 or 3 <= self.calls <= 101
+        judge = SemanticJudge(
+            adapter_factory=_Factory(
+                [TimeoutError("judge attempt one"), TimeoutError("judge attempt two")]
+                if failure
+                else []
+            ),
+            evaluator_execution=self.execution,
+        )
+        if failure:
+            return judge.execute(request)
+        return judge.execute(
+            request,
+            ungraded_reason=JudgeUngradedReason.POLICY_SKIPPED,
+        )
+
+
 def _repeated_bundle(
     root: Path,
     *,
@@ -75,6 +131,7 @@ def _repeated_bundle(
     intent_truth: IntentTruth,
     review_truth: ReviewTruth,
     judge: Any,
+    execution: Any = None,
 ):
     prepared = _prepared_bundle(root)
     snapshot, case = _frozen_snapshot_and_case(
@@ -105,26 +162,30 @@ def _repeated_bundle(
         bank=_case_bank(root, snapshot, case),
     )
     orchestrator = _frozen_orchestrator(run, judge=judge)
+    execution = execution or _execution()
     evaluated = orchestrator.evaluate_run(
         config.run_id,
-        evaluator_execution=_execution(),
+        evaluator_execution=execution,
         evaluation_revision="statistics-fixture-v1",
     )
-    hydrated = orchestrator.load_run_evaluation(
-        config.run_id,
-        evaluated.evaluation_id,
-    )
-    return run, hydrated
+    return run, evaluated
 
 
 @pytest.fixture(scope="module")
-def ratio_statistics(tmp_path_factory: pytest.TempPathFactory):
+def ratio_source(tmp_path_factory: pytest.TempPathFactory):
     truth = IntentTruth(
-        scorable=False,
-        authority=None,
-        expected_claims=(),
+        scorable=True,
+        authority=IntentAuthority.EXPLICIT_AUTHOR_METADATA,
+        expected_claims=(
+            ExpectedIntentClaim(
+                truth_id="expected-scope",
+                dimension=IntentDimension.SCOPE,
+                text="Expected canonical scope",
+                required=True,
+            ),
+        ),
         forbidden_claims=(),
-        clarification_policy=None,
+        clarification_policy=ClarificationPolicy.NOT_REQUIRED,
     )
     review_truth = ReviewTruth(
         completeness=TruthCompleteness.HUMAN_OBSERVED,
@@ -132,15 +193,25 @@ def ratio_statistics(tmp_path_factory: pytest.TempPathFactory):
         expected_findings=(),
         known_invalid_findings=(),
     )
+    execution = _execution()
+    judge = _JudgeFailureRatio(execution)
     run, bundle = _repeated_bundle(
         tmp_path_factory.mktemp("statistics-ratio"),
-        adapter=_FrozenSuccessAdapter(),
+        adapter=_JudgeRateAdapter(),
         trial_count=2,
         instance="statistics-ratio",
         intent_truth=truth,
         review_truth=review_truth,
-        judge=_CountingJudge(),
+        judge=judge,
+        execution=execution,
     )
+    assert judge.calls == 102
+    return run, bundle
+
+
+@pytest.fixture(scope="module")
+def ratio_statistics(ratio_source: Any):
+    run, bundle = ratio_source
     return compute_run_statistics(
         bundle,
         run_config=run.config,
@@ -241,79 +312,19 @@ def coverage_projection():
 
 
 def test_statistics_reaggregates_rates_from_numerators_and_denominators(
-    monkeypatch: pytest.MonkeyPatch,
+    ratio_statistics: Any,
 ) -> None:
-    case, replay, execution, config = _score_sources(trial_count=2)
-    _, _, _, first = _score_completed(
-        case,
-        replay,
-        execution,
-        config,
-        1,
-        finding_count=2,
-    )
-    _, _, _, original_second = _score_completed(
-        case,
-        replay,
-        execution,
-        config,
-        2,
-        finding_count=100,
-    )
-    changed_contributions = tuple(
-        replace(item, numerator=99)
-        if item.metric is CoreMetric.ISSUE_PRECISION
-        else item
-        for item in original_second.contributions
-    )
-    second = object.__new__(type(original_second))
-    for name in original_second.__dataclass_fields__:
-        object.__setattr__(
-            second,
-            name,
-            changed_contributions
-            if name == "contributions"
-            else getattr(original_second, name),
-        )
-    binding = AnalysisSourceBinding(
-        run_id=config.run_id,
-        evaluation_id=first.compatibility.evaluation_id,
-        summary_id=stable_id("statistics-test-summary", {"ratio": True}),
-        summary_digest=canonical_sha256({"summary": "ratio"}),
-        run_config_digest=config.digest(),
-        case_snapshot_digest=canonical_sha256({"snapshot": "ratio"}),
-        trial_score_digests=tuple(sorted((first.digest(), second.digest()))),
-    )
-    bind_calls = []
+    metric = ratio_statistics.metric(CoreMetric.JUDGE_FAILURE_RATE)
 
-    def bound(*args: Any, **kwargs: Any) -> AnalysisSourceBinding:
-        bind_calls.append((args, kwargs))
-        return binding
-
-    monkeypatch.setattr(statistics_module, "bind_analysis_source", bound)
-    result = compute_run_statistics(
-        SimpleNamespace(
-            trials=(
-                SimpleNamespace(trial_score=first),
-                SimpleNamespace(trial_score=second),
-            )
-        ),
-        run_config=config,
-        case_snapshot=SimpleNamespace(),
-        policy=POLICY,
-    )
-    metric = result.metric(CoreMetric.ISSUE_PRECISION)
-
-    assert len(bind_calls) == 1
     assert metric.numerator == 100
     assert metric.denominator == 102
     assert metric.value == 980_392
     assert metric.value != (500_000 + 990_000) // 2
     assert tuple(
-        result.trial_metric(index, CoreMetric.ISSUE_PRECISION).value
+        ratio_statistics.trial_metric(index, CoreMetric.JUDGE_FAILURE_RATE).value
         for index in (1, 2)
     ) == (500_000, 990_000)
-    assert metric.direction is MetricDirection.HIGHER_IS_BETTER
+    assert metric.direction is MetricDirection.LOWER_IS_BETTER
 
 
 def test_statistics_keeps_failed_and_ungraded_trials_in_coverage(
@@ -337,13 +348,67 @@ def test_statistics_reports_each_trial_index_without_best_trial_selection(
     projections = tuple(
         item
         for item in ratio_statistics.trial_metrics
-        if item.metric is CoreMetric.AGENT_FAILURE_RATE
+        if item.metric is CoreMetric.JUDGE_FAILURE_RATE
     )
 
     assert tuple(item.trial_index for item in projections) == (1, 2)
-    assert tuple(item.value for item in projections) == (0, 0)
+    assert tuple(item.value for item in projections) == (500_000, 990_000)
     assert ratio_statistics.trial_count == 2
     assert not hasattr(ratio_statistics, "best_trial_index")
+
+
+def test_statistics_trial_projection_plans_one_trial_per_case(
+    ratio_source: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run, bundle = ratio_source
+    original = statistics_module._aggregate_scores
+    source_policy = bundle.trials[0].trial_score.compatibility.metrics_policy
+    calls = []
+
+    def tracked(scores: Any, *, planned_trial_count: int):
+        aggregate, cases, by_task = original(
+            scores,
+            planned_trial_count=planned_trial_count,
+        )
+        assert aggregate.compatibility.metrics_policy == source_policy
+        assert all(
+            item.compatibility.metrics_policy == source_policy for item in cases
+        )
+        calls.append(
+            (
+                len(tuple(scores)),
+                planned_trial_count,
+                aggregate.planned_trial_count,
+                aggregate.terminal_trial_count,
+                tuple(
+                    (item.planned_trial_count, item.terminal_trial_count)
+                    for item in cases
+                ),
+            )
+        )
+        return aggregate, cases, by_task
+
+    monkeypatch.setattr(statistics_module, "_aggregate_scores", tracked)
+    result = compute_run_statistics(
+        bundle,
+        run_config=run.config,
+        case_snapshot=run.snapshot,
+        policy=POLICY,
+    )
+
+    projection_calls = calls[: run.config.trial_count]
+    assert all(
+        planned == terminal == 1
+        and case_counts == ((1, 1),)
+        for _source_count, _requested, planned, terminal, case_counts in projection_calls
+    )
+    assert calls[-1][1:4] == (run.config.trial_count, 2, 2)
+    assert result.metric(CoreMetric.JUDGE_FAILURE_RATE).value == 980_392
+    assert tuple(
+        result.trial_metric(index, CoreMetric.JUDGE_FAILURE_RATE).coverage.total_trial_count
+        for index in (1, 2)
+    ) == (1, 1)
 
 
 def test_statistics_marks_missing_authority_not_scorable_not_zero(
@@ -362,7 +427,7 @@ def test_statistics_bootstrap_is_deterministic_for_fixed_policy(
     ratio_statistics: Any,
 ) -> None:
     source = ratio_statistics.metric(
-        CoreMetric.AGENT_FAILURE_RATE
+        CoreMetric.JUDGE_FAILURE_RATE
     ).case_contributions[0]
     second = replace(
         source,
@@ -400,6 +465,186 @@ def test_statistics_bootstrap_is_deterministic_for_fixed_policy(
     assert StatisticsPolicyV1.from_dict(POLICY.to_dict()) == POLICY
     assert StatisticsPolicyV1.from_json(POLICY.to_json()) == POLICY
     assert RunStatisticsV1.from_json(ratio_statistics.to_json()) == ratio_statistics
+
+
+def test_statistics_run_bootstrap_budget_fails_before_rng_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered_rng = False
+
+    class ForbiddenRandom:
+        def __init__(self, _seed: int) -> None:
+            nonlocal entered_rng
+            entered_rng = True
+            raise AssertionError("RNG loop must not start after total-budget rejection")
+
+    monkeypatch.setattr(statistics_module.random, "Random", ForbiddenRandom)
+    with pytest.raises(StatisticsError, match="total bootstrap.*budget"):
+        statistics_module._validate_run_bootstrap_budget(
+            case_count=500,
+            iterations=100_000,
+            metric_count=len(CoreMetric),
+        )
+    assert entered_rng is False
+
+
+def test_statistics_compute_checks_total_budget_before_any_metric_bootstrap(
+    ratio_source: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run, bundle = ratio_source
+    entered_bootstrap = False
+
+    def reject_budget(**_kwargs: Any) -> int:
+        raise StatisticsError("total bootstrap work exceeds the Run resource budget")
+
+    def forbidden_bootstrap(*_args: Any, **_kwargs: Any):
+        nonlocal entered_bootstrap
+        entered_bootstrap = True
+        raise AssertionError("per-metric bootstrap must not start")
+
+    monkeypatch.setattr(
+        statistics_module,
+        "_validate_run_bootstrap_budget",
+        reject_budget,
+    )
+    monkeypatch.setattr(
+        statistics_module,
+        "paired_bootstrap_interval",
+        forbidden_bootstrap,
+    )
+    with pytest.raises(StatisticsError, match="total bootstrap.*budget"):
+        compute_run_statistics(
+            bundle,
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+            policy=POLICY,
+        )
+    assert entered_bootstrap is False
+
+
+def _reseal_stable_id(payload: dict[str, Any], field: str, namespace: str) -> None:
+    identity = dict(payload)
+    identity.pop(field)
+    payload[field] = stable_id(namespace, identity)
+
+
+@pytest.mark.parametrize(
+    ("metric_name", "replacement"),
+    (
+        (
+            CoreMetric.JUDGE_FAILURE_RATE.value,
+            {
+                "status": "available",
+                "numerator": 0,
+                "denominator": 102,
+                "value": 0,
+            },
+        ),
+        (
+            CoreMetric.ISSUE_F1.value,
+            {
+                "status": "available",
+                "numerator": 0,
+                "denominator": 1,
+                "value": 0,
+            },
+        ),
+        (
+            CoreMetric.CRITICAL_HIGH_MISS_COUNT.value,
+            {
+                "status": "available",
+                "numerator": 1,
+                "denominator": 2,
+                "value": 1,
+            },
+        ),
+        (
+            CoreMetric.FABRICATED_FINDINGS_PER_PR.value,
+            {
+                "status": "available",
+                "numerator": 1,
+                "denominator": 2,
+                "value": 500_000,
+            },
+        ),
+        (
+            CoreMetric.LINE_RECALL.value,
+            {
+                "status": "missing",
+                "numerator": None,
+                "denominator": None,
+                "value": None,
+            },
+        ),
+    ),
+)
+def test_statistics_rejects_resealed_metric_derived_field_tamper(
+    ratio_statistics: Any,
+    metric_name: str,
+    replacement: dict[str, Any],
+) -> None:
+    payload = deepcopy(ratio_statistics.to_dict())
+    metric = next(item for item in payload["metrics"] if item["metric"] == metric_name)
+    metric.update(replacement)
+    _reseal_stable_id(metric, "metric_id", "statistics-metric-v1")
+    _reseal_stable_id(payload, "statistics_id", "run-statistics-v1")
+
+    with pytest.raises(StatisticsError, match="Case contributions|reaggregated"):
+        RunStatisticsV1.from_dict(payload)
+
+
+def test_statistics_rejects_resealed_trial_projection_derived_field_tamper(
+    ratio_statistics: Any,
+) -> None:
+    payload = deepcopy(
+        ratio_statistics.trial_metric(1, CoreMetric.JUDGE_FAILURE_RATE).to_dict()
+    )
+    payload.update({"numerator": 0, "denominator": 2, "value": 0})
+    _reseal_stable_id(payload, "projection_id", "trial-metric-projection-v1")
+
+    with pytest.raises(StatisticsError, match="Case contributions|reaggregated"):
+        TrialMetricProjectionV1.from_dict(payload)
+
+
+def test_statistics_rejects_resealed_metric_coverage_tamper(
+    ratio_statistics: Any,
+) -> None:
+    payload = deepcopy(ratio_statistics.to_dict())
+    metric = next(
+        item
+        for item in payload["metrics"]
+        if item["metric"] == CoreMetric.JUDGE_FAILURE_RATE.value
+    )
+    metric["coverage"]["completed_trial_count"] = 1
+    metric["coverage"]["agent_failure_count"] = 1
+    _reseal_stable_id(metric, "metric_id", "statistics-metric-v1")
+    _reseal_stable_id(payload, "statistics_id", "run-statistics-v1")
+
+    with pytest.raises(StatisticsError, match="Case contributions|reaggregated"):
+        RunStatisticsV1.from_dict(payload)
+
+
+def test_statistics_rejects_post_binding_trial_score_digest_change(
+    ratio_source: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run, bundle = ratio_source
+    original_bind = statistics_module.bind_analysis_source
+
+    def bind_then_change_digest(*args: Any, **kwargs: Any):
+        binding = original_bind(*args, **kwargs)
+        monkeypatch.setattr(TrialScore, "digest", lambda _self: "0" * 64)
+        return binding
+
+    monkeypatch.setattr(statistics_module, "bind_analysis_source", bind_then_change_digest)
+    with pytest.raises(StatisticsError, match="TrialScore digests"):
+        compute_run_statistics(
+            bundle,
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+            policy=POLICY,
+        )
 
 
 @pytest.mark.parametrize(
