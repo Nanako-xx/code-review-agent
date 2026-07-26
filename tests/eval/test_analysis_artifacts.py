@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import review_agent_eval.analysis_artifacts as analysis_artifact_module
 import review_agent_eval.artifacts as artifact_module
 from review_agent_eval.analysis_artifacts import (
     ANALYSIS_RECEIPT_SCHEMA_VERSION,
@@ -28,6 +29,7 @@ from review_agent_eval.artifacts import (
 from review_agent_eval.config import derive_evaluation_id
 from review_agent_eval.models import (
     SchemaError,
+    canonical_json,
     canonical_json_bytes,
     canonical_sha256,
     stable_id,
@@ -87,6 +89,24 @@ def _store(tmp_path: Path, **kwargs: object) -> AnalysisArtifactStore:
     )
 
 
+def _hydrated_bundle(tmp_path: Path, *, instance: str):
+    run = _run_frozen(
+        tmp_path,
+        _FrozenSuccessAdapter(),
+        instance=instance,
+    )
+    orchestrator = _frozen_orchestrator(run, judge=_CountingJudge())
+    evaluated = orchestrator.evaluate_run(
+        run.config.run_id,
+        evaluator_execution=_execution(),
+        evaluation_revision="analysis-source-v1",
+    )
+    return run, orchestrator.load_run_evaluation(
+        run.config.run_id,
+        evaluated.evaluation_id,
+    )
+
+
 def test_analysis_bundle_is_create_only_and_reloads_identically(
     tmp_path: Path,
 ) -> None:
@@ -143,20 +163,9 @@ def test_analysis_bundle_is_create_only_and_reloads_identically(
 def test_analysis_receipt_binds_run_evaluation_and_source_digests(
     tmp_path: Path,
 ) -> None:
-    run = _run_frozen(
+    run, hydrated = _hydrated_bundle(
         tmp_path,
-        _FrozenSuccessAdapter(),
         instance="analysis-source-binding",
-    )
-    orchestrator = _frozen_orchestrator(run, judge=_CountingJudge())
-    evaluated = orchestrator.evaluate_run(
-        run.config.run_id,
-        evaluator_execution=_execution(),
-        evaluation_revision="analysis-source-v1",
-    )
-    hydrated = orchestrator.load_run_evaluation(
-        run.config.run_id,
-        evaluated.evaluation_id,
     )
 
     binding = bind_analysis_source(
@@ -165,7 +174,7 @@ def test_analysis_receipt_binds_run_evaluation_and_source_digests(
         case_snapshot=run.snapshot,
     )
     assert binding.run_id == run.config.run_id
-    assert binding.evaluation_id == evaluated.evaluation_id
+    assert binding.evaluation_id == hydrated.evaluation_id
     assert binding.summary_id == hydrated.summary.summary_id
     assert binding.summary_digest == hydrated.summary.digest()
     assert binding.run_config_digest == run.config.digest()
@@ -415,6 +424,141 @@ def test_analysis_json_names_reject_portable_casefold_collisions() -> None:
     )
     with pytest.raises(SchemaError, match="portable|collision"):
         replace(receipt, artifacts=colliding_refs)
+
+
+def test_analysis_receipt_marker_collision_leaves_no_orphan_namespace(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    receipt = _receipt({"statistics.json": {"status": "ok"}})
+
+    with pytest.raises(SchemaError, match="receipt|portable|reserved"):
+        AnalysisReceipt.create(
+            kind=receipt.kind,
+            source_bindings=receipt.source_bindings,
+            algorithm_digest=receipt.algorithm_digest,
+            files={"Receipt.json": {"status": "collision"}},
+        )
+    with pytest.raises(SchemaError, match="receipt|portable|reserved"):
+        AnalysisArtifactRef.create(
+            kind=receipt.kind,
+            artifact_id=receipt.artifact_id,
+            name="Receipt.json",
+            data=canonical_json_bytes({"status": "collision"}),
+        )
+    with pytest.raises(SchemaError, match="receipt|portable|reserved"):
+        store.publish_json_bundle(
+            receipt.kind,
+            receipt.artifact_id,
+            {"Receipt.json": {"status": "collision"}},
+            receipt,
+        )
+
+    assert list(store.root.iterdir()) == []
+    assert not (store.root / receipt.kind / receipt.artifact_id).exists()
+
+
+def test_analysis_kinds_are_closed_to_the_planned_allowlist() -> None:
+    expected = {
+        "statistics",
+        "comparison",
+        "calibration-package",
+        "calibration-result",
+        "gate-policy",
+        "gate-result",
+    }
+    assert set(analysis_artifact_module.ANALYSIS_ARTIFACT_KINDS) == expected
+    binding = _source_binding()
+    algorithm_digest = canonical_sha256({"algorithm": "kind-allowlist-v1"})
+    for kind in sorted(expected):
+        assert AnalysisReceipt.create(
+            kind=kind,
+            source_bindings=(binding,),
+            algorithm_digest=algorithm_digest,
+            files={"artifact.json": {"kind": kind}},
+        ).kind == kind
+    with pytest.raises(SchemaError, match="kind|unsupported|unknown"):
+        AnalysisReceipt.create(
+            kind="unknown-analysis-kind",
+            source_bindings=(binding,),
+            algorithm_digest=algorithm_digest,
+            files={"artifact.json": {}},
+        )
+
+
+@pytest.mark.parametrize(
+    "run_segment",
+    (".eval-runs", ".EVAL-RUNS", ".ｅｖａｌ－ｒｕｎｓ"),
+)
+def test_analysis_root_rejects_portable_run_store_ancestors_before_creation(
+    tmp_path: Path,
+    run_segment: str,
+) -> None:
+    container = tmp_path / "not-created"
+    root = container / run_segment / "custom-analysis-root"
+
+    with pytest.raises((ValueError, ArtifactSecurityError), match="Run|eval-runs"):
+        AnalysisArtifactStore(
+            root,
+            create_root=True,
+            max_file_bytes=4096,
+            max_total_read_bytes=16384,
+        )
+    assert not container.exists()
+
+
+def test_analysis_root_allows_custom_non_run_basename(tmp_path: Path) -> None:
+    root = tmp_path / "custom-task15-root"
+    store = AnalysisArtifactStore(
+        root,
+        create_root=True,
+        max_file_bytes=4096,
+        max_total_read_bytes=16384,
+    )
+    assert store.root.exists()
+
+
+def test_analysis_source_rejects_judge_inspection_and_trial_report_tamper(
+    tmp_path: Path,
+) -> None:
+    run, hydrated = _hydrated_bundle(
+        tmp_path,
+        instance="analysis-nested-artifact-binding",
+    )
+    trial = hydrated.trials[0]
+    tampered_input = replace(
+        trial.judge_input,
+        evaluator_execution_digest="0" * 64,
+    )
+    tampered_output = replace(
+        trial.judge_output,
+        input_artifact_digest="0" * 64,
+    )
+    inspection_payload = trial.inspection.to_dict()
+    inspection_payload["source_bindings"]["trial_score_digest"] = "0" * 64
+    tampered_inspection = object.__new__(type(trial.inspection))
+    object.__setattr__(
+        tampered_inspection,
+        "_canonical_json",
+        canonical_json(inspection_payload),
+    )
+
+    tampered_trials = (
+        replace(trial, judge_input=tampered_input),
+        replace(trial, judge_output=tampered_output),
+        replace(trial, inspection=tampered_inspection),
+        replace(trial, report=trial.report + "\n"),
+    )
+    for tampered_trial in tampered_trials:
+        with pytest.raises(
+            ArtifactIntegrityError,
+            match="Judge|inspection|report|source",
+        ):
+            bind_analysis_source(
+                replace(hydrated, trials=(tampered_trial,)),
+                run_config=run.config,
+                case_snapshot=run.snapshot,
+            )
 
 
 def test_analysis_tamper_fails_closed(tmp_path: Path) -> None:

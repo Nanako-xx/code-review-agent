@@ -1,6 +1,7 @@
 """Product-runtime-free list of lazy public Task 15 artifact exports."""
 
 ANALYSIS_PUBLIC_NAMES = (
+    "ANALYSIS_ARTIFACT_KINDS",
     "ANALYSIS_RECEIPT_SCHEMA_VERSION",
     "MAX_ANALYSIS_ARTIFACTS",
     "AnalysisSourceBinding",

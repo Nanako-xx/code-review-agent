@@ -48,6 +48,16 @@ from .models import (
 
 
 ANALYSIS_RECEIPT_SCHEMA_VERSION = "analysis_receipt_v1"
+ANALYSIS_ARTIFACT_KINDS = frozenset(
+    {
+        "statistics",
+        "comparison",
+        "calibration-package",
+        "calibration-result",
+        "gate-policy",
+        "gate-result",
+    }
+)
 MAX_ANALYSIS_ARTIFACTS = 64
 _RECEIPT_NAME = "receipt.json"
 _HEX_DIGITS = frozenset("0123456789abcdef")
@@ -64,7 +74,10 @@ def _digest(value: Any, context: str) -> str:
 
 
 def _kind(value: Any) -> str:
-    return validate_path_segment(value, "analysis artifact kind")
+    kind = validate_path_segment(value, "analysis artifact kind")
+    if kind not in ANALYSIS_ARTIFACT_KINDS:
+        raise SchemaError("analysis artifact kind is unsupported")
+    return kind
 
 
 def _artifact_id(value: Any) -> str:
@@ -73,9 +86,14 @@ def _artifact_id(value: Any) -> str:
 
 def _json_artifact_name(value: Any) -> str:
     name = validate_path_segment(value, "analysis JSON artifact name")
-    if name == _RECEIPT_NAME or not name.endswith(".json"):
+    if (
+        _portable_artifact_name_key(name)
+        == _portable_artifact_name_key(_RECEIPT_NAME)
+        or not name.endswith(".json")
+    ):
         raise SchemaError(
-            "analysis JSON artifact name must end in .json and not be receipt.json"
+            "analysis JSON artifact name must end in .json and not collide "
+            "with reserved receipt.json"
         )
     return name
 
@@ -84,6 +102,27 @@ def _portable_artifact_name_key(value: str) -> str:
     """Return the Windows-portable collision key for one validated name."""
 
     return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _windows_portable_path_segment_key(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold().rstrip(" .")
+
+
+def _validate_analysis_root_boundary(root: os.PathLike[str] | str) -> None:
+    try:
+        absolute = os.path.abspath(os.fspath(root))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Analysis root must be a filesystem path") from exc
+    portable_run_root = _windows_portable_path_segment_key(".eval-runs")
+    normalized = absolute.replace("\\", "/")
+    segments = tuple(item for item in normalized.split("/") if item)
+    if any(
+        _windows_portable_path_segment_key(segment) == portable_run_root
+        for segment in segments
+    ):
+        raise ValueError(
+            "Analysis root may not be the Run Store or descend from .eval-runs"
+        )
 
 
 def _exact_mapping(value: Any, fields: set[str], context: str) -> Mapping[str, Any]:
@@ -469,6 +508,7 @@ class AnalysisArtifactStore:
         max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
         max_total_read_bytes: int = DEFAULT_MAX_TOTAL_READ_BYTES,
     ) -> None:
+        _validate_analysis_root_boundary(root)
         self._storage = _AnalysisSafeStorage(
             root,
             create_root=create_root,
@@ -729,9 +769,15 @@ def bind_analysis_source(
     # Local imports avoid making protocol-only module import pull in the
     # orchestrator/report graph while still requiring concrete hydrated types.
     from .intent_evaluator import IntentEvaluationResult, IntentJudgeRelation
+    from .judge import JudgeInputArtifact, JudgeOutputArtifact
     from .metrics import IntentScoreBinding, ReviewScoreBinding, TrialScore
     from .orchestrator import RunEvaluationBundle, TrialEvaluationBundle
-    from .report import RunReportSummary, render_run_markdown
+    from .report import (
+        RunReportSummary,
+        TrialInspection,
+        render_run_markdown,
+        render_trial_markdown,
+    )
     from .review_evaluator import ReviewEvaluationResult
 
     if type(bundle) is not RunEvaluationBundle:
@@ -772,6 +818,7 @@ def bind_analysis_source(
         summary_id = summary.summary_id
         summary_digest = summary.digest()
         summary_cases = summary.cases
+        summary_identity = summary.identity
     except (AttributeError, TypeError, ValueError) as exc:
         raise ArtifactIntegrityError(
             "hydrated Evaluation summary is not a sealed RunReportSummary"
@@ -802,6 +849,35 @@ def bind_analysis_source(
         raise ArtifactIntegrityError(
             "hydrated Evaluation summary differs from verified source digests"
         )
+    expected_summary_suite = {
+        "suite_id": run_config.suite.suite_id,
+        "suite_version": run_config.suite.suite_version,
+        "manifest_digest": run_config.suite.manifest_digest,
+        "case_snapshot_id": case_snapshot.snapshot_id,
+        "case_snapshot_digest": case_snapshot.digest(),
+    }
+    evaluator_identity = (
+        None
+        if type(summary_identity) is not dict
+        else summary_identity.get("evaluator")
+    )
+    if (
+        type(summary_identity) is not dict
+        or summary_identity.get("suite") != expected_summary_suite
+        or summary_identity.get("agent") != run_config.agent.to_dict()
+        or type(evaluator_identity) is not dict
+        or evaluator_identity.get("configuration")
+        != bundle.evaluator_execution.evaluator.to_dict()
+        or evaluator_identity.get("evaluator_config_digest")
+        != bundle.evaluator_execution.evaluator_config_digest
+        or evaluator_identity.get("execution_config_digest") != execution_digest
+        or evaluator_identity.get("evaluation_id") != bundle.evaluation_id
+        or evaluator_identity.get("evaluation_revision")
+        != bundle.evaluation_revision
+    ):
+        raise ArtifactIntegrityError(
+            "hydrated Evaluation summary identity differs from available sources"
+        )
 
     if type(bundle.trials) is not tuple:
         raise ArtifactIntegrityError(
@@ -814,6 +890,7 @@ def bind_analysis_source(
             "hydrated Evaluation Trial coverage differs from RunConfig"
         )
     keyed_scores = []
+    score_metrics_policies = []
     for trial in trials:
         if type(trial) is not TrialEvaluationBundle:
             raise ArtifactIntegrityError(
@@ -822,6 +899,18 @@ def bind_analysis_source(
         if type(trial.trial_score) is not TrialScore:
             raise ArtifactIntegrityError(
                 "hydrated Evaluation Trial score is not a concrete TrialScore"
+            )
+        if type(trial.judge_input) is not JudgeInputArtifact:
+            raise ArtifactIntegrityError(
+                "hydrated Trial Judge input is not a concrete JudgeInputArtifact"
+            )
+        if type(trial.judge_output) is not JudgeOutputArtifact:
+            raise ArtifactIntegrityError(
+                "hydrated Trial Judge output is not a concrete JudgeOutputArtifact"
+            )
+        if type(trial.inspection) is not TrialInspection:
+            raise ArtifactIntegrityError(
+                "hydrated Trial inspection is not a concrete TrialInspection"
             )
         try:
             task_id = trial.task_id
@@ -1063,9 +1152,101 @@ def bind_analysis_source(
                 raise ArtifactIntegrityError(
                     "hydrated Review result differs from Submission/TrialScore bindings"
                 )
+        try:
+            replayed_judge_input = JudgeInputArtifact.from_dict(
+                trial.judge_input.to_dict(),
+                evaluator_execution=bundle.evaluator_execution,
+            )
+            bound_intent_evaluation = (
+                intent_result
+                if trial.judge_output.intent_evaluation_digest is not None
+                else None
+            )
+            replayed_judge_output = JudgeOutputArtifact.from_dict(
+                trial.judge_output.to_dict(),
+                input_artifact=replayed_judge_input,
+                evaluator_execution=bundle.evaluator_execution,
+                intent_evaluation=bound_intent_evaluation,
+            )
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "hydrated Trial Judge artifacts fail source-bound hydration"
+            ) from exc
+        if (
+            replayed_judge_input.to_dict() != trial.judge_input.to_dict()
+            or replayed_judge_output.to_dict() != trial.judge_output.to_dict()
+        ):
+            raise ArtifactIntegrityError(
+                "hydrated Trial Judge artifacts differ from canonical hydration"
+            )
+
+        inspection = trial.inspection
+        try:
+            inspection.__post_init__()
+            inspection_bindings = inspection.source_bindings
+        except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "hydrated Trial inspection is not canonically sealed"
+            ) from exc
+        expected_inspection_bindings = {
+            "run_id": run_config.run_id,
+            "run_config_digest": run_config.digest(),
+            "case_snapshot_id": case_snapshot.snapshot_id,
+            "case_snapshot_digest": case_snapshot.digest(),
+            "evaluation_id": bundle.evaluation_id,
+            "evaluation_revision": bundle.evaluation_revision,
+            "evaluator_execution_digest": execution_digest,
+            "task_id": task_id,
+            "trial_id": trial_id,
+            "trial_index": trial_index,
+            "canonical_case_digest": case_digest,
+            "eval_input_digest": input_digest,
+            "submission_digest": submission_digest,
+            "intent_result_digest": (
+                None if intent_result is None else intent_result.digest()
+            ),
+            "review_result_digest": (
+                None if review_result is None else review_result.digest()
+            ),
+            "trial_score_digest": score_digest,
+            "metrics_policy": compatibility.metrics_policy.to_dict(),
+        }
+        if type(inspection_bindings) is not dict or any(
+            inspection_bindings.get(name) != value
+            for name, value in expected_inspection_bindings.items()
+        ):
+            raise ArtifactIntegrityError(
+                "hydrated Trial inspection source bindings differ from Trial sources"
+            )
+        try:
+            rendered_trial_report = render_trial_markdown(inspection)
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "hydrated Trial inspection cannot be canonically rendered"
+            ) from exc
+        if type(trial.report) is not str or trial.report != rendered_trial_report:
+            raise ArtifactIntegrityError(
+                "hydrated Trial report differs from canonical inspection rendering"
+            )
+        score_metrics_policies.append(compatibility.metrics_policy.to_dict())
         keyed_scores.append(((task_id, trial_index), _digest(score_digest, "Trial score")))
     if len({key for key, _digest_value in keyed_scores}) != len(keyed_scores):
         raise ArtifactIntegrityError("hydrated Evaluation contains duplicate Trial slots")
+    canonical_metrics_policies = {
+        canonical_json_bytes(item) for item in score_metrics_policies
+    }
+    if (
+        len(canonical_metrics_policies) != 1
+        or summary_bindings.get("metrics_policy") != score_metrics_policies[0]
+    ):
+        raise ArtifactIntegrityError(
+            "hydrated Evaluation summary MetricsPolicy differs from Trial sources"
+        )
+    # RunReportSummary.from_dict additionally requires the immutable
+    # RunManifest/TrialEvaluationSource graph, which this confirmed Task 1
+    # binder signature intentionally does not accept.  The concrete bundle is
+    # therefore trusted only for that already-completed orchestrator replay;
+    # every source available here is checked above.
 
     projected = []
     if type(summary_cases) is not list:
@@ -1130,6 +1311,7 @@ def bind_analysis_source(
 
 
 __all__ = [
+    "ANALYSIS_ARTIFACT_KINDS",
     "ANALYSIS_RECEIPT_SCHEMA_VERSION",
     "MAX_ANALYSIS_ARTIFACTS",
     "AnalysisSourceBinding",
