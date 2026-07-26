@@ -13,6 +13,7 @@ import pytest
 import review_agent_eval.artifacts as artifact_module
 from review_agent_eval.analysis_artifacts import (
     ANALYSIS_RECEIPT_SCHEMA_VERSION,
+    AnalysisArtifactRef,
     AnalysisArtifactStore,
     AnalysisReceipt,
     AnalysisSourceBinding,
@@ -290,6 +291,45 @@ def test_analysis_receipt_binds_run_evaluation_and_source_digests(
             case_snapshot=run.snapshot,
         )
 
+    assert trial.intent_result is not None
+    assert trial.review_result is not None
+    assert trial.submission.review is not None
+    tampered_submission = replace(
+        trial.submission,
+        usage=replace(
+            trial.submission.usage,
+            tool_calls=(trial.submission.usage.tool_calls or 0) + 1,
+        ),
+    )
+    tampered_intent = replace(
+        trial.intent_result,
+        submission_intent_digest="0" * 64,
+    )
+    tampered_review_submission = replace(
+        trial.submission,
+        review=replace(
+            trial.submission.review,
+            uncertainties=trial.submission.review.uncertainties
+            + ("nested review tamper",),
+        ),
+    )
+    tampered_trials = (
+        replace(trial, submission=tampered_submission),
+        replace(trial, intent_result=tampered_intent),
+        replace(trial, review_result=None),
+        replace(trial, submission=tampered_review_submission),
+    )
+    for tampered_trial in tampered_trials:
+        with pytest.raises(
+            ArtifactIntegrityError,
+            match="Submission|Intent|Review|source",
+        ):
+            bind_analysis_source(
+                replace(hydrated, trials=(tampered_trial,)),
+                run_config=run.config,
+                case_snapshot=run.snapshot,
+            )
+
 
 def test_analysis_source_order_uses_complete_canonical_identity() -> None:
     first = _source_binding()
@@ -342,6 +382,39 @@ def test_analysis_source_binding_duplicates_are_rejected() -> None:
             algorithm_digest=algorithm_digest,
             files={"statistics.json": {"status": "ok"}},
         )
+
+
+def test_analysis_json_names_reject_portable_casefold_collisions() -> None:
+    binding = _source_binding()
+    algorithm_digest = canonical_sha256({"algorithm": "portable-name-v1"})
+    with pytest.raises(SchemaError, match="portable|collision"):
+        AnalysisReceipt.create(
+            kind="statistics",
+            source_bindings=(binding,),
+            algorithm_digest=algorithm_digest,
+            files={"A.json": {"value": 1}, "a.json": {"value": 2}},
+        )
+
+    receipt = AnalysisReceipt.create(
+        kind="statistics",
+        source_bindings=(binding,),
+        algorithm_digest=algorithm_digest,
+        files={"A.json": {"value": 1}},
+    )
+    colliding_ref = AnalysisArtifactRef.create(
+        kind=receipt.kind,
+        artifact_id=receipt.artifact_id,
+        name="a.json",
+        data=canonical_json_bytes({"value": 2}),
+    )
+    colliding_refs = tuple(
+        sorted(
+            (*receipt.artifacts, colliding_ref),
+            key=lambda item: item.relative_path,
+        )
+    )
+    with pytest.raises(SchemaError, match="portable|collision"):
+        replace(receipt, artifacts=colliding_refs)
 
 
 def test_analysis_tamper_fails_closed(tmp_path: Path) -> None:

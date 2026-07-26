@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
@@ -38,6 +39,7 @@ from .config import (
 )
 from .models import (
     EvalCase,
+    EvalSubmission,
     SchemaError,
     _JsonModel,
     canonical_json_bytes,
@@ -76,6 +78,12 @@ def _json_artifact_name(value: Any) -> str:
             "analysis JSON artifact name must end in .json and not be receipt.json"
         )
     return name
+
+
+def _portable_artifact_name_key(value: str) -> str:
+    """Return the Windows-portable collision key for one validated name."""
+
+    return unicodedata.normalize("NFKC", value).casefold()
 
 
 def _exact_mapping(value: Any, fields: set[str], context: str) -> Mapping[str, Any]:
@@ -273,10 +281,19 @@ def _canonical_file_payloads(files: Any) -> Dict[str, bytes]:
     if len(files) > MAX_ANALYSIS_ARTIFACTS:
         raise SchemaError("analysis bundle contains too many artifacts")
     result: Dict[str, bytes] = {}
+    portable_names: Dict[str, str] = {}
     for raw_name, value in files.items():
         name = _json_artifact_name(raw_name)
         if name in result:
             raise SchemaError("analysis bundle contains duplicate artifact names")
+        portable_name = _portable_artifact_name_key(name)
+        previous = portable_names.get(portable_name)
+        if previous is not None:
+            raise SchemaError(
+                "analysis bundle contains a portable filename collision: %s / %s"
+                % (previous, name)
+            )
+        portable_names[portable_name] = name
         validate_safe_json(value, "analysis artifact %s" % name)
         result[name] = canonical_json_bytes(value)
     return {name: result[name] for name in sorted(result)}
@@ -319,6 +336,14 @@ class AnalysisReceipt(_JsonModel):
             raise SchemaError("AnalysisReceipt artifacts are not canonical")
         if len({item.relative_path for item in artifacts}) != len(artifacts):
             raise SchemaError("AnalysisReceipt contains duplicate artifact paths")
+        portable_names = tuple(
+            _portable_artifact_name_key(item.relative_path.rsplit("/", 1)[-1])
+            for item in artifacts
+        )
+        if len(portable_names) != len(set(portable_names)):
+            raise SchemaError(
+                "AnalysisReceipt contains a portable artifact path collision"
+            )
         if any(item.kind != kind or item.artifact_id != artifact_id for item in artifacts):
             raise SchemaError("AnalysisReceipt artifact refs leave their namespace")
         expected_id = derive_analysis_artifact_id(
@@ -703,9 +728,11 @@ def bind_analysis_source(
 
     # Local imports avoid making protocol-only module import pull in the
     # orchestrator/report graph while still requiring concrete hydrated types.
-    from .metrics import TrialScore
+    from .intent_evaluator import IntentEvaluationResult, IntentJudgeRelation
+    from .metrics import IntentScoreBinding, ReviewScoreBinding, TrialScore
     from .orchestrator import RunEvaluationBundle, TrialEvaluationBundle
     from .report import RunReportSummary, render_run_markdown
+    from .review_evaluator import ReviewEvaluationResult
 
     if type(bundle) is not RunEvaluationBundle:
         raise TypeError("bundle must be a concrete hydrated RunEvaluationBundle")
@@ -863,6 +890,179 @@ def bind_analysis_source(
             raise ArtifactIntegrityError(
                 "hydrated TrialScore differs from Trial/Run/Case bindings"
             )
+        submission = trial.submission
+        if type(submission) is not EvalSubmission:
+            raise ArtifactIntegrityError(
+                "hydrated Trial source does not contain a concrete Submission"
+            )
+        submission_digest = submission.digest()
+        expected_failure_code = (
+            None if submission.failure is None else submission.failure.code
+        )
+        expected_failure_retryable = (
+            None if submission.failure is None else submission.failure.retryable
+        )
+        if (
+            submission.task_id != task_id
+            or submission.trial_id != trial_id
+            or submission.agent_id != run_config.agent.agent_id
+            or submission.eval_input_digest != input_digest
+            or submission_digest != score.submission_digest
+            or submission.status is not score.submission_status
+            or expected_failure_code is not score.failure_code
+            or expected_failure_retryable != score.failure_retryable
+            or submission.usage != score.usage
+            or submission.trace_ref != score.trace_ref
+        ):
+            raise ArtifactIntegrityError(
+                "hydrated Submission differs from its TrialScore source binding"
+            )
+
+        intent_result = trial.intent_result
+        intent_binding = score.intent_binding
+        if intent_result is None:
+            if intent_binding is not None:
+                raise ArtifactIntegrityError(
+                    "hydrated Intent result is missing for its TrialScore binding"
+                )
+        else:
+            if type(intent_result) is not IntentEvaluationResult:
+                raise ArtifactIntegrityError(
+                    "hydrated Intent result is not a concrete IntentEvaluationResult"
+                )
+            if submission.intent is None:
+                raise ArtifactIntegrityError(
+                    "hydrated Intent result has no Submission Intent source"
+                )
+            expected_submission_intent_digest = canonical_json_bytes(
+                submission.intent.to_dict()
+            )
+            expected_submission_intent_digest = hashlib.sha256(
+                expected_submission_intent_digest
+            ).hexdigest()
+            try:
+                expected_intent_binding = IntentScoreBinding(
+                    result_digest=intent_result.digest(),
+                    evaluator_revision=intent_result.evaluator_revision,
+                    policy_version=intent_result.policy_version,
+                    normalization_version=intent_result.normalization_version,
+                    status=intent_result.status,
+                    judge_request_count=len(intent_result.judge_requests),
+                    judge_graded_count=len(intent_result.judge_decisions),
+                    judge_failed_count=len(intent_result.judge_failures),
+                    judge_ungraded_count=len(intent_result.judge_ungraded),
+                    semantic_unknown_count=sum(
+                        item.relation is IntentJudgeRelation.UNKNOWN
+                        for item in intent_result.judge_decisions
+                    ),
+                )
+            except (SchemaError, TypeError, ValueError) as exc:
+                raise ArtifactIntegrityError(
+                    "hydrated Intent result cannot form a terminal score binding"
+                ) from exc
+            if (
+                intent_result.submission_intent_digest
+                != expected_submission_intent_digest
+                or intent_result.intent_truth_digest
+                != eval_case.intent_truth.digest()
+                or intent_result.clarification_script_digest
+                != eval_case.clarification_script.digest()
+                or intent_result.evaluator_revision
+                != compatibility.intent_evaluator_revision
+                or intent_result.policy_version
+                != compatibility.intent_policy_version
+                or intent_result.normalization_version
+                != compatibility.intent_normalization_version
+                or any(
+                    item.evaluator_execution_digest != execution_digest
+                    for item in (
+                        *intent_result.judge_failures,
+                        *intent_result.judge_ungraded,
+                    )
+                )
+                or intent_binding != expected_intent_binding
+            ):
+                raise ArtifactIntegrityError(
+                    "hydrated Intent result differs from Submission/TrialScore bindings"
+                )
+
+        review_result = trial.review_result
+        review_binding = score.review_binding
+        if review_result is None:
+            if review_binding is not None:
+                raise ArtifactIntegrityError(
+                    "hydrated Review result is missing for its TrialScore binding"
+                )
+        else:
+            if type(review_result) is not ReviewEvaluationResult:
+                raise ArtifactIntegrityError(
+                    "hydrated Review result is not a concrete ReviewEvaluationResult"
+                )
+            if submission.review is None:
+                raise ArtifactIntegrityError(
+                    "hydrated Review result has no Submission Review source"
+                )
+            submission_review_digest = hashlib.sha256(
+                canonical_json_bytes(submission.review.to_dict())
+            ).hexdigest()
+            submission_evidence_digest = hashlib.sha256(
+                canonical_json_bytes(
+                    [item.to_dict() for item in submission.evidence]
+                )
+            ).hexdigest()
+            coverage = review_result.coverage
+            try:
+                expected_review_binding = ReviewScoreBinding(
+                    result_digest=review_result.digest(),
+                    evaluator_revision=review_result.evaluator_revision,
+                    review_policy_version=review_result.review_policy_version,
+                    assignment_policy_version=(
+                        review_result.assignment_policy_version
+                    ),
+                    location_policy_version=review_result.location_policy_version,
+                    evidence_policy_version=(
+                        review_result.evidence_integrity_policy_version
+                    ),
+                    status=review_result.status,
+                    phase=review_result.phase,
+                    judge_request_count=coverage.judge_request_count,
+                    judge_graded_count=coverage.judge_graded_count,
+                    judge_failed_count=coverage.judge_failed_count,
+                    judge_ungraded_count=coverage.judge_ungraded_count,
+                    judge_pending_count=coverage.judge_pending_count,
+                    semantic_unknown_count=coverage.semantic_unknown_count,
+                    finding_count=coverage.finding_count,
+                    finding_resolved_count=coverage.finding_resolved_count,
+                )
+            except (SchemaError, TypeError, ValueError) as exc:
+                raise ArtifactIntegrityError(
+                    "hydrated Review result cannot form a terminal score binding"
+                ) from exc
+            if (
+                review_result.submission_digest != submission_digest
+                or review_result.submission_review_digest
+                != submission_review_digest
+                or review_result.submission_evidence_digest
+                != submission_evidence_digest
+                or review_result.eval_input_digest != input_digest
+                or review_result.review_truth_digest
+                != eval_case.review_truth.digest()
+                or review_result.evaluator_execution_digest != execution_digest
+                or review_result.evaluator_revision
+                != compatibility.review_evaluator_revision
+                or review_result.review_policy_version
+                != compatibility.review_policy_version
+                or review_result.assignment_policy_version
+                != compatibility.assignment_policy_version
+                or review_result.location_policy_version
+                != compatibility.location_policy_version
+                or review_result.evidence_integrity_policy_version
+                != compatibility.evidence_policy_version
+                or review_binding != expected_review_binding
+            ):
+                raise ArtifactIntegrityError(
+                    "hydrated Review result differs from Submission/TrialScore bindings"
+                )
         keyed_scores.append(((task_id, trial_index), _digest(score_digest, "Trial score")))
     if len({key for key, _digest_value in keyed_scores}) != len(keyed_scores):
         raise ArtifactIntegrityError("hydrated Evaluation contains duplicate Trial slots")
