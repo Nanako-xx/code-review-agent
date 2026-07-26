@@ -1822,17 +1822,85 @@ class RunStatisticsV1(_JsonModel):
         ):
             raise _error("RunStatisticsV1 Trial projections are incomplete/noncanonical")
         source_trial_count = len(self.source_binding.trial_score_digests)
-        case_count = len(metrics[0].case_contributions)
+        metric_cases = tuple(
+            (item.task_id, item.case_version, item.canonical_case_digest)
+            for item in metrics[0].case_contributions
+        )
+        case_count = len(metric_cases)
+        if (
+            not metric_cases
+            or metric_cases != tuple(sorted(metric_cases))
+            or len(metric_cases) != len(set(metric_cases))
+        ):
+            raise _error("RunStatisticsV1 metric Case keys are not canonical")
         if case_count * self.trial_count != source_trial_count:
             raise _error("RunStatisticsV1 source Trial coverage is inconsistent")
+        for metric in metrics:
+            current_cases = tuple(
+                (item.task_id, item.case_version, item.canonical_case_digest)
+                for item in metric.case_contributions
+            )
+            if (
+                metric.coverage.total_trial_count != source_trial_count
+                or len(current_cases) != case_count
+                or current_cases != metric_cases
+                or current_cases != tuple(sorted(current_cases))
+                or len(current_cases) != len(set(current_cases))
+                or any(
+                    item.metric is not metric.metric
+                    or item.trial_index is not None
+                    or item.coverage.total_trial_count != self.trial_count
+                    for item in metric.case_contributions
+                )
+                or metric.confidence_interval.seed
+                != self.bootstrap_policy.bootstrap_seed
+                or metric.confidence_interval.iterations
+                != self.bootstrap_policy.bootstrap_iterations
+                or metric.confidence_interval.confidence_level_ppm
+                != self.bootstrap_policy.confidence_level_ppm
+                or metric.confidence_interval.coverage.total_case_count
+                != case_count
+            ):
+                raise _error(
+                    "RunStatisticsV1 metric binding/coverage/confidence interval "
+                    "policy differs from sources"
+                )
+            metric_projections = tuple(
+                item for item in projections if item.metric is metric.metric
+            )
+            if (
+                len(metric_projections) != self.trial_count
+                or any(
+                    item.coverage.total_trial_count != case_count
+                    or len(item.case_contributions) != case_count
+                    or tuple(
+                        (
+                            contribution.task_id,
+                            contribution.case_version,
+                            contribution.canonical_case_digest,
+                        )
+                        for contribution in item.case_contributions
+                    )
+                    != metric_cases
+                    or any(
+                        contribution.metric is not metric.metric
+                        or contribution.trial_index != item.trial_index
+                        or contribution.coverage.total_trial_count != 1
+                        for contribution in item.case_contributions
+                    )
+                    for item in metric_projections
+                )
+                or _dispersion(metric.unit, metric_projections) != metric.dispersion
+            ):
+                raise _error("RunStatisticsV1 dispersion/projection coverage differs")
+
+        # Every Case population and Trial projection is now known to share the
+        # first metric's canonical Case keys.  Enforce the aggregate work bound
+        # before any per-metric bootstrap replay can initialize its RNG.
         _validate_run_bootstrap_budget(
             case_count=case_count,
             iterations=self.bootstrap_policy.bootstrap_iterations,
             metric_count=len(metrics),
-        )
-        metric_cases = tuple(
-            (item.task_id, item.case_version, item.canonical_case_digest)
-            for item in metrics[0].case_contributions
         )
         for metric in metrics:
             replayed_interval = paired_bootstrap_interval(
@@ -1843,50 +1911,11 @@ class RunStatisticsV1(_JsonModel):
                     self.bootstrap_policy.confidence_level_ppm
                 ),
             )
-            if (
-                metric.coverage.total_trial_count != source_trial_count
-                or tuple(
-                    (item.task_id, item.case_version, item.canonical_case_digest)
-                    for item in metric.case_contributions
-                )
-                != metric_cases
-                or any(
-                    item.coverage.total_trial_count != self.trial_count
-                    for item in metric.case_contributions
-                )
-                or metric.confidence_interval.seed
-                != self.bootstrap_policy.bootstrap_seed
-                or metric.confidence_interval.iterations
-                != self.bootstrap_policy.bootstrap_iterations
-                or metric.confidence_interval.confidence_level_ppm
-                != self.bootstrap_policy.confidence_level_ppm
-                or metric.confidence_interval != replayed_interval
-            ):
+            if metric.confidence_interval != replayed_interval:
                 raise _error(
-                    "RunStatisticsV1 metric binding/coverage/confidence interval "
-                    "differs from recomputed sources"
+                    "RunStatisticsV1 confidence interval differs from "
+                    "recomputed sources"
                 )
-            metric_projections = tuple(
-                item for item in projections if item.metric is metric.metric
-            )
-            if any(
-                item.coverage.total_trial_count != case_count
-                or tuple(
-                    (
-                        contribution.task_id,
-                        contribution.case_version,
-                        contribution.canonical_case_digest,
-                    )
-                    for contribution in item.case_contributions
-                )
-                != metric_cases
-                or any(
-                    contribution.coverage.total_trial_count != 1
-                    for contribution in item.case_contributions
-                )
-                for item in metric_projections
-            ) or _dispersion(metric.unit, metric_projections) != metric.dispersion:
-                raise _error("RunStatisticsV1 dispersion/projection coverage differs")
         object.__setattr__(self, "metrics", metrics)
         object.__setattr__(self, "trial_metrics", projections)
         canonical_json_bytes(self._identity_dict())

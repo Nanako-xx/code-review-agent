@@ -31,12 +31,14 @@ from review_agent_eval.models import (
     ReviewTruth,
     TruthCompleteness,
     NovelFindingPolicy,
+    canonical_sha256,
     stable_id,
 )
 from review_agent_eval.review_evaluator import ReviewEvaluator
 import review_agent_eval.statistics as statistics_module
 from review_agent_eval.statistics import (
     STATISTICS_ALGORITHM_VERSION,
+    ConfidenceIntervalV1,
     ConfidenceIntervalStatus,
     DerivedCaseContributionV1,
     MetricDirection,
@@ -867,6 +869,135 @@ def test_statistics_hydration_checks_total_budget_before_interval_replay(
     with pytest.raises(StatisticsError, match="total bootstrap.*budget"):
         RunStatisticsV1.from_dict(ratio_statistics.to_dict())
     assert entered_interval_replay is False
+
+
+def test_statistics_hydration_preflights_every_metric_before_bootstrap(
+    ratio_statistics: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case_count = 19
+    bootstrap_iterations = 100_000
+    assert len(ratio_statistics.metrics) == 26
+    assert (
+        case_count * len(ratio_statistics.metrics) * bootstrap_iterations
+        <= statistics_module.MAX_RUN_BOOTSTRAP_DRAWS
+    )
+    assert (
+        (case_count * 25 + 500) * bootstrap_iterations
+        > statistics_module.MAX_RUN_BOOTSTRAP_DRAWS
+    )
+
+    def expand_cases(source: Any, count: int) -> tuple[Any, ...]:
+        return tuple(
+            replace(
+                source,
+                task_id=f"preflight-case-{index:04d}",
+                canonical_case_digest=canonical_sha256(
+                    {"preflight-case": index}
+                ),
+            )
+            for index in range(count)
+        )
+
+    expanded_projections = []
+    for projection in ratio_statistics.trial_metrics:
+        contributions = expand_cases(
+            projection.case_contributions[0],
+            case_count,
+        )
+        aggregate = statistics_module._reaggregate_case_contributions(
+            contributions
+        )
+        expanded_projections.append(
+            replace(
+                projection,
+                status=aggregate.status,
+                numerator=aggregate.numerator,
+                denominator=aggregate.denominator,
+                value=aggregate.value,
+                coverage=aggregate.coverage,
+                case_contributions=contributions,
+            )
+        )
+
+    expanded_metrics = []
+    for index, metric in enumerate(ratio_statistics.metrics):
+        metric_case_count = (
+            500
+            if index == len(ratio_statistics.metrics) - 1
+            else case_count
+        )
+        contributions = expand_cases(
+            metric.case_contributions[0],
+            metric_case_count,
+        )
+        aggregate = statistics_module._reaggregate_case_contributions(
+            contributions
+        )
+        metric_projections = tuple(
+            projection
+            for projection in expanded_projections
+            if projection.metric is metric.metric
+        )
+        interval = ConfidenceIntervalV1(
+            metric=metric.metric,
+            kind=metric.kind,
+            unit=metric.unit,
+            status=ConfidenceIntervalStatus.NOT_SCORABLE,
+            lower_bound=None,
+            upper_bound=None,
+            seed=ratio_statistics.bootstrap_policy.bootstrap_seed,
+            iterations=bootstrap_iterations,
+            confidence_level_ppm=(
+                ratio_statistics.bootstrap_policy.confidence_level_ppm
+            ),
+            coverage=statistics_module._bootstrap_coverage(contributions),
+        )
+        expanded_metrics.append(
+            replace(
+                metric,
+                status=aggregate.status,
+                numerator=aggregate.numerator,
+                denominator=aggregate.denominator,
+                value=aggregate.value,
+                coverage=aggregate.coverage,
+                dispersion=statistics_module._dispersion(
+                    metric.unit,
+                    metric_projections,
+                ),
+                confidence_interval=interval,
+                case_contributions=contributions,
+            )
+        )
+
+    payload = deepcopy(ratio_statistics.to_dict())
+    payload["source_binding"]["trial_score_digests"] = sorted(
+        canonical_sha256({"preflight-score": index})
+        for index in range(case_count * ratio_statistics.trial_count)
+    )
+    payload["bootstrap_policy"]["bootstrap_iterations"] = bootstrap_iterations
+    payload["metrics"] = [metric.to_dict() for metric in expanded_metrics]
+    payload["trial_metrics"] = [
+        projection.to_dict() for projection in expanded_projections
+    ]
+    _reseal_stable_id(payload, "statistics_id", "run-statistics-v1")
+
+    bootstrap_calls = 0
+
+    def forbidden_bootstrap(*_args: Any, **_kwargs: Any):
+        nonlocal bootstrap_calls
+        bootstrap_calls += 1
+        raise AssertionError("bootstrap replay must not start before preflight")
+
+    monkeypatch.setattr(
+        statistics_module,
+        "paired_bootstrap_interval",
+        forbidden_bootstrap,
+    )
+
+    with pytest.raises(StatisticsError):
+        RunStatisticsV1.from_dict(payload)
+    assert bootstrap_calls == 0
 
 
 def test_statistics_rejects_post_binding_trial_score_digest_change(
