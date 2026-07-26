@@ -48,6 +48,7 @@ from .models import (
     SchemaError,
     _JsonModel,
     canonical_json_bytes,
+    canonical_sha256,
     stable_id,
 )
 
@@ -634,6 +635,17 @@ class AnalysisArtifactStore:
         self.root = self._storage.root
         self.max_file_bytes = self._storage.max_file_bytes
         self.max_total_read_bytes = self._storage.max_total_read_bytes
+
+    def _gate_store_identity_digest(self) -> str:
+        """Return an in-process-independent identity for this Store root."""
+
+        normalized = os.path.normcase(os.path.abspath(os.fspath(self.root)))
+        return canonical_sha256(
+            {
+                "analysis_store_root": normalized,
+                "analysis_store_identity_version": "v1",
+            }
+        )
 
     def _directory(self, kind: str, artifact_id: str) -> Path:
         canonical_kind = _kind(kind)
@@ -1648,24 +1660,36 @@ class AnalysisArtifactStore:
 
     def publish_gate_policy(
         self,
-        policy: Any,
+        proposal: Any = None,
         *,
         baseline: Any,
         candidate_run_config: Any,
-    ) -> AnalysisReceipt:
-        """Commit a prepared Gate Policy; this is its create-only freeze point."""
+        policy: Any = None,
+    ) -> Any:
+        """Prepare, publish, and return a Store-issued frozen policy.
+
+        ``proposal`` is deliberately not accepted as an already-frozen
+        evaluation capability.  The Store replays preparation from the
+        verified baseline and candidate RunConfig, then publishes the
+        prepared bytes before issuing ``FrozenGatePolicy``.
+        """
 
         from .comparison import VerifiedRunEvaluation
-        from .gates import GatePolicyV1, prepare_gate_policy
+        from .gates import GatePolicyV1, _freeze_gate_policy, prepare_gate_policy
 
-        if type(policy) is not GatePolicyV1:
-            raise TypeError("policy must be a GatePolicyV1")
+        if proposal is not None and policy is not None:
+            raise TypeError("provide only one gate policy proposal")
+        if proposal is None:
+            proposal = policy
+
+        if type(proposal) is not GatePolicyV1:
+            raise TypeError("proposal must be a GatePolicyV1")
         if type(baseline) is not VerifiedRunEvaluation:
             raise TypeError("baseline must be a VerifiedRunEvaluation")
         if type(candidate_run_config) is not EvalRunConfig:
             raise TypeError("candidate_run_config must be an EvalRunConfig")
         try:
-            canonical = GatePolicyV1.from_dict(policy.to_dict())
+            canonical = GatePolicyV1.from_dict(proposal.to_dict())
             replayed = prepare_gate_policy(
                 baseline,
                 candidate_run_config,
@@ -1677,13 +1701,9 @@ class AnalysisArtifactStore:
             raise ArtifactIntegrityError(
                 "gate policy fails strict baseline/RunConfig replay"
             ) from exc
-        if (
-            canonical != policy
-            or canonical_json_bytes(replayed.to_dict())
-            != canonical_json_bytes(canonical.to_dict())
-        ):
+        if canonical != proposal:
             raise ArtifactIntegrityError(
-                "gate policy differs from its prepared canonical identity"
+                "gate policy proposal differs from canonical hydration"
             )
         files = {"gate_policy.json": replayed.to_dict()}
         receipt = AnalysisReceipt.create(
@@ -1692,11 +1712,16 @@ class AnalysisArtifactStore:
             algorithm_digest=replayed.algorithm_digest,
             files=files,
         )
-        return self.publish_json_bundle(
+        stored_receipt = self.publish_json_bundle(
             receipt.kind,
             receipt.artifact_id,
             files,
             receipt,
+        )
+        return _freeze_gate_policy(
+            replayed,
+            stored_receipt,
+            store_identity_digest=self._gate_store_identity_digest(),
         )
 
     def _load_gate_policy_with_receipt(
@@ -1729,7 +1754,7 @@ class AnalysisArtifactStore:
         return receipt, policy
 
     def load_gate_policy(self, artifact_id: str) -> Any:
-        """Hydrate a frozen policy without claiming baseline source replay."""
+        """Hydrate raw GatePolicyV1 data without issuing evaluation authority."""
 
         _receipt, policy = self._load_gate_policy_with_receipt(artifact_id)
         return policy
@@ -1741,10 +1766,10 @@ class AnalysisArtifactStore:
         baseline: Any,
         candidate_run_config: Any,
     ) -> Any:
-        """Re-prepare and byte-compare a stored policy from trusted inputs."""
+        """Re-prepare, byte-compare, and issue a frozen stored policy."""
 
         from .comparison import VerifiedRunEvaluation
-        from .gates import prepare_gate_policy
+        from .gates import _freeze_gate_policy, prepare_gate_policy
 
         if type(baseline) is not VerifiedRunEvaluation:
             raise TypeError("baseline must be a VerifiedRunEvaluation")
@@ -1772,7 +1797,37 @@ class AnalysisArtifactStore:
             raise ArtifactIntegrityError(
                 "stored gate policy differs from exact source replay"
             )
-        return stored
+        return _freeze_gate_policy(
+            stored,
+            receipt,
+            store_identity_digest=self._gate_store_identity_digest(),
+        )
+
+    def _require_frozen_gate_policy(self, policy: Any) -> Any:
+        """Verify a frozen policy is issued by this Store and still present."""
+
+        from .gates import FrozenGatePolicy, _validate_frozen_gate_policy
+
+        if type(policy) is not FrozenGatePolicy:
+            raise TypeError(
+                "gate result publication requires a Store-issued FrozenGatePolicy"
+            )
+        _validate_frozen_gate_policy(
+            policy,
+            store_identity_digest=self._gate_store_identity_digest(),
+        )
+        receipt, stored = self._load_gate_policy_with_receipt(policy.artifact_id)
+        if (
+            receipt != policy.receipt
+            or receipt.digest() != policy.receipt_digest
+            or stored != policy.policy
+            or canonical_json_bytes(stored.to_dict())
+            != canonical_json_bytes(policy.policy.to_dict())
+        ):
+            raise ArtifactIntegrityError(
+                "FrozenGatePolicy does not match this Store's published receipt"
+            )
+        return policy
 
     @staticmethod
     def _gate_result_publication_digest(policy: Any, result: Any) -> str:
@@ -1783,6 +1838,8 @@ class AnalysisArtifactStore:
                 {
                     "algorithm_version": GATE_ALGORITHM_VERSION,
                     "policy_digest": result.policy_digest,
+                    "policy_artifact_id": result.policy_artifact_id,
+                    "policy_receipt_digest": result.policy_receipt_digest,
                     "comparison_id": result.comparison_id,
                     "calibration_result_digests": list(
                         policy.calibration_result_digests
@@ -1802,14 +1859,17 @@ class AnalysisArtifactStore:
         """Publish a result only after exact policy/comparison/calibration replay."""
 
         from .comparison import RunComparisonV1
-        from .gates import GatePolicyV1, GateResultV1, evaluate_gate
+        from .gates import FrozenGatePolicy, GateResultV1, evaluate_gate
 
         if type(result) is not GateResultV1:
             raise TypeError("result must be a GateResultV1")
-        if type(policy) is not GatePolicyV1:
-            raise TypeError("policy must be a GatePolicyV1")
+        if type(policy) is not FrozenGatePolicy:
+            raise TypeError(
+                "policy must be a Store-issued FrozenGatePolicy"
+            )
         if type(comparison) is not RunComparisonV1:
             raise TypeError("comparison must be a RunComparisonV1")
+        self._require_frozen_gate_policy(policy)
         try:
             canonical_result = GateResultV1.from_dict(result.to_dict())
             replayed = evaluate_gate(policy, comparison, calibrations)
@@ -1893,12 +1953,15 @@ class AnalysisArtifactStore:
         """Re-evaluate and byte-compare a stored result from all trusted inputs."""
 
         from .comparison import RunComparisonV1
-        from .gates import GatePolicyV1, evaluate_gate
+        from .gates import FrozenGatePolicy, evaluate_gate
 
-        if type(policy) is not GatePolicyV1:
-            raise TypeError("policy must be a GatePolicyV1")
+        if type(policy) is not FrozenGatePolicy:
+            raise TypeError(
+                "policy must be a Store-issued FrozenGatePolicy"
+            )
         if type(comparison) is not RunComparisonV1:
             raise TypeError("comparison must be a RunComparisonV1")
+        self._require_frozen_gate_policy(policy)
         receipt, stored = self._load_gate_result_with_receipt(artifact_id)
         try:
             replayed = evaluate_gate(policy, comparison, calibrations)

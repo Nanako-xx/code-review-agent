@@ -8,13 +8,14 @@ comparison and the explicitly named calibration results.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+import hashlib
 import re
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
-from .analysis_artifacts import AnalysisSourceBinding
+from .analysis_artifacts import AnalysisReceipt, AnalysisSourceBinding
 from .artifacts import ArtifactIntegrityError
 from .calibration import CalibrationResultV1, CalibrationStatus
 from .cases import CaseSplit, SuiteKind
@@ -52,6 +53,13 @@ MAX_GATE_CALIBRATIONS = 16
 MAX_GATE_REFS = 65_536
 MAX_GATE_INTEGER = (1 << 63) - 1
 MAX_GATE_BYTES = 256 * 1024 * 1024
+
+# This is deliberately an object identity rather than a serializable marker.
+# A FrozenGatePolicy can only be issued by the private factory below, after an
+# AnalysisArtifactStore has replayed the baseline/RunConfig preparation and
+# verified the receipt.  The public evaluator checks this seal before it ever
+# unwraps the policy.
+_FROZEN_GATE_POLICY_SEAL = object()
 
 
 class GateError(ValueError):
@@ -418,8 +426,12 @@ class GatePolicyV1(_JsonModel):
             raise _error("GatePolicyV1 constraints are duplicate or excessive")
         if constraints != tuple(sorted(constraints, key=_constraint_sort_key)):
             raise _error("GatePolicyV1 constraints are not canonical")
-        if eligibility is GateEligibility.RELEASE_BLOCKING and not constraints:
-            raise _error("release_blocking policy must configure at least one constraint")
+        if eligibility is GateEligibility.RELEASE_BLOCKING and (
+            not constraints or not any(item.required for item in constraints)
+        ):
+            raise _error(
+                "release_blocking policy must configure at least one required constraint"
+            )
         if not constraints and digests:
             raise _error("an empty diagnostic policy may not pre-register unused calibrations")
         object.__setattr__(self, "eligibility", eligibility)
@@ -508,6 +520,222 @@ class GatePolicyV1(_JsonModel):
     @classmethod
     def from_json(cls, data: Any) -> "GatePolicyV1":
         return _from_json(cls, data, "GatePolicyV1 JSON")
+
+
+@dataclass(frozen=True, init=False)
+class FrozenGatePolicy:
+    """A Store-issued, source-replayed gate policy.
+
+    ``GatePolicyV1`` is intentionally still a useful proposal/serialization
+    type.  It is not, however, an evaluation capability.  This wrapper is
+    the capability boundary: it carries the exact policy receipt and the
+    replayed baseline/candidate identities, and its constructor is sealed so
+    callers cannot manufacture one by simply deserializing a policy.
+    """
+
+    policy: GatePolicyV1
+    receipt: AnalysisReceipt
+    receipt_digest: str
+    artifact_id: str
+    baseline_binding: AnalysisSourceBinding
+    candidate_run_config_digest: str
+    _store_identity_digest: str = field(repr=False)
+    _seal: object = field(repr=False, compare=False)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError(
+            "FrozenGatePolicy is Store-issued; use AnalysisArtifactStore"
+        )
+
+    @classmethod
+    def _issue(
+        cls,
+        *,
+        policy: GatePolicyV1,
+        receipt: AnalysisReceipt,
+        store_identity_digest: str,
+        seal: object,
+    ) -> "FrozenGatePolicy":
+        if seal is not _FROZEN_GATE_POLICY_SEAL:
+            raise TypeError("FrozenGatePolicy can only be issued by its Store")
+        _validate_frozen_gate_policy_parts(
+            policy=policy,
+            receipt=receipt,
+            receipt_digest=receipt.digest(),
+            artifact_id=receipt.artifact_id,
+            baseline_binding=policy.baseline_binding,
+            candidate_run_config_digest=policy.candidate_run_config_digest,
+            store_identity_digest=store_identity_digest,
+            seal=seal,
+        )
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "policy", policy)
+        object.__setattr__(instance, "receipt", receipt)
+        object.__setattr__(instance, "receipt_digest", receipt.digest())
+        object.__setattr__(instance, "artifact_id", receipt.artifact_id)
+        object.__setattr__(instance, "baseline_binding", policy.baseline_binding)
+        object.__setattr__(
+            instance,
+            "candidate_run_config_digest",
+            policy.candidate_run_config_digest,
+        )
+        object.__setattr__(instance, "_store_identity_digest", store_identity_digest)
+        object.__setattr__(instance, "_seal", seal)
+        return instance
+
+    @property
+    def policy_digest(self) -> str:
+        return self.policy.policy_digest
+
+    @property
+    def candidate_run_id(self) -> str:
+        return self.policy.candidate_run_id
+
+    @property
+    def calibration_result_digests(self) -> Tuple[str, ...]:
+        return self.policy.calibration_result_digests
+
+    @property
+    def eligibility(self) -> GateEligibility:
+        return self.policy.eligibility
+
+    @property
+    def constraints(self) -> Tuple[MetricConstraintV1, ...]:
+        return self.policy.constraints
+
+    @property
+    def case_snapshot_digest(self) -> str:
+        return self.policy.case_snapshot_digest
+
+    @property
+    def trial_count(self) -> int:
+        return self.policy.trial_count
+
+    @property
+    def comparison_policy_digest(self) -> str:
+        return self.policy.comparison_policy_digest
+
+
+def _validate_frozen_gate_policy_parts(
+    *,
+    policy: Any,
+    receipt: Any,
+    receipt_digest: Any,
+    artifact_id: Any,
+    baseline_binding: Any,
+    candidate_run_config_digest: Any,
+    store_identity_digest: Any,
+    seal: Any,
+) -> None:
+    """Validate the non-serializable provenance carried by a frozen policy."""
+
+    if seal is not _FROZEN_GATE_POLICY_SEAL:
+        raise ArtifactIntegrityError("FrozenGatePolicy seal is invalid")
+    if type(policy) is not GatePolicyV1:
+        raise ArtifactIntegrityError("FrozenGatePolicy policy is not canonical")
+    if type(receipt) is not AnalysisReceipt:
+        raise ArtifactIntegrityError("FrozenGatePolicy receipt is invalid")
+    if receipt.kind != "gate-policy":
+        raise ArtifactIntegrityError("FrozenGatePolicy receipt has the wrong kind")
+    if type(baseline_binding) is not AnalysisSourceBinding:
+        raise ArtifactIntegrityError("FrozenGatePolicy baseline binding is invalid")
+    if baseline_binding != policy.baseline_binding:
+        raise ArtifactIntegrityError("FrozenGatePolicy baseline binding is not replayed")
+    if candidate_run_config_digest != policy.candidate_run_config_digest:
+        raise ArtifactIntegrityError(
+            "FrozenGatePolicy candidate RunConfig digest is not replayed"
+        )
+    _digest(receipt_digest, "FrozenGatePolicy.receipt_digest")
+    _digest(store_identity_digest, "FrozenGatePolicy.store_identity_digest")
+    if artifact_id != receipt.artifact_id:
+        raise ArtifactIntegrityError("FrozenGatePolicy artifact identity is invalid")
+    if receipt_digest != receipt.digest():
+        raise ArtifactIntegrityError("FrozenGatePolicy receipt digest is invalid")
+    if receipt.source_bindings != (policy.baseline_binding,):
+        raise ArtifactIntegrityError(
+            "FrozenGatePolicy receipt does not bind the baseline"
+        )
+    if receipt.algorithm_digest != policy.algorithm_digest:
+        raise ArtifactIntegrityError(
+            "FrozenGatePolicy receipt does not bind the canonical policy"
+        )
+    try:
+        canonical_policy = GatePolicyV1.from_dict(policy.to_dict())
+        canonical_receipt = AnalysisReceipt.from_dict(receipt.to_dict())
+    except (SchemaError, TypeError, ValueError) as exc:
+        raise ArtifactIntegrityError(
+            "FrozenGatePolicy nested policy/receipt is not canonical"
+        ) from exc
+    if canonical_policy != policy or canonical_receipt != receipt:
+        raise ArtifactIntegrityError(
+            "FrozenGatePolicy nested policy/receipt differs from canonical bytes"
+        )
+    refs = [
+        item
+        for item in receipt.artifacts
+        if item.relative_path.rsplit("/", 1)[-1] == "gate_policy.json"
+    ]
+    expected_data = canonical_json_bytes(policy.to_dict())
+    if (
+        len(refs) != 1
+        or refs[0].sha256 != hashlib.sha256(expected_data).hexdigest()
+        or refs[0].size_bytes != len(expected_data)
+    ):
+        raise ArtifactIntegrityError(
+            "FrozenGatePolicy receipt does not bind gate_policy.json"
+        )
+
+
+def _validate_frozen_gate_policy(
+    frozen: Any,
+    *,
+    store_identity_digest: str | None = None,
+) -> GatePolicyV1:
+    if type(frozen) is not FrozenGatePolicy:
+        raise TypeError(
+            "evaluate_gate requires a Store-issued FrozenGatePolicy"
+        )
+    try:
+        _validate_frozen_gate_policy_parts(
+            policy=frozen.policy,
+            receipt=frozen.receipt,
+            receipt_digest=frozen.receipt_digest,
+            artifact_id=frozen.artifact_id,
+            baseline_binding=frozen.baseline_binding,
+            candidate_run_config_digest=frozen.candidate_run_config_digest,
+            store_identity_digest=frozen._store_identity_digest,
+            seal=frozen._seal,
+        )
+    except ArtifactIntegrityError:
+        raise
+    except (AttributeError, GateError, SchemaError, TypeError, ValueError) as exc:
+        raise ArtifactIntegrityError(
+            "FrozenGatePolicy provenance is malformed"
+        ) from exc
+    if (
+        store_identity_digest is not None
+        and frozen._store_identity_digest != store_identity_digest
+    ):
+        raise ArtifactIntegrityError(
+            "FrozenGatePolicy belongs to another AnalysisArtifactStore"
+        )
+    return frozen.policy
+
+
+def _freeze_gate_policy(
+    policy: GatePolicyV1,
+    receipt: AnalysisReceipt,
+    *,
+    store_identity_digest: str,
+) -> FrozenGatePolicy:
+    """Private Store seam for issuing an evaluation-capable policy."""
+
+    return FrozenGatePolicy._issue(
+        policy=policy,
+        receipt=receipt,
+        store_identity_digest=store_identity_digest,
+        seal=_FROZEN_GATE_POLICY_SEAL,
+    )
 
 
 def _ref_sort_key(value: "GateFailureRefV1") -> tuple[str, str]:
@@ -736,6 +964,8 @@ class GateResultV1(_JsonModel):
     schema_version: str
     gate_result_id: str
     policy_digest: str
+    policy_artifact_id: str
+    policy_receipt_digest: str
     comparison_id: str
     decision: GateDecision
     checks: Tuple[GateCheckV1, ...]
@@ -744,6 +974,15 @@ class GateResultV1(_JsonModel):
         if self.schema_version != GATE_RESULT_SCHEMA_VERSION:
             raise _error("GateResultV1 schema_version is unsupported")
         _digest(self.policy_digest, "GateResultV1.policy_digest")
+        _opaque_stable_ref(
+            self.policy_artifact_id,
+            "analysis-artifact-v1",
+            "GateResultV1.policy_artifact_id",
+        )
+        _digest(
+            self.policy_receipt_digest,
+            "GateResultV1.policy_receipt_digest",
+        )
         _identifier(self.comparison_id, "GateResultV1.comparison_id")
         decision = _enum(GateDecision, self.decision, "GateResultV1.decision")
         checks = tuple(self.checks)
@@ -762,6 +1001,10 @@ class GateResultV1(_JsonModel):
             item.status is not GateCheckStatus.PASS for item in required
         ):
             raise _error("promote GateResultV1 has a non-passing required check")
+        if decision is GateDecision.PROMOTE and not required:
+            raise _error(
+                "promote GateResultV1 requires at least one required check"
+            )
         if decision is GateDecision.BLOCK and not any(
             item.status is GateCheckStatus.FAIL for item in required
         ):
@@ -782,6 +1025,8 @@ class GateResultV1(_JsonModel):
         identity = {
             "schema_version": GATE_RESULT_SCHEMA_VERSION,
             "policy_digest": values["policy_digest"],
+            "policy_artifact_id": values["policy_artifact_id"],
+            "policy_receipt_digest": values["policy_receipt_digest"],
             "comparison_id": values["comparison_id"],
             "decision": _enum(GateDecision, values["decision"], "GateResultV1.decision").value,
             "checks": [item.to_dict() for item in checks],
@@ -789,7 +1034,8 @@ class GateResultV1(_JsonModel):
         return cls(
             GATE_RESULT_SCHEMA_VERSION,
             stable_id("gate-result-v1", identity),
-            values["policy_digest"], values["comparison_id"],
+            values["policy_digest"], values["policy_artifact_id"],
+            values["policy_receipt_digest"], values["comparison_id"],
             _enum(GateDecision, values["decision"], "GateResultV1.decision"),
             checks,
         )
@@ -806,6 +1052,8 @@ class GateResultV1(_JsonModel):
         return canonical_sha256({
             "algorithm_version": GATE_ALGORITHM_VERSION,
             "policy_digest": self.policy_digest,
+            "policy_artifact_id": self.policy_artifact_id,
+            "policy_receipt_digest": self.policy_receipt_digest,
             "comparison_id": self.comparison_id,
             "calibration_result_digests": list(self.calibration_result_digests),
         })
@@ -814,6 +1062,8 @@ class GateResultV1(_JsonModel):
         return {
             "schema_version": self.schema_version,
             "policy_digest": self.policy_digest,
+            "policy_artifact_id": self.policy_artifact_id,
+            "policy_receipt_digest": self.policy_receipt_digest,
             "comparison_id": self.comparison_id,
             "decision": self.decision.value,
             "checks": [item.to_dict() for item in self.checks],
@@ -824,10 +1074,11 @@ class GateResultV1(_JsonModel):
 
     @classmethod
     def from_dict(cls, value: Any) -> "GateResultV1":
-        payload = _exact(value, ("schema_version", "gate_result_id", "policy_digest", "comparison_id", "decision", "checks"), "GateResultV1")
+        payload = _exact(value, ("schema_version", "gate_result_id", "policy_digest", "policy_artifact_id", "policy_receipt_digest", "comparison_id", "decision", "checks"), "GateResultV1")
         checks = _array(payload["checks"], "GateResultV1.checks", MAX_GATE_CONSTRAINTS)
         return cls(
             payload["schema_version"], payload["gate_result_id"], payload["policy_digest"],
+            payload["policy_artifact_id"], payload["policy_receipt_digest"],
             payload["comparison_id"], _enum(GateDecision, payload["decision"], "result.decision"),
             tuple(GateCheckV1.from_dict(item) for item in checks),
         )
@@ -979,6 +1230,17 @@ def prepare_gate_policy(
     baseline_binding = baseline.verify()
     candidate = _candidate_plan_is_canonical(candidate_run_config)
     canonical = _canonical_policy(policy)
+    # Keep this check even though GatePolicyV1.__post_init__ enforces it.  A
+    # hostile caller can bypass dataclass construction with object.__new__,
+    # and preparation is the last proposal-facing boundary before Store
+    # publication.
+    if canonical.eligibility is GateEligibility.RELEASE_BLOCKING and (
+        not canonical.constraints
+        or not any(item.required for item in canonical.constraints)
+    ):
+        raise _error(
+            "release_blocking policy must configure at least one required constraint"
+        )
     if canonical.baseline_binding != baseline_binding:
         raise _error("GatePolicy baseline binding differs from verified baseline")
     if canonical.candidate_run_id != candidate.run_id or canonical.candidate_run_config_digest != candidate.digest():
@@ -1166,12 +1428,15 @@ def _ineligible_check(
     )
 
 
-def evaluate_gate(
+def _evaluate_prepared_policy(
     policy: GatePolicyV1,
     comparison: RunComparisonV1,
     calibrations: Mapping[Any, CalibrationResultV1],
+    *,
+    policy_artifact_id: str,
+    policy_receipt_digest: str,
 ) -> GateResultV1:
-    """Evaluate every frozen constraint using only source-bound analysis inputs."""
+    """Evaluate a Store-verified policy using source-bound analysis inputs."""
 
     canonical_policy = _canonical_policy(policy)
     canonical_comparison = _canonical_comparison(comparison)
@@ -1319,15 +1584,42 @@ def evaluate_gate(
         decision = GateDecision.INELIGIBLE
     elif global_reasons or any(item.status is GateCheckStatus.INELIGIBLE and item.required for item in checks):
         decision = GateDecision.INELIGIBLE
+    elif not any(item.required for item in checks):
+        # Defensive non-vacuity rule for a forged/legacy prepared policy.
+        decision = GateDecision.INELIGIBLE
     elif any(item.status is GateCheckStatus.FAIL and item.required for item in checks):
         decision = GateDecision.BLOCK
     else:
         decision = GateDecision.PROMOTE
     return GateResultV1.create(
         policy_digest=canonical_policy.policy_digest,
+        policy_artifact_id=policy_artifact_id,
+        policy_receipt_digest=policy_receipt_digest,
         comparison_id=canonical_comparison.comparison_id,
         decision=decision,
         checks=tuple(checks),
+    )
+
+
+def evaluate_gate(
+    policy: FrozenGatePolicy,
+    comparison: RunComparisonV1,
+    calibrations: Mapping[Any, CalibrationResultV1],
+) -> GateResultV1:
+    """Evaluate only a Store-issued, verified frozen policy.
+
+    The raw ``GatePolicyV1`` remains proposal/serialization data and is
+    intentionally rejected here.  This keeps the release decision downstream
+    of the receipt-last publication and source replay boundary.
+    """
+
+    canonical_policy = _validate_frozen_gate_policy(policy)
+    return _evaluate_prepared_policy(
+        canonical_policy,
+        comparison,
+        calibrations,
+        policy_artifact_id=policy.artifact_id,
+        policy_receipt_digest=policy.receipt_digest,
     )
 
 
@@ -1350,6 +1642,7 @@ __all__ = [
     "MetricUnit",
     "MetricConstraintV1",
     "GatePolicyV1",
+    "FrozenGatePolicy",
     "GateFailureRefV1",
     "GateCheckV1",
     "GateResultV1",

@@ -29,6 +29,7 @@ from review_agent_eval.gates import (
     GateEligibility,
     GateError,
     GateOperator,
+    FrozenGatePolicy,
     MetricConstraintV1,
     GatePolicyV1,
     evaluate_gate,
@@ -72,7 +73,6 @@ from .test_orchestrator_target_replay_v2 import (
 )
 from .test_target_runner import _FrozenSuccessAdapter
 
-
 def _constraint(
     metric: CoreMetric,
     scope: GateConstraintScope,
@@ -111,6 +111,15 @@ def _policy(
         calibration_result_digests=calibration_result_digests,
         eligibility=eligibility,
         constraints=constraints,
+    )
+
+
+@pytest.fixture(scope="module")
+def gate_policy_store(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> AnalysisArtifactStore:
+    return AnalysisArtifactStore(
+        tmp_path_factory.mktemp("regression-gate-policy-store") / "analysis"
     )
 
 
@@ -316,7 +325,7 @@ def test_gate_policy_cannot_be_overwritten_or_rebound(
     )
     prepared = prepare_gate_policy(baseline, candidate_config, policy=policy)
     store = AnalysisArtifactStore(tmp_path / "analysis")
-    receipt = store.publish_gate_policy(
+    frozen = store.publish_gate_policy(
         prepared,
         baseline=baseline,
         candidate_run_config=candidate_config,
@@ -325,12 +334,15 @@ def test_gate_policy_cannot_be_overwritten_or_rebound(
         prepared,
         baseline=baseline,
         candidate_run_config=candidate_config,
-    ) == receipt
-    assert store.load_verified_gate_policy(
-        receipt.artifact_id,
+    ) == frozen
+    loaded = store.load_verified_gate_policy(
+        frozen.artifact_id,
         baseline=baseline,
         candidate_run_config=candidate_config,
-    ) == prepared
+    )
+    assert type(loaded) is FrozenGatePolicy
+    assert loaded == frozen
+    assert frozen.policy == prepared
 
     rebound = _policy(
         baseline,
@@ -344,7 +356,7 @@ def test_gate_policy_cannot_be_overwritten_or_rebound(
             policy=rebound,
         )
 
-    policy_path = store.root / "gate-policy" / receipt.artifact_id / "gate_policy.json"
+    policy_path = store.root / "gate-policy" / frozen.artifact_id / "gate_policy.json"
     policy_path.write_bytes(canonical_json_bytes({"tampered": True}))
     with pytest.raises((ArtifactIntegrityError, ArtifactConflictError)):
         store.publish_gate_policy(
@@ -356,6 +368,7 @@ def test_gate_policy_cannot_be_overwritten_or_rebound(
 
 def test_gate_checks_absolute_and_baseline_delta_constraints(
     core_gate_sources: dict[str, Any],
+    gate_policy_store: AnalysisArtifactStore,
 ) -> None:
     baseline = core_gate_sources["baseline"]
     candidate = core_gate_sources["block"]
@@ -381,7 +394,12 @@ def test_gate_checks_absolute_and_baseline_delta_constraints(
         core_gate_sources["block_config"],
         policy=policy,
     )
-    result = evaluate_gate(policy, comparison, {})
+    frozen = gate_policy_store.publish_gate_policy(
+        policy,
+        baseline=baseline,
+        candidate_run_config=core_gate_sources["block_config"],
+    )
+    result = evaluate_gate(frozen, comparison, {})
 
     assert result.decision is GateDecision.BLOCK
     by_scope = {check.scope: check for check in result.checks}
@@ -392,13 +410,14 @@ def test_gate_checks_absolute_and_baseline_delta_constraints(
 
 def test_gate_reports_case_and_trial_refs_for_each_failure(
     core_gate_sources: dict[str, Any],
+    gate_policy_store: AnalysisArtifactStore,
 ) -> None:
     baseline = core_gate_sources["baseline"]
     candidate = core_gate_sources["block"]
     comparison = compare_runs(baseline, candidate, COMPARISON_POLICY)
     actual = comparison.metric_delta(CoreMetric.AGENT_FAILURE_RATE).candidate.value
     assert actual is not None
-    policy = prepare_gate_policy(
+    prepared = prepare_gate_policy(
         baseline,
         core_gate_sources["block_config"],
         policy=_policy(
@@ -410,7 +429,12 @@ def test_gate_reports_case_and_trial_refs_for_each_failure(
             ),
         ),
     )
-    result = evaluate_gate(policy, comparison, {})
+    frozen = gate_policy_store.publish_gate_policy(
+        prepared,
+        baseline=baseline,
+        candidate_run_config=core_gate_sources["block_config"],
+    )
+    result = evaluate_gate(frozen, comparison, {})
     check = result.checks[0]
     assert check.status is GateCheckStatus.FAIL
     assert check.case_refs
@@ -423,6 +447,7 @@ def test_gate_requires_calibration_for_semantic_metrics(
     core_gate_sources: dict[str, Any],
     calibration_source: dict[str, Any],
     tmp_path: Path,
+    gate_policy_store: AnalysisArtifactStore,
 ) -> None:
     baseline = core_gate_sources["baseline"]
     candidate_config = core_gate_sources["promote_config"]
@@ -433,7 +458,7 @@ def test_gate_requires_calibration_for_semantic_metrics(
         JudgeTask.FINDING_EQUIVALENCE,
     )
     assert eligible.status.value == "gate_eligible"
-    policy = prepare_gate_policy(
+    prepared = prepare_gate_policy(
         baseline,
         candidate_config,
         policy=_policy(
@@ -446,8 +471,13 @@ def test_gate_requires_calibration_for_semantic_metrics(
             ),
         ),
     )
+    frozen = gate_policy_store.publish_gate_policy(
+        prepared,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    )
     passed = evaluate_gate(
-        policy,
+        frozen,
         comparison,
         {JudgeTask.FINDING_EQUIVALENCE.value: eligible},
     )
@@ -462,7 +492,12 @@ def test_gate_requires_calibration_for_semantic_metrics(
         ),
     )
     missing = prepare_gate_policy(baseline, candidate_config, policy=missing)
-    missing_result = evaluate_gate(missing, comparison, {})
+    missing_frozen = gate_policy_store.publish_gate_policy(
+        missing,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    )
+    missing_result = evaluate_gate(missing_frozen, comparison, {})
     assert missing_result.decision is GateDecision.INELIGIBLE
     assert missing_result.checks[0].status is GateCheckStatus.INELIGIBLE
 
@@ -541,8 +576,13 @@ def test_gate_requires_calibration_for_semantic_metrics(
                 ),
             ),
         )
-        untrusted = evaluate_gate(
+        untrusted_frozen = gate_policy_store.publish_gate_policy(
             untrusted_policy,
+            baseline=baseline,
+            candidate_run_config=candidate_config,
+        )
+        untrusted = evaluate_gate(
+            untrusted_frozen,
             comparison,
             {profile.value: calibration},
         )
@@ -552,6 +592,7 @@ def test_gate_requires_calibration_for_semantic_metrics(
 
 def test_gate_marks_public_or_unscorable_data_diagnostic_only(
     paired_sources: dict[str, Any],
+    gate_policy_store: AnalysisArtifactStore,
 ) -> None:
     baseline = paired_sources["baseline"]
     candidate_config = paired_sources["candidate_run"].config
@@ -565,7 +606,12 @@ def test_gate_marks_public_or_unscorable_data_diagnostic_only(
     assert prepared.eligibility is GateEligibility.DIAGNOSTIC_ONLY
     assert prepared.policy_id != requested.policy_id
     comparison = _comparison(paired_sources)
-    result = evaluate_gate(prepared, comparison, {})
+    frozen = gate_policy_store.publish_gate_policy(
+        prepared,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    )
+    result = evaluate_gate(frozen, comparison, {})
     assert result.decision is GateDecision.INELIGIBLE
     assert result.checks[0].status is GateCheckStatus.INELIGIBLE
 
@@ -581,6 +627,7 @@ def test_gate_marks_public_or_unscorable_data_diagnostic_only(
 def test_gate_returns_promote_block_and_ineligible_without_overall_score(
     core_gate_sources: dict[str, Any],
     paired_sources: dict[str, Any],
+    gate_policy_store: AnalysisArtifactStore,
 ) -> None:
     baseline = core_gate_sources["baseline"]
     promote_config = core_gate_sources["promote_config"]
@@ -601,7 +648,12 @@ def test_gate_returns_promote_block_and_ineligible_without_overall_score(
             constraints=(_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_MOST, promote_actual),),
         ),
     )
-    promoted = evaluate_gate(promote_policy, promote_comparison, {})
+    promote_frozen = gate_policy_store.publish_gate_policy(
+        promote_policy,
+        baseline=baseline,
+        candidate_run_config=promote_config,
+    )
+    promoted = evaluate_gate(promote_frozen, promote_comparison, {})
     assert promoted.decision is GateDecision.PROMOTE
 
     block_config = core_gate_sources["block_config"]
@@ -622,7 +674,12 @@ def test_gate_returns_promote_block_and_ineligible_without_overall_score(
             constraints=(_failing_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CANDIDATE_ABSOLUTE, block_actual),),
         ),
     )
-    blocked = evaluate_gate(block_policy, block_comparison, {})
+    block_frozen = gate_policy_store.publish_gate_policy(
+        block_policy,
+        baseline=baseline,
+        candidate_run_config=block_config,
+    )
+    blocked = evaluate_gate(block_frozen, block_comparison, {})
     assert blocked.decision is GateDecision.BLOCK
 
     public_baseline = paired_sources["baseline"]
@@ -656,12 +713,19 @@ def test_gate_returns_promote_block_and_ineligible_without_overall_score(
             constraints=(_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_MOST, 0),),
         ),
     )
-    ineligible = evaluate_gate(ineligible_policy, incomparable, {})
+    ineligible_frozen = gate_policy_store.publish_gate_policy(
+        ineligible_policy,
+        baseline=public_baseline,
+        candidate_run_config=public_config,
+    )
+    ineligible = evaluate_gate(ineligible_frozen, incomparable, {})
     assert ineligible.decision is GateDecision.INELIGIBLE
     assert set(promoted.to_dict()) == {
         "schema_version",
         "gate_result_id",
         "policy_digest",
+        "policy_artifact_id",
+        "policy_receipt_digest",
         "comparison_id",
         "decision",
         "checks",
@@ -707,7 +771,7 @@ def test_gate_artifact_result_replay_rejects_resealed_result(
     comparison = compare_runs(baseline, candidate, COMPARISON_POLICY)
     actual = comparison.metric_delta(CoreMetric.AGENT_FAILURE_RATE).candidate.value
     assert actual is not None
-    policy = prepare_gate_policy(
+    prepared = prepare_gate_policy(
         baseline,
         candidate_config,
         policy=_policy(
@@ -717,8 +781,13 @@ def test_gate_artifact_result_replay_rejects_resealed_result(
             constraints=(_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_MOST, actual),),
         ),
     )
-    result = evaluate_gate(policy, comparison, {})
     store = AnalysisArtifactStore(tmp_path / "analysis")
+    policy = store.publish_gate_policy(
+        prepared,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    )
+    result = evaluate_gate(policy, comparison, {})
     receipt = store.publish_gate_result(
         result,
         policy=policy,
@@ -747,6 +816,16 @@ def test_gate_artifact_result_replay_rejects_resealed_result(
         stable_id("gate-result-v1", forged_identity),
     )
     object.__setattr__(forged, "policy_digest", result.policy_digest)
+    object.__setattr__(
+        forged,
+        "policy_artifact_id",
+        result.policy_artifact_id,
+    )
+    object.__setattr__(
+        forged,
+        "policy_receipt_digest",
+        result.policy_receipt_digest,
+    )
     object.__setattr__(forged, "comparison_id", result.comparison_id)
     object.__setattr__(forged, "decision", forged_decision)
     object.__setattr__(forged, "checks", result.checks)
@@ -763,4 +842,142 @@ def test_gate_symbols_are_available_through_lazy_root_exports() -> None:
     import review_agent_eval
 
     assert review_agent_eval.GatePolicyV1 is GatePolicyV1
+    assert review_agent_eval.FrozenGatePolicy is FrozenGatePolicy
     assert review_agent_eval.evaluate_gate is evaluate_gate
+
+
+def test_gate_rejects_raw_policy_bypass_and_only_frozen_public_policy_is_ineligible(
+    paired_sources: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    baseline = paired_sources["baseline"]
+    candidate = paired_sources["candidate"]
+    candidate_config = paired_sources["candidate_run"].config
+    comparison = compare_runs(baseline, candidate, COMPARISON_POLICY)
+    raw_release = _policy(
+        baseline,
+        candidate_config,
+        eligibility=GateEligibility.RELEASE_BLOCKING,
+        constraints=(
+            _constraint(
+                CoreMetric.AGENT_FAILURE_RATE,
+                GateConstraintScope.CANDIDATE_ABSOLUTE,
+                GateOperator.AT_MOST,
+                1_000_000,
+            ),
+        ),
+    )
+
+    with pytest.raises(TypeError, match="FrozenGatePolicy|frozen"):
+        evaluate_gate(raw_release, comparison, {})
+
+    store = AnalysisArtifactStore(tmp_path / "analysis")
+    frozen = store.publish_gate_policy(
+        raw_release,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    )
+    assert type(frozen) is FrozenGatePolicy
+    assert frozen.policy.eligibility is GateEligibility.DIAGNOSTIC_ONLY
+    result = evaluate_gate(frozen, comparison, {})
+    assert result.decision is GateDecision.INELIGIBLE
+    assert result.policy_artifact_id == frozen.artifact_id
+    assert result.policy_receipt_digest == frozen.receipt_digest
+    with pytest.raises(TypeError, match="Store-issued|AnalysisArtifactStore"):
+        FrozenGatePolicy()
+    with pytest.raises((TypeError, ArtifactIntegrityError), match="FrozenGatePolicy|frozen"):
+        store.publish_gate_result(
+            result,
+            policy=raw_release,
+            comparison=comparison,
+            calibrations={},
+        )
+
+
+def test_gate_rejects_frozen_policy_from_another_analysis_store_even_with_same_receipt_digest(
+    paired_sources: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    baseline = paired_sources["baseline"]
+    candidate = paired_sources["candidate"]
+    candidate_config = paired_sources["candidate_run"].config
+    comparison = compare_runs(baseline, candidate, COMPARISON_POLICY)
+    proposal = _policy(
+        baseline,
+        candidate_config,
+        constraints=(
+            _constraint(
+                CoreMetric.AGENT_FAILURE_RATE,
+                GateConstraintScope.CANDIDATE_ABSOLUTE,
+                GateOperator.AT_MOST,
+                1_000_000,
+            ),
+        ),
+    )
+    first_store = AnalysisArtifactStore(tmp_path / "analysis-a")
+    second_store = AnalysisArtifactStore(tmp_path / "analysis-b")
+    first = first_store.publish_gate_policy(
+        proposal,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    )
+    second = second_store.publish_gate_policy(
+        proposal,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    )
+    assert first.artifact_id == second.artifact_id
+    assert first.receipt_digest == second.receipt_digest
+    result = evaluate_gate(second, comparison, {})
+
+    with pytest.raises(ArtifactIntegrityError, match="Store|store|receipt|frozen"):
+        first_store.publish_gate_result(
+            result,
+            policy=second,
+            comparison=comparison,
+            calibrations={},
+        )
+
+
+def test_release_policy_rejects_all_optional_constraints(
+    core_gate_sources: dict[str, Any],
+    gate_policy_store: AnalysisArtifactStore,
+) -> None:
+    baseline = core_gate_sources["baseline"]
+    candidate_config = core_gate_sources["promote_config"]
+    optional = _constraint(
+        CoreMetric.AGENT_FAILURE_RATE,
+        GateConstraintScope.CANDIDATE_ABSOLUTE,
+        GateOperator.AT_MOST,
+        1_000_000,
+        required=False,
+    )
+
+    with pytest.raises(GateError, match="required|release_blocking"):
+        _policy(
+            baseline,
+            candidate_config,
+            eligibility=GateEligibility.RELEASE_BLOCKING,
+            constraints=(optional,),
+        )
+
+    diagnostic = _policy(
+        baseline,
+        candidate_config,
+        eligibility=GateEligibility.DIAGNOSTIC_ONLY,
+        constraints=(optional,),
+    )
+    assert diagnostic.constraints == (optional,)
+    frozen = gate_policy_store.publish_gate_policy(
+        diagnostic,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    )
+    comparison = compare_runs(
+        baseline,
+        core_gate_sources["promote"],
+        COMPARISON_POLICY,
+    )
+    result = evaluate_gate(frozen, comparison, {})
+    assert result.decision is GateDecision.INELIGIBLE
+    assert result.checks[0].status is GateCheckStatus.PASS

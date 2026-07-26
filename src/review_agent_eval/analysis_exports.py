@@ -138,6 +138,7 @@ GATE_PUBLIC_NAMES = (
     "GateReferenceKind",
     "MetricConstraintV1",
     "GatePolicyV1",
+    "FrozenGatePolicy",
     "GateFailureRefV1",
     "GateCheckV1",
     "GateResultV1",
