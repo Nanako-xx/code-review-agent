@@ -37,6 +37,7 @@ from .metrics_exports import METRICS_PUBLIC_NAMES as _metrics_all
 from .report_exports import REPORT_PUBLIC_NAMES as _report_all
 from .analysis_exports import (
     ANALYSIS_PUBLIC_NAMES as _analysis_all,
+    COMPARISON_PUBLIC_NAMES as _comparison_all,
     STATISTICS_PUBLIC_NAMES as _statistics_all,
 )
 from .materialization import (
@@ -105,7 +106,13 @@ def __getattr__(name):
     if name in _analysis_all:
         from importlib import import_module
 
-        module = ".statistics" if name in _statistics_all else ".analysis_artifacts"
+        module = (
+            ".statistics"
+            if name in _statistics_all
+            else ".comparison"
+            if name in _comparison_all
+            else ".analysis_artifacts"
+        )
         value = getattr(import_module(module, __name__), name)
         globals()[name] = value
         return value

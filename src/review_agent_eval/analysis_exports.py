@@ -41,10 +41,51 @@ STATISTICS_PUBLIC_NAMES = (
     "compute_run_statistics",
 )
 
-ANALYSIS_PUBLIC_NAMES = ANALYSIS_ARTIFACT_PUBLIC_NAMES + STATISTICS_PUBLIC_NAMES
+COMPARISON_PUBLIC_NAMES = (
+    "COMPARISON_POLICY_SCHEMA_VERSION",
+    "COMPARISON_COMPATIBILITY_SCHEMA_VERSION",
+    "RUN_COMPARISON_SCHEMA_VERSION",
+    "COMPARISON_ALGORITHM_VERSION",
+    "MIN_COMPARISON_TRIAL_COUNT",
+    "MAX_COMPARISON_BYTES",
+    "REQUIRED_CASE_FIELDS",
+    "REQUIRED_EVALUATOR_FIELDS",
+    "ComparisonError",
+    "ComparisonStatus",
+    "DeltaClassification",
+    "DeltaNullReason",
+    "DeltaIntervalStatus",
+    "VerifiedRunEvaluation",
+    "ComparisonPolicyV1",
+    "CompatibilityFieldV1",
+    "CompatibilityProjectionV1",
+    "AgentProvenanceV1",
+    "AgentFieldDeltaV1",
+    "AgentDeltaV1",
+    "ComparisonCompatibilityV1",
+    "MetricValueV1",
+    "ContributionDeltaV1",
+    "PairedBootstrapCoverageV1",
+    "PairedDeltaConfidenceIntervalV1",
+    "MetricDeltaV1",
+    "JudgeCoverageV1",
+    "JudgeCoverageDeltaV1",
+    "TrialReferenceV1",
+    "PairedTrialDeltaV1",
+    "CaseDeltaV1",
+    "RunComparisonV1",
+    "compare_runs",
+)
+
+ANALYSIS_PUBLIC_NAMES = (
+    ANALYSIS_ARTIFACT_PUBLIC_NAMES
+    + STATISTICS_PUBLIC_NAMES
+    + COMPARISON_PUBLIC_NAMES
+)
 
 __all__ = [
     "ANALYSIS_ARTIFACT_PUBLIC_NAMES",
     "STATISTICS_PUBLIC_NAMES",
+    "COMPARISON_PUBLIC_NAMES",
     "ANALYSIS_PUBLIC_NAMES",
 ]

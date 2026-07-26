@@ -865,6 +865,134 @@ class AnalysisArtifactStore:
         )
         return decoded
 
+    def publish_comparison(
+        self,
+        comparison: Any,
+        *,
+        policy: Any,
+    ) -> AnalysisReceipt:
+        """Publish one canonical comparison result through the receipt-last seam."""
+
+        from .comparison import ComparisonPolicyV1, RunComparisonV1
+
+        if type(comparison) is not RunComparisonV1:
+            raise TypeError("comparison must be a RunComparisonV1")
+        if type(policy) is not ComparisonPolicyV1:
+            raise TypeError("policy must be a ComparisonPolicyV1")
+        try:
+            canonical_policy = ComparisonPolicyV1.from_dict(policy.to_dict())
+            replayed = RunComparisonV1.from_dict(comparison.to_dict())
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "comparison fails strict canonical hydration"
+            ) from exc
+        if replayed != comparison:
+            raise ArtifactIntegrityError(
+                "comparison differs from strict canonical hydration"
+            )
+        if (
+            replayed.algorithm_digest != canonical_policy.algorithm_digest
+            or replayed.compatibility.policy_digest
+            != canonical_policy.policy_digest
+        ):
+            raise ArtifactIntegrityError(
+                "comparison algorithm/policy digest differs from publication policy"
+            )
+        files = {"comparison_result.json": replayed.to_dict()}
+        receipt = AnalysisReceipt.create(
+            kind="comparison",
+            source_bindings=(
+                replayed.baseline_binding,
+                replayed.candidate_binding,
+            ),
+            algorithm_digest=replayed.algorithm_digest,
+            files=files,
+        )
+        return self.publish_json_bundle(
+            receipt.kind,
+            receipt.artifact_id,
+            files,
+            receipt,
+        )
+
+    def load_comparison(self, artifact_id: str) -> Any:
+        """Strictly hydrate a stored comparison without claiming source replay."""
+
+        from .comparison import RunComparisonV1
+
+        receipt, files = self._load_with_receipt(
+            "comparison",
+            _artifact_id(artifact_id),
+        )
+        if set(files) != {"comparison_result.json"}:
+            raise ArtifactIntegrityError(
+                "comparison bundle has an invalid exact artifact set"
+            )
+        try:
+            result = RunComparisonV1.from_dict(
+                files["comparison_result.json"]
+            )
+            expected_sources = _canonical_source_bindings(
+                (result.baseline_binding, result.candidate_binding),
+                "comparison receipt",
+            )
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "comparison result violates its strict canonical schema"
+            ) from exc
+        if (
+            receipt.source_bindings != expected_sources
+            or receipt.algorithm_digest != result.algorithm_digest
+        ):
+            raise ArtifactIntegrityError(
+                "comparison receipt differs from nested bindings or algorithm"
+            )
+        return result
+
+    def load_verified_comparison(
+        self,
+        artifact_id: str,
+        *,
+        baseline: Any,
+        candidate: Any,
+        policy: Any,
+    ) -> Any:
+        """Replay a comparison from caller-supplied verified source Evaluations."""
+
+        from .comparison import (
+            ComparisonPolicyV1,
+            VerifiedRunEvaluation,
+            compare_runs,
+        )
+
+        if type(baseline) is not VerifiedRunEvaluation:
+            raise TypeError("baseline must be a VerifiedRunEvaluation")
+        if type(candidate) is not VerifiedRunEvaluation:
+            raise TypeError("candidate must be a VerifiedRunEvaluation")
+        if type(policy) is not ComparisonPolicyV1:
+            raise TypeError("policy must be a ComparisonPolicyV1")
+        stored = self.load_comparison(artifact_id)
+        if (
+            stored.baseline_binding != baseline.source_binding
+            or stored.candidate_binding != candidate.source_binding
+        ):
+            raise ArtifactIntegrityError(
+                "caller-supplied comparison sources differ from stored provenance"
+            )
+        try:
+            replayed = compare_runs(baseline, candidate, policy)
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "comparison source replay failed"
+            ) from exc
+        if canonical_json_bytes(replayed.to_dict()) != canonical_json_bytes(
+            stored.to_dict()
+        ):
+            raise ArtifactIntegrityError(
+                "stored comparison differs from exact source replay"
+            )
+        return stored
+
 
 def _validate_review_judge_cross_binding(
     review_result: Any,
