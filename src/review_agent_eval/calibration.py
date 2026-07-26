@@ -148,12 +148,13 @@ _FORBIDDEN_BLIND_KEYS = frozenset(
 _FORBIDDEN_BLIND_VALUE_MARKERS = (
     "baseline",
     "candidate",
+    "decision",
     "expected winner",
+    "failure",
     "judge decision",
     "judge failure",
     "judge result",
 )
-_FORBIDDEN_EXACT_BLIND_VALUES = ("decision", "failure")
 _IDENTITY_FIELDS = frozenset(
     {
         "adapter_config_digest",
@@ -382,9 +383,6 @@ def _assert_blind_payload(
     forbidden_value_tokens = tuple(
         _collapsed_blind_token(item) for item in _FORBIDDEN_BLIND_VALUE_MARKERS
     )
-    forbidden_exact_value_tokens = frozenset(
-        _collapsed_blind_token(item) for item in _FORBIDDEN_EXACT_BLIND_VALUES
-    )
 
     def visit(current: Any, path: str) -> None:
         if type(current) is dict:
@@ -443,9 +441,7 @@ def _assert_blind_payload(
                 raise ArtifactSecurityError(
                     f"{context} contains forbidden source identity {identity!r} at {path}"
                 )
-        if collapsed in forbidden_exact_value_tokens or any(
-            marker in collapsed for marker in forbidden_value_tokens
-        ):
+        if any(marker in collapsed for marker in forbidden_value_tokens):
             raise ArtifactSecurityError(
                 f"{context} contains forbidden Judge-result text at {path}"
             )

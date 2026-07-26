@@ -628,6 +628,44 @@ def test_export_rejects_collapsed_forbidden_value_markers(
     assert not output_root.exists()
 
 
+@pytest.mark.parametrize(
+    "forbidden_value",
+    (
+        "prefix decision: equivalent suffix",
+        "prefix FAILURE: timeout suffix",
+        "prefix\u3010DeCiSiOn\u3011\uff1aequivalent suffix",
+        "prefix\uff1c\uff26\uff21\uff29\uff2c\uff35\uff32\uff25\uff0ftimeout\uff1esuffix",
+    ),
+)
+def test_export_rejects_bare_decision_and_failure_substrings(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forbidden_value: str,
+) -> None:
+    original = calibration_module._blind_payload
+
+    def injected(request: BlindJudgeInput):
+        payload, dimension = original(request)
+        payload["context_blocks"].append(
+            {"metadata": {"nested": {"note": forbidden_value}}}
+        )
+        return payload, dimension
+
+    monkeypatch.setattr(calibration_module, "_blind_payload", injected)
+    output_root = tmp_path / "external-calibration"
+    with pytest.raises(ArtifactSecurityError, match="forbidden|blind"):
+        export_calibration_package(
+            calibration_source["verified_by_profile"][
+                JudgeTask.FINDING_EQUIVALENCE
+            ],
+            profile=JudgeTask.FINDING_EQUIVALENCE,
+            policy=POLICY,
+            output_root=output_root,
+        )
+    assert not output_root.exists()
+
+
 def test_selection_policy_is_seeded_and_recorded(
     calibration_source: dict[str, Any],
     tmp_path: Path,
