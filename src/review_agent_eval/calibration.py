@@ -60,8 +60,10 @@ CALIBRATION_PACKAGE_MANIFEST_SCHEMA_VERSION = "calibration_package_manifest_v1"
 HUMAN_LABEL_SCHEMA_VERSION = "human_label_v1"
 HUMAN_LABEL_SET_SCHEMA_VERSION = "human_label_set_v1"
 HUMAN_REVIEWER_PROVENANCE_SCHEMA_VERSION = "human_reviewer_provenance_v1"
-HUMAN_ADJUDICATION_SCHEMA_VERSION = "human_adjudication_v1"
+ADJUDICATION_SCHEMA_VERSION = "adjudication_v1"
+HUMAN_ADJUDICATION_SCHEMA_VERSION = ADJUDICATION_SCHEMA_VERSION
 PROFILE_CALIBRATION_SCHEMA_VERSION = "profile_calibration_v1"
+AUXILIARY_CALIBRATION_SCHEMA_VERSION = "auxiliary_calibration_v1"
 CALIBRATION_RESULT_SCHEMA_VERSION = "calibration_result_v1"
 CALIBRATION_ALGORITHM_VERSION = "blind-judge-calibration-v1"
 CALIBRATION_BLINDED_REQUEST_SCHEMA_VERSION = "calibration_blinded_request_v1"
@@ -71,6 +73,7 @@ PPM_SCALE = 1_000_000
 MAX_CALIBRATION_SEED = (1 << 63) - 1
 MAX_CALIBRATION_ITEMS = 100_000
 MAX_CALIBRATION_BYTES = 256 * 1024 * 1024
+MAX_TRUSTED_PROVENANCE_DIGESTS = 4096
 JUDGE_FAILED_OUTCOME = "__judge_failed__"
 JUDGE_UNGRADED_OUTCOME = "__ungraded__"
 
@@ -89,6 +92,16 @@ class CalibrationStatus(str, Enum):
 class CalibrationSelectionCategory(str, Enum):
     MANDATORY = "mandatory"
     SEEDED = "seeded"
+
+
+class CalibrationAuxiliaryDimension(str, Enum):
+    SEVERITY_ASSESSMENT = "severity_assessment"
+    ACTIONABILITY = "actionability"
+
+
+class AuxiliaryCalibrationApplicability(str, Enum):
+    APPLICABLE = "applicable"
+    NOT_APPLICABLE = "not_applicable"
 
 
 class ReviewerProvenanceKind(str, Enum):
@@ -146,14 +159,30 @@ _FORBIDDEN_BLIND_KEYS = frozenset(
     }
 )
 _FORBIDDEN_BLIND_VALUE_MARKERS = (
-    "baseline",
-    "candidate",
-    "decision",
     "expected winner",
-    "failure",
     "judge decision",
     "judge failure",
     "judge result",
+)
+_STRUCTURED_BLIND_VALUE_MARKERS = (
+    "baseline",
+    "candidate",
+    "decision",
+    "failure",
+)
+_STRUCTURED_BLIND_VALUE_STATUSES = (
+    "baseline",
+    "candidate",
+    "error",
+    "failed",
+    "graded",
+    "loser",
+    "rejected",
+    "selected",
+    "success",
+    "timeout",
+    "ungraded",
+    "winner",
 )
 _IDENTITY_FIELDS = frozenset(
     {
@@ -316,6 +345,35 @@ def _collapsed_blind_token(value: str) -> str:
     )
 
 
+def _contains_structured_blind_value(
+    normalized: str,
+    *,
+    markers: Sequence[str],
+    allowed_values: Sequence[str],
+) -> bool:
+    for marker in markers:
+        offset = 0
+        while True:
+            start = normalized.find(marker, offset)
+            if start < 0:
+                break
+            end = start + len(marker)
+            before_is_boundary = start == 0 or not normalized[start - 1].isalnum()
+            if (
+                before_is_boundary
+                and end < len(normalized)
+                and not normalized[end].isalnum()
+            ):
+                value_start = end
+                while value_start < len(normalized) and not normalized[value_start].isalnum():
+                    value_start += 1
+                tail = _collapsed_blind_token(normalized[value_start:])
+                if any(tail.startswith(value) for value in allowed_values):
+                    return True
+            offset = start + 1
+    return False
+
+
 def _forbidden_identity_values(
     evaluation: VerifiedRunEvaluation,
 ) -> Tuple[str, ...]:
@@ -383,6 +441,34 @@ def _assert_blind_payload(
     forbidden_value_tokens = tuple(
         _collapsed_blind_token(item) for item in _FORBIDDEN_BLIND_VALUE_MARKERS
     )
+    structured_value_markers = tuple(
+        unicodedata.normalize("NFKC", item).casefold()
+        for item in _STRUCTURED_BLIND_VALUE_MARKERS
+    )
+    structured_allowed_values = tuple(
+        sorted(
+            {
+                *(
+                    _collapsed_blind_token(label)
+                    for labels in _ALLOWED_LABELS.values()
+                    for label in labels
+                ),
+                *(
+                    _collapsed_blind_token(item.value)
+                    for item in SeverityAssessment
+                ),
+                *(
+                    _collapsed_blind_token(item.value)
+                    for item in ActionabilityAssessment
+                ),
+                *(
+                    _collapsed_blind_token(item)
+                    for item in _STRUCTURED_BLIND_VALUE_STATUSES
+                ),
+            },
+            key=lambda item: (-len(item), item),
+        )
+    )
 
     def visit(current: Any, path: str) -> None:
         if type(current) is dict:
@@ -441,7 +527,13 @@ def _assert_blind_payload(
                 raise ArtifactSecurityError(
                     f"{context} contains forbidden source identity {identity!r} at {path}"
                 )
-        if any(marker in collapsed for marker in forbidden_value_tokens):
+        if any(marker in collapsed for marker in forbidden_value_tokens) or (
+            _contains_structured_blind_value(
+                normalized,
+                markers=structured_value_markers,
+                allowed_values=structured_allowed_values,
+            )
+        ):
             raise ArtifactSecurityError(
                 f"{context} contains forbidden Judge-result text at {path}"
             )
@@ -461,6 +553,12 @@ class CalibrationSelectionPolicyV1(_JsonModel):
     minimum_labels_per_class: int
     minimum_exact_agreement_ppm: int
     minimum_cohen_kappa_ppm: int
+    minimum_auxiliary_human_coverage_ppm: int
+    minimum_auxiliary_labels_per_class: int
+    minimum_auxiliary_exact_agreement_ppm: int
+    minimum_auxiliary_cohen_kappa_ppm: Optional[int]
+    trusted_reviewer_provenance_digests: Tuple[str, ...]
+    trusted_adjudicator_provenance_digests: Tuple[str, ...]
 
     def __post_init__(self) -> None:
         if self.schema_version != CALIBRATION_SELECTION_POLICY_SCHEMA_VERSION:
@@ -510,6 +608,43 @@ class CalibrationSelectionPolicyV1(_JsonModel):
             minimum=-PPM_SCALE,
             maximum=PPM_SCALE,
         )
+        _integer(
+            self.minimum_auxiliary_human_coverage_ppm,
+            "CalibrationSelectionPolicyV1.minimum_auxiliary_human_coverage_ppm",
+            maximum=PPM_SCALE,
+        )
+        _integer(
+            self.minimum_auxiliary_labels_per_class,
+            "CalibrationSelectionPolicyV1.minimum_auxiliary_labels_per_class",
+            maximum=maximum,
+        )
+        _integer(
+            self.minimum_auxiliary_exact_agreement_ppm,
+            "CalibrationSelectionPolicyV1.minimum_auxiliary_exact_agreement_ppm",
+            maximum=PPM_SCALE,
+        )
+        if self.minimum_auxiliary_cohen_kappa_ppm is not None:
+            _integer(
+                self.minimum_auxiliary_cohen_kappa_ppm,
+                "CalibrationSelectionPolicyV1.minimum_auxiliary_cohen_kappa_ppm",
+                minimum=-PPM_SCALE,
+                maximum=PPM_SCALE,
+            )
+        for name in (
+            "trusted_reviewer_provenance_digests",
+            "trusted_adjudicator_provenance_digests",
+        ):
+            values = tuple(getattr(self, name))
+            if (
+                len(values) > MAX_TRUSTED_PROVENANCE_DIGESTS
+                or values != tuple(sorted(set(values)))
+            ):
+                raise _error(
+                    f"CalibrationSelectionPolicyV1.{name} is not canonical"
+                )
+            for value in values:
+                _digest(value, f"CalibrationSelectionPolicyV1.{name}")
+            object.__setattr__(self, name, values)
 
     @classmethod
     def from_dict(cls, value: Any) -> "CalibrationSelectionPolicyV1":
@@ -526,10 +661,34 @@ class CalibrationSelectionPolicyV1(_JsonModel):
                 "minimum_labels_per_class",
                 "minimum_exact_agreement_ppm",
                 "minimum_cohen_kappa_ppm",
+                "minimum_auxiliary_human_coverage_ppm",
+                "minimum_auxiliary_labels_per_class",
+                "minimum_auxiliary_exact_agreement_ppm",
+                "minimum_auxiliary_cohen_kappa_ppm",
+                "trusted_reviewer_provenance_digests",
+                "trusted_adjudicator_provenance_digests",
             ),
             "CalibrationSelectionPolicyV1",
         )
-        return cls(**payload)
+        return cls(
+            **{
+                **payload,
+                "trusted_reviewer_provenance_digests": tuple(
+                    _array(
+                        payload["trusted_reviewer_provenance_digests"],
+                        "trusted_reviewer_provenance_digests",
+                        MAX_TRUSTED_PROVENANCE_DIGESTS,
+                    )
+                ),
+                "trusted_adjudicator_provenance_digests": tuple(
+                    _array(
+                        payload["trusted_adjudicator_provenance_digests"],
+                        "trusted_adjudicator_provenance_digests",
+                        MAX_TRUSTED_PROVENANCE_DIGESTS,
+                    )
+                ),
+            }
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -543,6 +702,24 @@ class CalibrationSelectionPolicyV1(_JsonModel):
             "minimum_labels_per_class": self.minimum_labels_per_class,
             "minimum_exact_agreement_ppm": self.minimum_exact_agreement_ppm,
             "minimum_cohen_kappa_ppm": self.minimum_cohen_kappa_ppm,
+            "minimum_auxiliary_human_coverage_ppm": (
+                self.minimum_auxiliary_human_coverage_ppm
+            ),
+            "minimum_auxiliary_labels_per_class": (
+                self.minimum_auxiliary_labels_per_class
+            ),
+            "minimum_auxiliary_exact_agreement_ppm": (
+                self.minimum_auxiliary_exact_agreement_ppm
+            ),
+            "minimum_auxiliary_cohen_kappa_ppm": (
+                self.minimum_auxiliary_cohen_kappa_ppm
+            ),
+            "trusted_reviewer_provenance_digests": list(
+                self.trusted_reviewer_provenance_digests
+            ),
+            "trusted_adjudicator_provenance_digests": list(
+                self.trusted_adjudicator_provenance_digests
+            ),
         }
 
 
@@ -1146,74 +1323,176 @@ class HumanReviewerProvenanceV1(_JsonModel):
 
 
 @dataclass(frozen=True)
-class HumanAdjudicationV1(_JsonModel):
+class AdjudicationV1(_JsonModel):
     schema_version: str
     adjudication_id: str
     adjudication_ref: str
-    reviewer_provenance: HumanReviewerProvenanceV1
+    package_id: str
+    package_digest: str
+    calibration_item_id: str
+    item_digest: str
+    profile: JudgeTask
+    original_label_refs: Tuple[str, ...]
+    final_primary_label: str
+    final_severity_assessment: Optional[SeverityAssessment]
+    final_actionability: Optional[ActionabilityAssessment]
+    adjudicator_provenance: HumanReviewerProvenanceV1
+    blind_attestation: bool
 
     def __post_init__(self) -> None:
-        if self.schema_version != HUMAN_ADJUDICATION_SCHEMA_VERSION:
-            raise _error("HumanAdjudicationV1 schema_version is unsupported")
+        if self.schema_version != ADJUDICATION_SCHEMA_VERSION:
+            raise _error("AdjudicationV1 schema_version is unsupported")
         validate_path_segment(self.adjudication_id, "adjudication_id")
-        _text(self.adjudication_ref, "adjudication_ref")
-        if type(self.reviewer_provenance) is not HumanReviewerProvenanceV1:
-            raise _error("adjudication reviewer provenance is invalid")
-        if self.reviewer_provenance.kind is not ReviewerProvenanceKind.HUMAN:
-            raise _error("adjudication requires HUMAN reviewer provenance")
-        expected = stable_id(
-            "human-adjudication-v1",
-            {
-                "schema_version": self.schema_version,
-                "adjudication_ref": self.adjudication_ref,
-                "reviewer_provenance": self.reviewer_provenance.to_dict(),
-            },
+        validate_path_segment(self.package_id, "adjudication package_id")
+        validate_path_segment(
+            self.calibration_item_id,
+            "adjudication calibration_item_id",
         )
-        if self.adjudication_id != expected:
+        _text(self.adjudication_ref, "adjudication_ref")
+        _digest(self.package_digest, "adjudication package_digest")
+        _digest(self.item_digest, "adjudication item_digest")
+        if type(self.profile) is not JudgeTask:
+            raise _error("adjudication profile is invalid")
+        refs = tuple(self.original_label_refs)
+        if not refs or len(refs) > 16 or refs != tuple(sorted(set(refs))):
+            raise _error("adjudication original_label_refs are not canonical")
+        for ref in refs:
+            _digest(ref, "adjudication original label ref")
+        if self.final_primary_label not in _allowed_labels(self.profile):
+            raise _error("adjudication final primary label is out of vocabulary")
+        if self.final_severity_assessment is not None:
+            if type(self.final_severity_assessment) is not SeverityAssessment:
+                raise _error("adjudication final severity assessment is invalid")
+        if self.final_actionability is not None:
+            if type(self.final_actionability) is not ActionabilityAssessment:
+                raise _error("adjudication final actionability is invalid")
+        if self.profile not in {
+            JudgeTask.FINDING_EQUIVALENCE,
+            JudgeTask.NOVEL_FACTUALITY,
+        } and (
+            self.final_severity_assessment is not None
+            or self.final_actionability is not None
+        ):
+            raise _error("adjudication auxiliary labels do not apply to this profile")
+        if type(self.adjudicator_provenance) is not HumanReviewerProvenanceV1:
+            raise _error("adjudicator provenance is invalid")
+        if self.adjudicator_provenance.kind is not ReviewerProvenanceKind.HUMAN:
+            raise _error("adjudication requires HUMAN adjudicator provenance")
+        if type(self.blind_attestation) is not bool or not self.blind_attestation:
+            raise _error("adjudication requires blind attestation")
+        identity = self.to_dict()
+        identity.pop("adjudication_id")
+        if self.adjudication_id != stable_id("adjudication-v1", identity):
             raise _error("adjudication_id is not canonical")
+        object.__setattr__(self, "original_label_refs", refs)
 
     @classmethod
     def create(
         cls,
         *,
+        package: CalibrationPackageV1,
+        item: CalibrationItemV1,
         adjudication_ref: str,
-        reviewer_provenance: HumanReviewerProvenanceV1,
-    ) -> "HumanAdjudicationV1":
-        if type(reviewer_provenance) is not HumanReviewerProvenanceV1:
-            raise TypeError(
-                "reviewer_provenance must be HumanReviewerProvenanceV1"
-            )
-        identity = {
-            "schema_version": HUMAN_ADJUDICATION_SCHEMA_VERSION,
+        original_label_refs: Iterable[str],
+        final_primary_label: str,
+        final_severity_assessment: Optional[SeverityAssessment],
+        final_actionability: Optional[ActionabilityAssessment],
+        adjudicator_provenance: HumanReviewerProvenanceV1,
+        blind_attestation: bool,
+    ) -> "AdjudicationV1":
+        if type(package) is not CalibrationPackageV1:
+            raise TypeError("package must be a CalibrationPackageV1")
+        if type(item) is not CalibrationItemV1:
+            raise TypeError("item must be a CalibrationItemV1")
+        if item.calibration_item_id not in {
+            value.calibration_item_id for value in package.items
+        }:
+            raise _error("adjudication item is unknown to its package")
+        fields = {
+            "schema_version": ADJUDICATION_SCHEMA_VERSION,
             "adjudication_ref": adjudication_ref,
-            "reviewer_provenance": reviewer_provenance.to_dict(),
+            "package_id": package.package_id,
+            "package_digest": package.digest(),
+            "calibration_item_id": item.calibration_item_id,
+            "item_digest": item.digest(),
+            "profile": package.profile,
+            "original_label_refs": tuple(sorted(tuple(original_label_refs))),
+            "final_primary_label": final_primary_label,
+            "final_severity_assessment": final_severity_assessment,
+            "final_actionability": final_actionability,
+            "adjudicator_provenance": adjudicator_provenance,
+            "blind_attestation": blind_attestation,
+        }
+        serialized = {
+            **fields,
+            "profile": package.profile.value,
+            "original_label_refs": list(fields["original_label_refs"]),
+            "final_severity_assessment": (
+                None
+                if final_severity_assessment is None
+                else final_severity_assessment.value
+            ),
+            "final_actionability": (
+                None if final_actionability is None else final_actionability.value
+            ),
+            "adjudicator_provenance": adjudicator_provenance.to_dict(),
         }
         return cls(
-            adjudication_id=stable_id("human-adjudication-v1", identity),
-            schema_version=identity["schema_version"],
-            adjudication_ref=adjudication_ref,
-            reviewer_provenance=reviewer_provenance,
+            adjudication_id=stable_id("adjudication-v1", serialized),
+            **fields,
         )
 
     @classmethod
-    def from_dict(cls, value: Any) -> "HumanAdjudicationV1":
+    def from_dict(cls, value: Any) -> "AdjudicationV1":
         payload = _exact(
             value,
             (
                 "schema_version",
                 "adjudication_id",
                 "adjudication_ref",
-                "reviewer_provenance",
+                "package_id",
+                "package_digest",
+                "calibration_item_id",
+                "item_digest",
+                "profile",
+                "original_label_refs",
+                "final_primary_label",
+                "final_severity_assessment",
+                "final_actionability",
+                "adjudicator_provenance",
+                "blind_attestation",
             ),
-            "HumanAdjudicationV1",
+            "AdjudicationV1",
         )
         return cls(
-            schema_version=payload["schema_version"],
-            adjudication_id=payload["adjudication_id"],
-            adjudication_ref=payload["adjudication_ref"],
-            reviewer_provenance=HumanReviewerProvenanceV1.from_dict(
-                payload["reviewer_provenance"]
-            ),
+            **{
+                **payload,
+                "profile": _enum(JudgeTask, payload["profile"], "adjudication profile"),
+                "original_label_refs": tuple(
+                    _array(payload["original_label_refs"], "original_label_refs", 16)
+                ),
+                "adjudicator_provenance": HumanReviewerProvenanceV1.from_dict(
+                    payload["adjudicator_provenance"]
+                ),
+                "final_severity_assessment": (
+                    None
+                    if payload["final_severity_assessment"] is None
+                    else _enum(
+                        SeverityAssessment,
+                        payload["final_severity_assessment"],
+                        "final_severity_assessment",
+                    )
+                ),
+                "final_actionability": (
+                    None
+                    if payload["final_actionability"] is None
+                    else _enum(
+                        ActionabilityAssessment,
+                        payload["final_actionability"],
+                        "final_actionability",
+                    )
+                ),
+            }
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1221,8 +1500,27 @@ class HumanAdjudicationV1(_JsonModel):
             "schema_version": self.schema_version,
             "adjudication_id": self.adjudication_id,
             "adjudication_ref": self.adjudication_ref,
-            "reviewer_provenance": self.reviewer_provenance.to_dict(),
+            "package_id": self.package_id,
+            "package_digest": self.package_digest,
+            "calibration_item_id": self.calibration_item_id,
+            "item_digest": self.item_digest,
+            "profile": self.profile.value,
+            "original_label_refs": list(self.original_label_refs),
+            "final_primary_label": self.final_primary_label,
+            "final_severity_assessment": (
+                None
+                if self.final_severity_assessment is None
+                else self.final_severity_assessment.value
+            ),
+            "final_actionability": (
+                None if self.final_actionability is None else self.final_actionability.value
+            ),
+            "adjudicator_provenance": self.adjudicator_provenance.to_dict(),
+            "blind_attestation": self.blind_attestation,
         }
+
+
+HumanAdjudicationV1 = AdjudicationV1
 
 
 def _timestamp(value: Any) -> str:
@@ -1249,13 +1547,13 @@ class HumanLabelV1(_JsonModel):
     source_digest: str
     profile: JudgeTask
     label: str
-    severity_assessment: Optional[str]
-    actionability: Optional[str]
+    severity_assessment: Optional[SeverityAssessment]
+    actionability: Optional[ActionabilityAssessment]
     reviewer_provenance: HumanReviewerProvenanceV1
     blind_attestation: bool
     labeled_at: str
     disputed: bool
-    adjudication: Optional[HumanAdjudicationV1]
+    adjudication: Optional[AdjudicationV1]
 
     def __post_init__(self) -> None:
         if self.schema_version != HUMAN_LABEL_SCHEMA_VERSION:
@@ -1277,17 +1575,11 @@ class HumanLabelV1(_JsonModel):
         if self.label not in _allowed_labels(self.profile):
             raise _error("HumanLabelV1 label is out of vocabulary")
         if self.severity_assessment is not None:
-            _enum(
-                SeverityAssessment,
-                self.severity_assessment,
-                "HumanLabelV1.severity_assessment",
-            )
+            if type(self.severity_assessment) is not SeverityAssessment:
+                raise _error("HumanLabelV1.severity_assessment is invalid")
         if self.actionability is not None:
-            _enum(
-                ActionabilityAssessment,
-                self.actionability,
-                "HumanLabelV1.actionability",
-            )
+            if type(self.actionability) is not ActionabilityAssessment:
+                raise _error("HumanLabelV1.actionability is invalid")
         if self.profile not in {
             JudgeTask.FINDING_EQUIVALENCE,
             JudgeTask.NOVEL_FACTUALITY,
@@ -1300,24 +1592,108 @@ class HumanLabelV1(_JsonModel):
         _timestamp(self.labeled_at)
         if type(self.disputed) is not bool:
             raise _error("HumanLabelV1.disputed must be bool")
-        if self.adjudication is not None and type(self.adjudication) is not HumanAdjudicationV1:
+        if self.adjudication is not None and type(self.adjudication) is not AdjudicationV1:
             raise _error("HumanLabelV1 adjudication is invalid")
         if self.adjudication is not None and not self.disputed:
             raise _error("HumanLabelV1 adjudication requires a disputed label")
+        if self.adjudication is not None:
+            adjudication = self.adjudication
+            if (
+                adjudication.package_id != self.package_id
+                or adjudication.package_digest != self.package_digest
+                or adjudication.calibration_item_id != self.calibration_item_id
+                or adjudication.item_digest != self.item_digest
+                or adjudication.profile is not self.profile
+                or self.original_label_digest not in adjudication.original_label_refs
+            ):
+                raise _error("HumanLabelV1 adjudication binding is invalid")
+            if (
+                adjudication.adjudicator_provenance.digest()
+                == self.reviewer_provenance.digest()
+                or adjudication.adjudicator_provenance.reviewer_id
+                == self.reviewer_provenance.reviewer_id
+            ):
+                raise _error("adjudicator must be independent from the original reviewer")
 
     @property
     def eligible(self) -> bool:
-        return (
-            self.blind_attestation
-            and self.reviewer_provenance.kind is ReviewerProvenanceKind.HUMAN
-            and (
-                not self.disputed
-                or (
-                    self.adjudication is not None
-                    and self.adjudication.reviewer_provenance.kind
-                    is ReviewerProvenanceKind.HUMAN
-                )
-            )
+        """Eligibility cannot be established without a package-bound trust policy."""
+
+        return False
+
+    @property
+    def original_label_digest(self) -> str:
+        return canonical_sha256(
+            {
+                "schema_version": self.schema_version,
+                "package_id": self.package_id,
+                "package_digest": self.package_digest,
+                "package_source_digest": self.package_source_digest,
+                "calibration_item_id": self.calibration_item_id,
+                "item_digest": self.item_digest,
+                "source_digest": self.source_digest,
+                "profile": self.profile.value,
+                "label": self.label,
+                "severity_assessment": (
+                    None
+                    if self.severity_assessment is None
+                    else self.severity_assessment.value
+                ),
+                "actionability": (
+                    None if self.actionability is None else self.actionability.value
+                ),
+                "reviewer_provenance": self.reviewer_provenance.to_dict(),
+                "blind_attestation": self.blind_attestation,
+                "labeled_at": self.labeled_at,
+                "disputed": self.disputed,
+            }
+        )
+
+    @property
+    def effective_label(self) -> str:
+        if self.disputed and self.adjudication is not None:
+            return self.adjudication.final_primary_label
+        return self.label
+
+    @property
+    def effective_severity_assessment(self) -> Optional[str]:
+        if self.disputed and self.adjudication is not None:
+            value = self.adjudication.final_severity_assessment
+        else:
+            value = self.severity_assessment
+        return None if value is None else value.value
+
+    @property
+    def effective_actionability(self) -> Optional[str]:
+        if self.disputed and self.adjudication is not None:
+            value = self.adjudication.final_actionability
+        else:
+            value = self.actionability
+        return None if value is None else value.value
+
+    def eligible_under(self, policy: CalibrationSelectionPolicyV1) -> bool:
+        if type(policy) is not CalibrationSelectionPolicyV1:
+            raise TypeError("policy must be CalibrationSelectionPolicyV1")
+        if (
+            not self.blind_attestation
+            or self.reviewer_provenance.kind is not ReviewerProvenanceKind.HUMAN
+            or self.reviewer_provenance.digest()
+            not in policy.trusted_reviewer_provenance_digests
+        ):
+            return False
+        if not self.disputed:
+            return True
+        return bool(
+            self.adjudication is not None
+            and self.adjudication.blind_attestation
+            and self.adjudication.adjudicator_provenance.kind
+            is ReviewerProvenanceKind.HUMAN
+            and self.adjudication.adjudicator_provenance.digest()
+            in policy.trusted_adjudicator_provenance_digests
+            and self.adjudication.adjudicator_provenance.digest()
+            != self.reviewer_provenance.digest()
+            and self.adjudication.adjudicator_provenance.reviewer_id
+            != self.reviewer_provenance.reviewer_id
         )
 
     @classmethod
@@ -1327,13 +1703,13 @@ class HumanLabelV1(_JsonModel):
         package: CalibrationPackageV1,
         item: CalibrationItemV1,
         label: str,
-        severity_assessment: Optional[str],
-        actionability: Optional[str],
+        severity_assessment: Optional[SeverityAssessment],
+        actionability: Optional[ActionabilityAssessment],
         reviewer_provenance: HumanReviewerProvenanceV1,
         blind_attestation: bool,
         labeled_at: str,
         disputed: bool,
-        adjudication: Optional[HumanAdjudicationV1],
+        adjudication: Optional[AdjudicationV1],
     ) -> "HumanLabelV1":
         if type(package) is not CalibrationPackageV1:
             raise TypeError("package must be a CalibrationPackageV1")
@@ -1396,7 +1772,25 @@ class HumanLabelV1(_JsonModel):
                 "adjudication": (
                     None
                     if payload["adjudication"] is None
-                    else HumanAdjudicationV1.from_dict(payload["adjudication"])
+                    else AdjudicationV1.from_dict(payload["adjudication"])
+                ),
+                "severity_assessment": (
+                    None
+                    if payload["severity_assessment"] is None
+                    else _enum(
+                        SeverityAssessment,
+                        payload["severity_assessment"],
+                        "HumanLabelV1.severity_assessment",
+                    )
+                ),
+                "actionability": (
+                    None
+                    if payload["actionability"] is None
+                    else _enum(
+                        ActionabilityAssessment,
+                        payload["actionability"],
+                        "HumanLabelV1.actionability",
+                    )
                 ),
             }
         )
@@ -1412,8 +1806,12 @@ class HumanLabelV1(_JsonModel):
             "source_digest": self.source_digest,
             "profile": self.profile.value,
             "label": self.label,
-            "severity_assessment": self.severity_assessment,
-            "actionability": self.actionability,
+            "severity_assessment": (
+                None if self.severity_assessment is None else self.severity_assessment.value
+            ),
+            "actionability": (
+                None if self.actionability is None else self.actionability.value
+            ),
             "reviewer_provenance": self.reviewer_provenance.to_dict(),
             "blind_attestation": self.blind_attestation,
             "labeled_at": self.labeled_at,
@@ -1710,6 +2108,292 @@ def _kappa_from_matrix(
 
 
 @dataclass(frozen=True)
+class LabelCountV1(_JsonModel):
+    label: str
+    count: int
+
+    def __post_init__(self) -> None:
+        _text(self.label, "LabelCountV1.label")
+        _integer(self.count, "LabelCountV1.count")
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "LabelCountV1":
+        return cls(**_exact(value, ("label", "count"), "LabelCountV1"))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"label": self.label, "count": self.count}
+
+
+@dataclass(frozen=True)
+class AuxiliaryCalibrationV1(_JsonModel):
+    schema_version: str
+    auxiliary_calibration_id: str
+    dimension: CalibrationAuxiliaryDimension
+    applicability: AuxiliaryCalibrationApplicability
+    allowed_labels: Tuple[str, ...]
+    recorded_outcomes: Tuple[str, ...]
+    applicable_item_count: int
+    labeled_item_count: int
+    eligible_labeled_item_count: int
+    pending_item_count: int
+    labeled_item_coverage_ppm: Optional[int]
+    eligible_item_coverage_ppm: Optional[int]
+    applicable_occurrence_count: int
+    labeled_occurrence_count: int
+    eligible_labeled_occurrence_count: int
+    unique_human_label_counts: Tuple[LabelCountV1, ...]
+    confusion_matrix: Tuple[ConfusionMatrixCellV1, ...]
+    exact_agreement_numerator: int
+    exact_agreement_denominator: int
+    exact_agreement_ppm: Optional[int]
+    class_metrics: Tuple[ClassCalibrationV1, ...]
+    cohen_kappa_ppm: Optional[int]
+    cohen_kappa_null_reason: Optional[KappaNullReason]
+    disagreement_count: int
+    disagreement_occurrence_refs: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != AUXILIARY_CALIBRATION_SCHEMA_VERSION:
+            raise _error("AuxiliaryCalibrationV1 schema_version is unsupported")
+        validate_path_segment(
+            self.auxiliary_calibration_id,
+            "auxiliary_calibration_id",
+        )
+        if type(self.dimension) is not CalibrationAuxiliaryDimension:
+            raise _error("auxiliary calibration dimension is invalid")
+        if type(self.applicability) is not AuxiliaryCalibrationApplicability:
+            raise _error("auxiliary calibration applicability is invalid")
+        canonical_labels = (
+            tuple(item.value for item in SeverityAssessment)
+            if self.dimension is CalibrationAuxiliaryDimension.SEVERITY_ASSESSMENT
+            else tuple(item.value for item in ActionabilityAssessment)
+        )
+        labels = tuple(self.allowed_labels)
+        outcomes = tuple(self.recorded_outcomes)
+        if labels != canonical_labels or outcomes != canonical_labels:
+            raise _error("auxiliary calibration labels are not canonical")
+        applicable_items = _integer(
+            self.applicable_item_count,
+            "applicable_item_count",
+        )
+        labeled_items = _integer(self.labeled_item_count, "labeled_item_count")
+        eligible_items = _integer(
+            self.eligible_labeled_item_count,
+            "eligible_labeled_item_count",
+        )
+        pending_items = _integer(self.pending_item_count, "pending_item_count")
+        if (
+            labeled_items + pending_items != applicable_items
+            or eligible_items > labeled_items
+        ):
+            raise _error("auxiliary item coverage counts are inconsistent")
+        if (
+            self.labeled_item_coverage_ppm
+            != _ratio_ppm(labeled_items, applicable_items)
+            or self.eligible_item_coverage_ppm
+            != _ratio_ppm(eligible_items, applicable_items)
+        ):
+            raise _error("auxiliary item coverage ratios are not canonical")
+        applicable_occurrences = _integer(
+            self.applicable_occurrence_count,
+            "applicable_occurrence_count",
+        )
+        labeled_occurrences = _integer(
+            self.labeled_occurrence_count,
+            "labeled_occurrence_count",
+        )
+        eligible_occurrences = _integer(
+            self.eligible_labeled_occurrence_count,
+            "eligible_labeled_occurrence_count",
+        )
+        if (
+            applicable_occurrences < applicable_items
+            or labeled_occurrences > applicable_occurrences
+            or eligible_occurrences > labeled_occurrences
+            or eligible_occurrences < eligible_items
+        ):
+            raise _error("auxiliary occurrence coverage counts are inconsistent")
+        if (
+            self.applicability is AuxiliaryCalibrationApplicability.NOT_APPLICABLE
+            and (applicable_items != 0 or applicable_occurrences != 0)
+        ) or (
+            self.applicability is AuxiliaryCalibrationApplicability.APPLICABLE
+            and (applicable_items == 0 or applicable_occurrences == 0)
+        ):
+            raise _error("auxiliary applicability differs from authoritative coverage")
+        unique_counts = tuple(self.unique_human_label_counts)
+        if (
+            len(unique_counts) != len(labels)
+            or any(type(item) is not LabelCountV1 for item in unique_counts)
+            or tuple(item.label for item in unique_counts) != labels
+            or sum(item.count for item in unique_counts) != eligible_items
+        ):
+            raise _error("auxiliary unique class support is not canonical")
+        matrix = tuple(self.confusion_matrix)
+        expected_pairs = tuple((human, recorded) for human in labels for recorded in outcomes)
+        if (
+            len(matrix) != len(expected_pairs)
+            or any(type(item) is not ConfusionMatrixCellV1 for item in matrix)
+            or tuple((item.human_label, item.recorded_label) for item in matrix)
+            != expected_pairs
+        ):
+            raise _error("auxiliary confusion matrix is not canonical")
+        counts = {(item.human_label, item.recorded_label): item.count for item in matrix}
+        if sum(counts.values()) != eligible_occurrences:
+            raise _error("auxiliary confusion matrix coverage is inconsistent")
+        agreement = sum(counts[(label, label)] for label in labels)
+        if (
+            self.exact_agreement_numerator != agreement
+            or self.exact_agreement_denominator != eligible_occurrences
+            or self.exact_agreement_ppm != _ratio_ppm(agreement, eligible_occurrences)
+        ):
+            raise _error("auxiliary exact agreement is not canonical")
+        metrics = tuple(self.class_metrics)
+        if (
+            len(metrics) != len(labels)
+            or any(type(item) is not ClassCalibrationV1 for item in metrics)
+            or tuple(item.label for item in metrics) != labels
+        ):
+            raise _error("auxiliary class metrics are not canonical")
+        for metric in metrics:
+            human_count = sum(counts[(metric.label, outcome)] for outcome in outcomes)
+            recorded_count = sum(counts[(human, metric.label)] for human in labels)
+            if (
+                metric.human_count != human_count
+                or metric.recorded_count != recorded_count
+                or metric.true_positive_count != counts[(metric.label, metric.label)]
+            ):
+                raise _error("auxiliary class metrics differ from matrix")
+        kappa, kappa_null = _kappa_from_matrix(labels, outcomes, counts)
+        if self.cohen_kappa_ppm != kappa or self.cohen_kappa_null_reason is not kappa_null:
+            raise _error("auxiliary Cohen kappa is not canonical")
+        refs = tuple(self.disagreement_occurrence_refs)
+        disagreement_count = _integer(self.disagreement_count, "disagreement_count")
+        if (
+            refs != tuple(sorted(set(refs)))
+            or len(refs) != disagreement_count
+            or disagreement_count != eligible_occurrences - agreement
+        ):
+            raise _error("auxiliary disagreement refs are invalid")
+        for ref in refs:
+            validate_path_segment(ref, "auxiliary disagreement occurrence ref")
+        identity = self.to_dict()
+        identity.pop("auxiliary_calibration_id")
+        if self.auxiliary_calibration_id != stable_id(
+            "auxiliary-calibration-v1",
+            identity,
+        ):
+            raise _error("auxiliary_calibration_id is not canonical")
+        object.__setattr__(self, "allowed_labels", labels)
+        object.__setattr__(self, "recorded_outcomes", outcomes)
+        object.__setattr__(self, "unique_human_label_counts", unique_counts)
+        object.__setattr__(self, "confusion_matrix", matrix)
+        object.__setattr__(self, "class_metrics", metrics)
+        object.__setattr__(self, "disagreement_occurrence_refs", refs)
+
+    @classmethod
+    def create(cls, **fields: Any) -> "AuxiliaryCalibrationV1":
+        identity = {"schema_version": AUXILIARY_CALIBRATION_SCHEMA_VERSION, **fields}
+        serialized = {
+            key: (
+                value.value
+                if isinstance(value, Enum)
+                else [item.to_dict() if isinstance(item, _JsonModel) else item for item in value]
+                if type(value) in (tuple, list)
+                else value
+            )
+            for key, value in identity.items()
+        }
+        return cls(
+            auxiliary_calibration_id=stable_id(
+                "auxiliary-calibration-v1",
+                serialized,
+            ),
+            **identity,
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "AuxiliaryCalibrationV1":
+        fields = (
+            "schema_version", "auxiliary_calibration_id", "dimension", "applicability",
+            "allowed_labels", "recorded_outcomes", "applicable_item_count",
+            "labeled_item_count", "eligible_labeled_item_count", "pending_item_count",
+            "labeled_item_coverage_ppm", "eligible_item_coverage_ppm",
+            "applicable_occurrence_count", "labeled_occurrence_count",
+            "eligible_labeled_occurrence_count", "unique_human_label_counts",
+            "confusion_matrix", "exact_agreement_numerator",
+            "exact_agreement_denominator", "exact_agreement_ppm", "class_metrics",
+            "cohen_kappa_ppm", "cohen_kappa_null_reason", "disagreement_count",
+            "disagreement_occurrence_refs",
+        )
+        payload = _exact(value, fields, "AuxiliaryCalibrationV1")
+        return cls(
+            **{
+                **payload,
+                "dimension": _enum(CalibrationAuxiliaryDimension, payload["dimension"], "dimension"),
+                "applicability": _enum(
+                    AuxiliaryCalibrationApplicability,
+                    payload["applicability"],
+                    "applicability",
+                ),
+                "allowed_labels": tuple(_array(payload["allowed_labels"], "allowed_labels", 16)),
+                "recorded_outcomes": tuple(_array(payload["recorded_outcomes"], "recorded_outcomes", 16)),
+                "unique_human_label_counts": tuple(
+                    LabelCountV1.from_dict(item)
+                    for item in _array(payload["unique_human_label_counts"], "unique_human_label_counts", 16)
+                ),
+                "confusion_matrix": tuple(
+                    ConfusionMatrixCellV1.from_dict(item)
+                    for item in _array(payload["confusion_matrix"], "confusion_matrix", 256)
+                ),
+                "class_metrics": tuple(
+                    ClassCalibrationV1.from_dict(item)
+                    for item in _array(payload["class_metrics"], "class_metrics", 16)
+                ),
+                "cohen_kappa_null_reason": (
+                    None
+                    if payload["cohen_kappa_null_reason"] is None
+                    else _enum(KappaNullReason, payload["cohen_kappa_null_reason"], "cohen_kappa_null_reason")
+                ),
+                "disagreement_occurrence_refs": tuple(
+                    _array(payload["disagreement_occurrence_refs"], "disagreement_occurrence_refs")
+                ),
+            }
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "auxiliary_calibration_id": self.auxiliary_calibration_id,
+            "dimension": self.dimension.value,
+            "applicability": self.applicability.value,
+            "allowed_labels": list(self.allowed_labels),
+            "recorded_outcomes": list(self.recorded_outcomes),
+            "applicable_item_count": self.applicable_item_count,
+            "labeled_item_count": self.labeled_item_count,
+            "eligible_labeled_item_count": self.eligible_labeled_item_count,
+            "pending_item_count": self.pending_item_count,
+            "labeled_item_coverage_ppm": self.labeled_item_coverage_ppm,
+            "eligible_item_coverage_ppm": self.eligible_item_coverage_ppm,
+            "applicable_occurrence_count": self.applicable_occurrence_count,
+            "labeled_occurrence_count": self.labeled_occurrence_count,
+            "eligible_labeled_occurrence_count": self.eligible_labeled_occurrence_count,
+            "unique_human_label_counts": [item.to_dict() for item in self.unique_human_label_counts],
+            "confusion_matrix": [item.to_dict() for item in self.confusion_matrix],
+            "exact_agreement_numerator": self.exact_agreement_numerator,
+            "exact_agreement_denominator": self.exact_agreement_denominator,
+            "exact_agreement_ppm": self.exact_agreement_ppm,
+            "class_metrics": [item.to_dict() for item in self.class_metrics],
+            "cohen_kappa_ppm": self.cohen_kappa_ppm,
+            "cohen_kappa_null_reason": (
+                None if self.cohen_kappa_null_reason is None else self.cohen_kappa_null_reason.value
+            ),
+            "disagreement_count": self.disagreement_count,
+            "disagreement_occurrence_refs": list(self.disagreement_occurrence_refs),
+        }
+
+
+@dataclass(frozen=True)
 class ProfileCalibrationV1(_JsonModel):
     schema_version: str
     profile_calibration_id: str
@@ -1729,10 +2413,14 @@ class ProfileCalibrationV1(_JsonModel):
     unadjudicated_dispute_count: int
     labeled_coverage_ppm: Optional[int]
     eligible_coverage_ppm: Optional[int]
+    selected_occurrence_count: int
+    labeled_occurrence_count: int
+    eligible_labeled_occurrence_count: int
     judge_graded_count: int
     semantic_unknown_count: int
     judge_failure_count: int
     judge_ungraded_count: int
+    unique_primary_label_counts: Tuple[LabelCountV1, ...]
     confusion_matrix: Tuple[ConfusionMatrixCellV1, ...]
     exact_agreement_numerator: int
     exact_agreement_denominator: int
@@ -1742,6 +2430,7 @@ class ProfileCalibrationV1(_JsonModel):
     cohen_kappa_null_reason: Optional[KappaNullReason]
     disagreement_count: int
     disagreement_item_refs: Tuple[str, ...]
+    auxiliary_calibrations: Tuple[AuxiliaryCalibrationV1, ...]
     status: CalibrationStatus
 
     def __post_init__(self) -> None:
@@ -1780,12 +2469,39 @@ class ProfileCalibrationV1(_JsonModel):
             or self.eligible_coverage_ppm != expected_eligible_coverage
         ):
             raise _error("ProfileCalibrationV1 coverage ratios are not canonical")
+        selected_occurrences = _integer(
+            self.selected_occurrence_count,
+            "selected_occurrence_count",
+        )
+        labeled_occurrences = _integer(
+            self.labeled_occurrence_count,
+            "labeled_occurrence_count",
+        )
+        eligible_occurrences = _integer(
+            self.eligible_labeled_occurrence_count,
+            "eligible_labeled_occurrence_count",
+        )
+        if (
+            selected_occurrences < selected
+            or labeled_occurrences > selected_occurrences
+            or eligible_occurrences > labeled_occurrences
+            or eligible_occurrences < eligible
+        ):
+            raise _error("ProfileCalibrationV1 occurrence coverage is inconsistent")
         graded = _integer(self.judge_graded_count, "judge_graded_count")
         unknown = _integer(self.semantic_unknown_count, "semantic_unknown_count")
         failed = _integer(self.judge_failure_count, "judge_failure_count")
         ungraded = _integer(self.judge_ungraded_count, "judge_ungraded_count")
-        if graded + failed + ungraded != selected or unknown > graded:
+        if graded + failed + ungraded != selected_occurrences or unknown > graded:
             raise _error("ProfileCalibrationV1 Judge coverage is inconsistent")
+        unique_counts = tuple(self.unique_primary_label_counts)
+        if (
+            len(unique_counts) != len(labels)
+            or any(type(item) is not LabelCountV1 for item in unique_counts)
+            or tuple(item.label for item in unique_counts) != labels
+            or sum(item.count for item in unique_counts) != eligible
+        ):
+            raise _error("ProfileCalibrationV1 unique class support is not canonical")
         matrix = tuple(self.confusion_matrix)
         expected_pairs = tuple((human, recorded) for human in labels for recorded in outcomes)
         if (
@@ -1796,13 +2512,13 @@ class ProfileCalibrationV1(_JsonModel):
         ):
             raise _error("ProfileCalibrationV1 confusion matrix is not canonical")
         counts = {(item.human_label, item.recorded_label): item.count for item in matrix}
-        if sum(counts.values()) != eligible:
+        if sum(counts.values()) != eligible_occurrences:
             raise _error("ProfileCalibrationV1 confusion matrix coverage is inconsistent")
         agreement = sum(counts[(label, label)] for label in labels)
         if (
             self.exact_agreement_numerator != agreement
-            or self.exact_agreement_denominator != eligible
-            or self.exact_agreement_ppm != _ratio_ppm(agreement, eligible)
+            or self.exact_agreement_denominator != eligible_occurrences
+            or self.exact_agreement_ppm != _ratio_ppm(agreement, eligible_occurrences)
         ):
             raise _error("ProfileCalibrationV1 exact agreement is not canonical")
         metrics = tuple(self.class_metrics)
@@ -1829,11 +2545,19 @@ class ProfileCalibrationV1(_JsonModel):
         if (
             refs != tuple(sorted(set(refs)))
             or len(refs) != disagreement_count
-            or disagreement_count != eligible - agreement
+            or disagreement_count != eligible_occurrences - agreement
         ):
             raise _error("ProfileCalibrationV1 disagreement metadata is invalid")
         for ref in refs:
             validate_path_segment(ref, "disagreement item ref")
+        auxiliary = tuple(self.auxiliary_calibrations)
+        if (
+            len(auxiliary) != len(CalibrationAuxiliaryDimension)
+            or any(type(item) is not AuxiliaryCalibrationV1 for item in auxiliary)
+            or tuple(item.dimension for item in auxiliary)
+            != tuple(CalibrationAuxiliaryDimension)
+        ):
+            raise _error("ProfileCalibrationV1 auxiliary calibrations are not canonical")
         if type(self.status) is not CalibrationStatus:
             raise _error("ProfileCalibrationV1.status is invalid")
         identity = self.to_dict()
@@ -1843,9 +2567,11 @@ class ProfileCalibrationV1(_JsonModel):
             raise _error("ProfileCalibrationV1 profile_calibration_id is not canonical")
         object.__setattr__(self, "allowed_labels", labels)
         object.__setattr__(self, "recorded_outcomes", outcomes)
+        object.__setattr__(self, "unique_primary_label_counts", unique_counts)
         object.__setattr__(self, "confusion_matrix", matrix)
         object.__setattr__(self, "class_metrics", metrics)
         object.__setattr__(self, "disagreement_item_refs", refs)
+        object.__setattr__(self, "auxiliary_calibrations", auxiliary)
 
     @classmethod
     def create(cls, **fields: Any) -> "ProfileCalibrationV1":
@@ -1876,12 +2602,15 @@ class ProfileCalibrationV1(_JsonModel):
             "allowed_labels", "recorded_outcomes", "selected_count", "labeled_count",
             "eligible_labeled_count", "pending_label_count", "unattested_label_count",
             "unadjudicated_dispute_count", "labeled_coverage_ppm",
-            "eligible_coverage_ppm", "judge_graded_count", "semantic_unknown_count",
+            "eligible_coverage_ppm", "selected_occurrence_count",
+            "labeled_occurrence_count", "eligible_labeled_occurrence_count",
+            "judge_graded_count", "semantic_unknown_count",
             "judge_failure_count", "judge_ungraded_count", "confusion_matrix",
+            "unique_primary_label_counts",
             "exact_agreement_numerator", "exact_agreement_denominator",
             "exact_agreement_ppm", "class_metrics", "cohen_kappa_ppm",
             "cohen_kappa_null_reason", "disagreement_count",
-            "disagreement_item_refs", "status",
+            "disagreement_item_refs", "auxiliary_calibrations", "status",
         )
         payload = _exact(value, fields, "ProfileCalibrationV1")
         matrix = _array(payload["confusion_matrix"], "confusion_matrix", 512)
@@ -1892,6 +2621,10 @@ class ProfileCalibrationV1(_JsonModel):
                 "profile": _enum(JudgeTask, payload["profile"], "profile"),
                 "allowed_labels": tuple(_array(payload["allowed_labels"], "allowed_labels", 16)),
                 "recorded_outcomes": tuple(_array(payload["recorded_outcomes"], "recorded_outcomes", 18)),
+                "unique_primary_label_counts": tuple(
+                    LabelCountV1.from_dict(item)
+                    for item in _array(payload["unique_primary_label_counts"], "unique_primary_label_counts", 16)
+                ),
                 "confusion_matrix": tuple(ConfusionMatrixCellV1.from_dict(item) for item in matrix),
                 "class_metrics": tuple(ClassCalibrationV1.from_dict(item) for item in metrics),
                 "cohen_kappa_null_reason": (
@@ -1900,6 +2633,10 @@ class ProfileCalibrationV1(_JsonModel):
                     )
                 ),
                 "disagreement_item_refs": tuple(_array(payload["disagreement_item_refs"], "disagreement_item_refs")),
+                "auxiliary_calibrations": tuple(
+                    AuxiliaryCalibrationV1.from_dict(item)
+                    for item in _array(payload["auxiliary_calibrations"], "auxiliary_calibrations", 2)
+                ),
                 "status": _enum(CalibrationStatus, payload["status"], "status"),
             }
         )
@@ -1924,10 +2661,16 @@ class ProfileCalibrationV1(_JsonModel):
             "unadjudicated_dispute_count": self.unadjudicated_dispute_count,
             "labeled_coverage_ppm": self.labeled_coverage_ppm,
             "eligible_coverage_ppm": self.eligible_coverage_ppm,
+            "selected_occurrence_count": self.selected_occurrence_count,
+            "labeled_occurrence_count": self.labeled_occurrence_count,
+            "eligible_labeled_occurrence_count": self.eligible_labeled_occurrence_count,
             "judge_graded_count": self.judge_graded_count,
             "semantic_unknown_count": self.semantic_unknown_count,
             "judge_failure_count": self.judge_failure_count,
             "judge_ungraded_count": self.judge_ungraded_count,
+            "unique_primary_label_counts": [
+                item.to_dict() for item in self.unique_primary_label_counts
+            ],
             "confusion_matrix": [item.to_dict() for item in self.confusion_matrix],
             "exact_agreement_numerator": self.exact_agreement_numerator,
             "exact_agreement_denominator": self.exact_agreement_denominator,
@@ -1939,6 +2682,9 @@ class ProfileCalibrationV1(_JsonModel):
             ),
             "disagreement_count": self.disagreement_count,
             "disagreement_item_refs": list(self.disagreement_item_refs),
+            "auxiliary_calibrations": [
+                item.to_dict() for item in self.auxiliary_calibrations
+            ],
             "status": self.status.value,
         }
 
@@ -1989,11 +2735,12 @@ class CalibrationResultV1(_JsonModel):
             labeled=profile.labeled_count,
             eligible=profile.eligible_labeled_count,
             class_counts={
-                metric.label: metric.human_count
-                for metric in profile.class_metrics
+                item.label: item.count
+                for item in profile.unique_primary_label_counts
             },
             exact_agreement_ppm=profile.exact_agreement_ppm,
             kappa_ppm=profile.cohen_kappa_ppm,
+            auxiliary_calibrations=profile.auxiliary_calibrations,
         )
         if self.status is not expected_status:
             raise _error(
@@ -2589,12 +3336,14 @@ def _export_entries(storage: _CalibrationExportStorage, directory: Path) -> set[
                         "calibration export artifact has an unsafe hardlink count"
                     )
                 names.add(entry.name)
+                if len(names) > 2:
+                    raise ArtifactIntegrityError(
+                        "calibration export has unknown artifacts"
+                    )
     except (ArtifactSecurityError, ArtifactIntegrityError):
         raise
     except OSError as exc:
         raise ArtifactSecurityError("could not inspect calibration export") from exc
-    if len(names) > 2:
-        raise ArtifactIntegrityError("calibration export has unknown artifacts")
     if len({_portable_key(name) for name in names}) != len(names):
         raise ArtifactSecurityError("calibration export has a portable name collision")
     return names
@@ -2678,6 +3427,7 @@ def _status_for(
     class_counts: Mapping[str, int],
     exact_agreement_ppm: Optional[int],
     kappa_ppm: Optional[int],
+    auxiliary_calibrations: Sequence[AuxiliaryCalibrationV1],
 ) -> CalibrationStatus:
     if labeled == 0 or eligible == 0:
         return CalibrationStatus.PENDING_HUMAN_LABELS
@@ -2689,6 +3439,17 @@ def _status_for(
         or eligible_coverage < policy.minimum_human_coverage_ppm
     ):
         return CalibrationStatus.INSUFFICIENT_COVERAGE
+    for auxiliary in auxiliary_calibrations:
+        if auxiliary.applicability is AuxiliaryCalibrationApplicability.NOT_APPLICABLE:
+            continue
+        if (
+            auxiliary.eligible_labeled_item_count
+            != auxiliary.applicable_item_count
+            or auxiliary.eligible_item_coverage_ppm is None
+            or auxiliary.eligible_item_coverage_ppm
+            < policy.minimum_auxiliary_human_coverage_ppm
+        ):
+            return CalibrationStatus.INSUFFICIENT_COVERAGE
     if (
         any(
             count < policy.minimum_labels_per_class
@@ -2700,7 +3461,167 @@ def _status_for(
         or kappa_ppm < policy.minimum_cohen_kappa_ppm
     ):
         return CalibrationStatus.FAILED_THRESHOLDS
+    for auxiliary in auxiliary_calibrations:
+        if auxiliary.applicability is AuxiliaryCalibrationApplicability.NOT_APPLICABLE:
+            continue
+        unique_counts = {
+            item.label: item.count
+            for item in auxiliary.unique_human_label_counts
+        }
+        if (
+            any(
+                count < policy.minimum_auxiliary_labels_per_class
+                for count in unique_counts.values()
+            )
+            or auxiliary.exact_agreement_ppm is None
+            or auxiliary.exact_agreement_ppm
+            < policy.minimum_auxiliary_exact_agreement_ppm
+            or (
+                policy.minimum_auxiliary_cohen_kappa_ppm is not None
+                and (
+                    auxiliary.cohen_kappa_ppm is None
+                    or auxiliary.cohen_kappa_ppm
+                    < policy.minimum_auxiliary_cohen_kappa_ppm
+                )
+            )
+        ):
+            return CalibrationStatus.FAILED_THRESHOLDS
     return CalibrationStatus.GATE_ELIGIBLE
+
+
+def _class_metrics_for_counts(
+    labels: Sequence[str],
+    outcomes: Sequence[str],
+    counts: Mapping[tuple[str, str], int],
+) -> Tuple[ClassCalibrationV1, ...]:
+    metrics = []
+    for label in labels:
+        human_count = sum(counts[(label, outcome)] for outcome in outcomes)
+        recorded_count = sum(counts[(human, label)] for human in labels)
+        true_positive = counts[(label, label)]
+        metrics.append(
+            ClassCalibrationV1(
+                label=label,
+                human_count=human_count,
+                recorded_count=recorded_count,
+                true_positive_count=true_positive,
+                precision_ppm=_ratio_ppm(true_positive, recorded_count),
+                precision_null_reason=(
+                    ClassMetricNullReason.NO_RECORDED_PREDICTIONS
+                    if recorded_count == 0
+                    else None
+                ),
+                recall_ppm=_ratio_ppm(true_positive, human_count),
+                recall_null_reason=(
+                    ClassMetricNullReason.NO_HUMAN_LABELS
+                    if human_count == 0
+                    else None
+                ),
+            )
+        )
+    return tuple(metrics)
+
+
+def _score_auxiliary_dimension(
+    dimension: CalibrationAuxiliaryDimension,
+    occurrences: Sequence[tuple[CalibrationSelectionRecordV1, _SelectionCandidate]],
+    label_map: Mapping[str, HumanLabelV1],
+    policy: CalibrationSelectionPolicyV1,
+) -> AuxiliaryCalibrationV1:
+    labels = (
+        tuple(item.value for item in SeverityAssessment)
+        if dimension is CalibrationAuxiliaryDimension.SEVERITY_ASSESSMENT
+        else tuple(item.value for item in ActionabilityAssessment)
+    )
+    counts = {(human, recorded): 0 for human in labels for recorded in labels}
+    applicable_items: set[str] = set()
+    labeled_items: set[str] = set()
+    eligible_items: Dict[str, str] = {}
+    applicable_occurrences = 0
+    labeled_occurrences = 0
+    eligible_occurrences = 0
+    disagreements: list[str] = []
+    for record, selected in occurrences:
+        recorded = (
+            selected.severity_assessment
+            if dimension is CalibrationAuxiliaryDimension.SEVERITY_ASSESSMENT
+            else selected.actionability
+        )
+        if recorded is None:
+            continue
+        applicable_occurrences += 1
+        applicable_items.add(record.calibration_item_id)
+        human = label_map.get(record.calibration_item_id)
+        if human is None:
+            continue
+        human_value = (
+            human.effective_severity_assessment
+            if dimension is CalibrationAuxiliaryDimension.SEVERITY_ASSESSMENT
+            else human.effective_actionability
+        )
+        if human_value is None:
+            continue
+        labeled_occurrences += 1
+        labeled_items.add(record.calibration_item_id)
+        if not human.eligible_under(policy):
+            continue
+        eligible_occurrences += 1
+        eligible_items[record.calibration_item_id] = human_value
+        counts[(human_value, recorded)] += 1
+        if human_value != recorded:
+            disagreements.append(record.selection_record_id)
+    matrix = tuple(
+        ConfusionMatrixCellV1(human, recorded, counts[(human, recorded)])
+        for human in labels
+        for recorded in labels
+    )
+    agreement = sum(counts[(label, label)] for label in labels)
+    kappa, kappa_null = _kappa_from_matrix(labels, labels, counts)
+    unique_counts = tuple(
+        LabelCountV1(
+            label,
+            sum(1 for value in eligible_items.values() if value == label),
+        )
+        for label in labels
+    )
+    applicable_item_count = len(applicable_items)
+    labeled_item_count = len(labeled_items)
+    eligible_item_count = len(eligible_items)
+    return AuxiliaryCalibrationV1.create(
+        dimension=dimension,
+        applicability=(
+            AuxiliaryCalibrationApplicability.APPLICABLE
+            if applicable_occurrences
+            else AuxiliaryCalibrationApplicability.NOT_APPLICABLE
+        ),
+        allowed_labels=labels,
+        recorded_outcomes=labels,
+        applicable_item_count=applicable_item_count,
+        labeled_item_count=labeled_item_count,
+        eligible_labeled_item_count=eligible_item_count,
+        pending_item_count=applicable_item_count - labeled_item_count,
+        labeled_item_coverage_ppm=_ratio_ppm(
+            labeled_item_count,
+            applicable_item_count,
+        ),
+        eligible_item_coverage_ppm=_ratio_ppm(
+            eligible_item_count,
+            applicable_item_count,
+        ),
+        applicable_occurrence_count=applicable_occurrences,
+        labeled_occurrence_count=labeled_occurrences,
+        eligible_labeled_occurrence_count=eligible_occurrences,
+        unique_human_label_counts=unique_counts,
+        confusion_matrix=matrix,
+        exact_agreement_numerator=agreement,
+        exact_agreement_denominator=eligible_occurrences,
+        exact_agreement_ppm=_ratio_ppm(agreement, eligible_occurrences),
+        class_metrics=_class_metrics_for_counts(labels, labels, counts),
+        cohen_kappa_ppm=kappa,
+        cohen_kappa_null_reason=kappa_null,
+        disagreement_count=len(disagreements),
+        disagreement_occurrence_refs=tuple(sorted(disagreements)),
+    )
 
 
 def score_calibration(
@@ -2745,19 +3666,15 @@ def score_calibration(
     allowed = package.items[0].allowed_labels if package.items else _allowed_labels(package.profile)
     outcomes = allowed + (JUDGE_FAILED_OUTCOME, JUDGE_UNGRADED_OUTCOME)
     counts = {(human, recorded): 0 for human in allowed for recorded in outcomes}
-    labeled_count = 0
-    eligible_count = 0
-    unattested = 0
-    disputes = 0
     disagreements: list[str] = []
-    disagreement_count = 0
     graded = 0
     semantic_unknown = 0
     failed = 0
     ungraded = 0
     if len(replayed_selection) != len(package.selection_records):
         raise ArtifactIntegrityError("calibration selection replay length differs")
-    for record, selected in zip(package.selection_records, replayed_selection):
+    occurrences = tuple(zip(package.selection_records, replayed_selection))
+    for record, selected in occurrences:
         if (
             record.calibration_item_id != selected.item.calibration_item_id
             or record.source_digest != selected.source_digest
@@ -2765,6 +3682,29 @@ def score_calibration(
             raise ArtifactIntegrityError(
                 "calibration selection differs from source request replay"
             )
+    selected_item_ids = {record.calibration_item_id for record, _ in occurrences}
+    if selected_item_ids != {item.calibration_item_id for item in package.items}:
+        raise ArtifactIntegrityError("calibration unique item replay differs")
+    labeled_item_ids = selected_item_ids.intersection(label_map)
+    eligible_label_map = {
+        item_id: label_map[item_id]
+        for item_id in labeled_item_ids
+        if label_map[item_id].eligible_under(package.policy)
+    }
+    selected_count = len(selected_item_ids)
+    labeled_count = len(labeled_item_ids)
+    eligible_count = len(eligible_label_map)
+    unattested = sum(
+        1 for item_id in labeled_item_ids if not label_map[item_id].blind_attestation
+    )
+    disputes = sum(
+        1
+        for item_id in labeled_item_ids
+        if label_map[item_id].disputed and label_map[item_id].adjudication is None
+    )
+    labeled_occurrence_count = 0
+    eligible_occurrence_count = 0
+    for record, selected in occurrences:
         recorded_outcome = selected.recorded_outcome
         if recorded_outcome == JUDGE_FAILED_OUTCOME:
             failed += 1
@@ -2777,61 +3717,52 @@ def score_calibration(
         human = label_map.get(record.calibration_item_id)
         if human is None:
             continue
-        labeled_count += 1
-        if not human.blind_attestation:
-            unattested += 1
-        if human.disputed and human.adjudication is None:
-            disputes += 1
-        if not human.eligible:
+        labeled_occurrence_count += 1
+        if record.calibration_item_id not in eligible_label_map:
             continue
-        eligible_count += 1
-        counts[(human.label, recorded_outcome)] += 1
-        if human.label != recorded_outcome:
-            disagreement_count += 1
-            disagreements.append(record.calibration_item_id)
+        eligible_occurrence_count += 1
+        effective_label = human.effective_label
+        counts[(effective_label, recorded_outcome)] += 1
+        if effective_label != recorded_outcome:
+            disagreements.append(record.selection_record_id)
     matrix = tuple(
         ConfusionMatrixCellV1(human, recorded, counts[(human, recorded)])
         for human in allowed
         for recorded in outcomes
     )
     agreement = sum(counts[(label, label)] for label in allowed)
-    exact_ppm = _ratio_ppm(agreement, eligible_count)
-    class_metrics = []
-    class_counts = {}
-    for label in allowed:
-        human_count = sum(counts[(label, outcome)] for outcome in outcomes)
-        recorded_count = sum(counts[(human, label)] for human in allowed)
-        true_positive = counts[(label, label)]
-        class_counts[label] = human_count
-        class_metrics.append(
-            ClassCalibrationV1(
-                label=label,
-                human_count=human_count,
-                recorded_count=recorded_count,
-                true_positive_count=true_positive,
-                precision_ppm=_ratio_ppm(true_positive, recorded_count),
-                precision_null_reason=(
-                    ClassMetricNullReason.NO_RECORDED_PREDICTIONS
-                    if recorded_count == 0
-                    else None
-                ),
-                recall_ppm=_ratio_ppm(true_positive, human_count),
-                recall_null_reason=(
-                    ClassMetricNullReason.NO_HUMAN_LABELS
-                    if human_count == 0
-                    else None
-                ),
-            )
+    exact_ppm = _ratio_ppm(agreement, eligible_occurrence_count)
+    class_metrics = _class_metrics_for_counts(allowed, outcomes, counts)
+    unique_class_counts = {
+        label: sum(
+            1
+            for human in eligible_label_map.values()
+            if human.effective_label == label
         )
+        for label in allowed
+    }
+    unique_primary_label_counts = tuple(
+        LabelCountV1(label, unique_class_counts[label]) for label in allowed
+    )
     kappa, kappa_null = _kappa_from_matrix(allowed, outcomes, counts)
+    auxiliary_calibrations = tuple(
+        _score_auxiliary_dimension(
+            dimension,
+            occurrences,
+            label_map,
+            package.policy,
+        )
+        for dimension in CalibrationAuxiliaryDimension
+    )
     status = _status_for(
         policy=package.policy,
-        selected=len(package.selection_records),
+        selected=selected_count,
         labeled=labeled_count,
         eligible=eligible_count,
-        class_counts=class_counts,
+        class_counts=unique_class_counts,
         exact_agreement_ppm=exact_ppm,
         kappa_ppm=kappa,
+        auxiliary_calibrations=auxiliary_calibrations,
     )
     profile_fields = {
         "profile": package.profile,
@@ -2842,27 +3773,32 @@ def score_calibration(
         "label_set_digest": labels.digest(),
         "allowed_labels": allowed,
         "recorded_outcomes": outcomes,
-        "selected_count": len(package.selection_records),
+        "selected_count": selected_count,
         "labeled_count": labeled_count,
         "eligible_labeled_count": eligible_count,
-        "pending_label_count": len(package.selection_records) - labeled_count,
+        "pending_label_count": selected_count - labeled_count,
         "unattested_label_count": unattested,
         "unadjudicated_dispute_count": disputes,
-        "labeled_coverage_ppm": _ratio_ppm(labeled_count, len(package.selection_records)),
-        "eligible_coverage_ppm": _ratio_ppm(eligible_count, len(package.selection_records)),
+        "labeled_coverage_ppm": _ratio_ppm(labeled_count, selected_count),
+        "eligible_coverage_ppm": _ratio_ppm(eligible_count, selected_count),
+        "selected_occurrence_count": len(occurrences),
+        "labeled_occurrence_count": labeled_occurrence_count,
+        "eligible_labeled_occurrence_count": eligible_occurrence_count,
         "judge_graded_count": graded,
         "semantic_unknown_count": semantic_unknown,
         "judge_failure_count": failed,
         "judge_ungraded_count": ungraded,
+        "unique_primary_label_counts": unique_primary_label_counts,
         "confusion_matrix": matrix,
         "exact_agreement_numerator": agreement,
-        "exact_agreement_denominator": eligible_count,
+        "exact_agreement_denominator": eligible_occurrence_count,
         "exact_agreement_ppm": exact_ppm,
-        "class_metrics": tuple(class_metrics),
+        "class_metrics": class_metrics,
         "cohen_kappa_ppm": kappa,
         "cohen_kappa_null_reason": kappa_null,
-        "disagreement_count": disagreement_count,
-        "disagreement_item_refs": tuple(sorted(set(disagreements))),
+        "disagreement_count": len(disagreements),
+        "disagreement_item_refs": tuple(sorted(disagreements)),
+        "auxiliary_calibrations": auxiliary_calibrations,
         "status": status,
     }
     profile_result = ProfileCalibrationV1.create(**profile_fields)
@@ -2888,13 +3824,17 @@ __all__ = [
     "HUMAN_LABEL_SCHEMA_VERSION",
     "HUMAN_LABEL_SET_SCHEMA_VERSION",
     "HUMAN_REVIEWER_PROVENANCE_SCHEMA_VERSION",
+    "ADJUDICATION_SCHEMA_VERSION",
     "HUMAN_ADJUDICATION_SCHEMA_VERSION",
     "PROFILE_CALIBRATION_SCHEMA_VERSION",
+    "AUXILIARY_CALIBRATION_SCHEMA_VERSION",
     "CALIBRATION_RESULT_SCHEMA_VERSION",
     "CALIBRATION_ALGORITHM_VERSION",
     "CalibrationError",
     "CalibrationStatus",
     "CalibrationSelectionCategory",
+    "CalibrationAuxiliaryDimension",
+    "AuxiliaryCalibrationApplicability",
     "ReviewerProvenanceKind",
     "KappaNullReason",
     "ClassMetricNullReason",
@@ -2904,11 +3844,14 @@ __all__ = [
     "CalibrationPackageV1",
     "CalibrationPackageManifestV1",
     "HumanReviewerProvenanceV1",
+    "AdjudicationV1",
     "HumanAdjudicationV1",
     "HumanLabelV1",
     "HumanLabelSetV1",
     "ConfusionMatrixCellV1",
     "ClassCalibrationV1",
+    "LabelCountV1",
+    "AuxiliaryCalibrationV1",
     "ProfileCalibrationV1",
     "CalibrationResultV1",
     "export_calibration_package",

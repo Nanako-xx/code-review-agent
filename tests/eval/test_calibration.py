@@ -17,9 +17,13 @@ from review_agent_eval.artifacts import (
     ArtifactSecurityError,
 )
 from review_agent_eval.calibration import (
+    AdjudicationV1,
     CALIBRATION_ALGORITHM_VERSION,
     CALIBRATION_SELECTION_POLICY_SCHEMA_VERSION,
     CalibrationPackageV1,
+    CalibrationSelectionRecordV1,
+    AuxiliaryCalibrationApplicability,
+    CalibrationAuxiliaryDimension,
     CalibrationResultV1,
     CalibrationSelectionPolicyV1,
     CalibrationStatus,
@@ -35,8 +39,10 @@ from review_agent_eval.comparison import VerifiedRunEvaluation
 from review_agent_eval.config import JudgeKind
 from review_agent_eval.intent_evaluator import IntentMatchKind, IntentTruth
 from review_agent_eval.judge import (
+    ActionabilityAssessment,
     BlindJudgeInput,
     JudgeTask,
+    SeverityAssessment,
     SemanticJudge,
 )
 from review_agent_eval.models import (
@@ -65,6 +71,20 @@ from .test_orchestrator_target_replay_v2 import (
 from .test_target_runner import _FrozenSuccessAdapter
 
 
+TRUSTED_REVIEWER = HumanReviewerProvenanceV1.create(
+    kind=ReviewerProvenanceKind.HUMAN,
+    reviewer_id="independent-reviewer-1",
+    provenance_ref="external-review-record-1",
+    attestation_ref="human-attestation-record-1",
+)
+TRUSTED_ADJUDICATOR = HumanReviewerProvenanceV1.create(
+    kind=ReviewerProvenanceKind.HUMAN,
+    reviewer_id="independent-adjudicator-1",
+    provenance_ref="external-adjudicator-record-1",
+    attestation_ref="human-adjudicator-attestation-1",
+)
+
+
 POLICY = CalibrationSelectionPolicyV1(
     schema_version=CALIBRATION_SELECTION_POLICY_SCHEMA_VERSION,
     algorithm_version=CALIBRATION_ALGORITHM_VERSION,
@@ -76,6 +96,12 @@ POLICY = CalibrationSelectionPolicyV1(
     minimum_labels_per_class=0,
     minimum_exact_agreement_ppm=900_000,
     minimum_cohen_kappa_ppm=800_000,
+    minimum_auxiliary_human_coverage_ppm=1_000_000,
+    minimum_auxiliary_labels_per_class=0,
+    minimum_auxiliary_exact_agreement_ppm=900_000,
+    minimum_auxiliary_cohen_kappa_ppm=None,
+    trusted_reviewer_provenance_digests=(TRUSTED_REVIEWER.digest(),),
+    trusted_adjudicator_provenance_digests=(TRUSTED_ADJUDICATOR.digest(),),
 )
 
 
@@ -296,31 +322,32 @@ def _human_label(
     label: str,
     *,
     reviewer_kind: ReviewerProvenanceKind = ReviewerProvenanceKind.HUMAN,
+    reviewer_provenance: HumanReviewerProvenanceV1 | None = None,
     disputed: bool = False,
     adjudication: HumanAdjudicationV1 | None = None,
 ) -> HumanLabelV1:
-    reviewer = HumanReviewerProvenanceV1.create(
-        kind=reviewer_kind,
-        reviewer_id="independent-reviewer-1",
-        provenance_ref="external-review-record-1",
-        attestation_ref=(
-            "human-attestation-record-1"
-            if reviewer_kind is ReviewerProvenanceKind.HUMAN
-            else None
-        ),
+    reviewer = reviewer_provenance or (
+        TRUSTED_REVIEWER
+        if reviewer_kind is ReviewerProvenanceKind.HUMAN
+        else HumanReviewerProvenanceV1.create(
+            kind=reviewer_kind,
+            reviewer_id="independent-reviewer-1",
+            provenance_ref="external-review-record-1",
+            attestation_ref=None,
+        )
     )
     return HumanLabelV1.create(
         package=package,
         item=item,
         label=label,
         severity_assessment=(
-            "consistent"
+            SeverityAssessment.CONSISTENT
             if package.profile
             in {JudgeTask.FINDING_EQUIVALENCE, JudgeTask.NOVEL_FACTUALITY}
             else None
         ),
         actionability=(
-            "actionable"
+            ActionabilityAssessment.ACTIONABLE
             if package.profile
             in {JudgeTask.FINDING_EQUIVALENCE, JudgeTask.NOVEL_FACTUALITY}
             else None
@@ -666,6 +693,37 @@ def test_export_rejects_bare_decision_and_failure_substrings(
     assert not output_root.exists()
 
 
+def test_export_allows_unstructured_marker_words_in_source_context(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = calibration_module._blind_payload
+
+    def injected(request: BlindJudgeInput):
+        payload, dimension = original(request)
+        payload["context_blocks"].append(
+            {
+                "metadata": {
+                    "note": (
+                        "The failure handling follows a decision tree while the "
+                        "candidate collection retains a baseline snapshot."
+                    )
+                }
+            }
+        )
+        return payload, dimension
+
+    monkeypatch.setattr(calibration_module, "_blind_payload", injected)
+    package = export_calibration_package(
+        calibration_source["verified_by_profile"][JudgeTask.FINDING_EQUIVALENCE],
+        profile=JudgeTask.FINDING_EQUIVALENCE,
+        policy=POLICY,
+        output_root=tmp_path / "external-calibration",
+    )
+    assert package.items
+
+
 def test_selection_policy_is_seeded_and_recorded(
     calibration_source: dict[str, Any],
     tmp_path: Path,
@@ -825,15 +883,47 @@ def test_disputed_label_requires_adjudication_before_gate_eligibility(
     assert unresolved_result.status is not CalibrationStatus.GATE_ELIGIBLE
     assert unresolved_result.profiles[0].unadjudicated_dispute_count == 1
 
-    adjudicator = HumanReviewerProvenanceV1.create(
+    untrusted_adjudicator = HumanReviewerProvenanceV1.create(
         kind=ReviewerProvenanceKind.HUMAN,
-        reviewer_id="independent-adjudicator-1",
-        provenance_ref="external-adjudicator-record-1",
-        attestation_ref="human-adjudicator-attestation-1",
+        reviewer_id="unregistered-adjudicator",
+        provenance_ref="unregistered-adjudication-record",
+        attestation_ref="unregistered-adjudication-attestation",
     )
-    adjudication = HumanAdjudicationV1.create(
+    untrusted_adjudication = AdjudicationV1.create(
+        package=package,
+        item=package.items[0],
+        adjudication_ref="untrusted-adjudication",
+        original_label_refs=(disputed.original_label_digest,),
+        final_primary_label=disputed.label,
+        final_severity_assessment=disputed.severity_assessment,
+        final_actionability=disputed.actionability,
+        adjudicator_provenance=untrusted_adjudicator,
+        blind_attestation=True,
+    )
+    untrusted_labels = HumanLabelSetV1.create(
+        package=package,
+        labels=(
+            replace(disputed, adjudication=untrusted_adjudication),
+            *matching.labels[1:],
+        ),
+    )
+    untrusted_result = score_calibration(
+        calibration_source["verified_by_profile"][package.profile],
+        package=package,
+        labels=untrusted_labels,
+    )
+    assert untrusted_result.status is not CalibrationStatus.GATE_ELIGIBLE
+
+    adjudication = AdjudicationV1.create(
+        package=package,
+        item=package.items[0],
         adjudication_ref="adjudication-record-1",
-        reviewer_provenance=adjudicator,
+        original_label_refs=(disputed.original_label_digest,),
+        final_primary_label=disputed.label,
+        final_severity_assessment=disputed.severity_assessment,
+        final_actionability=disputed.actionability,
+        adjudicator_provenance=TRUSTED_ADJUDICATOR,
+        blind_attestation=True,
     )
     adjudicated = HumanLabelSetV1.create(
         package=package,
@@ -848,6 +938,80 @@ def test_disputed_label_requires_adjudication_before_gate_eligibility(
         labels=adjudicated,
     )
     assert adjudicated_result.status is CalibrationStatus.GATE_ELIGIBLE
+
+    same_reviewer = AdjudicationV1.create(
+        package=package,
+        item=package.items[0],
+        adjudication_ref="same-reviewer-adjudication",
+        original_label_refs=(disputed.original_label_digest,),
+        final_primary_label=disputed.label,
+        final_severity_assessment=disputed.severity_assessment,
+        final_actionability=disputed.actionability,
+        adjudicator_provenance=disputed.reviewer_provenance,
+        blind_attestation=True,
+    )
+    with pytest.raises(ValueError, match="independent|different|reviewer"):
+        replace(disputed, adjudication=same_reviewer)
+
+
+def test_unregistered_human_provenance_never_counts_as_eligible(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    package = _export(
+        calibration_source,
+        tmp_path,
+        JudgeTask.FINDING_EQUIVALENCE,
+    )
+    unregistered = HumanReviewerProvenanceV1.create(
+        kind=ReviewerProvenanceKind.HUMAN,
+        reviewer_id="self-asserted-human",
+        provenance_ref="self-asserted-record",
+        attestation_ref="self-asserted-attestation",
+    )
+    labels = HumanLabelSetV1.create(
+        package=package,
+        labels=tuple(
+            _human_label(
+                package,
+                item,
+                (
+                    "different"
+                    if "incorrect review behavior"
+                    in item.blinded_request_payload["items"][0]["text"]
+                    else "equivalent"
+                ),
+                reviewer_provenance=unregistered,
+            )
+            for item in package.items
+        ),
+    )
+    result = score_calibration(
+        calibration_source["verified_by_profile"][package.profile],
+        package=package,
+        labels=labels,
+    )
+    assert result.status is CalibrationStatus.PENDING_HUMAN_LABELS
+    assert result.profiles[0].eligible_labeled_count == 0
+
+    empty_trust_policy = replace(
+        POLICY,
+        trusted_reviewer_provenance_digests=(),
+        trusted_adjudicator_provenance_digests=(),
+    )
+    empty_trust_package = _export(
+        calibration_source,
+        tmp_path / "empty-trust",
+        JudgeTask.FINDING_EQUIVALENCE,
+        policy=empty_trust_policy,
+    )
+    empty_trust_result = score_calibration(
+        calibration_source["verified_by_profile"][empty_trust_package.profile],
+        package=empty_trust_package,
+        labels=_matching_labels(empty_trust_package),
+    )
+    assert empty_trust_result.status is CalibrationStatus.PENDING_HUMAN_LABELS
+    assert empty_trust_result.profiles[0].eligible_labeled_count == 0
 
 
 def test_calibration_profiles_are_scored_independently(
@@ -881,6 +1045,100 @@ def test_calibration_profiles_are_scored_independently(
     assert all(
         result.status is CalibrationStatus.PENDING_HUMAN_LABELS
         for result in results.values()
+    )
+
+
+def test_authoritative_auxiliary_labels_are_scored_and_gate_independently(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    package = _export(
+        calibration_source,
+        tmp_path,
+        JudgeTask.FINDING_EQUIVALENCE,
+    )
+    matching = _matching_labels(package)
+    matching_result = score_calibration(
+        calibration_source["verified_by_profile"][package.profile],
+        package=package,
+        labels=matching,
+    )
+    auxiliary = {
+        item.dimension: item
+        for item in matching_result.profiles[0].auxiliary_calibrations
+    }
+    assert matching_result.status is CalibrationStatus.GATE_ELIGIBLE
+    assert auxiliary[
+        CalibrationAuxiliaryDimension.SEVERITY_ASSESSMENT
+    ].applicability is AuxiliaryCalibrationApplicability.APPLICABLE
+    assert auxiliary[
+        CalibrationAuxiliaryDimension.ACTIONABILITY
+    ].exact_agreement_ppm == 1_000_000
+
+    missing = HumanLabelSetV1.create(
+        package=package,
+        labels=(
+            replace(matching.labels[0], severity_assessment=None),
+            *matching.labels[1:],
+        ),
+    )
+    missing_result = score_calibration(
+        calibration_source["verified_by_profile"][package.profile],
+        package=package,
+        labels=missing,
+    )
+    missing_severity = next(
+        item
+        for item in missing_result.profiles[0].auxiliary_calibrations
+        if item.dimension is CalibrationAuxiliaryDimension.SEVERITY_ASSESSMENT
+    )
+    assert missing_result.status is CalibrationStatus.INSUFFICIENT_COVERAGE
+    assert missing_severity.eligible_labeled_item_count < (
+        missing_severity.applicable_item_count
+    )
+    assert missing_result.profiles[0].exact_agreement_ppm == 1_000_000
+
+    wrong = HumanLabelSetV1.create(
+        package=package,
+        labels=tuple(
+            replace(label, severity_assessment=SeverityAssessment.OVERSTATED)
+            for label in matching.labels
+        ),
+    )
+    wrong_result = score_calibration(
+        calibration_source["verified_by_profile"][package.profile],
+        package=package,
+        labels=wrong,
+    )
+    wrong_severity = next(
+        item
+        for item in wrong_result.profiles[0].auxiliary_calibrations
+        if item.dimension is CalibrationAuxiliaryDimension.SEVERITY_ASSESSMENT
+    )
+    assert wrong_result.status is CalibrationStatus.FAILED_THRESHOLDS
+    assert wrong_result.profiles[0].exact_agreement_ppm == 1_000_000
+    assert wrong_severity.exact_agreement_ppm != 1_000_000
+
+
+def test_non_authoritative_auxiliary_dimensions_are_typed_not_applicable(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    package = _export(
+        calibration_source,
+        tmp_path,
+        JudgeTask.INTENT_EQUIVALENCE,
+    )
+    result = score_calibration(
+        calibration_source["verified_by_profile"][package.profile],
+        package=package,
+        labels=_matching_labels(package),
+    )
+    assert all(
+        item.applicability is AuxiliaryCalibrationApplicability.NOT_APPLICABLE
+        and item.applicable_item_count == 0
+        and item.applicable_occurrence_count == 0
+        for item in result.profiles[0].auxiliary_calibrations
     )
 
 
@@ -985,6 +1243,84 @@ def test_kappa_and_confusion_matrix_are_reproducible(
     )
 
 
+def test_duplicate_item_coverage_is_unique_but_judge_metrics_are_per_occurrence(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evaluation = calibration_source["verified_by_profile"][
+        JudgeTask.INTENT_EQUIVALENCE
+    ]
+    package, selected = calibration_module._build_package_with_selection(
+        evaluation,
+        profile=JudgeTask.INTENT_EQUIVALENCE,
+        policy=POLICY,
+    )
+    assert len(package.items) == len(selected) == 1
+    first_record = package.selection_records[0]
+    duplicate_source_digest = canonical_sha256("duplicate-source-occurrence")
+    second_selected = replace(
+        selected[0],
+        source_digest=duplicate_source_digest,
+        recorded_outcome="different",
+        primary_label="different",
+    )
+    second_record = CalibrationSelectionRecordV1.create(
+        calibration_item_id=first_record.calibration_item_id,
+        item_digest=first_record.item_digest,
+        source_digest=duplicate_source_digest,
+        selection_order=2,
+        selection_seed=POLICY.selection_seed,
+    )
+    records = (first_record, second_record)
+    selection_digest = canonical_sha256([item.to_dict() for item in records])
+    duplicate_package = CalibrationPackageV1(
+        schema_version=package.schema_version,
+        package_id=stable_id(
+            "calibration-package-v1",
+            package.profile.value,
+            package.policy.digest(),
+            package.source_digest,
+            package.payload_digest,
+            selection_digest,
+        ),
+        profile=package.profile,
+        policy=package.policy,
+        source_digest=package.source_digest,
+        payload_digest=package.payload_digest,
+        selection_digest=selection_digest,
+        items=package.items,
+        selection_records=records,
+        status=package.status,
+    )
+    labels = _matching_labels(duplicate_package)
+
+    def duplicate_replay(*args: Any, **kwargs: Any):
+        del args, kwargs
+        return duplicate_package, (selected[0], second_selected)
+
+    monkeypatch.setattr(
+        calibration_module,
+        "_build_package_with_selection",
+        duplicate_replay,
+    )
+    result = score_calibration(
+        evaluation,
+        package=duplicate_package,
+        labels=labels,
+    )
+    profile = result.profiles[0]
+    assert profile.selected_count == 1
+    assert profile.labeled_count == 1
+    assert profile.eligible_labeled_count == 1
+    assert profile.selected_occurrence_count == 2
+    assert profile.eligible_labeled_occurrence_count == 2
+    assert profile.exact_agreement_denominator == 2
+    assert sum(cell.count for cell in profile.confusion_matrix) == 2
+    assert profile.disagreement_count == 1
+    assert profile.disagreement_item_refs == (second_record.selection_record_id,)
+
+
 def test_export_rejects_repository_paths_and_tampered_resume(
     calibration_source: dict[str, Any],
     tmp_path: Path,
@@ -1017,6 +1353,47 @@ def test_export_rejects_repository_paths_and_tampered_resume(
             tmp_path,
             JudgeTask.INTENT_EQUIVALENCE,
         )
+
+
+def test_export_entry_limit_stops_at_third_scandir_item(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "streaming-export"
+    storage = calibration_module._CalibrationExportStorage(root)
+    directory = root / "package"
+    directory.mkdir()
+    for name in ("one.json", "two.json", "three.json", "must-not-read.json"):
+        (directory / name).write_text("{}", encoding="utf-8")
+
+    original_scandir = os.scandir
+    observed = {"count": 0}
+
+    class CountingScandir:
+        def __init__(self, path: Any) -> None:
+            self._context = original_scandir(path)
+            self._iterator: Any = None
+
+        def __enter__(self):
+            self._iterator = self._context.__enter__()
+            return self
+
+        def __exit__(self, *args: Any):
+            return self._context.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            observed["count"] += 1
+            if observed["count"] > 3:
+                raise AssertionError("export enumeration read beyond its hard limit")
+            return next(self._iterator)
+
+    monkeypatch.setattr(os, "scandir", CountingScandir)
+    with pytest.raises(ArtifactIntegrityError, match="unknown|artifacts"):
+        calibration_module._export_entries(storage, directory)
+    assert observed["count"] == 3
 
 
 def test_recomputed_item_id_cannot_bypass_payload_binding(
