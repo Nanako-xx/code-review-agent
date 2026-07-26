@@ -33,6 +33,7 @@ from .judge import (
     BlindJudgeInput,
     FindingMatchRelation,
     JudgeExecutionResult,
+    JudgeFailureCode,
     JudgeRunStatus,
     JudgeTask,
     NovelFactuality,
@@ -76,6 +77,10 @@ MAX_CALIBRATION_BYTES = 256 * 1024 * 1024
 MAX_TRUSTED_PROVENANCE_DIGESTS = 4096
 JUDGE_FAILED_OUTCOME = "__judge_failed__"
 JUDGE_UNGRADED_OUTCOME = "__ungraded__"
+_RESERVED_OUTCOME_SENTINELS = (
+    JUDGE_FAILED_OUTCOME,
+    JUDGE_UNGRADED_OUTCOME,
+)
 
 
 class CalibrationError(ValueError):
@@ -175,13 +180,10 @@ _STRUCTURED_BLIND_VALUE_STATUSES = (
     "candidate",
     "error",
     "failed",
-    "graded",
     "loser",
     "rejected",
     "selected",
     "success",
-    "timeout",
-    "ungraded",
     "winner",
 )
 _IDENTITY_FIELDS = frozenset(
@@ -462,12 +464,28 @@ def _assert_blind_payload(
                     for item in ActionabilityAssessment
                 ),
                 *(
+                    _collapsed_blind_token(item.value)
+                    for item in JudgeFailureCode
+                ),
+                *(
+                    _collapsed_blind_token(item.value)
+                    for item in JudgeRunStatus
+                ),
+                *(
+                    _collapsed_blind_token(item)
+                    for item in _RESERVED_OUTCOME_SENTINELS
+                ),
+                *(
                     _collapsed_blind_token(item)
                     for item in _STRUCTURED_BLIND_VALUE_STATUSES
                 ),
             },
             key=lambda item: (-len(item), item),
         )
+    )
+    reserved_outcome_sentinels = tuple(
+        unicodedata.normalize("NFKC", item).casefold()
+        for item in _RESERVED_OUTCOME_SENTINELS
     )
 
     def visit(current: Any, path: str) -> None:
@@ -527,8 +545,10 @@ def _assert_blind_payload(
                 raise ArtifactSecurityError(
                     f"{context} contains forbidden source identity {identity!r} at {path}"
                 )
-        if any(marker in collapsed for marker in forbidden_value_tokens) or (
-            _contains_structured_blind_value(
+        if (
+            any(sentinel in normalized for sentinel in reserved_outcome_sentinels)
+            or any(marker in collapsed for marker in forbidden_value_tokens)
+            or _contains_structured_blind_value(
                 normalized,
                 markers=structured_value_markers,
                 allowed_values=structured_allowed_values,

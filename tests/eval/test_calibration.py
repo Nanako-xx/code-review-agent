@@ -42,6 +42,7 @@ from review_agent_eval.judge import (
     ActionabilityAssessment,
     BlindJudgeInput,
     JudgeTask,
+    JudgeFailureCode,
     SeverityAssessment,
     SemanticJudge,
 )
@@ -722,6 +723,50 @@ def test_export_allows_unstructured_marker_words_in_source_context(
         output_root=tmp_path / "external-calibration",
     )
     assert package.items
+
+
+@pytest.mark.parametrize(
+    "forbidden_value",
+    (
+        *(f"failure: {code.value}" for code in JudgeFailureCode),
+        *(
+            f"decision: {sentinel}"
+            for sentinel in (
+                calibration_module.JUDGE_FAILED_OUTCOME,
+                calibration_module.JUDGE_UNGRADED_OUTCOME,
+            )
+        ),
+        calibration_module.JUDGE_FAILED_OUTCOME,
+        calibration_module.JUDGE_UNGRADED_OUTCOME,
+    ),
+)
+def test_export_rejects_typed_failure_codes_and_reserved_outcome_sentinels(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forbidden_value: str,
+) -> None:
+    original = calibration_module._blind_payload
+
+    def injected(request: BlindJudgeInput):
+        payload, dimension = original(request)
+        payload["context_blocks"].append(
+            {"metadata": {"nested": {"status": f"prefix {forbidden_value} suffix"}}}
+        )
+        return payload, dimension
+
+    monkeypatch.setattr(calibration_module, "_blind_payload", injected)
+    output_root = tmp_path / "external-calibration"
+    with pytest.raises(ArtifactSecurityError, match="forbidden|blind"):
+        export_calibration_package(
+            calibration_source["verified_by_profile"][
+                JudgeTask.FINDING_EQUIVALENCE
+            ],
+            profile=JudgeTask.FINDING_EQUIVALENCE,
+            policy=POLICY,
+            output_root=output_root,
+        )
+    assert not output_root.exists()
 
 
 def test_selection_policy_is_seeded_and_recorded(
