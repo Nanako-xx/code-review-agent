@@ -136,6 +136,20 @@ def _portable_artifact_name_key(value: str) -> str:
     return unicodedata.normalize("NFKC", value).casefold()
 
 
+def _calibration_publication_digest(role: str, payload: Mapping[str, Any]) -> str:
+    """Bind a calibration Analysis namespace to its exact nested payload."""
+
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "protocol": "analysis-calibration-publication-v1",
+                "role": role,
+                "payload": dict(payload),
+            }
+        )
+    ).hexdigest()
+
+
 def _windows_portable_path_segment_key(value: str) -> str:
     return unicodedata.normalize("NFKC", value).casefold().rstrip(" .")
 
@@ -990,6 +1004,620 @@ class AnalysisArtifactStore:
         ):
             raise ArtifactIntegrityError(
                 "stored comparison differs from exact source replay"
+            )
+        return stored
+
+    def publish_calibration_package(
+        self,
+        package: Any,
+        *,
+        evaluation: Any,
+        policy: Any,
+    ) -> AnalysisReceipt:
+        """Publish only the source-bound manifest for an external blind package."""
+
+        from .calibration import (
+            CALIBRATION_ALGORITHM_VERSION,
+            CalibrationPackageManifestV1,
+            CalibrationPackageV1,
+            CalibrationSelectionPolicyV1,
+            _build_package,
+        )
+        from .comparison import VerifiedRunEvaluation
+
+        if type(package) is not CalibrationPackageV1:
+            raise TypeError("package must be a CalibrationPackageV1")
+        if type(evaluation) is not VerifiedRunEvaluation:
+            raise TypeError("evaluation must be a VerifiedRunEvaluation")
+        if type(policy) is not CalibrationSelectionPolicyV1:
+            raise TypeError("policy must be a CalibrationSelectionPolicyV1")
+        try:
+            canonical_policy = CalibrationSelectionPolicyV1.from_dict(
+                policy.to_dict()
+            )
+            canonical_package = CalibrationPackageV1.from_dict(package.to_dict())
+            source_binding = evaluation.verify()
+            replayed = _build_package(
+                evaluation,
+                profile=canonical_package.profile,
+                policy=canonical_policy,
+            )
+            if canonical_json_bytes(replayed.to_dict()) != canonical_json_bytes(
+                canonical_package.to_dict()
+            ):
+                raise ValueError("package differs from exact Evaluation replay")
+            manifest = CalibrationPackageManifestV1.from_package(replayed)
+        except ArtifactIntegrityError:
+            raise
+        except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "calibration package fails strict source-bound replay"
+            ) from exc
+        files = {"calibration_package_manifest.json": manifest.to_dict()}
+        algorithm_digest = _calibration_publication_digest(
+            "calibration-package-manifest",
+            {
+                "algorithm_version": CALIBRATION_ALGORITHM_VERSION,
+                "manifest": manifest.to_dict(),
+            },
+        )
+        receipt = AnalysisReceipt.create(
+            kind="calibration-package",
+            source_bindings=(source_binding,),
+            algorithm_digest=algorithm_digest,
+            files=files,
+        )
+        return self.publish_json_bundle(
+            receipt.kind,
+            receipt.artifact_id,
+            files,
+            receipt,
+        )
+
+    def _load_calibration_package_manifest_with_receipt(
+        self,
+        artifact_id: str,
+    ) -> tuple[AnalysisReceipt, Any]:
+        from .calibration import (
+            CALIBRATION_ALGORITHM_VERSION,
+            CalibrationPackageManifestV1,
+        )
+
+        receipt, files = self._load_with_receipt(
+            "calibration-package",
+            _artifact_id(artifact_id),
+        )
+        if set(files) != {"calibration_package_manifest.json"}:
+            raise ArtifactIntegrityError(
+                "calibration package bundle has an invalid exact artifact set"
+            )
+        try:
+            manifest = CalibrationPackageManifestV1.from_dict(
+                files["calibration_package_manifest.json"]
+            )
+            expected_algorithm = _calibration_publication_digest(
+                "calibration-package-manifest",
+                {
+                    "algorithm_version": CALIBRATION_ALGORITHM_VERSION,
+                    "manifest": manifest.to_dict(),
+                },
+            )
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "calibration package manifest violates its strict schema"
+            ) from exc
+        if (
+            len(receipt.source_bindings) != 1
+            or receipt.algorithm_digest != expected_algorithm
+        ):
+            raise ArtifactIntegrityError(
+                "calibration package receipt differs from nested manifest bindings"
+            )
+        return receipt, manifest
+
+    def load_calibration_package_manifest(self, artifact_id: str) -> Any:
+        """Hydrate a manifest without claiming Evaluation source replay."""
+
+        _receipt, manifest = self._load_calibration_package_manifest_with_receipt(
+            artifact_id
+        )
+        return manifest
+
+    def load_verified_calibration_package_manifest(
+        self,
+        artifact_id: str,
+        *,
+        evaluation: Any,
+        policy: Any,
+        package: Any,
+    ) -> Any:
+        """Replay a package manifest from caller-supplied verified sources."""
+
+        from .calibration import (
+            CalibrationPackageManifestV1,
+            CalibrationPackageV1,
+            CalibrationSelectionPolicyV1,
+            _build_package,
+        )
+        from .comparison import VerifiedRunEvaluation
+
+        if type(evaluation) is not VerifiedRunEvaluation:
+            raise TypeError("evaluation must be a VerifiedRunEvaluation")
+        if type(policy) is not CalibrationSelectionPolicyV1:
+            raise TypeError("policy must be a CalibrationSelectionPolicyV1")
+        if type(package) is not CalibrationPackageV1:
+            raise TypeError("package must be a CalibrationPackageV1")
+        receipt, stored = self._load_calibration_package_manifest_with_receipt(
+            artifact_id
+        )
+        try:
+            source_binding = evaluation.verify()
+            canonical_policy = CalibrationSelectionPolicyV1.from_dict(
+                policy.to_dict()
+            )
+            canonical_package = CalibrationPackageV1.from_dict(package.to_dict())
+            replayed_package = _build_package(
+                evaluation,
+                profile=canonical_package.profile,
+                policy=canonical_policy,
+            )
+            if canonical_json_bytes(replayed_package.to_dict()) != canonical_json_bytes(
+                canonical_package.to_dict()
+            ):
+                raise ValueError("caller package differs from Evaluation replay")
+            replayed_manifest = CalibrationPackageManifestV1.from_package(
+                replayed_package
+            )
+        except ArtifactIntegrityError:
+            raise
+        except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "calibration package source replay failed"
+            ) from exc
+        if receipt.source_bindings != (source_binding,):
+            raise ArtifactIntegrityError(
+                "caller Evaluation differs from calibration package provenance"
+            )
+        if canonical_json_bytes(replayed_manifest.to_dict()) != canonical_json_bytes(
+            stored.to_dict()
+        ):
+            raise ArtifactIntegrityError(
+                "stored calibration package manifest differs from exact source replay"
+            )
+        return stored
+
+    def publish_human_label_set(
+        self,
+        labels: Any,
+        *,
+        evaluation: Any,
+        policy: Any,
+        package: Any,
+    ) -> AnalysisReceipt:
+        """Publish human provenance under a separate create-only result namespace."""
+
+        from .calibration import (
+            CALIBRATION_ALGORITHM_VERSION,
+            CalibrationPackageV1,
+            CalibrationSelectionPolicyV1,
+            HumanLabelSetV1,
+            _build_package,
+        )
+        from .comparison import VerifiedRunEvaluation
+
+        if type(labels) is not HumanLabelSetV1:
+            raise TypeError("labels must be a HumanLabelSetV1")
+        if type(evaluation) is not VerifiedRunEvaluation:
+            raise TypeError("evaluation must be a VerifiedRunEvaluation")
+        if type(policy) is not CalibrationSelectionPolicyV1:
+            raise TypeError("policy must be a CalibrationSelectionPolicyV1")
+        if type(package) is not CalibrationPackageV1:
+            raise TypeError("package must be a CalibrationPackageV1")
+        try:
+            canonical_policy = CalibrationSelectionPolicyV1.from_dict(
+                policy.to_dict()
+            )
+            canonical_package = CalibrationPackageV1.from_dict(package.to_dict())
+            source_binding = evaluation.verify()
+            replayed_package = _build_package(
+                evaluation,
+                profile=canonical_package.profile,
+                policy=canonical_policy,
+            )
+            if canonical_json_bytes(replayed_package.to_dict()) != canonical_json_bytes(
+                canonical_package.to_dict()
+            ):
+                raise ValueError("package differs from exact Evaluation replay")
+            canonical_labels = HumanLabelSetV1.from_dict(
+                labels.to_dict(),
+                package=replayed_package,
+            )
+            if canonical_json_bytes(canonical_labels.to_dict()) != canonical_json_bytes(
+                labels.to_dict()
+            ):
+                raise ValueError("label set differs from canonical package replay")
+        except ArtifactIntegrityError:
+            raise
+        except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "human label set fails strict source/package replay"
+            ) from exc
+        files = {"human_label_set.json": canonical_labels.to_dict()}
+        algorithm_digest = _calibration_publication_digest(
+            "human-label-set",
+            {
+                "algorithm_version": CALIBRATION_ALGORITHM_VERSION,
+                "source_digest": replayed_package.source_digest,
+                "policy_digest": canonical_policy.digest(),
+                "package_id": replayed_package.package_id,
+                "package_digest": replayed_package.digest(),
+                "payload_digest": replayed_package.payload_digest,
+                "selection_digest": replayed_package.selection_digest,
+                "label_set_id": canonical_labels.label_set_id,
+                "label_set_digest": canonical_labels.digest(),
+            },
+        )
+        receipt = AnalysisReceipt.create(
+            kind="calibration-result",
+            source_bindings=(source_binding,),
+            algorithm_digest=algorithm_digest,
+            files=files,
+        )
+        return self.publish_json_bundle(
+            receipt.kind,
+            receipt.artifact_id,
+            files,
+            receipt,
+        )
+
+    def _load_human_label_set_with_receipt(
+        self,
+        artifact_id: str,
+        *,
+        package: Any,
+    ) -> tuple[AnalysisReceipt, Any]:
+        from .calibration import (
+            CALIBRATION_ALGORITHM_VERSION,
+            CalibrationPackageV1,
+            HumanLabelSetV1,
+        )
+
+        if type(package) is not CalibrationPackageV1:
+            raise TypeError("package must be a CalibrationPackageV1")
+        receipt, files = self._load_with_receipt(
+            "calibration-result",
+            _artifact_id(artifact_id),
+        )
+        if set(files) != {"human_label_set.json"}:
+            raise ArtifactIntegrityError(
+                "human label bundle has an invalid exact artifact set"
+            )
+        try:
+            canonical_package = CalibrationPackageV1.from_dict(package.to_dict())
+            labels = HumanLabelSetV1.from_dict(
+                files["human_label_set.json"],
+                package=canonical_package,
+            )
+            expected_algorithm = _calibration_publication_digest(
+                "human-label-set",
+                {
+                    "algorithm_version": CALIBRATION_ALGORITHM_VERSION,
+                    "source_digest": canonical_package.source_digest,
+                    "policy_digest": canonical_package.policy.digest(),
+                    "package_id": canonical_package.package_id,
+                    "package_digest": canonical_package.digest(),
+                    "payload_digest": canonical_package.payload_digest,
+                    "selection_digest": canonical_package.selection_digest,
+                    "label_set_id": labels.label_set_id,
+                    "label_set_digest": labels.digest(),
+                },
+            )
+        except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "human label set violates strict package binding"
+            ) from exc
+        if (
+            len(receipt.source_bindings) != 1
+            or receipt.algorithm_digest != expected_algorithm
+        ):
+            raise ArtifactIntegrityError(
+                "human label receipt differs from nested package/label digests"
+            )
+        return receipt, labels
+
+    def load_human_label_set(self, artifact_id: str, *, package: Any) -> Any:
+        """Hydrate labels against a package without claiming Evaluation replay."""
+
+        _receipt, labels = self._load_human_label_set_with_receipt(
+            artifact_id,
+            package=package,
+        )
+        return labels
+
+    def load_verified_human_label_set(
+        self,
+        artifact_id: str,
+        *,
+        evaluation: Any,
+        policy: Any,
+        package: Any,
+        labels: Any,
+    ) -> Any:
+        """Replay stored labels against every caller-supplied calibration source."""
+
+        from .calibration import (
+            CalibrationPackageV1,
+            CalibrationSelectionPolicyV1,
+            HumanLabelSetV1,
+            _build_package,
+        )
+        from .comparison import VerifiedRunEvaluation
+
+        if type(evaluation) is not VerifiedRunEvaluation:
+            raise TypeError("evaluation must be a VerifiedRunEvaluation")
+        if type(policy) is not CalibrationSelectionPolicyV1:
+            raise TypeError("policy must be a CalibrationSelectionPolicyV1")
+        if type(package) is not CalibrationPackageV1:
+            raise TypeError("package must be a CalibrationPackageV1")
+        if type(labels) is not HumanLabelSetV1:
+            raise TypeError("labels must be a HumanLabelSetV1")
+        receipt, stored = self._load_human_label_set_with_receipt(
+            artifact_id,
+            package=package,
+        )
+        try:
+            source_binding = evaluation.verify()
+            canonical_policy = CalibrationSelectionPolicyV1.from_dict(
+                policy.to_dict()
+            )
+            canonical_package = CalibrationPackageV1.from_dict(package.to_dict())
+            replayed_package = _build_package(
+                evaluation,
+                profile=canonical_package.profile,
+                policy=canonical_policy,
+            )
+            if canonical_json_bytes(replayed_package.to_dict()) != canonical_json_bytes(
+                canonical_package.to_dict()
+            ):
+                raise ValueError("caller package differs from Evaluation replay")
+            replayed_labels = HumanLabelSetV1.from_dict(
+                labels.to_dict(),
+                package=replayed_package,
+            )
+        except ArtifactIntegrityError:
+            raise
+        except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "human label source replay failed"
+            ) from exc
+        if receipt.source_bindings != (source_binding,):
+            raise ArtifactIntegrityError(
+                "caller Evaluation differs from human label provenance"
+            )
+        if canonical_json_bytes(replayed_labels.to_dict()) != canonical_json_bytes(
+            stored.to_dict()
+        ):
+            raise ArtifactIntegrityError(
+                "stored human label set differs from exact source replay"
+            )
+        return stored
+
+    def publish_calibration_result(
+        self,
+        result: Any,
+        *,
+        evaluation: Any,
+        policy: Any,
+        package: Any,
+        labels: Any,
+    ) -> AnalysisReceipt:
+        """Publish a scored profile only after exact offline source replay."""
+
+        from .calibration import (
+            CALIBRATION_ALGORITHM_VERSION,
+            CalibrationPackageV1,
+            CalibrationResultV1,
+            CalibrationSelectionPolicyV1,
+            HumanLabelSetV1,
+            _build_package,
+            score_calibration,
+        )
+        from .comparison import VerifiedRunEvaluation
+
+        if type(result) is not CalibrationResultV1:
+            raise TypeError("result must be a CalibrationResultV1")
+        if type(evaluation) is not VerifiedRunEvaluation:
+            raise TypeError("evaluation must be a VerifiedRunEvaluation")
+        if type(policy) is not CalibrationSelectionPolicyV1:
+            raise TypeError("policy must be a CalibrationSelectionPolicyV1")
+        if type(package) is not CalibrationPackageV1:
+            raise TypeError("package must be a CalibrationPackageV1")
+        if type(labels) is not HumanLabelSetV1:
+            raise TypeError("labels must be a HumanLabelSetV1")
+        try:
+            canonical_policy = CalibrationSelectionPolicyV1.from_dict(
+                policy.to_dict()
+            )
+            canonical_package = CalibrationPackageV1.from_dict(package.to_dict())
+            source_binding = evaluation.verify()
+            replayed_package = _build_package(
+                evaluation,
+                profile=canonical_package.profile,
+                policy=canonical_policy,
+            )
+            if canonical_json_bytes(replayed_package.to_dict()) != canonical_json_bytes(
+                canonical_package.to_dict()
+            ):
+                raise ValueError("package differs from exact Evaluation replay")
+            canonical_labels = HumanLabelSetV1.from_dict(
+                labels.to_dict(),
+                package=replayed_package,
+            )
+            canonical_result = CalibrationResultV1.from_dict(result.to_dict())
+            replayed_result = score_calibration(
+                evaluation,
+                package=replayed_package,
+                labels=canonical_labels,
+            )
+            if canonical_json_bytes(replayed_result.to_dict()) != canonical_json_bytes(
+                canonical_result.to_dict()
+            ):
+                raise ValueError("calibration result differs from exact score replay")
+        except ArtifactIntegrityError:
+            raise
+        except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "calibration result fails strict source/package/label replay"
+            ) from exc
+        files = {"calibration_result.json": replayed_result.to_dict()}
+        algorithm_digest = _calibration_publication_digest(
+            "calibration-result",
+            {
+                "algorithm_version": CALIBRATION_ALGORITHM_VERSION,
+                "source_digest": replayed_result.source_digest,
+                "policy_digest": replayed_result.policy.digest(),
+                "package_id": replayed_result.package_id,
+                "package_digest": replayed_result.package_digest,
+                "payload_digest": replayed_result.payload_digest,
+                "label_set_id": replayed_result.label_set_id,
+                "label_set_digest": replayed_result.label_set_digest,
+                "calibration_result_id": replayed_result.calibration_result_id,
+                "calibration_result_digest": replayed_result.digest(),
+            },
+        )
+        receipt = AnalysisReceipt.create(
+            kind="calibration-result",
+            source_bindings=(source_binding,),
+            algorithm_digest=algorithm_digest,
+            files=files,
+        )
+        return self.publish_json_bundle(
+            receipt.kind,
+            receipt.artifact_id,
+            files,
+            receipt,
+        )
+
+    def _load_calibration_result_with_receipt(
+        self,
+        artifact_id: str,
+    ) -> tuple[AnalysisReceipt, Any]:
+        from .calibration import CALIBRATION_ALGORITHM_VERSION, CalibrationResultV1
+
+        receipt, files = self._load_with_receipt(
+            "calibration-result",
+            _artifact_id(artifact_id),
+        )
+        if set(files) != {"calibration_result.json"}:
+            raise ArtifactIntegrityError(
+                "calibration result bundle has an invalid exact artifact set"
+            )
+        try:
+            result = CalibrationResultV1.from_dict(
+                files["calibration_result.json"]
+            )
+            expected_algorithm = _calibration_publication_digest(
+                "calibration-result",
+                {
+                    "algorithm_version": CALIBRATION_ALGORITHM_VERSION,
+                    "source_digest": result.source_digest,
+                    "policy_digest": result.policy.digest(),
+                    "package_id": result.package_id,
+                    "package_digest": result.package_digest,
+                    "payload_digest": result.payload_digest,
+                    "label_set_id": result.label_set_id,
+                    "label_set_digest": result.label_set_digest,
+                    "calibration_result_id": result.calibration_result_id,
+                    "calibration_result_digest": result.digest(),
+                },
+            )
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "calibration result violates its strict canonical schema"
+            ) from exc
+        if (
+            len(receipt.source_bindings) != 1
+            or receipt.algorithm_digest != expected_algorithm
+        ):
+            raise ArtifactIntegrityError(
+                "calibration result receipt differs from nested source/policy/package/label digests"
+            )
+        return receipt, result
+
+    def load_calibration_result(self, artifact_id: str) -> Any:
+        """Hydrate a result without claiming Evaluation or human-label replay."""
+
+        _receipt, result = self._load_calibration_result_with_receipt(artifact_id)
+        return result
+
+    def load_verified_calibration_result(
+        self,
+        artifact_id: str,
+        *,
+        evaluation: Any,
+        policy: Any,
+        package: Any,
+        labels: Any,
+    ) -> Any:
+        """Recompute and byte-compare a stored result from all trusted inputs."""
+
+        from .calibration import (
+            CalibrationPackageV1,
+            CalibrationSelectionPolicyV1,
+            HumanLabelSetV1,
+            _build_package,
+            score_calibration,
+        )
+        from .comparison import VerifiedRunEvaluation
+
+        if type(evaluation) is not VerifiedRunEvaluation:
+            raise TypeError("evaluation must be a VerifiedRunEvaluation")
+        if type(policy) is not CalibrationSelectionPolicyV1:
+            raise TypeError("policy must be a CalibrationSelectionPolicyV1")
+        if type(package) is not CalibrationPackageV1:
+            raise TypeError("package must be a CalibrationPackageV1")
+        if type(labels) is not HumanLabelSetV1:
+            raise TypeError("labels must be a HumanLabelSetV1")
+        receipt, stored = self._load_calibration_result_with_receipt(artifact_id)
+        try:
+            source_binding = evaluation.verify()
+            canonical_policy = CalibrationSelectionPolicyV1.from_dict(
+                policy.to_dict()
+            )
+            canonical_package = CalibrationPackageV1.from_dict(package.to_dict())
+            replayed_package = _build_package(
+                evaluation,
+                profile=canonical_package.profile,
+                policy=canonical_policy,
+            )
+            if canonical_json_bytes(replayed_package.to_dict()) != canonical_json_bytes(
+                canonical_package.to_dict()
+            ):
+                raise ValueError("caller package differs from Evaluation replay")
+            canonical_labels = HumanLabelSetV1.from_dict(
+                labels.to_dict(),
+                package=replayed_package,
+            )
+            replayed = score_calibration(
+                evaluation,
+                package=replayed_package,
+                labels=canonical_labels,
+            )
+        except ArtifactIntegrityError:
+            raise
+        except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "calibration result source replay failed"
+            ) from exc
+        if receipt.source_bindings != (source_binding,):
+            raise ArtifactIntegrityError(
+                "caller Evaluation differs from calibration result provenance"
+            )
+        if canonical_json_bytes(replayed.to_dict()) != canonical_json_bytes(
+            stored.to_dict()
+        ):
+            raise ArtifactIntegrityError(
+                "stored calibration result differs from exact source replay"
             )
         return stored
 

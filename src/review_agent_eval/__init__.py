@@ -37,6 +37,7 @@ from .metrics_exports import METRICS_PUBLIC_NAMES as _metrics_all
 from .report_exports import REPORT_PUBLIC_NAMES as _report_all
 from .analysis_exports import (
     ANALYSIS_PUBLIC_NAMES as _analysis_all,
+    CALIBRATION_PUBLIC_NAMES as _calibration_all,
     COMPARISON_PUBLIC_NAMES as _comparison_all,
     STATISTICS_PUBLIC_NAMES as _statistics_all,
 )
@@ -111,6 +112,8 @@ def __getattr__(name):
             if name in _statistics_all
             else ".comparison"
             if name in _comparison_all
+            else ".calibration"
+            if name in _calibration_all
             else ".analysis_artifacts"
         )
         value = getattr(import_module(module, __name__), name)

@@ -77,15 +77,47 @@ COMPARISON_PUBLIC_NAMES = (
     "compare_runs",
 )
 
+CALIBRATION_PUBLIC_NAMES = (
+    "CALIBRATION_SELECTION_POLICY_SCHEMA_VERSION",
+    "CALIBRATION_ITEM_SCHEMA_VERSION",
+    "CALIBRATION_SELECTION_RECORD_SCHEMA_VERSION",
+    "CALIBRATION_PACKAGE_SCHEMA_VERSION",
+    "CALIBRATION_PACKAGE_MANIFEST_SCHEMA_VERSION",
+    "HUMAN_LABEL_SCHEMA_VERSION",
+    "HUMAN_LABEL_SET_SCHEMA_VERSION",
+    "PROFILE_CALIBRATION_SCHEMA_VERSION",
+    "CALIBRATION_RESULT_SCHEMA_VERSION",
+    "CALIBRATION_ALGORITHM_VERSION",
+    "CalibrationError",
+    "CalibrationStatus",
+    "KappaNullReason",
+    "ClassMetricNullReason",
+    "CalibrationSelectionPolicyV1",
+    "CalibrationItemV1",
+    "CalibrationSelectionRecordV1",
+    "CalibrationPackageV1",
+    "CalibrationPackageManifestV1",
+    "HumanLabelV1",
+    "HumanLabelSetV1",
+    "ConfusionMatrixCellV1",
+    "ClassCalibrationV1",
+    "ProfileCalibrationV1",
+    "CalibrationResultV1",
+    "export_calibration_package",
+    "score_calibration",
+)
+
 ANALYSIS_PUBLIC_NAMES = (
     ANALYSIS_ARTIFACT_PUBLIC_NAMES
     + STATISTICS_PUBLIC_NAMES
     + COMPARISON_PUBLIC_NAMES
+    + CALIBRATION_PUBLIC_NAMES
 )
 
 __all__ = [
     "ANALYSIS_ARTIFACT_PUBLIC_NAMES",
     "STATISTICS_PUBLIC_NAMES",
     "COMPARISON_PUBLIC_NAMES",
+    "CALIBRATION_PUBLIC_NAMES",
     "ANALYSIS_PUBLIC_NAMES",
 ]
