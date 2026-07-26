@@ -1651,6 +1651,14 @@ class RunComparisonV1(_JsonModel):
         ):
             case_sources = statistics.metrics[0].case_contributions
             if (
+                projection.value("case_snapshot.digest")
+                != binding.case_snapshot_digest
+            ):
+                raise _error(
+                    f"RunComparisonV1 {label} projection case_snapshot.digest "
+                    "differs from its source binding"
+                )
+            if (
                 projection.value("trial.count") != statistics.trial_count
                 or projection.value("cases.task_ids")
                 != [item.task_id for item in case_sources]

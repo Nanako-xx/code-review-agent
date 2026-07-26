@@ -14,6 +14,7 @@ from review_agent_eval.comparison import (
     REQUIRED_CASE_FIELDS,
     REQUIRED_EVALUATOR_FIELDS,
     CaseDeltaV1,
+    ComparisonCompatibilityV1,
     ComparisonError,
     ComparisonPolicyV1,
     ComparisonStatus,
@@ -541,6 +542,110 @@ def test_comparison_artifact_rejects_tamper_and_resealed_nested_contradiction(
     path.write_bytes(data[:-1] + (b" " if data[-1:] != b" " else b"\n"))
     with pytest.raises(ArtifactIntegrityError, match="digest|hash|size|canonical"):
         store.load_comparison(receipt.artifact_id)
+
+
+def _tampered_case_snapshot_projection_payload(
+    result: RunComparisonV1,
+    projection_name: str,
+) -> dict[str, Any]:
+    payload = deepcopy(result.to_dict())
+    compatibility = payload["compatibility"]
+    projection = compatibility[projection_name]
+    field = next(
+        item
+        for item in projection["fields"]
+        if item["path"] == "case_snapshot.digest"
+    )
+    field["value"] = "0" * 64
+    projection["projection_digest"] = canonical_sha256(
+        {"fields": projection["fields"]}
+    )
+    compatibility["shared_projection"] = None
+    compatibility_identity = dict(compatibility)
+    compatibility_identity.pop("compatibility_id")
+    compatibility["compatibility_id"] = stable_id(
+        "comparison-compatibility-v1",
+        compatibility_identity,
+    )
+    payload["status"] = ComparisonStatus.NOT_COMPARABLE.value
+    payload["metric_deltas"] = []
+    payload["case_deltas"] = []
+    payload["incompatibilities"] = ["case_snapshot.digest"]
+    comparison_identity = dict(payload)
+    comparison_identity.pop("comparison_id")
+    payload["comparison_id"] = stable_id(
+        "run-comparison-v1",
+        comparison_identity,
+    )
+    return payload
+
+
+def _forge_comparison_from_tampered_payload(
+    source: RunComparisonV1,
+    payload: dict[str, Any],
+) -> RunComparisonV1:
+    forged = object.__new__(RunComparisonV1)
+    values = {
+        name: getattr(source, name)
+        for name in source.__dataclass_fields__
+    }
+    values.update(
+        comparison_id=payload["comparison_id"],
+        status=ComparisonStatus.NOT_COMPARABLE,
+        compatibility=ComparisonCompatibilityV1.from_dict(
+            payload["compatibility"]
+        ),
+        metric_deltas=(),
+        case_deltas=(),
+        incompatibilities=("case_snapshot.digest",),
+    )
+    for name, value in values.items():
+        object.__setattr__(forged, name, value)
+    return forged
+
+
+@pytest.mark.parametrize(
+    "projection_name",
+    ("baseline_projection", "candidate_projection"),
+)
+def test_comparison_hydration_rejects_resealed_case_snapshot_projection_tamper(
+    paired_sources: dict[str, Any],
+    projection_name: str,
+) -> None:
+    payload = _tampered_case_snapshot_projection_payload(
+        _comparison(paired_sources),
+        projection_name,
+    )
+
+    with pytest.raises(
+        ComparisonError,
+        match="case snapshot|case_snapshot|source binding",
+    ):
+        RunComparisonV1.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "projection_name",
+    ("baseline_projection", "candidate_projection"),
+)
+def test_comparison_publish_rejects_resealed_case_snapshot_projection_tamper(
+    paired_sources: dict[str, Any],
+    tmp_path: Path,
+    projection_name: str,
+) -> None:
+    result = _comparison(paired_sources)
+    payload = _tampered_case_snapshot_projection_payload(
+        result,
+        projection_name,
+    )
+    forged = _forge_comparison_from_tampered_payload(result, payload)
+    store = AnalysisArtifactStore(tmp_path / ".eval-analyses")
+
+    with pytest.raises(
+        ArtifactIntegrityError,
+        match="canonical|hydration|binding|projection",
+    ):
+        store.publish_comparison(forged, policy=POLICY)
 
 
 def test_not_comparable_artifact_round_trip_has_no_partial_delta(
