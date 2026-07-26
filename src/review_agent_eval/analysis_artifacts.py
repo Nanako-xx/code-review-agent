@@ -857,6 +857,184 @@ class AnalysisArtifactStore:
         return decoded
 
 
+def _validate_review_judge_cross_binding(
+    review_result: Any,
+    judge_output: Any,
+    *,
+    evaluator_execution_digest: str,
+) -> None:
+    """Cross-bind terminal Review receipts to persisted Judge executions."""
+
+    from .judge import JudgeOutputArtifact, JudgeRunStatus, JudgeTask
+    from .review_evaluator import (
+        ReviewEvaluationResult,
+        ReviewEvaluationStatus,
+        ReviewJudgeDecisionReceipt,
+        ReviewJudgeFailureReceipt,
+        ReviewJudgeRequestRecord,
+        ReviewJudgeUngradedReceipt,
+    )
+
+    if type(judge_output) is not JudgeOutputArtifact:
+        raise ArtifactIntegrityError(
+            "Review Judge cross-binding requires a concrete JudgeOutputArtifact"
+        )
+    review_results = tuple(
+        item
+        for item in judge_output.results
+        if item.request.task is not JudgeTask.INTENT_EQUIVALENCE
+    )
+    result_by_request: Dict[str, Any] = {}
+    blind_request_ids = set()
+    result_digests = set()
+    for result in review_results:
+        request_id = result.request.source_request_id
+        result_digest = result.digest()
+        if (
+            request_id in result_by_request
+            or result.request.request_id in blind_request_ids
+            or result_digest in result_digests
+        ):
+            raise ArtifactIntegrityError(
+                "Review JudgeOutput contains duplicate request or result identities"
+            )
+        if result.evaluator_execution_digest != evaluator_execution_digest:
+            raise ArtifactIntegrityError(
+                "Review Judge result belongs to another evaluator execution"
+            )
+        result_by_request[request_id] = result
+        blind_request_ids.add(result.request.request_id)
+        result_digests.add(result_digest)
+
+    if review_result is None:
+        if result_by_request:
+            raise ArtifactIntegrityError(
+                "Review JudgeOutput has results without a ReviewEvaluationResult"
+            )
+        return
+    if type(review_result) is not ReviewEvaluationResult:
+        raise ArtifactIntegrityError(
+            "Review Judge cross-binding requires ReviewEvaluationResult"
+        )
+    if review_result.status is ReviewEvaluationStatus.PENDING_JUDGE:
+        raise ArtifactIntegrityError(
+            "terminal Trial contains a pending ReviewEvaluationResult"
+        )
+    requests = tuple(review_result.judge_requests)
+    if any(type(item) is not ReviewJudgeRequestRecord for item in requests):
+        raise ArtifactIntegrityError(
+            "Review evaluation contains a non-concrete Judge request"
+        )
+    request_by_id = {item.request_id: item for item in requests}
+    if len(request_by_id) != len(requests):
+        raise ArtifactIntegrityError(
+            "Review evaluation contains duplicate Judge request IDs"
+        )
+    if set(result_by_request) != set(request_by_id):
+        raise ArtifactIntegrityError(
+            "Review JudgeOutput does not exactly cover terminal Review requests"
+        )
+
+    derived_decisions = []
+    derived_failures = []
+    derived_ungraded = []
+    for request_id in sorted(request_by_id):
+        record = request_by_id[request_id]
+        result = result_by_request[request_id]
+        if (
+            result.request != record.request
+            or result.request.source_request_id != record.request_id
+            or result.request.source_request_digest
+            != record.request.source_request_digest
+            or result.request.digest() != record.request_digest
+            or result.request.request_id != record.blind_request_id
+            or result.request.task is not record.task
+            or result.evaluator_execution_digest
+            != review_result.evaluator_execution_digest
+        ):
+            raise ArtifactIntegrityError(
+                "Review Judge result differs from its canonical request binding"
+            )
+        common = {
+            "request_id": record.request_id,
+            "task": record.task,
+            "request_digest": record.request_digest,
+            "evaluator_execution_digest": result.evaluator_execution_digest,
+            "judge_result_digest": result.digest(),
+            "blind_request_id": record.blind_request_id,
+        }
+        try:
+            if result.status is JudgeRunStatus.GRADED:
+                if result.decision is None:
+                    raise ValueError("graded Judge result lacks decision")
+                derived_decisions.append(
+                    ReviewJudgeDecisionReceipt(
+                        decision=result.decision,
+                        **common,
+                    )
+                )
+            elif result.status is JudgeRunStatus.JUDGE_FAILED:
+                if result.failure is None:
+                    raise ValueError("failed Judge result lacks failure")
+                derived_failures.append(
+                    ReviewJudgeFailureReceipt(
+                        failure=result.failure,
+                        **common,
+                    )
+                )
+            elif result.status is JudgeRunStatus.UNGRADED:
+                if result.ungraded_reason is None:
+                    raise ValueError("ungraded Judge result lacks reason")
+                derived_ungraded.append(
+                    ReviewJudgeUngradedReceipt(
+                        ungraded_reason=result.ungraded_reason,
+                        **common,
+                    )
+                )
+            else:
+                raise ValueError("Judge result has unsupported terminal status")
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "Review Judge result cannot form a canonical receipt"
+            ) from exc
+
+    expected_groups = (
+        (
+            tuple(sorted(derived_decisions, key=lambda item: item.request_id)),
+            tuple(review_result.judge_decisions),
+            ReviewJudgeDecisionReceipt,
+        ),
+        (
+            tuple(sorted(derived_failures, key=lambda item: item.request_id)),
+            tuple(review_result.judge_failures),
+            ReviewJudgeFailureReceipt,
+        ),
+        (
+            tuple(sorted(derived_ungraded, key=lambda item: item.request_id)),
+            tuple(review_result.judge_ungraded),
+            ReviewJudgeUngradedReceipt,
+        ),
+    )
+    actual_receipt_ids = []
+    for derived, actual, receipt_type in expected_groups:
+        if (
+            any(type(item) is not receipt_type for item in actual)
+            or actual != tuple(sorted(actual, key=lambda item: item.request_id))
+            or actual != derived
+        ):
+            raise ArtifactIntegrityError(
+                "Review Judge receipts differ from JudgeOutput terminal results"
+            )
+        actual_receipt_ids.extend(item.request_id for item in actual)
+    if (
+        len(actual_receipt_ids) != len(set(actual_receipt_ids))
+        or set(actual_receipt_ids) != set(request_by_id)
+    ):
+        raise ArtifactIntegrityError(
+            "Review Judge requests do not have exactly one terminal receipt"
+        )
+
+
 def bind_analysis_source(
     bundle: Any,
     *,
@@ -1336,6 +1514,10 @@ def bind_analysis_source(
                 evaluator_execution=bundle.evaluator_execution,
                 intent_evaluation=bound_intent_evaluation,
             )
+            if bound_intent_evaluation is not None:
+                replayed_judge_output.validate_intent_evaluation(
+                    bound_intent_evaluation
+                )
         except (SchemaError, TypeError, ValueError) as exc:
             raise ArtifactIntegrityError(
                 "hydrated Trial Judge artifacts fail source-bound hydration"
@@ -1347,6 +1529,11 @@ def bind_analysis_source(
             raise ArtifactIntegrityError(
                 "hydrated Trial Judge artifacts differ from canonical hydration"
             )
+        _validate_review_judge_cross_binding(
+            review_result,
+            replayed_judge_output,
+            evaluator_execution_digest=execution_digest,
+        )
 
         inspection = trial.inspection
         try:

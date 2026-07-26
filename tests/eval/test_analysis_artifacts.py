@@ -28,6 +28,7 @@ from review_agent_eval.artifacts import (
     ArtifactSecurityError,
 )
 from review_agent_eval.config import derive_evaluation_id
+from review_agent_eval.metrics import TrialScorer
 from review_agent_eval.models import (
     SchemaError,
     canonical_json,
@@ -40,7 +41,9 @@ from review_agent_eval.report import render_run_markdown, render_trial_markdown
 from .test_artifacts import make_case_snapshot, make_config, make_store
 from .test_orchestrator_target_replay_v2 import (
     _CountingJudge,
+    _FrozenFindingAdapter,
     _FrozenSuccessAdapter,
+    _RecordingJudge,
     _execution,
     _frozen_orchestrator,
     _run_frozen,
@@ -164,6 +167,21 @@ def _replace_json_scalars(value: Any, replacements: dict[str, str]) -> Any:
     if type(value) is str:
         return replacements.get(value, value)
     return value
+
+
+def _trial_scorer_for_score(score: Any) -> TrialScorer:
+    compatibility = score.compatibility
+    return TrialScorer(
+        compatibility.metrics_policy,
+        intent_evaluator_revision=compatibility.intent_evaluator_revision,
+        review_evaluator_revision=compatibility.review_evaluator_revision,
+        intent_policy_version=compatibility.intent_policy_version,
+        intent_normalization_version=compatibility.intent_normalization_version,
+        review_policy_version=compatibility.review_policy_version,
+        assignment_policy_version=compatibility.assignment_policy_version,
+        location_policy_version=compatibility.location_policy_version,
+        evidence_policy_version=compatibility.evidence_policy_version,
+    )
 
 
 def test_analysis_bundle_is_create_only_and_reloads_identically(
@@ -871,6 +889,124 @@ def test_analysis_source_replays_forged_score_despite_synchronized_reports(
     with pytest.raises(
         ArtifactIntegrityError,
         match="TrialScore|score|replay|source",
+    ):
+        bind_analysis_source(
+            forged_bundle,
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+        )
+
+
+def test_analysis_source_cross_binds_review_receipts_to_judge_output(
+    tmp_path: Path,
+) -> None:
+    run = _run_frozen(
+        tmp_path,
+        _FrozenFindingAdapter("A novel issue requiring semantic Review Judge work."),
+        instance="analysis-review-judge-cross-binding",
+    )
+    orchestrator = _frozen_orchestrator(
+        run,
+        judge=_RecordingJudge(_execution()),
+    )
+    evaluated = orchestrator.evaluate_run(
+        run.config.run_id,
+        evaluator_execution=_execution(),
+        evaluation_revision="analysis-source-v1",
+    )
+    hydrated = orchestrator.load_run_evaluation(
+        run.config.run_id,
+        evaluated.evaluation_id,
+    )
+    trial = hydrated.trials[0]
+    review_result = trial.review_result
+    assert review_result is not None
+    assert review_result.judge_ungraded
+    original_receipt = review_result.judge_ungraded[0]
+    all_result_digests = {
+        item.judge_result_digest
+        for items in (
+            review_result.judge_decisions,
+            review_result.judge_failures,
+            review_result.judge_ungraded,
+        )
+        for item in items
+    }
+    forged_judge_digest = next(
+        value
+        for value in ("0" * 64, "1" * 64)
+        if value not in all_result_digests
+    )
+    forged_receipt = replace(
+        original_receipt,
+        judge_result_digest=forged_judge_digest,
+    )
+    forged_review = _forge_dataclass(
+        review_result,
+        judge_ungraded=(
+            forged_receipt,
+            *review_result.judge_ungraded[1:],
+        ),
+    )
+    forged_review.__post_init__()
+
+    score = trial.trial_score
+    forged_score = _trial_scorer_for_score(score).score(
+        run_config=run.config,
+        evaluator_execution=hydrated.evaluator_execution,
+        evaluation_revision=hydrated.evaluation_revision,
+        eval_case=trial.eval_case,
+        submission=trial.submission,
+        trial_index=trial.trial_index,
+        intent_result=trial.intent_result,
+        review_result=forged_review,
+    )
+    replacements = {
+        original_receipt.judge_result_digest: forged_judge_digest,
+        review_result.digest(): forged_review.digest(),
+        score.score_id: forged_score.score_id,
+        score.digest(): forged_score.digest(),
+    }
+    inspection_payload = _replace_json_scalars(
+        trial.inspection.to_dict(),
+        replacements,
+    )
+    forged_inspection = _reseal_report_payload(
+        trial.inspection,
+        payload=inspection_payload,
+        id_field="inspection_id",
+        stable_namespace="trial-inspection-v1",
+    )
+    forged_trial = replace(
+        trial,
+        review_result=forged_review,
+        trial_score=forged_score,
+        inspection=forged_inspection,
+        report=render_trial_markdown(forged_inspection),
+    )
+    assert forged_trial.judge_input is trial.judge_input
+    assert forged_trial.judge_output is trial.judge_output
+
+    summary_payload = _replace_json_scalars(
+        hydrated.summary.to_dict(),
+        replacements,
+    )
+    forged_summary = _reseal_report_payload(
+        hydrated.summary,
+        payload=summary_payload,
+        id_field="summary_id",
+        stable_namespace="run-report-summary-v1",
+    )
+    forged_bundle = replace(
+        hydrated,
+        trials=(forged_trial,),
+        summary=forged_summary,
+        report=render_run_markdown(forged_summary),
+    )
+
+    with pytest.raises(
+        ArtifactIntegrityError,
+        match="Review|Judge|receipt|cross|source",
     ):
         bind_analysis_source(
             forged_bundle,
