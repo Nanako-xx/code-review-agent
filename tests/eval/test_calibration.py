@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from review_agent.model_protocol import ModelResponseKind, ModelTurnResponse
+import review_agent_eval.calibration as calibration_module
 from review_agent_eval.analysis_artifacts import AnalysisArtifactStore
 from review_agent_eval.artifacts import (
     ArtifactConflictError,
@@ -18,17 +19,22 @@ from review_agent_eval.artifacts import (
 from review_agent_eval.calibration import (
     CALIBRATION_ALGORITHM_VERSION,
     CALIBRATION_SELECTION_POLICY_SCHEMA_VERSION,
+    CalibrationSelectionCategory,
     CalibrationPackageV1,
     CalibrationResultV1,
     CalibrationSelectionPolicyV1,
     CalibrationStatus,
+    HumanAdjudicationV1,
     HumanLabelSetV1,
     HumanLabelV1,
+    HumanReviewerProvenanceV1,
+    ReviewerProvenanceKind,
     export_calibration_package,
     score_calibration,
 )
 from review_agent_eval.comparison import VerifiedRunEvaluation
-from review_agent_eval.intent_evaluator import IntentTruth
+from review_agent_eval.config import JudgeKind
+from review_agent_eval.intent_evaluator import IntentMatchKind, IntentTruth
 from review_agent_eval.judge import (
     BlindJudgeInput,
     JudgeTask,
@@ -166,6 +172,12 @@ def calibration_source(tmp_path_factory: pytest.TempPathFactory):
                     "dimension": "goal",
                     "text": "Support a dry-run mode without changing persisted state.",
                     "required": True,
+                },
+                {
+                    "truth_id": "intent-deterministic-exact",
+                    "dimension": "goal",
+                    "text": "Preserve access control",
+                    "required": True,
                 }
             ],
             "forbidden_claims": [],
@@ -284,9 +296,20 @@ def _human_label(
     item: Any,
     label: str,
     *,
+    reviewer_kind: ReviewerProvenanceKind = ReviewerProvenanceKind.HUMAN,
     disputed: bool = False,
-    adjudication_ref: str | None = None,
+    adjudication: HumanAdjudicationV1 | None = None,
 ) -> HumanLabelV1:
+    reviewer = HumanReviewerProvenanceV1.create(
+        kind=reviewer_kind,
+        reviewer_id="independent-reviewer-1",
+        provenance_ref="external-review-record-1",
+        attestation_ref=(
+            "human-attestation-record-1"
+            if reviewer_kind is ReviewerProvenanceKind.HUMAN
+            else None
+        ),
+    )
     return HumanLabelV1.create(
         package=package,
         item=item,
@@ -303,16 +326,19 @@ def _human_label(
             in {JudgeTask.FINDING_EQUIVALENCE, JudgeTask.NOVEL_FACTUALITY}
             else None
         ),
-        reviewer_id="independent-reviewer-1",
-        reviewer_provenance="external-human-review-v1",
+        reviewer_provenance=reviewer,
         blind_attestation=True,
         labeled_at="2026-07-26T10:00:00Z",
         disputed=disputed,
-        adjudication_ref=adjudication_ref,
+        adjudication=adjudication,
     )
 
 
-def _matching_labels(package: Any) -> HumanLabelSetV1:
+def _matching_labels(
+    package: Any,
+    *,
+    reviewer_kind: ReviewerProvenanceKind = ReviewerProvenanceKind.HUMAN,
+) -> HumanLabelSetV1:
     fixed_profile_labels = {
         JudgeTask.INTENT_EQUIVALENCE: "equivalent",
         JudgeTask.NOVEL_FACTUALITY: "plausible",
@@ -330,7 +356,12 @@ def _matching_labels(package: Any) -> HumanLabelSetV1:
             )
         assert label is not None
         labels.append(
-            _human_label(package, item, label)
+            _human_label(
+                package,
+                item,
+                label,
+                reviewer_kind=reviewer_kind,
+            )
         )
     return HumanLabelSetV1.create(package=package, labels=labels)
 
@@ -389,19 +420,96 @@ def test_export_hides_agent_baseline_candidate_and_judge_decision(
         "model",
         "source_request_id",
         "request_id",
+        "recorded_outcome",
+        "recorded_primary_label",
+        "recorded_severity_assessment",
+        "recorded_actionability",
+        "selection_reasons",
+        "stratum",
     }
     assert forbidden_keys.isdisjoint(set(_walk_keys(exported)))
-    agent = calibration_source["verified_by_profile"][JudgeTask.FINDING_EQUIVALENCE].run_config.agent
+    assert forbidden_keys.isdisjoint(set(_walk_keys(package.to_dict())))
+    verified = calibration_source["verified_by_profile"][
+        JudgeTask.FINDING_EQUIVALENCE
+    ]
+    agent = verified.run_config.agent
+    judge_profile = verified.bundle.evaluator_execution.evaluator.profile(
+        JudgeKind.FINDING_EQUIVALENCE
+    )
     forbidden_values = {
+        verified.run_id,
+        verified.evaluation_id,
+        verified.run_config.run_instance_key,
         agent.agent_id,
         agent.agent_name,
         agent.agent_version,
         agent.model,
         agent.provider,
+        agent.prompt_config_digest,
+        verified.run_config.agent_config_digest,
+        judge_profile.judge_id,
+        judge_profile.provider,
+        judge_profile.model,
+        judge_profile.adapter_config_digest,
+        judge_profile.system_prompt_digest,
     }
-    assert forbidden_values.isdisjoint(set(_walk_strings(exported)))
+    exported_strings = tuple(_walk_strings(exported))
+    assert all(
+        value.casefold() != forbidden.casefold()
+        and (
+            len(forbidden) < 4
+            or forbidden.casefold() not in value.casefold()
+        )
+        for forbidden in forbidden_values
+        for value in exported_strings
+    )
     assert exported["payload_digest"] == package.payload_digest
     assert exported["items"]
+
+
+@pytest.mark.parametrize(
+    "injection",
+    ("identity_key", "identity_value", "judge_result_key"),
+)
+def test_export_rejects_deep_identity_and_judge_result_injection(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    injection: str,
+) -> None:
+    original = calibration_module._blind_payload
+
+    def injected(request: BlindJudgeInput):
+        payload, dimension = original(request)
+        if injection == "identity_key":
+            payload["items"][0]["metadata"]["scripted-model"] = "nested"
+        elif injection == "identity_value":
+            payload["items"][0]["text"] += " nested scripted-model identity"
+        else:
+            payload["context_blocks"].append(
+                {
+                    "metadata": {
+                        "nested": {
+                            "judge_result": "equivalent",
+                            "failure": None,
+                        }
+                    }
+                }
+            )
+        return payload, dimension
+
+    monkeypatch.setattr(calibration_module, "_blind_payload", injected)
+    output_root = tmp_path / "external-calibration"
+    with pytest.raises(ArtifactSecurityError, match="forbidden|identity|blind"):
+        export_calibration_package(
+            calibration_source["verified_by_profile"][
+                JudgeTask.FINDING_EQUIVALENCE
+            ],
+            profile=JudgeTask.FINDING_EQUIVALENCE,
+            policy=POLICY,
+            output_root=output_root,
+        )
+    assert not output_root.exists()
 
 
 def test_selection_policy_is_seeded_and_recorded(
@@ -426,9 +534,49 @@ def test_selection_policy_is_seeded_and_recorded(
     )
     assert all(
         record.selection_seed == first.policy.selection_seed
-        and record.selection_reasons
+        and record.selection_rank
+        and record.selection_stratum_digest
+        and type(record.selection_category) is CalibrationSelectionCategory
         and record.source_digest
         for record in first.selection_records
+    )
+
+
+def test_real_deterministic_judge_conflict_is_mandatory(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    verified = calibration_source["verified_by_profile"][
+        JudgeTask.INTENT_EQUIVALENCE
+    ]
+    trial = verified.trials[0]
+    judge_result = next(
+        item
+        for item in trial.judge_output.results
+        if item.request.task is JudgeTask.INTENT_EQUIVALENCE
+    )
+    semantic = next(
+        item
+        for item in trial.intent_result.candidates
+        if item.request_id == judge_result.request.source_request_id
+    )
+    assert semantic.match_kind is IntentMatchKind.SEMANTIC
+    assert semantic.selected is False
+    assert any(
+        item.selected
+        and item.match_kind is not IntentMatchKind.SEMANTIC
+        and item.generated_id == semantic.generated_id
+        for item in trial.intent_result.candidates
+    )
+
+    package = _export(
+        calibration_source,
+        tmp_path,
+        JudgeTask.INTENT_EQUIVALENCE,
+    )
+    assert len(package.selection_records) == 1
+    assert package.selection_records[0].selection_category is (
+        CalibrationSelectionCategory.MANDATORY
     )
 
 
@@ -471,7 +619,7 @@ def test_disputed_label_requires_adjudication_before_gate_eligibility(
     disputed = replace(
         matching.labels[0],
         disputed=True,
-        adjudication_ref=None,
+        adjudication=None,
     )
     unresolved = HumanLabelSetV1.create(
         package=package,
@@ -486,10 +634,20 @@ def test_disputed_label_requires_adjudication_before_gate_eligibility(
     assert unresolved_result.status is not CalibrationStatus.GATE_ELIGIBLE
     assert unresolved_result.profiles[0].unadjudicated_dispute_count == 1
 
+    adjudicator = HumanReviewerProvenanceV1.create(
+        kind=ReviewerProvenanceKind.HUMAN,
+        reviewer_id="independent-adjudicator-1",
+        provenance_ref="external-adjudicator-record-1",
+        attestation_ref="human-adjudicator-attestation-1",
+    )
+    adjudication = HumanAdjudicationV1.create(
+        adjudication_ref="adjudication-record-1",
+        reviewer_provenance=adjudicator,
+    )
     adjudicated = HumanLabelSetV1.create(
         package=package,
         labels=(
-            replace(disputed, adjudication_ref="adjudication-record-1"),
+            replace(disputed, adjudication=adjudication),
             *matching.labels[1:],
         ),
     )
@@ -557,6 +715,38 @@ def test_missing_labels_are_pending_not_fake_agreement(
     assert profile.exact_agreement_ppm is None
     assert profile.cohen_kappa_ppm is None
     assert profile.cohen_kappa_null_reason is not None
+
+
+@pytest.mark.parametrize(
+    "reviewer_kind",
+    (ReviewerProvenanceKind.FIXTURE, ReviewerProvenanceKind.SYNTHETIC),
+)
+def test_non_human_matching_labels_never_become_gate_eligible(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+    reviewer_kind: ReviewerProvenanceKind,
+) -> None:
+    package = _export(
+        calibration_source,
+        tmp_path,
+        JudgeTask.FINDING_EQUIVALENCE,
+    )
+    labels = _matching_labels(package, reviewer_kind=reviewer_kind)
+    result = score_calibration(
+        calibration_source["verified_by_profile"][package.profile],
+        package=package,
+        labels=labels,
+    )
+    profile = result.profiles[0]
+
+    assert result.status in {
+        CalibrationStatus.PENDING_HUMAN_LABELS,
+        CalibrationStatus.INSUFFICIENT_COVERAGE,
+    }
+    assert result.status is not CalibrationStatus.GATE_ELIGIBLE
+    assert profile.labeled_count == len(package.selection_records)
+    assert profile.eligible_labeled_count == 0
+    assert profile.exact_agreement_denominator == 0
 
 
 def test_kappa_and_confusion_matrix_are_reproducible(
@@ -658,9 +848,27 @@ def test_recomputed_item_id_cannot_bypass_payload_binding(
         )
 
     package_payload = package.to_dict()
+    forbidden_result_fields = {
+        "judge_result_digest",
+        "recorded_outcome",
+        "recorded_primary_label",
+        "recorded_severity_assessment",
+        "recorded_actionability",
+        "selection_reasons",
+        "stratum",
+    }
+    assert forbidden_result_fields.isdisjoint(set(_walk_keys(package_payload)))
     record = package_payload["selection_records"][0]
-    record["recorded_outcome"] = "attacker_oov"
-    record["recorded_primary_label"] = "attacker_oov"
+    record["selection_rank"] = "0" * 64
+    with pytest.raises(ValueError, match="selection_record_id|canonical"):
+        CalibrationPackageV1.from_dict(package_payload)
+
+    record_identity = dict(record)
+    del record_identity["selection_record_id"]
+    record["selection_record_id"] = stable_id(
+        "calibration-selection-v1",
+        record_identity,
+    )
     package_payload["selection_digest"] = canonical_sha256(
         package_payload["selection_records"]
     )
@@ -672,8 +880,13 @@ def test_recomputed_item_id_cannot_bypass_payload_binding(
         package.payload_digest,
         package_payload["selection_digest"],
     )
-    with pytest.raises(ValueError, match="outcome|label|vocabulary"):
-        CalibrationPackageV1.from_dict(package_payload)
+    forged = CalibrationPackageV1.from_dict(package_payload)
+    with pytest.raises(ArtifactIntegrityError, match="source replay|differs"):
+        score_calibration(
+            calibration_source["verified_by_profile"][package.profile],
+            package=forged,
+            labels=HumanLabelSetV1.create(package=forged, labels=()),
+        )
 
 
 def test_recomputed_result_ids_cannot_bypass_status_or_disagreement_metrics(
@@ -771,6 +984,17 @@ def test_analysis_manifest_omits_raw_payload_and_verified_load_replays_sources(
     for item in package.items:
         assert item.blinded_request_payload_json.encode("utf-8") not in manifest_bytes
     assert b'"items"' not in manifest_bytes
+    assert {
+        "judge_result_digest",
+        "recorded_outcome",
+        "recorded_primary_label",
+        "recorded_severity_assessment",
+        "recorded_actionability",
+        "selection_reasons",
+        "stratum",
+        "decision",
+        "failure",
+    }.isdisjoint(set(_walk_keys(manifest.to_dict())))
     assert manifest.payload_digest == package.payload_digest
     assert store.load_verified_calibration_package_manifest(
         package_receipt.artifact_id,
@@ -788,6 +1012,13 @@ def test_analysis_manifest_omits_raw_payload_and_verified_load_replays_sources(
     assert store.load_human_label_set(
         label_receipt.artifact_id,
         package=package,
+    ) == labels
+    assert store.load_verified_human_label_set(
+        label_receipt.artifact_id,
+        evaluation=calibration_source["verified_by_profile"][package.profile],
+        policy=POLICY,
+        package=package,
+        labels=labels,
     ) == labels
 
     result_receipt = store.publish_calibration_result(
@@ -841,8 +1072,12 @@ def test_export_rejects_symlink_or_junction_root(
     linked = tmp_path / "linked"
     try:
         linked.symlink_to(outside, target_is_directory=True)
-    except OSError as exc:
+    except NotImplementedError as exc:
         pytest.skip(f"symlink creation is unavailable: {exc}")
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip(f"symlink privilege is unavailable: {exc}")
+        raise
     with pytest.raises(ArtifactSecurityError, match="link|reparse|unsafe"):
         export_calibration_package(
             calibration_source["verified_by_profile"][JudgeTask.INTENT_EQUIVALENCE],

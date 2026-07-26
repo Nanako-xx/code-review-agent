@@ -150,6 +150,27 @@ def _calibration_publication_digest(role: str, payload: Mapping[str, Any]) -> st
     ).hexdigest()
 
 
+def _human_provenance_digest(labels: Any) -> str:
+    """Digest only typed reviewer/adjudicator provenance for receipt binding."""
+
+    return hashlib.sha256(
+        canonical_json_bytes(
+            [
+                {
+                    "calibration_item_id": item.calibration_item_id,
+                    "reviewer_provenance": item.reviewer_provenance.to_dict(),
+                    "adjudication": (
+                        None
+                        if item.adjudication is None
+                        else item.adjudication.to_dict()
+                    ),
+                }
+                for item in labels.labels
+            ]
+        )
+    ).hexdigest()
+
+
 def _windows_portable_path_segment_key(value: str) -> str:
     return unicodedata.normalize("NFKC", value).casefold().rstrip(" .")
 
@@ -1255,6 +1276,9 @@ class AnalysisArtifactStore:
                 "selection_digest": replayed_package.selection_digest,
                 "label_set_id": canonical_labels.label_set_id,
                 "label_set_digest": canonical_labels.digest(),
+                "human_provenance_digest": _human_provenance_digest(
+                    canonical_labels
+                ),
             },
         )
         receipt = AnalysisReceipt.create(
@@ -1310,6 +1334,7 @@ class AnalysisArtifactStore:
                     "selection_digest": canonical_package.selection_digest,
                     "label_set_id": labels.label_set_id,
                     "label_set_digest": labels.digest(),
+                    "human_provenance_digest": _human_provenance_digest(labels),
                 },
             )
         except (AttributeError, SchemaError, TypeError, ValueError) as exc:

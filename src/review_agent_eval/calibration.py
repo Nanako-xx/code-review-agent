@@ -27,7 +27,7 @@ from .artifacts import (
 )
 from .comparison import VerifiedRunEvaluation
 from .config import JudgeKind, validate_path_segment
-from .intent_evaluator import IntentJudgeRelation
+from .intent_evaluator import IntentJudgeRelation, IntentMatchKind
 from .judge import (
     ActionabilityAssessment,
     BlindJudgeInput,
@@ -49,6 +49,7 @@ from .models import (
     canonical_sha256,
     stable_id,
 )
+from .review_evaluator import FindingMatchKind
 
 
 CALIBRATION_SELECTION_POLICY_SCHEMA_VERSION = "calibration_selection_policy_v1"
@@ -58,6 +59,8 @@ CALIBRATION_PACKAGE_SCHEMA_VERSION = "calibration_package_v1"
 CALIBRATION_PACKAGE_MANIFEST_SCHEMA_VERSION = "calibration_package_manifest_v1"
 HUMAN_LABEL_SCHEMA_VERSION = "human_label_v1"
 HUMAN_LABEL_SET_SCHEMA_VERSION = "human_label_set_v1"
+HUMAN_REVIEWER_PROVENANCE_SCHEMA_VERSION = "human_reviewer_provenance_v1"
+HUMAN_ADJUDICATION_SCHEMA_VERSION = "human_adjudication_v1"
 PROFILE_CALIBRATION_SCHEMA_VERSION = "profile_calibration_v1"
 CALIBRATION_RESULT_SCHEMA_VERSION = "calibration_result_v1"
 CALIBRATION_ALGORITHM_VERSION = "blind-judge-calibration-v1"
@@ -81,6 +84,17 @@ class CalibrationStatus(str, Enum):
     INSUFFICIENT_COVERAGE = "insufficient_coverage"
     FAILED_THRESHOLDS = "failed_thresholds"
     GATE_ELIGIBLE = "gate_eligible"
+
+
+class CalibrationSelectionCategory(str, Enum):
+    MANDATORY = "mandatory"
+    SEEDED = "seeded"
+
+
+class ReviewerProvenanceKind(str, Enum):
+    HUMAN = "human"
+    FIXTURE = "fixture"
+    SYNTHETIC = "synthetic"
 
 
 class KappaNullReason(str, Enum):
@@ -109,6 +123,80 @@ _SELECTION_REASONS = frozenset(
 )
 _MANDATORY_REASONS = _SELECTION_REASONS - {"seeded_normal_stratum"}
 _HEX = frozenset("0123456789abcdef")
+_FORBIDDEN_BLIND_KEYS = frozenset(
+    {
+        "agent",
+        "agent_id",
+        "agent_name",
+        "baseline",
+        "baseline_id",
+        "candidate",
+        "candidate_id",
+        "decision",
+        "expected_winner",
+        "failure",
+        "judge_decision",
+        "judge_failure",
+        "judge_result",
+        "judge_result_digest",
+        "model",
+        "provider",
+        "request_id",
+        "source_request_id",
+    }
+)
+_FORBIDDEN_TEXT_MARKERS = (
+    '"decision"',
+    '"expected_winner"',
+    '"failure"',
+    '"judge_decision"',
+    '"judge_failure"',
+    '"judge_result"',
+    "'decision'",
+    "'expected_winner'",
+    "'failure'",
+    "'judge_decision'",
+    "'judge_failure'",
+    "'judge_result'",
+)
+_IDENTITY_FIELDS = frozenset(
+    {
+        "adapter_config_digest",
+        "adapter_id",
+        "adapter_version",
+        "agent_config_digest",
+        "agent_id",
+        "agent_name",
+        "agent_version",
+        "commit",
+        "evaluation_id",
+        "evaluation_revision",
+        "evaluator_config_digest",
+        "evaluator_id",
+        "judge_id",
+        "judge_version",
+        "model",
+        "model_artifact_digest",
+        "prompt_config_digest",
+        "provider",
+        "run_id",
+        "run_instance_key",
+        "system_prompt_digest",
+        "system_prompt_version",
+    }
+)
+_BASELINE_CANDIDATE_IDENTITY_FIELDS = frozenset(
+    {
+        "baseline",
+        "baseline_agent_id",
+        "baseline_id",
+        "baseline_identity",
+        "candidate",
+        "candidate_agent_id",
+        "candidate_id",
+        "candidate_identity",
+    }
+)
 
 
 def _error(message: str) -> CalibrationError:
@@ -203,6 +291,146 @@ def _allowed_labels(profile: JudgeTask) -> Tuple[str, ...]:
     if type(profile) is not JudgeTask:
         raise _error("profile must be a JudgeTask")
     return _ALLOWED_LABELS[profile]
+
+
+def _identity_strings(value: Any) -> Tuple[str, ...]:
+    if type(value) is str:
+        return (value,) if value else ()
+    if type(value) is dict:
+        result: list[str] = []
+        for child in value.values():
+            result.extend(_identity_strings(child))
+        return tuple(result)
+    if type(value) in (list, tuple):
+        result = []
+        for child in value:
+            result.extend(_identity_strings(child))
+        return tuple(result)
+    return ()
+
+
+def _forbidden_identity_values(
+    evaluation: VerifiedRunEvaluation,
+) -> Tuple[str, ...]:
+    if type(evaluation) is not VerifiedRunEvaluation:
+        raise TypeError("evaluation must be a VerifiedRunEvaluation")
+    roots = (
+        evaluation.source_binding.to_dict(),
+        evaluation.run_config.to_dict(),
+        evaluation.bundle.evaluator_execution.to_dict(),
+        {
+            "evaluation_id": evaluation.evaluation_id,
+            "evaluation_revision": evaluation.bundle.evaluation_revision,
+            "run_id": evaluation.run_id,
+        },
+    )
+    values: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if type(value) is not dict:
+            return
+        for raw_key, child in value.items():
+            key = str(raw_key).casefold().replace("-", "_").replace(" ", "_")
+            if (
+                key in _IDENTITY_FIELDS
+                or key in _BASELINE_CANDIDATE_IDENTITY_FIELDS
+                or key.endswith("_config_digest")
+                or (
+                    type(child) is str
+                    and any(
+                        marker in key
+                        for marker in ("baseline", "candidate", "prompt")
+                    )
+                )
+            ):
+                values.update(_identity_strings(child))
+            if type(child) is dict:
+                visit(child)
+            elif type(child) in (list, tuple):
+                for nested in child:
+                    visit(nested)
+
+    for root in roots:
+        visit(root)
+    return tuple(sorted(values, key=lambda item: (item.casefold(), item)))
+
+
+def _assert_blind_payload(
+    value: Any,
+    *,
+    forbidden_identity_values: Sequence[str],
+    context: str,
+) -> None:
+    identities = tuple(
+        (item, item.casefold())
+        for item in forbidden_identity_values
+        if type(item) is str and item
+    )
+
+    def visit(current: Any, path: str) -> None:
+        if type(current) is dict:
+            for raw_key, child in current.items():
+                if type(raw_key) is not str:
+                    raise ArtifactSecurityError(
+                        f"{context} contains a non-string key at {path}"
+                    )
+                key = raw_key.casefold().replace("-", "_").replace(" ", "_")
+                if key in _FORBIDDEN_BLIND_KEYS or any(
+                    marker in key
+                    for marker in (
+                        "expected_winner",
+                        "judge_decision",
+                        "judge_failure",
+                        "judge_result",
+                    )
+                ):
+                    raise ArtifactSecurityError(
+                        f"{context} contains forbidden key {raw_key!r} at {path}"
+                    )
+                for identity, folded_identity in identities:
+                    identity_key = folded_identity.replace("-", "_").replace(
+                        " ", "_"
+                    )
+                    if key == identity_key or (
+                        len(identity_key) >= 4 and identity_key in key
+                    ):
+                        raise ArtifactSecurityError(
+                            f"{context} contains forbidden source identity "
+                            f"{identity!r} in a key at {path}"
+                        )
+                visit(child, f"{path}.{raw_key}")
+            return
+        if type(current) in (list, tuple):
+            for index, child in enumerate(current):
+                visit(child, f"{path}[{index}]")
+            return
+        if type(current) is not str:
+            return
+        folded = current.casefold()
+        for identity, folded_identity in identities:
+            if folded == folded_identity or (
+                len(folded_identity) >= 4 and folded_identity in folded
+            ):
+                raise ArtifactSecurityError(
+                    f"{context} contains forbidden source identity {identity!r} at {path}"
+                )
+        if current.strip().casefold() in {
+            "decision",
+            "expected winner",
+            "expected_winner",
+            "failure",
+            "judge decision",
+            "judge_decision",
+            "judge failure",
+            "judge_failure",
+            "judge result",
+            "judge_result",
+        } or any(marker in folded for marker in _FORBIDDEN_TEXT_MARKERS):
+            raise ArtifactSecurityError(
+                f"{context} contains forbidden Judge-result text at {path}"
+            )
+
+    visit(value, "$")
 
 
 @dataclass(frozen=True)
@@ -361,6 +589,11 @@ class CalibrationItemV1(_JsonModel):
             raise _error("CalibrationItemV1 blinded payload is invalid") from exc
         if type(payload) is not dict or canonical_json(payload) != self.blinded_request_payload_json:
             raise _error("CalibrationItemV1 blinded payload is not canonical")
+        _assert_blind_payload(
+            payload,
+            forbidden_identity_values=(),
+            context="CalibrationItemV1 blinded payload",
+        )
         if self.payload_digest != canonical_sha256(payload):
             raise _error("CalibrationItemV1 payload_digest is not canonical")
         labels = tuple(self.allowed_labels)
@@ -448,15 +681,11 @@ class CalibrationSelectionRecordV1(_JsonModel):
     calibration_item_id: str
     item_digest: str
     source_digest: str
-    judge_result_digest: str
     selection_order: int
     selection_seed: int
-    stratum: str
-    selection_reasons: Tuple[str, ...]
-    recorded_outcome: str
-    recorded_primary_label: Optional[str]
-    recorded_severity_assessment: Optional[str]
-    recorded_actionability: Optional[str]
+    selection_rank: str
+    selection_stratum_digest: str
+    selection_category: CalibrationSelectionCategory
 
     def __post_init__(self) -> None:
         if self.schema_version != CALIBRATION_SELECTION_RECORD_SCHEMA_VERSION:
@@ -465,49 +694,72 @@ class CalibrationSelectionRecordV1(_JsonModel):
         validate_path_segment(self.calibration_item_id, "calibration_item_id")
         _digest(self.item_digest, "CalibrationSelectionRecordV1.item_digest")
         _digest(self.source_digest, "CalibrationSelectionRecordV1.source_digest")
-        _digest(
-            self.judge_result_digest,
-            "CalibrationSelectionRecordV1.judge_result_digest",
-        )
         _integer(self.selection_order, "selection_order", minimum=1)
         _integer(self.selection_seed, "selection_seed", maximum=MAX_CALIBRATION_SEED)
-        _text(self.stratum, "CalibrationSelectionRecordV1.stratum")
-        reasons = tuple(self.selection_reasons)
-        if (
-            not reasons
-            or reasons != tuple(sorted(set(reasons)))
-            or not set(reasons).issubset(_SELECTION_REASONS)
-        ):
-            raise _error("Calibration selection reasons are not canonical")
-        object.__setattr__(self, "selection_reasons", reasons)
-        _text(self.recorded_outcome, "recorded_outcome")
-        _optional_text(self.recorded_primary_label, "recorded_primary_label")
-        _optional_text(
-            self.recorded_severity_assessment,
-            "recorded_severity_assessment",
+        _digest(self.selection_rank, "CalibrationSelectionRecordV1.selection_rank")
+        _digest(
+            self.selection_stratum_digest,
+            "CalibrationSelectionRecordV1.selection_stratum_digest",
         )
-        _optional_text(self.recorded_actionability, "recorded_actionability")
-        if self.recorded_severity_assessment is not None:
-            _enum(
-                SeverityAssessment,
-                self.recorded_severity_assessment,
-                "recorded_severity_assessment",
-            )
-        if self.recorded_actionability is not None:
-            _enum(
-                ActionabilityAssessment,
-                self.recorded_actionability,
-                "recorded_actionability",
-            )
+        if type(self.selection_category) is not CalibrationSelectionCategory:
+            raise _error("Calibration selection category is invalid")
         expected = stable_id(
             "calibration-selection-v1",
-            self.calibration_item_id,
-            self.item_digest,
-            self.source_digest,
-            self.judge_result_digest,
+            {
+                "schema_version": self.schema_version,
+                "calibration_item_id": self.calibration_item_id,
+                "item_digest": self.item_digest,
+                "source_digest": self.source_digest,
+                "selection_order": self.selection_order,
+                "selection_seed": self.selection_seed,
+                "selection_rank": self.selection_rank,
+                "selection_stratum_digest": self.selection_stratum_digest,
+                "selection_category": self.selection_category.value,
+            },
         )
         if self.selection_record_id != expected:
             raise _error("Calibration selection_record_id is not canonical")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        calibration_item_id: str,
+        item_digest: str,
+        source_digest: str,
+        selection_order: int,
+        selection_seed: int,
+        selection_rank: str,
+        selection_stratum_digest: str,
+        selection_category: CalibrationSelectionCategory,
+    ) -> "CalibrationSelectionRecordV1":
+        if type(selection_category) is not CalibrationSelectionCategory:
+            raise TypeError(
+                "selection_category must be a CalibrationSelectionCategory"
+            )
+        identity = {
+            "schema_version": CALIBRATION_SELECTION_RECORD_SCHEMA_VERSION,
+            "calibration_item_id": calibration_item_id,
+            "item_digest": item_digest,
+            "source_digest": source_digest,
+            "selection_order": selection_order,
+            "selection_seed": selection_seed,
+            "selection_rank": selection_rank,
+            "selection_stratum_digest": selection_stratum_digest,
+            "selection_category": selection_category.value,
+        }
+        return cls(
+            selection_record_id=stable_id("calibration-selection-v1", identity),
+            schema_version=identity["schema_version"],
+            calibration_item_id=calibration_item_id,
+            item_digest=item_digest,
+            source_digest=source_digest,
+            selection_order=selection_order,
+            selection_seed=selection_seed,
+            selection_rank=selection_rank,
+            selection_stratum_digest=selection_stratum_digest,
+            selection_category=selection_category,
+        )
 
     @classmethod
     def from_dict(cls, value: Any) -> "CalibrationSelectionRecordV1":
@@ -519,20 +771,24 @@ class CalibrationSelectionRecordV1(_JsonModel):
                 "calibration_item_id",
                 "item_digest",
                 "source_digest",
-                "judge_result_digest",
                 "selection_order",
                 "selection_seed",
-                "stratum",
-                "selection_reasons",
-                "recorded_outcome",
-                "recorded_primary_label",
-                "recorded_severity_assessment",
-                "recorded_actionability",
+                "selection_rank",
+                "selection_stratum_digest",
+                "selection_category",
             ),
             "CalibrationSelectionRecordV1",
         )
-        reasons = _array(payload["selection_reasons"], "selection_reasons", 4)
-        return cls(**{**payload, "selection_reasons": tuple(reasons)})
+        return cls(
+            **{
+                **payload,
+                "selection_category": _enum(
+                    CalibrationSelectionCategory,
+                    payload["selection_category"],
+                    "selection_category",
+                ),
+            }
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -541,71 +797,12 @@ class CalibrationSelectionRecordV1(_JsonModel):
             "calibration_item_id": self.calibration_item_id,
             "item_digest": self.item_digest,
             "source_digest": self.source_digest,
-            "judge_result_digest": self.judge_result_digest,
             "selection_order": self.selection_order,
             "selection_seed": self.selection_seed,
-            "stratum": self.stratum,
-            "selection_reasons": list(self.selection_reasons),
-            "recorded_outcome": self.recorded_outcome,
-            "recorded_primary_label": self.recorded_primary_label,
-            "recorded_severity_assessment": self.recorded_severity_assessment,
-            "recorded_actionability": self.recorded_actionability,
+            "selection_rank": self.selection_rank,
+            "selection_stratum_digest": self.selection_stratum_digest,
+            "selection_category": self.selection_category.value,
         }
-
-
-def _validate_profile_selection_records(
-    profile: JudgeTask,
-    records: Sequence[CalibrationSelectionRecordV1],
-) -> None:
-    allowed = set(_allowed_labels(profile))
-    terminal_outcomes = {
-        JUDGE_FAILED_OUTCOME,
-        JUDGE_UNGRADED_OUTCOME,
-    }
-    for record in records:
-        if record.recorded_outcome not in allowed | terminal_outcomes:
-            raise _error("Calibration selection outcome is out of vocabulary")
-        if record.recorded_outcome in terminal_outcomes:
-            if (
-                record.recorded_primary_label is not None
-                or record.recorded_severity_assessment is not None
-                or record.recorded_actionability is not None
-            ):
-                raise _error("Calibration terminal outcome carries a decision")
-        elif record.recorded_primary_label != record.recorded_outcome:
-            raise _error("Calibration recorded primary label is inconsistent")
-        if profile not in {
-            JudgeTask.FINDING_EQUIVALENCE,
-            JudgeTask.NOVEL_FACTUALITY,
-        } and (
-            record.recorded_severity_assessment is not None
-            or record.recorded_actionability is not None
-        ):
-            raise _error("Calibration profile has inapplicable auxiliary labels")
-        reasons = set(record.selection_reasons)
-        mandatory = reasons.intersection(_MANDATORY_REASONS)
-        if mandatory:
-            if "seeded_normal_stratum" in reasons or record.stratum != "mandatory":
-                raise _error("Calibration mandatory selection stratum is invalid")
-        elif (
-            record.selection_reasons != ("seeded_normal_stratum",)
-            or record.stratum != f"normal:{record.recorded_outcome}"
-        ):
-            raise _error("Calibration normal selection stratum is invalid")
-        semantic_unknown = record.recorded_primary_label == "unknown"
-        if semantic_unknown != (
-            "mandatory_semantic_unknown" in record.selection_reasons
-        ):
-            raise _error("Calibration semantic unknown selection is inconsistent")
-        if (
-            "mandatory_high_critical_fabricated" in reasons
-            and profile
-            not in {
-                JudgeTask.FINDING_EQUIVALENCE,
-                JudgeTask.NOVEL_FACTUALITY,
-            }
-        ):
-            raise _error("Calibration fabricated selection has wrong profile")
 
 
 @dataclass(frozen=True)
@@ -665,7 +862,6 @@ class CalibrationPackageV1(_JsonModel):
             raise _error("CalibrationPackageV1 selection binding is invalid")
         if any(item.profile is not self.profile for item in items):
             raise _error("CalibrationPackageV1 mixes profiles")
-        _validate_profile_selection_records(self.profile, records)
         if self.payload_digest != canonical_sha256([item.to_dict() for item in items]):
             raise _error("CalibrationPackageV1 payload_digest is not canonical")
         if self.selection_digest != canonical_sha256(
@@ -755,15 +951,7 @@ class CalibrationPackageV1(_JsonModel):
             "payload_digest": self.payload_digest,
             "selection_digest": self.selection_digest,
             "status": self.status.value,
-            "selections": [
-                {
-                    "calibration_item_id": record.calibration_item_id,
-                    "item_digest": record.item_digest,
-                    "selection_order": record.selection_order,
-                    "selection_seed": record.selection_seed,
-                }
-                for record in self.selection_records
-            ],
+            "selections": [record.to_dict() for record in self.selection_records],
             "items": [item.to_dict() for item in self.items],
         }
 
@@ -883,6 +1071,185 @@ class CalibrationPackageManifestV1(_JsonModel):
         }
 
 
+@dataclass(frozen=True)
+class HumanReviewerProvenanceV1(_JsonModel):
+    schema_version: str
+    provenance_id: str
+    kind: ReviewerProvenanceKind
+    reviewer_id: str
+    provenance_ref: str
+    attestation_ref: Optional[str]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != HUMAN_REVIEWER_PROVENANCE_SCHEMA_VERSION:
+            raise _error("HumanReviewerProvenanceV1 schema_version is unsupported")
+        validate_path_segment(self.provenance_id, "reviewer provenance_id")
+        if type(self.kind) is not ReviewerProvenanceKind:
+            raise _error("reviewer provenance kind is invalid")
+        _text(self.reviewer_id, "reviewer provenance reviewer_id")
+        _text(self.provenance_ref, "reviewer provenance_ref")
+        _optional_text(self.attestation_ref, "reviewer attestation_ref")
+        if self.kind is ReviewerProvenanceKind.HUMAN:
+            if self.attestation_ref is None:
+                raise _error("human reviewer provenance requires an attestation ref")
+        elif self.attestation_ref is not None:
+            raise _error("fixture/synthetic provenance cannot carry human attestation")
+        expected = stable_id(
+            "human-reviewer-provenance-v1",
+            {
+                "schema_version": self.schema_version,
+                "kind": self.kind.value,
+                "reviewer_id": self.reviewer_id,
+                "provenance_ref": self.provenance_ref,
+                "attestation_ref": self.attestation_ref,
+            },
+        )
+        if self.provenance_id != expected:
+            raise _error("reviewer provenance_id is not canonical")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        kind: ReviewerProvenanceKind,
+        reviewer_id: str,
+        provenance_ref: str,
+        attestation_ref: Optional[str],
+    ) -> "HumanReviewerProvenanceV1":
+        if type(kind) is not ReviewerProvenanceKind:
+            raise TypeError("kind must be a ReviewerProvenanceKind")
+        identity = {
+            "schema_version": HUMAN_REVIEWER_PROVENANCE_SCHEMA_VERSION,
+            "kind": kind.value,
+            "reviewer_id": reviewer_id,
+            "provenance_ref": provenance_ref,
+            "attestation_ref": attestation_ref,
+        }
+        return cls(
+            provenance_id=stable_id("human-reviewer-provenance-v1", identity),
+            schema_version=identity["schema_version"],
+            kind=kind,
+            reviewer_id=reviewer_id,
+            provenance_ref=provenance_ref,
+            attestation_ref=attestation_ref,
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "HumanReviewerProvenanceV1":
+        payload = _exact(
+            value,
+            (
+                "schema_version",
+                "provenance_id",
+                "kind",
+                "reviewer_id",
+                "provenance_ref",
+                "attestation_ref",
+            ),
+            "HumanReviewerProvenanceV1",
+        )
+        return cls(
+            **{
+                **payload,
+                "kind": _enum(
+                    ReviewerProvenanceKind,
+                    payload["kind"],
+                    "reviewer provenance kind",
+                ),
+            }
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "provenance_id": self.provenance_id,
+            "kind": self.kind.value,
+            "reviewer_id": self.reviewer_id,
+            "provenance_ref": self.provenance_ref,
+            "attestation_ref": self.attestation_ref,
+        }
+
+
+@dataclass(frozen=True)
+class HumanAdjudicationV1(_JsonModel):
+    schema_version: str
+    adjudication_id: str
+    adjudication_ref: str
+    reviewer_provenance: HumanReviewerProvenanceV1
+
+    def __post_init__(self) -> None:
+        if self.schema_version != HUMAN_ADJUDICATION_SCHEMA_VERSION:
+            raise _error("HumanAdjudicationV1 schema_version is unsupported")
+        validate_path_segment(self.adjudication_id, "adjudication_id")
+        _text(self.adjudication_ref, "adjudication_ref")
+        if type(self.reviewer_provenance) is not HumanReviewerProvenanceV1:
+            raise _error("adjudication reviewer provenance is invalid")
+        if self.reviewer_provenance.kind is not ReviewerProvenanceKind.HUMAN:
+            raise _error("adjudication requires HUMAN reviewer provenance")
+        expected = stable_id(
+            "human-adjudication-v1",
+            {
+                "schema_version": self.schema_version,
+                "adjudication_ref": self.adjudication_ref,
+                "reviewer_provenance": self.reviewer_provenance.to_dict(),
+            },
+        )
+        if self.adjudication_id != expected:
+            raise _error("adjudication_id is not canonical")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        adjudication_ref: str,
+        reviewer_provenance: HumanReviewerProvenanceV1,
+    ) -> "HumanAdjudicationV1":
+        if type(reviewer_provenance) is not HumanReviewerProvenanceV1:
+            raise TypeError(
+                "reviewer_provenance must be HumanReviewerProvenanceV1"
+            )
+        identity = {
+            "schema_version": HUMAN_ADJUDICATION_SCHEMA_VERSION,
+            "adjudication_ref": adjudication_ref,
+            "reviewer_provenance": reviewer_provenance.to_dict(),
+        }
+        return cls(
+            adjudication_id=stable_id("human-adjudication-v1", identity),
+            schema_version=identity["schema_version"],
+            adjudication_ref=adjudication_ref,
+            reviewer_provenance=reviewer_provenance,
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "HumanAdjudicationV1":
+        payload = _exact(
+            value,
+            (
+                "schema_version",
+                "adjudication_id",
+                "adjudication_ref",
+                "reviewer_provenance",
+            ),
+            "HumanAdjudicationV1",
+        )
+        return cls(
+            schema_version=payload["schema_version"],
+            adjudication_id=payload["adjudication_id"],
+            adjudication_ref=payload["adjudication_ref"],
+            reviewer_provenance=HumanReviewerProvenanceV1.from_dict(
+                payload["reviewer_provenance"]
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "adjudication_id": self.adjudication_id,
+            "adjudication_ref": self.adjudication_ref,
+            "reviewer_provenance": self.reviewer_provenance.to_dict(),
+        }
+
+
 def _timestamp(value: Any) -> str:
     text = _text(value, "HumanLabelV1.labeled_at", 64)
     if not text.endswith("Z"):
@@ -909,12 +1276,11 @@ class HumanLabelV1(_JsonModel):
     label: str
     severity_assessment: Optional[str]
     actionability: Optional[str]
-    reviewer_id: str
-    reviewer_provenance: str
+    reviewer_provenance: HumanReviewerProvenanceV1
     blind_attestation: bool
     labeled_at: str
     disputed: bool
-    adjudication_ref: Optional[str]
+    adjudication: Optional[HumanAdjudicationV1]
 
     def __post_init__(self) -> None:
         if self.schema_version != HUMAN_LABEL_SCHEMA_VERSION:
@@ -952,24 +1318,31 @@ class HumanLabelV1(_JsonModel):
             JudgeTask.NOVEL_FACTUALITY,
         } and (self.severity_assessment is not None or self.actionability is not None):
             raise _error("HumanLabelV1 auxiliary labels do not apply to this profile")
-        _text(self.reviewer_id, "HumanLabelV1.reviewer_id")
-        _text(
-            self.reviewer_provenance,
-            "HumanLabelV1.reviewer_provenance",
-        )
+        if type(self.reviewer_provenance) is not HumanReviewerProvenanceV1:
+            raise _error("HumanLabelV1 reviewer provenance is invalid")
         if type(self.blind_attestation) is not bool:
             raise _error("HumanLabelV1.blind_attestation must be bool")
         _timestamp(self.labeled_at)
         if type(self.disputed) is not bool:
             raise _error("HumanLabelV1.disputed must be bool")
-        _optional_text(self.adjudication_ref, "HumanLabelV1.adjudication_ref")
-        if self.adjudication_ref is not None and not self.disputed:
+        if self.adjudication is not None and type(self.adjudication) is not HumanAdjudicationV1:
+            raise _error("HumanLabelV1 adjudication is invalid")
+        if self.adjudication is not None and not self.disputed:
             raise _error("HumanLabelV1 adjudication requires a disputed label")
 
     @property
     def eligible(self) -> bool:
-        return self.blind_attestation and (
-            not self.disputed or self.adjudication_ref is not None
+        return (
+            self.blind_attestation
+            and self.reviewer_provenance.kind is ReviewerProvenanceKind.HUMAN
+            and (
+                not self.disputed
+                or (
+                    self.adjudication is not None
+                    and self.adjudication.reviewer_provenance.kind
+                    is ReviewerProvenanceKind.HUMAN
+                )
+            )
         )
 
     @classmethod
@@ -981,12 +1354,11 @@ class HumanLabelV1(_JsonModel):
         label: str,
         severity_assessment: Optional[str],
         actionability: Optional[str],
-        reviewer_id: str,
-        reviewer_provenance: str,
+        reviewer_provenance: HumanReviewerProvenanceV1,
         blind_attestation: bool,
         labeled_at: str,
         disputed: bool,
-        adjudication_ref: Optional[str],
+        adjudication: Optional[HumanAdjudicationV1],
     ) -> "HumanLabelV1":
         if type(package) is not CalibrationPackageV1:
             raise TypeError("package must be a CalibrationPackageV1")
@@ -1008,12 +1380,11 @@ class HumanLabelV1(_JsonModel):
             label=label,
             severity_assessment=severity_assessment,
             actionability=actionability,
-            reviewer_id=reviewer_id,
             reviewer_provenance=reviewer_provenance,
             blind_attestation=blind_attestation,
             labeled_at=labeled_at,
             disputed=disputed,
-            adjudication_ref=adjudication_ref,
+            adjudication=adjudication,
         )
 
     @classmethod
@@ -1032,12 +1403,11 @@ class HumanLabelV1(_JsonModel):
                 "label",
                 "severity_assessment",
                 "actionability",
-                "reviewer_id",
                 "reviewer_provenance",
                 "blind_attestation",
                 "labeled_at",
                 "disputed",
-                "adjudication_ref",
+                "adjudication",
             ),
             "HumanLabelV1",
         )
@@ -1045,6 +1415,14 @@ class HumanLabelV1(_JsonModel):
             **{
                 **payload,
                 "profile": _enum(JudgeTask, payload["profile"], "HumanLabelV1.profile"),
+                "reviewer_provenance": HumanReviewerProvenanceV1.from_dict(
+                    payload["reviewer_provenance"]
+                ),
+                "adjudication": (
+                    None
+                    if payload["adjudication"] is None
+                    else HumanAdjudicationV1.from_dict(payload["adjudication"])
+                ),
             }
         )
 
@@ -1061,12 +1439,13 @@ class HumanLabelV1(_JsonModel):
             "label": self.label,
             "severity_assessment": self.severity_assessment,
             "actionability": self.actionability,
-            "reviewer_id": self.reviewer_id,
-            "reviewer_provenance": self.reviewer_provenance,
+            "reviewer_provenance": self.reviewer_provenance.to_dict(),
             "blind_attestation": self.blind_attestation,
             "labeled_at": self.labeled_at,
             "disputed": self.disputed,
-            "adjudication_ref": self.adjudication_ref,
+            "adjudication": (
+                None if self.adjudication is None else self.adjudication.to_dict()
+            ),
         }
 
 
@@ -1791,7 +2170,11 @@ def _blind_payload(request: BlindJudgeInput) -> tuple[Dict[str, Any], Optional[s
     return payload, dimension
 
 
-def _calibration_item(result: JudgeExecutionResult) -> CalibrationItemV1:
+def _calibration_item(
+    result: JudgeExecutionResult,
+    *,
+    forbidden_identity_values: Sequence[str],
+) -> CalibrationItemV1:
     request = result.request
     profile = _profile_snapshot(result)
     if (
@@ -1801,6 +2184,11 @@ def _calibration_item(result: JudgeExecutionResult) -> CalibrationItemV1:
     ):
         raise ArtifactIntegrityError("calibration request rubric differs from profile")
     payload, dimension = _blind_payload(request)
+    _assert_blind_payload(
+        payload,
+        forbidden_identity_values=forbidden_identity_values,
+        context="calibration blinded request",
+    )
     payload_json = _canonical_payload(payload, "calibration blinded request")
     payload_digest = canonical_sha256(payload)
     item_id = _item_identity(
@@ -1834,26 +2222,71 @@ def _calibration_item(result: JudgeExecutionResult) -> CalibrationItemV1:
     )
 
 
-def _result_conflicts_with_evaluation(trial: Any, result: JudgeExecutionResult) -> bool:
+def _deterministic_judge_conflict(
+    trial: Any,
+    result: JudgeExecutionResult,
+) -> bool:
+    if result.status is not JudgeRunStatus.GRADED or result.decision is None:
+        return False
     request_id = result.request.source_request_id
     if result.request.task is JudgeTask.INTENT_EQUIVALENCE:
         evaluation = trial.intent_result
         if evaluation is None:
-            return result.status is JudgeRunStatus.GRADED
-        persisted = {
-            item.request_id: item for item in evaluation.judge_decisions
-        }.get(request_id)
-    else:
-        evaluation = trial.review_result
-        if evaluation is None:
-            return result.status is JudgeRunStatus.GRADED
-        receipt = {
-            item.request_id: item for item in evaluation.judge_decisions
-        }.get(request_id)
-        persisted = None if receipt is None else receipt.decision
-    if result.status is JudgeRunStatus.GRADED:
-        return persisted is None or persisted.to_dict() != result.decision.to_dict()
-    return persisted is not None
+            return False
+        candidate = next(
+            (
+                item
+                for item in evaluation.candidates
+                if item.request_id == request_id
+            ),
+            None,
+        )
+        if (
+            candidate is None
+            or result.decision.relation is not IntentJudgeRelation.EQUIVALENT
+            or candidate.selected
+        ):
+            return False
+        return any(
+            item.selected
+            and item.match_kind is not IntentMatchKind.SEMANTIC
+            and (
+                item.generated_id == candidate.generated_id
+                or item.truth_id == candidate.truth_id
+            )
+            for item in evaluation.candidates
+        )
+    # Novel factuality and Evidence support deliberately have no deterministic
+    # semantic label for the same request.  Evidence integrity, for example,
+    # is not a deterministic substitute for Evidence support.
+    if result.request.task is not JudgeTask.FINDING_EQUIVALENCE:
+        return False
+    evaluation = trial.review_result
+    if evaluation is None:
+        return False
+    candidates = (
+        *evaluation.known_invalid_candidates,
+        *evaluation.expected_candidates,
+    )
+    candidate = next(
+        (item for item in candidates if item.request_id == request_id),
+        None,
+    )
+    if (
+        candidate is None
+        or result.decision.relation is not FindingMatchRelation.EQUIVALENT
+        or candidate.selected
+    ):
+        return False
+    return any(
+        item.selected
+        and item.match_kind is FindingMatchKind.EXACT
+        and (
+            item.finding_id == candidate.finding_id
+            or item.truth_id == candidate.truth_id
+        )
+        for item in candidates
+    )
 
 
 def _high_critical_fabricated(trial: Any, result: JudgeExecutionResult) -> bool:
@@ -1889,15 +2322,19 @@ def _candidate_for(
     result: JudgeExecutionResult,
     *,
     policy: CalibrationSelectionPolicyV1,
+    forbidden_identity_values: Sequence[str],
 ) -> _SelectionCandidate:
-    item = _calibration_item(result)
+    item = _calibration_item(
+        result,
+        forbidden_identity_values=forbidden_identity_values,
+    )
     outcome, primary, severity, actionability = _decision_projection(result)
     reasons = []
     if primary == "unknown":
         reasons.append("mandatory_semantic_unknown")
     if _high_critical_fabricated(trial, result):
         reasons.append("mandatory_high_critical_fabricated")
-    if _result_conflicts_with_evaluation(trial, result):
+    if _deterministic_judge_conflict(trial, result):
         reasons.append("mandatory_deterministic_conflict")
     if reasons:
         stratum = "mandatory"
@@ -1981,12 +2418,12 @@ def _select_candidates(
     return tuple(mandatory + sampled)
 
 
-def _build_package(
+def _build_package_with_selection(
     evaluation: VerifiedRunEvaluation,
     *,
     profile: JudgeTask,
     policy: CalibrationSelectionPolicyV1,
-) -> CalibrationPackageV1:
+) -> tuple[CalibrationPackageV1, Tuple[_SelectionCandidate, ...]]:
     if type(evaluation) is not VerifiedRunEvaluation:
         raise TypeError("evaluation must be a VerifiedRunEvaluation")
     if type(profile) is not JudgeTask:
@@ -1997,6 +2434,7 @@ def _build_package(
     canonical_policy = CalibrationSelectionPolicyV1.from_dict(policy.to_dict())
     if canonical_policy != policy:
         raise _error("calibration selection policy is not canonical")
+    forbidden_identity_values = _forbidden_identity_values(evaluation)
     candidates: list[_SelectionCandidate] = []
     source_artifacts = []
     for trial in evaluation.trials:
@@ -2017,7 +2455,12 @@ def _build_package(
         for result in trial.judge_output.results:
             if result.request.task is profile:
                 candidates.append(
-                    _candidate_for(trial, result, policy=canonical_policy)
+                    _candidate_for(
+                        trial,
+                        result,
+                        policy=canonical_policy,
+                        forbidden_identity_values=forbidden_identity_values,
+                    )
                 )
     selected = _select_candidates(candidates, canonical_policy)
     item_map = {item.item.calibration_item_id: item.item for item in selected}
@@ -2025,29 +2468,37 @@ def _build_package(
     records = []
     for order, selected_item in enumerate(selected, start=1):
         item = selected_item.item
-        record_id = stable_id(
-            "calibration-selection-v1",
-            item.calibration_item_id,
-            item.digest(),
-            selected_item.source_digest,
-            selected_item.result.digest(),
+        category = (
+            CalibrationSelectionCategory.MANDATORY
+            if set(selected_item.reasons).intersection(_MANDATORY_REASONS)
+            else CalibrationSelectionCategory.SEEDED
         )
         records.append(
-            CalibrationSelectionRecordV1(
-                schema_version=CALIBRATION_SELECTION_RECORD_SCHEMA_VERSION,
-                selection_record_id=record_id,
+            CalibrationSelectionRecordV1.create(
                 calibration_item_id=item.calibration_item_id,
                 item_digest=item.digest(),
                 source_digest=selected_item.source_digest,
-                judge_result_digest=selected_item.result.digest(),
                 selection_order=order,
                 selection_seed=canonical_policy.selection_seed,
-                stratum=selected_item.stratum,
-                selection_reasons=selected_item.reasons,
-                recorded_outcome=selected_item.recorded_outcome,
-                recorded_primary_label=selected_item.primary_label,
-                recorded_severity_assessment=selected_item.severity_assessment,
-                recorded_actionability=selected_item.actionability,
+                selection_rank=canonical_sha256(
+                    {
+                        "seed_rank": selected_item.seed_rank,
+                        "category": category.value,
+                        "reason_digest": canonical_sha256(
+                            list(selected_item.reasons)
+                        ),
+                        "item_digest": item.digest(),
+                        "source_digest": selected_item.source_digest,
+                    }
+                ),
+                selection_stratum_digest=canonical_sha256(
+                    {
+                        "algorithm": canonical_policy.algorithm_version,
+                        "profile": profile.value,
+                        "stratum": selected_item.stratum,
+                    }
+                ),
+                selection_category=category,
             )
         )
     record_tuple = tuple(records)
@@ -2068,7 +2519,7 @@ def _build_package(
         payload_digest,
         selection_digest,
     )
-    return CalibrationPackageV1(
+    package = CalibrationPackageV1(
         schema_version=CALIBRATION_PACKAGE_SCHEMA_VERSION,
         package_id=package_id,
         profile=profile,
@@ -2080,6 +2531,21 @@ def _build_package(
         selection_records=record_tuple,
         status=CalibrationStatus.PENDING_HUMAN_LABELS,
     )
+    return package, selected
+
+
+def _build_package(
+    evaluation: VerifiedRunEvaluation,
+    *,
+    profile: JudgeTask,
+    policy: CalibrationSelectionPolicyV1,
+) -> CalibrationPackageV1:
+    package, _selected = _build_package_with_selection(
+        evaluation,
+        profile=profile,
+        policy=policy,
+    )
+    return package
 
 
 def _portable_key(value: str) -> str:
@@ -2225,6 +2691,11 @@ def export_calibration_package(
     """Export a create-only blind package from persisted Evaluation artifacts."""
 
     package = _build_package(evaluation, profile=profile, policy=policy)
+    _assert_blind_payload(
+        package.to_blind_dict(),
+        forbidden_identity_values=_forbidden_identity_values(evaluation),
+        context="calibration package export",
+    )
     _write_external_package(package, output_root)
     return package
 
@@ -2239,7 +2710,7 @@ def _status_for(
     exact_agreement_ppm: Optional[int],
     kappa_ppm: Optional[int],
 ) -> CalibrationStatus:
-    if labeled == 0:
+    if labeled == 0 or eligible == 0:
         return CalibrationStatus.PENDING_HUMAN_LABELS
     eligible_coverage = _ratio_ppm(eligible, selected)
     if (
@@ -2279,7 +2750,7 @@ def score_calibration(
         raise TypeError("labels must be a HumanLabelSetV1")
     evaluation.verify()
     canonical_package = CalibrationPackageV1.from_dict(package.to_dict())
-    replayed_package = _build_package(
+    replayed_package, replayed_selection = _build_package_with_selection(
         evaluation,
         profile=package.profile,
         policy=package.policy,
@@ -2315,14 +2786,24 @@ def score_calibration(
     semantic_unknown = 0
     failed = 0
     ungraded = 0
-    for record in package.selection_records:
-        if record.recorded_outcome == JUDGE_FAILED_OUTCOME:
+    if len(replayed_selection) != len(package.selection_records):
+        raise ArtifactIntegrityError("calibration selection replay length differs")
+    for record, selected in zip(package.selection_records, replayed_selection):
+        if (
+            record.calibration_item_id != selected.item.calibration_item_id
+            or record.source_digest != selected.source_digest
+        ):
+            raise ArtifactIntegrityError(
+                "calibration selection differs from source request replay"
+            )
+        recorded_outcome = selected.recorded_outcome
+        if recorded_outcome == JUDGE_FAILED_OUTCOME:
             failed += 1
-        elif record.recorded_outcome == JUDGE_UNGRADED_OUTCOME:
+        elif recorded_outcome == JUDGE_UNGRADED_OUTCOME:
             ungraded += 1
         else:
             graded += 1
-            if record.recorded_primary_label == "unknown":
+            if selected.primary_label == "unknown":
                 semantic_unknown += 1
         human = label_map.get(record.calibration_item_id)
         if human is None:
@@ -2330,13 +2811,13 @@ def score_calibration(
         labeled_count += 1
         if not human.blind_attestation:
             unattested += 1
-        if human.disputed and human.adjudication_ref is None:
+        if human.disputed and human.adjudication is None:
             disputes += 1
         if not human.eligible:
             continue
         eligible_count += 1
-        counts[(human.label, record.recorded_outcome)] += 1
-        if human.label != record.recorded_outcome:
+        counts[(human.label, recorded_outcome)] += 1
+        if human.label != recorded_outcome:
             disagreement_count += 1
             disagreements.append(record.calibration_item_id)
     matrix = tuple(
@@ -2437,11 +2918,15 @@ __all__ = [
     "CALIBRATION_PACKAGE_MANIFEST_SCHEMA_VERSION",
     "HUMAN_LABEL_SCHEMA_VERSION",
     "HUMAN_LABEL_SET_SCHEMA_VERSION",
+    "HUMAN_REVIEWER_PROVENANCE_SCHEMA_VERSION",
+    "HUMAN_ADJUDICATION_SCHEMA_VERSION",
     "PROFILE_CALIBRATION_SCHEMA_VERSION",
     "CALIBRATION_RESULT_SCHEMA_VERSION",
     "CALIBRATION_ALGORITHM_VERSION",
     "CalibrationError",
     "CalibrationStatus",
+    "CalibrationSelectionCategory",
+    "ReviewerProvenanceKind",
     "KappaNullReason",
     "ClassMetricNullReason",
     "CalibrationSelectionPolicyV1",
@@ -2449,6 +2934,8 @@ __all__ = [
     "CalibrationSelectionRecordV1",
     "CalibrationPackageV1",
     "CalibrationPackageManifestV1",
+    "HumanReviewerProvenanceV1",
+    "HumanAdjudicationV1",
     "HumanLabelV1",
     "HumanLabelSetV1",
     "ConfusionMatrixCellV1",
