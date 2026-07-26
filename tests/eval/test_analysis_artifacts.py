@@ -6,6 +6,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,7 @@ from review_agent_eval.analysis_artifacts import (
     AnalysisReceipt,
     AnalysisSourceBinding,
     bind_analysis_source,
+    derive_analysis_artifact_id,
 )
 from review_agent_eval.artifacts import (
     ArtifactConflictError,
@@ -23,9 +25,14 @@ from review_agent_eval.artifacts import (
     ArtifactSecurityError,
 )
 from review_agent_eval.config import derive_evaluation_id
-from review_agent_eval.models import canonical_json_bytes, canonical_sha256, stable_id
+from review_agent_eval.models import (
+    SchemaError,
+    canonical_json_bytes,
+    canonical_sha256,
+    stable_id,
+)
 
-from .test_artifacts import make_case_snapshot, make_config
+from .test_artifacts import make_case_snapshot, make_config, make_store
 from .test_orchestrator_target_replay_v2 import (
     _CountingJudge,
     _FrozenSuccessAdapter,
@@ -193,6 +200,149 @@ def test_analysis_receipt_binds_run_evaluation_and_source_digests(
             case_snapshot=run.snapshot,
         )
 
+    forged_bundle = SimpleNamespace(
+        **{
+            name: getattr(hydrated, name)
+            for name in (
+                "run_id",
+                "evaluation_id",
+                "evaluation_revision",
+                "evaluator_execution",
+                "trials",
+                "summary",
+                "report",
+            )
+        }
+    )
+    with pytest.raises(TypeError, match="RunEvaluationBundle"):
+        bind_analysis_source(
+            forged_bundle,
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+        )
+
+    trial = hydrated.trials[0]
+    with pytest.raises(ArtifactIntegrityError, match="TrialEvaluationBundle"):
+        bind_analysis_source(
+            replace(hydrated, trials=(SimpleNamespace(**vars(trial)),)),
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+        )
+
+    summary_duck = SimpleNamespace(
+        source_bindings=hydrated.summary.source_bindings,
+        summary_id=hydrated.summary.summary_id,
+        cases=hydrated.summary.cases,
+        digest=hydrated.summary.digest,
+    )
+    with pytest.raises(ArtifactIntegrityError, match="RunReportSummary|summary"):
+        bind_analysis_source(
+            replace(hydrated, summary=summary_duck),
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+        )
+
+    with pytest.raises(ArtifactIntegrityError, match="Trial|Run"):
+        bind_analysis_source(
+            replace(
+                hydrated,
+                trials=(replace(trial, run_id="run-" + "0" * 64),),
+            ),
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+        )
+
+    score = trial.trial_score
+    score_duck = SimpleNamespace(**vars(score))
+    score_duck.digest = score.digest
+    with pytest.raises(ArtifactIntegrityError, match="TrialScore|score"):
+        bind_analysis_source(
+            replace(
+                hydrated,
+                trials=(replace(trial, trial_score=score_duck),),
+            ),
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+        )
+
+    with pytest.raises(ArtifactIntegrityError, match="Case|case"):
+        bind_analysis_source(
+            replace(
+                hydrated,
+                trials=(
+                    replace(
+                        trial,
+                        eval_case=replace(
+                            trial.eval_case,
+                            case_version=trial.eval_case.case_version + 1,
+                        ),
+                    ),
+                ),
+            ),
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+        )
+
+    with pytest.raises(ArtifactIntegrityError, match="report|render"):
+        bind_analysis_source(
+            replace(hydrated, report=hydrated.report + "\n"),
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+        )
+
+
+def test_analysis_source_order_uses_complete_canonical_identity() -> None:
+    first = _source_binding()
+    second = replace(
+        first,
+        run_config_digest="1" * 64,
+        case_snapshot_digest="2" * 64,
+        trial_score_digests=("3" * 64,),
+    )
+    files = {"statistics.json": {"status": "ok"}}
+    algorithm_digest = canonical_sha256({"algorithm": "canonical-order-v1"})
+
+    forward = AnalysisReceipt.create(
+        kind="statistics",
+        source_bindings=(first, second),
+        algorithm_digest=algorithm_digest,
+        files=files,
+    )
+    reverse = AnalysisReceipt.create(
+        kind="statistics",
+        source_bindings=(second, first),
+        algorithm_digest=algorithm_digest,
+        files=files,
+    )
+
+    assert forward.artifact_id == reverse.artifact_id
+    assert canonical_json_bytes(forward.to_dict()) == canonical_json_bytes(
+        reverse.to_dict()
+    )
+    assert derive_analysis_artifact_id(
+        "statistics", (first, second), algorithm_digest
+    ) == derive_analysis_artifact_id(
+        "statistics", (second, first), algorithm_digest
+    )
+
+
+def test_analysis_source_binding_duplicates_are_rejected() -> None:
+    binding = _source_binding()
+    algorithm_digest = canonical_sha256({"algorithm": "duplicate-source-v1"})
+    with pytest.raises(SchemaError, match="duplicate"):
+        derive_analysis_artifact_id(
+            "statistics",
+            (binding, binding),
+            algorithm_digest,
+        )
+    with pytest.raises(SchemaError, match="duplicate"):
+        AnalysisReceipt.create(
+            kind="statistics",
+            source_bindings=(binding, binding),
+            algorithm_digest=algorithm_digest,
+            files={"statistics.json": {"status": "ok"}},
+        )
+
 
 def test_analysis_tamper_fails_closed(tmp_path: Path) -> None:
     store = _store(tmp_path)
@@ -308,6 +458,23 @@ def test_analysis_rejects_junction_reparse_and_hardlink(
     monkeypatch.setattr(artifact_module.os, "lstat", fake_lstat)
     with pytest.raises(ArtifactSecurityError, match="reparse"):
         store.load_json_bundle(receipt.kind, receipt.artifact_id)
+
+
+def test_run_artifact_store_hardlink_behavior_is_unchanged(tmp_path: Path) -> None:
+    store, config, _manifest, _plan, _trial = make_store(tmp_path)
+    ref = store._write_json(
+        config.run_id,
+        "auxiliary/historical-hardlink.json",
+        {"historical": True},
+    )
+    source = store.root / config.run_id / Path(*ref.relative_path.split("/"))
+    alias = tmp_path / "historical-hardlink-alias.json"
+    try:
+        os.link(source, alias)
+    except OSError as exc:
+        pytest.skip("hardlink creation is unavailable: %s" % exc)
+
+    assert store.read_json_artifact(config.run_id, ref) == {"historical": True}
 
 
 @pytest.mark.skipif(os.name != "nt", reason="junction behavior is Windows-specific")

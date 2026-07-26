@@ -3004,6 +3004,7 @@ class ArtifactStore:
             max_total_read_bytes=max_total_read_bytes,
             create_root=create_root,
             required_root_name=".eval-runs",
+            reject_hardlinks=False,
         )
 
     def _initialize_storage_root(
@@ -3014,6 +3015,7 @@ class ArtifactStore:
         max_total_read_bytes: int,
         create_root: bool,
         required_root_name: Optional[str],
+        reject_hardlinks: bool,
     ) -> None:
         """Initialize the shared fail-closed storage boundary.
 
@@ -3030,6 +3032,8 @@ class ArtifactStore:
             raise ValueError("max_file_bytes may not exceed max_total_read_bytes")
         if type(create_root) is not bool:
             raise ValueError("create_root must be a bool")
+        if type(reject_hardlinks) is not bool:
+            raise ValueError("reject_hardlinks must be a bool")
         root = _absolute_storage_path(storage_root)
         if required_root_name is not None and root.name != required_root_name:
             raise ValueError(
@@ -3039,6 +3043,7 @@ class ArtifactStore:
         self.root = root
         self.max_file_bytes = max_file_bytes
         self.max_total_read_bytes = max_total_read_bytes
+        self._reject_hardlinks = reject_hardlinks
         if create_root:
             self._prepare_root()
         else:
@@ -3298,7 +3303,7 @@ class ArtifactStore:
             raise ArtifactSecurityError(
                 "artifact is a symlink, reparse point, or special file"
             )
-        if _hardlinked_file(info):
+        if self._reject_hardlinks and _hardlinked_file(info):
             raise ArtifactSecurityError("artifact has an unsafe hardlink count")
         return True
 
@@ -3457,7 +3462,11 @@ class ArtifactStore:
                 raise ArtifactSecurityError(
                     "writer lock is a symlink, reparse point, or special file"
                 )
-            if existing is not None and _hardlinked_file(existing):
+            if (
+                self._reject_hardlinks
+                and existing is not None
+                and _hardlinked_file(existing)
+            ):
                 raise ArtifactSecurityError(
                     "writer lock has an unsafe hardlink count"
                 )
@@ -3484,7 +3493,7 @@ class ArtifactStore:
                 info = os.fstat(descriptor)
                 if _unsafe_node(info) or not stat.S_ISREG(info.st_mode):
                     raise ArtifactSecurityError("writer lock is not a regular file")
-                if _hardlinked_file(info):
+                if self._reject_hardlinks and _hardlinked_file(info):
                     raise ArtifactSecurityError(
                         "writer lock has an unsafe hardlink count"
                     )
@@ -3605,7 +3614,7 @@ class ArtifactStore:
             raise ArtifactSecurityError(
                 "artifact is a symlink, reparse point, or special file"
             )
-        if _hardlinked_file(before):
+        if self._reject_hardlinks and _hardlinked_file(before):
             raise ArtifactSecurityError("artifact has an unsafe hardlink count")
         if before.st_size > effective_maximum:
             raise ArtifactIntegrityError("artifact exceeds the single-file byte limit")
@@ -3623,7 +3632,7 @@ class ArtifactStore:
             opened = os.fstat(descriptor)
             if _unsafe_node(opened) or not stat.S_ISREG(opened.st_mode):
                 raise ArtifactSecurityError("artifact changed during safe open")
-            if _hardlinked_file(opened):
+            if self._reject_hardlinks and _hardlinked_file(opened):
                 raise ArtifactSecurityError("artifact has an unsafe hardlink count")
             before_identity = _file_identity(before)
             opened_identity = _descriptor_identity(descriptor, opened)
@@ -3703,7 +3712,7 @@ class ArtifactStore:
                         raise ArtifactSecurityError(
                             "artifact path changed while it was open"
                         )
-                    if _hardlinked_file(recheck):
+                    if self._reject_hardlinks and _hardlinked_file(recheck):
                         raise ArtifactSecurityError(
                             "artifact has an unsafe hardlink count"
                         )
@@ -3744,7 +3753,7 @@ class ArtifactStore:
             raise ArtifactSecurityError(
                 "artifact path changed into a link, reparse point, or special file"
             )
-        if _hardlinked_file(path_after):
+        if self._reject_hardlinks and _hardlinked_file(path_after):
             raise ArtifactSecurityError("artifact has an unsafe hardlink count")
         if (
             _file_identity(opened) is not None

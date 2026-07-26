@@ -29,6 +29,7 @@ from .artifacts import (
 from .cases import RunCaseSnapshot
 from .config import (
     EvalRunConfig,
+    EvaluatorExecutionConfig,
     derive_evaluation_id,
     validate_safe_json,
     validate_evaluation_id_shape,
@@ -36,6 +37,7 @@ from .config import (
     validate_run_id,
 )
 from .models import (
+    EvalCase,
     SchemaError,
     _JsonModel,
     canonical_json_bytes,
@@ -83,12 +85,9 @@ def _exact_mapping(value: Any, fields: set[str], context: str) -> Mapping[str, A
 
 
 def _source_sort_key(value: "AnalysisSourceBinding") -> tuple[Any, ...]:
-    return (
-        value.run_id,
-        value.evaluation_id,
-        value.summary_id,
-        value.summary_digest,
-    )
+    """Sort by the complete canonical source identity, never a prefix."""
+
+    return (canonical_json_bytes(value.to_dict()),)
 
 
 @dataclass(frozen=True)
@@ -164,6 +163,23 @@ class AnalysisSourceBinding(_JsonModel):
         }
 
 
+def _canonical_source_bindings(
+    values: Iterable[AnalysisSourceBinding],
+    context: str,
+) -> Tuple[AnalysisSourceBinding, ...]:
+    try:
+        sources = tuple(values)
+    except TypeError as exc:
+        raise SchemaError("%s must be an iterable" % context) from exc
+    if not sources or any(type(item) is not AnalysisSourceBinding for item in sources):
+        raise SchemaError("%s requires typed source bindings" % context)
+    keyed = tuple((_source_sort_key(item), item) for item in sources)
+    identities = tuple(key for key, _item in keyed)
+    if len(identities) != len(set(identities)):
+        raise SchemaError("%s contains a duplicate source binding" % context)
+    return tuple(item for _key, item in sorted(keyed, key=lambda pair: pair[0]))
+
+
 @dataclass(frozen=True)
 class AnalysisArtifactRef(_JsonModel):
     """Digest and path descriptor for one committed analysis child file."""
@@ -237,11 +253,10 @@ def derive_analysis_artifact_id(
 
     canonical_kind = _kind(kind)
     algorithm = _digest(algorithm_digest, "analysis algorithm_digest")
-    sources = tuple(source_bindings)
-    if not sources or any(type(item) is not AnalysisSourceBinding for item in sources):
-        raise SchemaError("analysis artifact requires typed source bindings")
-    if sources != tuple(sorted(sources, key=_source_sort_key)):
-        raise SchemaError("analysis source bindings are not canonically ordered")
+    sources = _canonical_source_bindings(
+        source_bindings,
+        "analysis artifact",
+    )
     return stable_id(
         "analysis-artifact-v1",
         {
@@ -287,11 +302,11 @@ class AnalysisReceipt(_JsonModel):
         if type(self.source_bindings) not in (tuple, list):
             raise SchemaError("AnalysisReceipt source_bindings must be a list")
         sources = tuple(self.source_bindings)
-        if not sources or any(type(item) is not AnalysisSourceBinding for item in sources):
-            raise SchemaError("AnalysisReceipt source_bindings are invalid")
-        if len(sources) != len(set(sources)):
-            raise SchemaError("AnalysisReceipt contains duplicate source bindings")
-        if sources != tuple(sorted(sources, key=_source_sort_key)):
+        canonical_sources = _canonical_source_bindings(
+            sources,
+            "AnalysisReceipt",
+        )
+        if sources != canonical_sources:
             raise SchemaError("AnalysisReceipt source bindings are not canonical")
         if type(self.artifacts) not in (tuple, list):
             raise SchemaError("AnalysisReceipt artifacts must be a list")
@@ -326,7 +341,10 @@ class AnalysisReceipt(_JsonModel):
         files: Mapping[str, Any],
     ) -> "AnalysisReceipt":
         canonical_kind = _kind(kind)
-        sources = tuple(sorted(tuple(source_bindings), key=_source_sort_key))
+        sources = _canonical_source_bindings(
+            source_bindings,
+            "AnalysisReceipt",
+        )
         artifact_id = derive_analysis_artifact_id(
             canonical_kind,
             sources,
@@ -411,6 +429,7 @@ class _AnalysisSafeStorage(ArtifactStore):
             max_total_read_bytes=max_total_read_bytes,
             create_root=create_root,
             required_root_name=None,
+            reject_hardlinks=True,
         )
 
 
@@ -682,24 +701,23 @@ def bind_analysis_source(
 ) -> AnalysisSourceBinding:
     """Verify one hydrated orchestrator Run Evaluation and seal its roots."""
 
+    # Local imports avoid making protocol-only module import pull in the
+    # orchestrator/report graph while still requiring concrete hydrated types.
+    from .metrics import TrialScore
+    from .orchestrator import RunEvaluationBundle, TrialEvaluationBundle
+    from .report import RunReportSummary, render_run_markdown
+
+    if type(bundle) is not RunEvaluationBundle:
+        raise TypeError("bundle must be a concrete hydrated RunEvaluationBundle")
     if type(run_config) is not EvalRunConfig:
         raise TypeError("run_config must be an EvalRunConfig")
     if type(case_snapshot) is not RunCaseSnapshot:
         raise TypeError("case_snapshot must be a RunCaseSnapshot")
-    required = (
-        "run_id",
-        "evaluation_id",
-        "evaluation_revision",
-        "evaluator_execution",
-        "trials",
-        "summary",
-        "report",
-    )
-    if any(not hasattr(bundle, name) for name in required):
-        raise TypeError("bundle must be an already hydrated RunEvaluationBundle")
     if bundle.run_id != run_config.run_id:
         raise ArtifactIntegrityError("hydrated Evaluation belongs to another RunConfig")
     try:
+        if type(bundle.evaluator_execution) is not EvaluatorExecutionConfig:
+            raise TypeError("evaluator execution is not concrete")
         validate_evaluation_id_shape(bundle.evaluation_id)
         execution_digest = bundle.evaluator_execution.digest()
         expected_evaluation_id = derive_evaluation_id(
@@ -721,9 +739,6 @@ def bind_analysis_source(
 
     summary = bundle.summary
     try:
-        # Local imports keep protocol-only module import product-runtime-free.
-        from .report import RunReportSummary
-
         if type(summary) is not RunReportSummary:
             raise TypeError("summary is not a sealed RunReportSummary")
         summary_bindings = summary.source_bindings
@@ -734,6 +749,16 @@ def bind_analysis_source(
         raise ArtifactIntegrityError(
             "hydrated Evaluation summary is not a sealed RunReportSummary"
         ) from exc
+    try:
+        rendered_report = render_run_markdown(summary)
+    except (SchemaError, TypeError, ValueError) as exc:
+        raise ArtifactIntegrityError(
+            "hydrated Evaluation summary cannot be canonically rendered"
+        ) from exc
+    if type(bundle.report) is not str or bundle.report != rendered_report:
+        raise ArtifactIntegrityError(
+            "hydrated Evaluation report differs from canonical summary rendering"
+        )
     expected_summary_bindings = {
         "run_id": run_config.run_id,
         "run_config_digest": run_config.digest(),
@@ -751,12 +776,11 @@ def bind_analysis_source(
             "hydrated Evaluation summary differs from verified source digests"
         )
 
-    try:
-        trials = tuple(bundle.trials)
-    except (TypeError, ValueError) as exc:
+    if type(bundle.trials) is not tuple:
         raise ArtifactIntegrityError(
-            "hydrated Evaluation Trial collection is invalid"
-        ) from exc
+            "hydrated Evaluation Trial collection is not canonical"
+        )
+    trials = bundle.trials
     planned_count = len(run_config.suite.cases) * run_config.trial_count
     if len(trials) != planned_count:
         raise ArtifactIntegrityError(
@@ -764,14 +788,24 @@ def bind_analysis_source(
         )
     keyed_scores = []
     for trial in trials:
+        if type(trial) is not TrialEvaluationBundle:
+            raise ArtifactIntegrityError(
+                "hydrated Evaluation contains a non-concrete TrialEvaluationBundle"
+            )
+        if type(trial.trial_score) is not TrialScore:
+            raise ArtifactIntegrityError(
+                "hydrated Evaluation Trial score is not a concrete TrialScore"
+            )
         try:
             task_id = trial.task_id
             trial_index = trial.trial_index
             trial_id = trial.trial_id
             score_digest = trial.trial_score.digest()
+            suite_case = run_config.suite.case(task_id)
+            snapshot_entry = case_snapshot.case(task_id)
         except (AttributeError, TypeError, ValueError) as exc:
             raise ArtifactIntegrityError(
-                "hydrated Evaluation contains an invalid Trial score"
+                "hydrated Evaluation contains an invalid Trial source"
             ) from exc
         try:
             expected_trial_id = run_config.trial_id(task_id, trial_index)
@@ -779,9 +813,55 @@ def bind_analysis_source(
             raise ArtifactIntegrityError(
                 "hydrated Evaluation contains an invalid Trial slot"
             ) from exc
-        if trial.evaluation_id != bundle.evaluation_id or trial_id != expected_trial_id:
+        if (
+            trial.run_id != run_config.run_id
+            or trial.evaluation_id != bundle.evaluation_id
+            or trial.evaluation_revision != bundle.evaluation_revision
+            or type(trial.evaluator_execution) is not EvaluatorExecutionConfig
+            or trial.evaluator_execution.digest() != execution_digest
+            or trial_id != expected_trial_id
+        ):
             raise ArtifactIntegrityError(
                 "hydrated Evaluation Trial differs from its immutable Run slot"
+            )
+        eval_case = trial.eval_case
+        if type(eval_case) is not EvalCase:
+            raise ArtifactIntegrityError(
+                "hydrated Evaluation Trial does not contain a concrete EvalCase"
+            )
+        case_digest = eval_case.digest()
+        input_digest = eval_case.eval_input().digest()
+        if (
+            eval_case.task_id != task_id
+            or eval_case.case_version != suite_case.case_version
+            or eval_case.case_version != snapshot_entry.manifest_case.case_version
+            or case_digest != suite_case.canonical_case_digest
+            or case_digest != snapshot_entry.canonical_case_digest
+            or input_digest != suite_case.eval_input_digest
+            or input_digest != snapshot_entry.input.digest()
+        ):
+            raise ArtifactIntegrityError(
+                "hydrated Evaluation Case differs from RunConfig/Case Snapshot"
+            )
+        score = trial.trial_score
+        compatibility = score.compatibility
+        if (
+            score.task_id != task_id
+            or score.case_version != eval_case.case_version
+            or score.trial_index != trial_index
+            or score.trial_id != trial_id
+            or score.canonical_case_digest != case_digest
+            or score.eval_input_digest != input_digest
+            or score.evaluation_revision != bundle.evaluation_revision
+            or compatibility.run_id != run_config.run_id
+            or compatibility.evaluation_id != bundle.evaluation_id
+            or compatibility.case_snapshot_id != case_snapshot.snapshot_id
+            or compatibility.case_snapshot_digest != case_snapshot.digest()
+            or compatibility.trial_count != run_config.trial_count
+            or compatibility.evaluator_execution_digest != execution_digest
+        ):
+            raise ArtifactIntegrityError(
+                "hydrated TrialScore differs from Trial/Run/Case bindings"
             )
         keyed_scores.append(((task_id, trial_index), _digest(score_digest, "Trial score")))
     if len({key for key, _digest_value in keyed_scores}) != len(keyed_scores):
@@ -793,12 +873,35 @@ def bind_analysis_source(
     for case in summary_cases:
         if type(case) is not dict or type(case.get("trials")) is not list:
             raise ArtifactIntegrityError("hydrated Evaluation Trial projection is invalid")
+        try:
+            summary_entry = case_snapshot.case(case.get("task_id"))
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "hydrated Evaluation summary contains an unknown Case"
+            ) from exc
+        if (
+            case.get("case_version") != summary_entry.manifest_case.case_version
+            or case.get("canonical_case_digest")
+            != summary_entry.canonical_case_digest
+            or case.get("eval_input_digest") != summary_entry.input.digest()
+        ):
+            raise ArtifactIntegrityError(
+                "hydrated Evaluation summary Case differs from Case Snapshot"
+            )
         for trial in case["trials"]:
             if type(trial) is not dict or type(trial.get("score_ref")) is not dict:
                 raise ArtifactIntegrityError(
                     "hydrated Evaluation summary is missing a Trial score binding"
                 )
             score_ref = trial["score_ref"]
+            if (
+                trial.get("task_id") != case.get("task_id")
+                or score_ref.get("task_id") != trial.get("task_id")
+                or score_ref.get("trial_id") != trial.get("trial_id")
+            ):
+                raise ArtifactIntegrityError(
+                    "hydrated Evaluation summary Trial ref is misbound"
+                )
             projected.append(
                 (
                     (trial.get("task_id"), trial.get("trial_index")),
