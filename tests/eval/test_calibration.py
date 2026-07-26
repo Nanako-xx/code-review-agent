@@ -19,7 +19,6 @@ from review_agent_eval.artifacts import (
 from review_agent_eval.calibration import (
     CALIBRATION_ALGORITHM_VERSION,
     CALIBRATION_SELECTION_POLICY_SCHEMA_VERSION,
-    CalibrationSelectionCategory,
     CalibrationPackageV1,
     CalibrationResultV1,
     CalibrationSelectionPolicyV1,
@@ -387,6 +386,31 @@ def _walk_strings(value: Any):
             yield from _walk_strings(child)
 
 
+_FORBIDDEN_SELECTION_METADATA_KEYS = {
+    "recorded_outcome",
+    "recorded_primary_label",
+    "recorded_severity_assessment",
+    "recorded_actionability",
+    "reason_digest",
+    "seed_rank",
+    "selection_category",
+    "selection_rank",
+    "selection_reasons",
+    "selection_stratum_digest",
+    "stratum",
+    "stratum_digest",
+}
+
+
+def _assert_no_enumerable_selection_metadata(value: Any) -> None:
+    assert _FORBIDDEN_SELECTION_METADATA_KEYS.isdisjoint(set(_walk_keys(value)))
+    strings = tuple(item.casefold() for item in _walk_strings(value))
+    assert "mandatory" not in strings
+    assert "__judge_failed__" not in strings
+    assert "__ungraded__" not in strings
+    assert not any(item.startswith("normal:") for item in strings)
+
+
 def test_export_hides_agent_baseline_candidate_and_judge_decision(
     calibration_source: dict[str, Any],
     tmp_path: Path,
@@ -425,6 +449,10 @@ def test_export_hides_agent_baseline_candidate_and_judge_decision(
         "recorded_severity_assessment",
         "recorded_actionability",
         "selection_reasons",
+        "selection_category",
+        "selection_rank",
+        "selection_stratum_digest",
+        "seed_rank",
         "stratum",
     }
     assert forbidden_keys.isdisjoint(set(_walk_keys(exported)))
@@ -465,11 +493,19 @@ def test_export_hides_agent_baseline_candidate_and_judge_decision(
     )
     assert exported["payload_digest"] == package.payload_digest
     assert exported["items"]
+    _assert_no_enumerable_selection_metadata(exported)
+    _assert_no_enumerable_selection_metadata(package.to_dict())
 
 
 @pytest.mark.parametrize(
     "injection",
-    ("identity_key", "identity_value", "judge_result_key"),
+    (
+        "identity_key",
+        "identity_value",
+        "identity_key_unicode",
+        "identity_value_unicode",
+        "judge_result_key",
+    ),
 )
 def test_export_rejects_deep_identity_and_judge_result_injection(
     calibration_source: dict[str, Any],
@@ -485,6 +521,10 @@ def test_export_rejects_deep_identity_and_judge_result_injection(
             payload["items"][0]["metadata"]["scripted-model"] = "nested"
         elif injection == "identity_value":
             payload["items"][0]["text"] += " nested scripted-model identity"
+        elif injection == "identity_key_unicode":
+            payload["items"][0]["metadata"]["scripted\uff0emodel"] = "nested"
+        elif injection == "identity_value_unicode":
+            payload["items"][0]["text"] += " nested scripted\uff0fmodel identity"
         else:
             payload["context_blocks"].append(
                 {
@@ -501,6 +541,82 @@ def test_export_rejects_deep_identity_and_judge_result_injection(
     monkeypatch.setattr(calibration_module, "_blind_payload", injected)
     output_root = tmp_path / "external-calibration"
     with pytest.raises(ArtifactSecurityError, match="forbidden|identity|blind"):
+        export_calibration_package(
+            calibration_source["verified_by_profile"][
+                JudgeTask.FINDING_EQUIVALENCE
+            ],
+            profile=JudgeTask.FINDING_EQUIVALENCE,
+            policy=POLICY,
+            output_root=output_root,
+        )
+    assert not output_root.exists()
+
+
+@pytest.mark.parametrize(
+    "forbidden_key",
+    (
+        "judge.result",
+        "judge__result",
+        "judge-result",
+        "Judge Result",
+        "judge\u2014result",
+    ),
+)
+def test_export_rejects_collapsed_forbidden_key_markers(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forbidden_key: str,
+) -> None:
+    original = calibration_module._blind_payload
+
+    def injected(request: BlindJudgeInput):
+        payload, dimension = original(request)
+        payload["items"][0]["metadata"][forbidden_key] = "nested"
+        return payload, dimension
+
+    monkeypatch.setattr(calibration_module, "_blind_payload", injected)
+    output_root = tmp_path / "external-calibration"
+    with pytest.raises(ArtifactSecurityError, match="forbidden|blind"):
+        export_calibration_package(
+            calibration_source["verified_by_profile"][
+                JudgeTask.FINDING_EQUIVALENCE
+            ],
+            profile=JudgeTask.FINDING_EQUIVALENCE,
+            policy=POLICY,
+            output_root=output_root,
+        )
+    assert not output_root.exists()
+
+
+@pytest.mark.parametrize(
+    "forbidden_value",
+    (
+        "prefix::judge.result::suffix",
+        "prefix[[judge__decision]]suffix",
+        "prefix\u3010judge\u2014failure\u3011suffix",
+        "encoded|expected/winner|marker",
+        "role=baseline\uff0fcandidate",
+    ),
+)
+def test_export_rejects_collapsed_forbidden_value_markers(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forbidden_value: str,
+) -> None:
+    original = calibration_module._blind_payload
+
+    def injected(request: BlindJudgeInput):
+        payload, dimension = original(request)
+        payload["context_blocks"].append(
+            {"metadata": {"nested": {"note": forbidden_value}}}
+        )
+        return payload, dimension
+
+    monkeypatch.setattr(calibration_module, "_blind_payload", injected)
+    output_root = tmp_path / "external-calibration"
+    with pytest.raises(ArtifactSecurityError, match="forbidden|blind"):
         export_calibration_package(
             calibration_source["verified_by_profile"][
                 JudgeTask.FINDING_EQUIVALENCE
@@ -532,14 +648,52 @@ def test_selection_policy_is_seeded_and_recorded(
     assert tuple(record.selection_order for record in first.selection_records) == tuple(
         range(1, len(first.selection_records) + 1)
     )
+    expected_record_fields = {
+        "schema_version",
+        "selection_record_id",
+        "calibration_item_id",
+        "item_digest",
+        "source_digest",
+        "selection_order",
+        "selection_seed",
+    }
     assert all(
         record.selection_seed == first.policy.selection_seed
-        and record.selection_rank
-        and record.selection_stratum_digest
-        and type(record.selection_category) is CalibrationSelectionCategory
         and record.source_digest
+        and set(record.to_dict()) == expected_record_fields
+        and not hasattr(record, "selection_category")
+        and not hasattr(record, "selection_rank")
+        and not hasattr(record, "selection_stratum_digest")
         for record in first.selection_records
     )
+    _assert_no_enumerable_selection_metadata(first.to_dict())
+    _assert_no_enumerable_selection_metadata(first.to_blind_dict())
+    assert CalibrationPackageV1.from_dict(first.to_dict()) == first
+
+
+def test_selection_record_schema_rejects_enumerable_metadata_reforging(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    package = _export(
+        calibration_source,
+        tmp_path,
+        JudgeTask.FINDING_EQUIVALENCE,
+    )
+    injected_fields = {
+        "selection_category": "mandatory",
+        "selection_stratum_digest": canonical_sha256("normal:equivalent"),
+        "selection_rank": canonical_sha256("judge_failed"),
+        "seed_rank": canonical_sha256("ungraded"),
+        "stratum": "normal:unknown",
+        "selection_reasons": ["mandatory_semantic_unknown"],
+        "recorded_outcome": "__judge_failed__",
+    }
+    for field, value in injected_fields.items():
+        payload = json.loads(canonical_json(package.to_dict()))
+        payload["selection_records"][0][field] = value
+        with pytest.raises(ValueError, match="unknown|fields|keys"):
+            CalibrationPackageV1.from_dict(payload)
 
 
 def test_real_deterministic_judge_conflict_is_mandatory(
@@ -568,6 +722,7 @@ def test_real_deterministic_judge_conflict_is_mandatory(
         and item.generated_id == semantic.generated_id
         for item in trial.intent_result.candidates
     )
+    assert calibration_module._deterministic_judge_conflict(trial, judge_result)
 
     package = _export(
         calibration_source,
@@ -575,9 +730,7 @@ def test_real_deterministic_judge_conflict_is_mandatory(
         JudgeTask.INTENT_EQUIVALENCE,
     )
     assert len(package.selection_records) == 1
-    assert package.selection_records[0].selection_category is (
-        CalibrationSelectionCategory.MANDATORY
-    )
+    _assert_no_enumerable_selection_metadata(package.to_dict())
 
 
 def test_human_label_requires_package_and_item_digest(
@@ -854,12 +1007,16 @@ def test_recomputed_item_id_cannot_bypass_payload_binding(
         "recorded_primary_label",
         "recorded_severity_assessment",
         "recorded_actionability",
+        "seed_rank",
+        "selection_category",
+        "selection_rank",
         "selection_reasons",
+        "selection_stratum_digest",
         "stratum",
     }
     assert forbidden_result_fields.isdisjoint(set(_walk_keys(package_payload)))
     record = package_payload["selection_records"][0]
-    record["selection_rank"] = "0" * 64
+    record["source_digest"] = "0" * 64
     with pytest.raises(ValueError, match="selection_record_id|canonical"):
         CalibrationPackageV1.from_dict(package_payload)
 
@@ -881,6 +1038,7 @@ def test_recomputed_item_id_cannot_bypass_payload_binding(
         package_payload["selection_digest"],
     )
     forged = CalibrationPackageV1.from_dict(package_payload)
+    _assert_no_enumerable_selection_metadata(forged.to_dict())
     with pytest.raises(ArtifactIntegrityError, match="source replay|differs"):
         score_calibration(
             calibration_source["verified_by_profile"][package.profile],
@@ -990,11 +1148,19 @@ def test_analysis_manifest_omits_raw_payload_and_verified_load_replays_sources(
         "recorded_primary_label",
         "recorded_severity_assessment",
         "recorded_actionability",
+        "seed_rank",
+        "selection_category",
+        "selection_rank",
         "selection_reasons",
+        "selection_stratum_digest",
         "stratum",
         "decision",
         "failure",
     }.isdisjoint(set(_walk_keys(manifest.to_dict())))
+    _assert_no_enumerable_selection_metadata(package.to_dict())
+    _assert_no_enumerable_selection_metadata(package.to_blind_dict())
+    _assert_no_enumerable_selection_metadata(manifest.to_dict())
+    _assert_no_enumerable_selection_metadata(package_receipt.to_dict())
     assert manifest.payload_digest == package.payload_digest
     assert store.load_verified_calibration_package_manifest(
         package_receipt.artifact_id,
@@ -1002,6 +1168,34 @@ def test_analysis_manifest_omits_raw_payload_and_verified_load_replays_sources(
         policy=POLICY,
         package=package,
     ) == manifest
+
+    forged_payload = json.loads(canonical_json(package.to_dict()))
+    forged_record = forged_payload["selection_records"][0]
+    forged_record["source_digest"] = "0" * 64
+    forged_record_identity = dict(forged_record)
+    del forged_record_identity["selection_record_id"]
+    forged_record["selection_record_id"] = stable_id(
+        "calibration-selection-v1",
+        forged_record_identity,
+    )
+    forged_payload["selection_digest"] = canonical_sha256(
+        forged_payload["selection_records"]
+    )
+    forged_payload["package_id"] = stable_id(
+        "calibration-package-v1",
+        package.profile.value,
+        package.policy.digest(),
+        package.source_digest,
+        package.payload_digest,
+        forged_payload["selection_digest"],
+    )
+    forged_package = CalibrationPackageV1.from_dict(forged_payload)
+    with pytest.raises(ArtifactIntegrityError, match="replay|source-bound"):
+        store.publish_calibration_package(
+            forged_package,
+            evaluation=calibration_source["verified_by_profile"][package.profile],
+            policy=POLICY,
+        )
 
     label_receipt = store.publish_human_label_set(
         labels,

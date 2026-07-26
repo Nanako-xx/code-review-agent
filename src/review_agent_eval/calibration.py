@@ -145,20 +145,15 @@ _FORBIDDEN_BLIND_KEYS = frozenset(
         "source_request_id",
     }
 )
-_FORBIDDEN_TEXT_MARKERS = (
-    '"decision"',
-    '"expected_winner"',
-    '"failure"',
-    '"judge_decision"',
-    '"judge_failure"',
-    '"judge_result"',
-    "'decision'",
-    "'expected_winner'",
-    "'failure'",
-    "'judge_decision'",
-    "'judge_failure'",
-    "'judge_result'",
+_FORBIDDEN_BLIND_VALUE_MARKERS = (
+    "baseline",
+    "candidate",
+    "expected winner",
+    "judge decision",
+    "judge failure",
+    "judge result",
 )
+_FORBIDDEN_EXACT_BLIND_VALUES = ("decision", "failure")
 _IDENTITY_FIELDS = frozenset(
     {
         "adapter_config_digest",
@@ -309,6 +304,17 @@ def _identity_strings(value: Any) -> Tuple[str, ...]:
     return ()
 
 
+def _collapsed_blind_token(value: str) -> str:
+    """NFKC/case-fold text and retain only Unicode letters and numbers."""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return "".join(
+        character
+        for character in normalized
+        if unicodedata.category(character)[:1] in {"L", "N"}
+    )
+
+
 def _forbidden_identity_values(
     evaluation: VerifiedRunEvaluation,
 ) -> Tuple[str, ...]:
@@ -362,9 +368,22 @@ def _assert_blind_payload(
     context: str,
 ) -> None:
     identities = tuple(
-        (item, item.casefold())
+        (
+            item,
+            unicodedata.normalize("NFKC", item).casefold(),
+            _collapsed_blind_token(item),
+        )
         for item in forbidden_identity_values
         if type(item) is str and item
+    )
+    forbidden_key_tokens = tuple(
+        _collapsed_blind_token(item) for item in _FORBIDDEN_BLIND_KEYS
+    )
+    forbidden_value_tokens = tuple(
+        _collapsed_blind_token(item) for item in _FORBIDDEN_BLIND_VALUE_MARKERS
+    )
+    forbidden_exact_value_tokens = frozenset(
+        _collapsed_blind_token(item) for item in _FORBIDDEN_EXACT_BLIND_VALUES
     )
 
     def visit(current: Any, path: str) -> None:
@@ -374,25 +393,25 @@ def _assert_blind_payload(
                     raise ArtifactSecurityError(
                         f"{context} contains a non-string key at {path}"
                     )
-                key = raw_key.casefold().replace("-", "_").replace(" ", "_")
-                if key in _FORBIDDEN_BLIND_KEYS or any(
-                    marker in key
-                    for marker in (
-                        "expected_winner",
-                        "judge_decision",
-                        "judge_failure",
-                        "judge_result",
-                    )
-                ):
+                normalized_key = unicodedata.normalize("NFKC", raw_key).casefold()
+                collapsed_key = _collapsed_blind_token(raw_key)
+                if any(marker in collapsed_key for marker in forbidden_key_tokens):
                     raise ArtifactSecurityError(
                         f"{context} contains forbidden key {raw_key!r} at {path}"
                     )
-                for identity, folded_identity in identities:
-                    identity_key = folded_identity.replace("-", "_").replace(
-                        " ", "_"
-                    )
-                    if key == identity_key or (
-                        len(identity_key) >= 4 and identity_key in key
+                for identity, normalized_identity, collapsed_identity in identities:
+                    if normalized_key == normalized_identity or (
+                        len(normalized_identity) >= 4
+                        and normalized_identity in normalized_key
+                    ) or (
+                        collapsed_identity
+                        and (
+                            collapsed_key == collapsed_identity
+                            or (
+                                len(collapsed_identity) >= 4
+                                and collapsed_identity in collapsed_key
+                            )
+                        )
                     ):
                         raise ArtifactSecurityError(
                             f"{context} contains forbidden source identity "
@@ -406,26 +425,27 @@ def _assert_blind_payload(
             return
         if type(current) is not str:
             return
-        folded = current.casefold()
-        for identity, folded_identity in identities:
-            if folded == folded_identity or (
-                len(folded_identity) >= 4 and folded_identity in folded
+        normalized = unicodedata.normalize("NFKC", current).casefold()
+        collapsed = _collapsed_blind_token(current)
+        for identity, normalized_identity, collapsed_identity in identities:
+            if normalized == normalized_identity or (
+                len(normalized_identity) >= 4 and normalized_identity in normalized
+            ) or (
+                collapsed_identity
+                and (
+                    collapsed == collapsed_identity
+                    or (
+                        len(collapsed_identity) >= 4
+                        and collapsed_identity in collapsed
+                    )
+                )
             ):
                 raise ArtifactSecurityError(
                     f"{context} contains forbidden source identity {identity!r} at {path}"
                 )
-        if current.strip().casefold() in {
-            "decision",
-            "expected winner",
-            "expected_winner",
-            "failure",
-            "judge decision",
-            "judge_decision",
-            "judge failure",
-            "judge_failure",
-            "judge result",
-            "judge_result",
-        } or any(marker in folded for marker in _FORBIDDEN_TEXT_MARKERS):
+        if collapsed in forbidden_exact_value_tokens or any(
+            marker in collapsed for marker in forbidden_value_tokens
+        ):
             raise ArtifactSecurityError(
                 f"{context} contains forbidden Judge-result text at {path}"
             )
@@ -683,9 +703,6 @@ class CalibrationSelectionRecordV1(_JsonModel):
     source_digest: str
     selection_order: int
     selection_seed: int
-    selection_rank: str
-    selection_stratum_digest: str
-    selection_category: CalibrationSelectionCategory
 
     def __post_init__(self) -> None:
         if self.schema_version != CALIBRATION_SELECTION_RECORD_SCHEMA_VERSION:
@@ -696,13 +713,6 @@ class CalibrationSelectionRecordV1(_JsonModel):
         _digest(self.source_digest, "CalibrationSelectionRecordV1.source_digest")
         _integer(self.selection_order, "selection_order", minimum=1)
         _integer(self.selection_seed, "selection_seed", maximum=MAX_CALIBRATION_SEED)
-        _digest(self.selection_rank, "CalibrationSelectionRecordV1.selection_rank")
-        _digest(
-            self.selection_stratum_digest,
-            "CalibrationSelectionRecordV1.selection_stratum_digest",
-        )
-        if type(self.selection_category) is not CalibrationSelectionCategory:
-            raise _error("Calibration selection category is invalid")
         expected = stable_id(
             "calibration-selection-v1",
             {
@@ -712,9 +722,6 @@ class CalibrationSelectionRecordV1(_JsonModel):
                 "source_digest": self.source_digest,
                 "selection_order": self.selection_order,
                 "selection_seed": self.selection_seed,
-                "selection_rank": self.selection_rank,
-                "selection_stratum_digest": self.selection_stratum_digest,
-                "selection_category": self.selection_category.value,
             },
         )
         if self.selection_record_id != expected:
@@ -729,14 +736,7 @@ class CalibrationSelectionRecordV1(_JsonModel):
         source_digest: str,
         selection_order: int,
         selection_seed: int,
-        selection_rank: str,
-        selection_stratum_digest: str,
-        selection_category: CalibrationSelectionCategory,
     ) -> "CalibrationSelectionRecordV1":
-        if type(selection_category) is not CalibrationSelectionCategory:
-            raise TypeError(
-                "selection_category must be a CalibrationSelectionCategory"
-            )
         identity = {
             "schema_version": CALIBRATION_SELECTION_RECORD_SCHEMA_VERSION,
             "calibration_item_id": calibration_item_id,
@@ -744,9 +744,6 @@ class CalibrationSelectionRecordV1(_JsonModel):
             "source_digest": source_digest,
             "selection_order": selection_order,
             "selection_seed": selection_seed,
-            "selection_rank": selection_rank,
-            "selection_stratum_digest": selection_stratum_digest,
-            "selection_category": selection_category.value,
         }
         return cls(
             selection_record_id=stable_id("calibration-selection-v1", identity),
@@ -756,9 +753,6 @@ class CalibrationSelectionRecordV1(_JsonModel):
             source_digest=source_digest,
             selection_order=selection_order,
             selection_seed=selection_seed,
-            selection_rank=selection_rank,
-            selection_stratum_digest=selection_stratum_digest,
-            selection_category=selection_category,
         )
 
     @classmethod
@@ -773,22 +767,10 @@ class CalibrationSelectionRecordV1(_JsonModel):
                 "source_digest",
                 "selection_order",
                 "selection_seed",
-                "selection_rank",
-                "selection_stratum_digest",
-                "selection_category",
             ),
             "CalibrationSelectionRecordV1",
         )
-        return cls(
-            **{
-                **payload,
-                "selection_category": _enum(
-                    CalibrationSelectionCategory,
-                    payload["selection_category"],
-                    "selection_category",
-                ),
-            }
-        )
+        return cls(**payload)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -799,9 +781,6 @@ class CalibrationSelectionRecordV1(_JsonModel):
             "source_digest": self.source_digest,
             "selection_order": self.selection_order,
             "selection_seed": self.selection_seed,
-            "selection_rank": self.selection_rank,
-            "selection_stratum_digest": self.selection_stratum_digest,
-            "selection_category": self.selection_category.value,
         }
 
 
@@ -2415,7 +2394,25 @@ def _select_candidates(
             item.source_digest,
         ),
     )[:remaining]
-    return tuple(mandatory + sampled)
+    selected = mandatory + sampled
+    return tuple(
+        sorted(
+            selected,
+            key=lambda item: (
+                canonical_sha256(
+                    {
+                        "algorithm": policy.algorithm_version,
+                        "selection_seed": policy.selection_seed,
+                        "profile": item.item.profile.value,
+                        "calibration_item_id": item.item.calibration_item_id,
+                        "source_digest": item.source_digest,
+                    }
+                ),
+                item.item.calibration_item_id,
+                item.source_digest,
+            ),
+        )
+    )
 
 
 def _build_package_with_selection(
@@ -2468,11 +2465,6 @@ def _build_package_with_selection(
     records = []
     for order, selected_item in enumerate(selected, start=1):
         item = selected_item.item
-        category = (
-            CalibrationSelectionCategory.MANDATORY
-            if set(selected_item.reasons).intersection(_MANDATORY_REASONS)
-            else CalibrationSelectionCategory.SEEDED
-        )
         records.append(
             CalibrationSelectionRecordV1.create(
                 calibration_item_id=item.calibration_item_id,
@@ -2480,25 +2472,6 @@ def _build_package_with_selection(
                 source_digest=selected_item.source_digest,
                 selection_order=order,
                 selection_seed=canonical_policy.selection_seed,
-                selection_rank=canonical_sha256(
-                    {
-                        "seed_rank": selected_item.seed_rank,
-                        "category": category.value,
-                        "reason_digest": canonical_sha256(
-                            list(selected_item.reasons)
-                        ),
-                        "item_digest": item.digest(),
-                        "source_digest": selected_item.source_digest,
-                    }
-                ),
-                selection_stratum_digest=canonical_sha256(
-                    {
-                        "algorithm": canonical_policy.algorithm_version,
-                        "profile": profile.value,
-                        "stratum": selected_item.stratum,
-                    }
-                ),
-                selection_category=category,
             )
         )
     record_tuple = tuple(records)
