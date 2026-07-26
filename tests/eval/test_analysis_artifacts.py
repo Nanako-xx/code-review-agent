@@ -34,6 +34,7 @@ from review_agent_eval.models import (
     canonical_sha256,
     stable_id,
 )
+from review_agent_eval.report import render_run_markdown, render_trial_markdown
 
 from .test_artifacts import make_case_snapshot, make_config, make_store
 from .test_orchestrator_target_replay_v2 import (
@@ -105,6 +106,24 @@ def _hydrated_bundle(tmp_path: Path, *, instance: str):
         run.config.run_id,
         evaluated.evaluation_id,
     )
+
+
+def _reseal_report_projection(
+    value: object,
+    *,
+    id_field: str,
+    stable_namespace: str,
+    source_bindings: dict[str, object],
+):
+    payload = value.to_dict()
+    payload["source_bindings"] = source_bindings
+    identity = dict(payload)
+    identity.pop(id_field)
+    payload[id_field] = stable_id(stable_namespace, identity)
+    sealed = object.__new__(type(value))
+    object.__setattr__(sealed, "_canonical_json", canonical_json(payload))
+    sealed.__post_init__()
+    return sealed
 
 
 def test_analysis_bundle_is_create_only_and_reloads_identically(
@@ -561,6 +580,154 @@ def test_analysis_source_rejects_judge_inspection_and_trial_report_tamper(
             )
 
 
+def test_analysis_source_requires_exact_report_source_binding_schemas(
+    tmp_path: Path,
+) -> None:
+    run, hydrated = _hydrated_bundle(
+        tmp_path,
+        instance="analysis-report-binding-schema",
+    )
+    summary_bindings = hydrated.summary.source_bindings
+    summary_variants = []
+    extra_summary = dict(summary_bindings)
+    extra_summary["unexpected"] = "recomputed"
+    summary_variants.append(extra_summary)
+    missing_summary = dict(summary_bindings)
+    missing_summary.pop("run_manifest_digest")
+    summary_variants.append(missing_summary)
+    for bindings in summary_variants:
+        tampered_summary = _reseal_report_projection(
+            hydrated.summary,
+            id_field="summary_id",
+            stable_namespace="run-report-summary-v1",
+            source_bindings=bindings,
+        )
+        with pytest.raises(
+            ArtifactIntegrityError,
+            match="summary|source|binding|schema",
+        ):
+            bind_analysis_source(
+                replace(
+                    hydrated,
+                    summary=tampered_summary,
+                    report=render_run_markdown(tampered_summary),
+                ),
+                run_config=run.config,
+                case_snapshot=run.snapshot,
+            )
+
+    trial = hydrated.trials[0]
+    inspection_bindings = trial.inspection.source_bindings
+    inspection_variants = []
+    extra_inspection = dict(inspection_bindings)
+    extra_inspection["unexpected"] = "recomputed"
+    inspection_variants.append(extra_inspection)
+    missing_inspection = dict(inspection_bindings)
+    missing_inspection.pop("run_manifest_digest")
+    inspection_variants.append(missing_inspection)
+    for bindings in inspection_variants:
+        tampered_inspection = _reseal_report_projection(
+            trial.inspection,
+            id_field="inspection_id",
+            stable_namespace="trial-inspection-v1",
+            source_bindings=bindings,
+        )
+        tampered_trial = replace(
+            trial,
+            inspection=tampered_inspection,
+            report=render_trial_markdown(tampered_inspection),
+        )
+        with pytest.raises(
+            ArtifactIntegrityError,
+            match="inspection|source|binding|schema",
+        ):
+            bind_analysis_source(
+                replace(hydrated, trials=(tampered_trial,)),
+                run_config=run.config,
+                case_snapshot=run.snapshot,
+            )
+
+
+def test_analysis_source_rejects_manifest_digest_tamper_and_disagreement(
+    tmp_path: Path,
+) -> None:
+    run, hydrated = _hydrated_bundle(
+        tmp_path,
+        instance="analysis-run-manifest-binding",
+    )
+    trial = hydrated.trials[0]
+    original_digest = hydrated.summary.source_bindings["run_manifest_digest"]
+    assert isinstance(original_digest, str) and len(original_digest) == 64
+    alternate_digest = "0" * 64 if original_digest != "0" * 64 else "1" * 64
+
+    tampered_summary_bindings = dict(hydrated.summary.source_bindings)
+    tampered_summary_bindings["run_manifest_digest"] = alternate_digest
+    tampered_summary = _reseal_report_projection(
+        hydrated.summary,
+        id_field="summary_id",
+        stable_namespace="run-report-summary-v1",
+        source_bindings=tampered_summary_bindings,
+    )
+    with pytest.raises(
+        ArtifactIntegrityError,
+        match="manifest|summary|source|binding",
+    ):
+        bind_analysis_source(
+            replace(
+                hydrated,
+                summary=tampered_summary,
+                report=render_run_markdown(tampered_summary),
+            ),
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+        )
+
+    tampered_inspection_bindings = dict(trial.inspection.source_bindings)
+    tampered_inspection_bindings["run_manifest_digest"] = alternate_digest
+    tampered_inspection = _reseal_report_projection(
+        trial.inspection,
+        id_field="inspection_id",
+        stable_namespace="trial-inspection-v1",
+        source_bindings=tampered_inspection_bindings,
+    )
+    tampered_trial = replace(
+        trial,
+        inspection=tampered_inspection,
+        report=render_trial_markdown(tampered_inspection),
+    )
+    with pytest.raises(
+        ArtifactIntegrityError,
+        match="manifest|inspection|source|binding",
+    ):
+        bind_analysis_source(
+            replace(hydrated, trials=(tampered_trial,)),
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+        )
+
+    invalid_summary_bindings = dict(hydrated.summary.source_bindings)
+    invalid_summary_bindings["run_manifest_digest"] = "not-a-digest"
+    invalid_summary = _reseal_report_projection(
+        hydrated.summary,
+        id_field="summary_id",
+        stable_namespace="run-report-summary-v1",
+        source_bindings=invalid_summary_bindings,
+    )
+    with pytest.raises(
+        ArtifactIntegrityError,
+        match="manifest|summary|source|digest",
+    ):
+        bind_analysis_source(
+            replace(
+                hydrated,
+                summary=invalid_summary,
+                report=render_run_markdown(invalid_summary),
+            ),
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+        )
+
+
 def test_analysis_tamper_fails_closed(tmp_path: Path) -> None:
     store = _store(tmp_path)
     files = {"statistics.json": {"metrics": [1]}}
@@ -745,6 +912,47 @@ def test_analysis_rejects_windows_short_path_alias(tmp_path: Path) -> None:
             {"statistics.json": {}},
             _receipt({"statistics.json": {}}),
         )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="short paths are Windows-specific")
+def test_analysis_root_rejects_short_run_store_alias_before_creation(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run store alias parent" / ".eval-runs"
+    run_root.mkdir(parents=True)
+    buffer = ctypes.create_unicode_buffer(32768)
+    written = ctypes.windll.kernel32.GetShortPathNameW(
+        str(run_root),
+        buffer,
+        len(buffer),
+    )
+    if not written or os.path.normcase(buffer.value) == os.path.normcase(
+        str(run_root)
+    ):
+        pytest.skip("8.3 short path aliases are unavailable")
+    run_root_key = analysis_artifact_module._windows_portable_path_segment_key(
+        ".eval-runs"
+    )
+    if any(
+        analysis_artifact_module._windows_portable_path_segment_key(part)
+        == run_root_key
+        for part in Path(buffer.value).parts
+    ):
+        pytest.skip("the Run Store segment did not receive a distinct 8.3 alias")
+
+    target = Path(buffer.value) / "custom-analysis-output"
+    assert not target.exists()
+    with pytest.raises(
+        (ValueError, ArtifactSecurityError),
+        match="Run Store|eval-runs|final|path",
+    ):
+        AnalysisArtifactStore(
+            target,
+            create_root=True,
+            max_file_bytes=4096,
+            max_total_read_bytes=16384,
+        )
+    assert not target.exists()
 
 
 def test_analysis_write_does_not_create_missing_read_only_root(

@@ -23,9 +23,14 @@ from .artifacts import (
     ArtifactSecurityError,
     ArtifactStore,
     _ReadBudget,
+    _absolute_storage_path,
     _hardlinked_file,
     _strict_json_loads,
     _unsafe_node,
+    _windows_close_handle,
+    _windows_open_directory_handle,
+    _windows_raw_handle_attributes,
+    _windows_raw_handle_path,
 )
 from .cases import RunCaseSnapshot
 from .config import (
@@ -61,6 +66,33 @@ ANALYSIS_ARTIFACT_KINDS = frozenset(
 MAX_ANALYSIS_ARTIFACTS = 64
 _RECEIPT_NAME = "receipt.json"
 _HEX_DIGITS = frozenset("0123456789abcdef")
+_GLOBAL_REPORT_SOURCE_BINDING_FIELDS = frozenset(
+    {
+        "run_id",
+        "run_config_digest",
+        "run_manifest_digest",
+        "case_snapshot_id",
+        "case_snapshot_digest",
+        "evaluation_id",
+        "evaluation_revision",
+        "evaluator_execution_digest",
+        "metrics_policy",
+    }
+)
+_TRIAL_REPORT_SOURCE_BINDING_FIELDS = (
+    _GLOBAL_REPORT_SOURCE_BINDING_FIELDS
+    | {
+        "task_id",
+        "trial_id",
+        "trial_index",
+        "canonical_case_digest",
+        "eval_input_digest",
+        "submission_digest",
+        "intent_result_digest",
+        "review_result_digest",
+        "trial_score_digest",
+    }
+)
 
 
 def _digest(value: Any, context: str) -> str:
@@ -108,21 +140,70 @@ def _windows_portable_path_segment_key(value: str) -> str:
     return unicodedata.normalize("NFKC", value).casefold().rstrip(" .")
 
 
+def _path_contains_portable_run_root(path: os.PathLike[str] | str) -> bool:
+    portable_run_root = _windows_portable_path_segment_key(".eval-runs")
+    normalized = os.fspath(path).replace("\\", "/")
+    return any(
+        _windows_portable_path_segment_key(segment) == portable_run_root
+        for segment in normalized.split("/")
+        if segment
+    )
+
+
+def _nearest_existing_directory(path: Path) -> Path:
+    current = path
+    while True:
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            parent = current.parent
+            if parent == current:
+                raise ArtifactSecurityError(
+                    "could not locate an existing Analysis root ancestor"
+                )
+            current = parent
+            continue
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "could not inspect the Analysis root ancestor"
+            ) from exc
+        if _unsafe_node(metadata) or not stat.S_ISDIR(metadata.st_mode):
+            raise ArtifactSecurityError(
+                "Analysis root ancestor is a link, reparse point, or non-directory"
+            )
+        return current
+
+
+def _validate_windows_final_root_boundary(root: Path) -> None:
+    if os.name != "nt":
+        return
+    ancestor = _nearest_existing_directory(root)
+    handle = _windows_open_directory_handle(ancestor)
+    try:
+        final_ancestor = _windows_raw_handle_path(handle)
+        attributes = _windows_raw_handle_attributes(handle)
+    finally:
+        _windows_close_handle(handle)
+    if attributes & 0x400 or not attributes & 0x10:
+        raise ArtifactSecurityError(
+            "Analysis root ancestor handle is a reparse point or non-directory"
+        )
+    if _path_contains_portable_run_root(final_ancestor):
+        raise ArtifactSecurityError(
+            "Analysis root final path may not be the Run Store or descend from .eval-runs"
+        )
+
+
 def _validate_analysis_root_boundary(root: os.PathLike[str] | str) -> None:
     try:
-        absolute = os.path.abspath(os.fspath(root))
+        absolute = _absolute_storage_path(root)
     except (TypeError, ValueError) as exc:
         raise ValueError("Analysis root must be a filesystem path") from exc
-    portable_run_root = _windows_portable_path_segment_key(".eval-runs")
-    normalized = absolute.replace("\\", "/")
-    segments = tuple(item for item in normalized.split("/") if item)
-    if any(
-        _windows_portable_path_segment_key(segment) == portable_run_root
-        for segment in segments
-    ):
+    if _path_contains_portable_run_root(absolute):
         raise ValueError(
             "Analysis root may not be the Run Store or descend from .eval-runs"
         )
+    _validate_windows_final_root_boundary(absolute)
 
 
 def _exact_mapping(value: Any, fields: set[str], context: str) -> Mapping[str, Any]:
@@ -814,12 +895,13 @@ def bind_analysis_source(
     try:
         if type(summary) is not RunReportSummary:
             raise TypeError("summary is not a sealed RunReportSummary")
+        summary.__post_init__()
         summary_bindings = summary.source_bindings
         summary_id = summary.summary_id
         summary_digest = summary.digest()
         summary_cases = summary.cases
         summary_identity = summary.identity
-    except (AttributeError, TypeError, ValueError) as exc:
+    except (AttributeError, SchemaError, TypeError, ValueError) as exc:
         raise ArtifactIntegrityError(
             "hydrated Evaluation summary is not a sealed RunReportSummary"
         ) from exc
@@ -833,6 +915,22 @@ def bind_analysis_source(
         raise ArtifactIntegrityError(
             "hydrated Evaluation report differs from canonical summary rendering"
         )
+    if (
+        type(summary_bindings) is not dict
+        or set(summary_bindings) != _GLOBAL_REPORT_SOURCE_BINDING_FIELDS
+    ):
+        raise ArtifactIntegrityError(
+            "hydrated Evaluation summary source bindings have an invalid exact schema"
+        )
+    try:
+        summary_manifest_digest = _digest(
+            summary_bindings["run_manifest_digest"],
+            "summary RunManifest digest",
+        )
+    except SchemaError as exc:
+        raise ArtifactIntegrityError(
+            "hydrated Evaluation summary RunManifest digest is invalid"
+        ) from exc
     expected_summary_bindings = {
         "run_id": run_config.run_id,
         "run_config_digest": run_config.digest(),
@@ -842,7 +940,7 @@ def bind_analysis_source(
         "evaluation_revision": bundle.evaluation_revision,
         "evaluator_execution_digest": execution_digest,
     }
-    if type(summary_bindings) is not dict or any(
+    if any(
         summary_bindings.get(name) != value
         for name, value in expected_summary_bindings.items()
     ):
@@ -1191,6 +1289,7 @@ def bind_analysis_source(
         expected_inspection_bindings = {
             "run_id": run_config.run_id,
             "run_config_digest": run_config.digest(),
+            "run_manifest_digest": summary_manifest_digest,
             "case_snapshot_id": case_snapshot.snapshot_id,
             "case_snapshot_digest": case_snapshot.digest(),
             "evaluation_id": bundle.evaluation_id,
@@ -1211,9 +1310,10 @@ def bind_analysis_source(
             "trial_score_digest": score_digest,
             "metrics_policy": compatibility.metrics_policy.to_dict(),
         }
-        if type(inspection_bindings) is not dict or any(
-            inspection_bindings.get(name) != value
-            for name, value in expected_inspection_bindings.items()
+        if (
+            type(inspection_bindings) is not dict
+            or set(inspection_bindings) != _TRIAL_REPORT_SOURCE_BINDING_FIELDS
+            or inspection_bindings != expected_inspection_bindings
         ):
             raise ArtifactIntegrityError(
                 "hydrated Trial inspection source bindings differ from Trial sources"
