@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import review_agent_eval.comparison as comparison_module
 from review_agent_eval.analysis_artifacts import AnalysisArtifactStore
 from review_agent_eval.artifacts import ArtifactIntegrityError
 from review_agent_eval.comparison import (
@@ -40,6 +41,9 @@ from review_agent_eval.models import (
 )
 from review_agent_eval.statistics import (
     STATISTICS_ALGORITHM_VERSION,
+    ConfidenceIntervalStatus,
+    ConfidenceIntervalV1,
+    RunStatisticsV1,
     StatisticsPolicyV1,
 )
 
@@ -544,9 +548,11 @@ def test_comparison_artifact_rejects_tamper_and_resealed_nested_contradiction(
         store.load_comparison(receipt.artifact_id)
 
 
-def _tampered_case_snapshot_projection_payload(
+def _tampered_projection_payload(
     result: RunComparisonV1,
     projection_name: str,
+    field_path: str,
+    field_value: Any,
 ) -> dict[str, Any]:
     payload = deepcopy(result.to_dict())
     compatibility = payload["compatibility"]
@@ -554,9 +560,9 @@ def _tampered_case_snapshot_projection_payload(
     field = next(
         item
         for item in projection["fields"]
-        if item["path"] == "case_snapshot.digest"
+        if item["path"] == field_path
     )
-    field["value"] = "0" * 64
+    field["value"] = field_value
     projection["projection_digest"] = canonical_sha256(
         {"fields": projection["fields"]}
     )
@@ -570,7 +576,7 @@ def _tampered_case_snapshot_projection_payload(
     payload["status"] = ComparisonStatus.NOT_COMPARABLE.value
     payload["metric_deltas"] = []
     payload["case_deltas"] = []
-    payload["incompatibilities"] = ["case_snapshot.digest"]
+    payload["incompatibilities"] = [field_path]
     comparison_identity = dict(payload)
     comparison_identity.pop("comparison_id")
     payload["comparison_id"] = stable_id(
@@ -597,7 +603,7 @@ def _forge_comparison_from_tampered_payload(
         ),
         metric_deltas=(),
         case_deltas=(),
-        incompatibilities=("case_snapshot.digest",),
+        incompatibilities=tuple(payload["incompatibilities"]),
     )
     for name, value in values.items():
         object.__setattr__(forged, name, value)
@@ -612,9 +618,11 @@ def test_comparison_hydration_rejects_resealed_case_snapshot_projection_tamper(
     paired_sources: dict[str, Any],
     projection_name: str,
 ) -> None:
-    payload = _tampered_case_snapshot_projection_payload(
+    payload = _tampered_projection_payload(
         _comparison(paired_sources),
         projection_name,
+        "case_snapshot.digest",
+        "0" * 64,
     )
 
     with pytest.raises(
@@ -634,9 +642,11 @@ def test_comparison_publish_rejects_resealed_case_snapshot_projection_tamper(
     projection_name: str,
 ) -> None:
     result = _comparison(paired_sources)
-    payload = _tampered_case_snapshot_projection_payload(
+    payload = _tampered_projection_payload(
         result,
         projection_name,
+        "case_snapshot.digest",
+        "0" * 64,
     )
     forged = _forge_comparison_from_tampered_payload(result, payload)
     store = AnalysisArtifactStore(tmp_path / ".eval-analyses")
@@ -646,6 +656,199 @@ def test_comparison_publish_rejects_resealed_case_snapshot_projection_tamper(
         match="canonical|hydration|binding|projection",
     ):
         store.publish_comparison(forged, policy=POLICY)
+
+
+@pytest.mark.parametrize(
+    "projection_name",
+    ("baseline_projection", "candidate_projection"),
+)
+def test_comparison_hydration_rejects_resealed_evaluator_projection_tamper(
+    paired_sources: dict[str, Any],
+    projection_name: str,
+) -> None:
+    payload = _tampered_projection_payload(
+        _comparison(paired_sources),
+        projection_name,
+        "evaluator.execution.digest",
+        "0" * 64,
+    )
+
+    with pytest.raises(
+        ComparisonError,
+        match="evaluation|evaluator|execution|source binding",
+    ):
+        RunComparisonV1.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "projection_name",
+    ("baseline_projection", "candidate_projection"),
+)
+def test_comparison_publish_rejects_resealed_evaluator_projection_tamper(
+    paired_sources: dict[str, Any],
+    tmp_path: Path,
+    projection_name: str,
+) -> None:
+    result = _comparison(paired_sources)
+    payload = _tampered_projection_payload(
+        result,
+        projection_name,
+        "evaluator.execution.digest",
+        "0" * 64,
+    )
+    forged = _forge_comparison_from_tampered_payload(result, payload)
+    store = AnalysisArtifactStore(tmp_path / ".eval-analyses")
+
+    with pytest.raises(
+        ArtifactIntegrityError,
+        match="canonical|hydration|binding|evaluation|evaluator",
+    ):
+        store.publish_comparison(forged, policy=POLICY)
+
+
+def _tampered_nested_statistics_ci_payload(
+    result: RunComparisonV1,
+) -> dict[str, Any]:
+    payload = deepcopy(result.to_dict())
+    statistics = payload["baseline_statistics"]
+    metric = next(
+        item
+        for item in statistics["metrics"]
+        if item["metric"] == CoreMetric.AGENT_FAILURE_RATE.value
+    )
+    interval = metric["confidence_interval"]
+    coverage = interval["coverage"]
+    coverage["available_case_count"] = 0
+    coverage["missing_case_count"] = coverage["total_case_count"]
+    interval.update(
+        status=ConfidenceIntervalStatus.AVAILABLE.value,
+        lower_bound=0,
+        upper_bound=0,
+    )
+    for value, field_name, namespace in (
+        (interval, "interval_id", "confidence-interval-v1"),
+        (metric, "metric_id", "statistics-metric-v1"),
+        (statistics, "statistics_id", "run-statistics-v1"),
+    ):
+        identity = dict(value)
+        identity.pop(field_name)
+        value[field_name] = stable_id(namespace, identity)
+    comparison_identity = dict(payload)
+    comparison_identity.pop("comparison_id")
+    payload["comparison_id"] = stable_id(
+        "run-comparison-v1",
+        comparison_identity,
+    )
+    return payload
+
+
+def _forge_comparison_with_tampered_statistics(
+    source: RunComparisonV1,
+    payload: dict[str, Any],
+) -> RunComparisonV1:
+    source_statistics = source.baseline_statistics
+    metric_payload = next(
+        item
+        for item in payload["baseline_statistics"]["metrics"]
+        if item["metric"] == CoreMetric.AGENT_FAILURE_RATE.value
+    )
+    tampered_interval = ConfidenceIntervalV1.from_dict(
+        metric_payload["confidence_interval"]
+    )
+    source_metric = source_statistics.metric(CoreMetric.AGENT_FAILURE_RATE)
+    tampered_metric = replace(
+        source_metric,
+        confidence_interval=tampered_interval,
+    )
+    forged_statistics = object.__new__(RunStatisticsV1)
+    statistics_values = {
+        name: getattr(source_statistics, name)
+        for name in source_statistics.__dataclass_fields__
+    }
+    statistics_values["metrics"] = tuple(
+        tampered_metric if item.metric is CoreMetric.AGENT_FAILURE_RATE else item
+        for item in source_statistics.metrics
+    )
+    for name, value in statistics_values.items():
+        object.__setattr__(forged_statistics, name, value)
+
+    forged = object.__new__(RunComparisonV1)
+    comparison_values = {
+        name: getattr(source, name)
+        for name in source.__dataclass_fields__
+    }
+    comparison_values.update(
+        comparison_id=payload["comparison_id"],
+        baseline_statistics=forged_statistics,
+    )
+    for name, value in comparison_values.items():
+        object.__setattr__(forged, name, value)
+    return forged
+
+
+def test_comparison_rejects_resealed_nested_statistics_ci_tamper(
+    paired_sources: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    result = _comparison(paired_sources)
+    payload = _tampered_nested_statistics_ci_payload(result)
+
+    with pytest.raises(
+        ValueError,
+        match="confidence interval|bootstrap|recomputed",
+    ):
+        RunComparisonV1.from_dict(payload)
+
+    forged = _forge_comparison_with_tampered_statistics(result, payload)
+    store = AnalysisArtifactStore(tmp_path / ".eval-analyses")
+    with pytest.raises(
+        ArtifactIntegrityError,
+        match="canonical|hydration|confidence|bootstrap",
+    ):
+        store.publish_comparison(forged, policy=POLICY)
+
+
+def test_compare_revalidates_real_sources_after_statistics(
+    paired_sources: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = paired_sources["baseline"]
+    attacked_bundle = replace(source.bundle)
+    attacked = VerifiedRunEvaluation.create(
+        attacked_bundle,
+        run_config=source.run_config,
+        case_snapshot=source.case_snapshot,
+    )
+    original_report = attacked_bundle.report
+    original_compute = comparison_module.compute_run_statistics
+    mutated = False
+
+    def mutate_after_statistics(bundle: Any, **kwargs: Any):
+        nonlocal mutated
+        statistics = original_compute(bundle, **kwargs)
+        if bundle is attacked_bundle:
+            object.__setattr__(
+                attacked_bundle,
+                "report",
+                original_report + "\nsource changed after statistics",
+            )
+            mutated = True
+        return statistics
+
+    monkeypatch.setattr(
+        comparison_module,
+        "compute_run_statistics",
+        mutate_after_statistics,
+    )
+    try:
+        with pytest.raises(
+            ArtifactIntegrityError,
+            match="report|source|changed|binding",
+        ):
+            compare_runs(attacked, paired_sources["candidate"], POLICY)
+    finally:
+        object.__setattr__(attacked_bundle, "report", original_report)
+    assert mutated is True
 
 
 def test_not_comparable_artifact_round_trip_has_no_partial_delta(

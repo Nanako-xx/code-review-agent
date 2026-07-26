@@ -1825,11 +1825,24 @@ class RunStatisticsV1(_JsonModel):
         case_count = len(metrics[0].case_contributions)
         if case_count * self.trial_count != source_trial_count:
             raise _error("RunStatisticsV1 source Trial coverage is inconsistent")
+        _validate_run_bootstrap_budget(
+            case_count=case_count,
+            iterations=self.bootstrap_policy.bootstrap_iterations,
+            metric_count=len(metrics),
+        )
         metric_cases = tuple(
             (item.task_id, item.case_version, item.canonical_case_digest)
             for item in metrics[0].case_contributions
         )
         for metric in metrics:
+            replayed_interval = paired_bootstrap_interval(
+                metric.case_contributions,
+                seed=self.bootstrap_policy.bootstrap_seed,
+                iterations=self.bootstrap_policy.bootstrap_iterations,
+                confidence_level_ppm=(
+                    self.bootstrap_policy.confidence_level_ppm
+                ),
+            )
             if (
                 metric.coverage.total_trial_count != source_trial_count
                 or tuple(
@@ -1847,8 +1860,12 @@ class RunStatisticsV1(_JsonModel):
                 != self.bootstrap_policy.bootstrap_iterations
                 or metric.confidence_interval.confidence_level_ppm
                 != self.bootstrap_policy.confidence_level_ppm
+                or metric.confidence_interval != replayed_interval
             ):
-                raise _error("RunStatisticsV1 metric binding/coverage is inconsistent")
+                raise _error(
+                    "RunStatisticsV1 metric binding/coverage/confidence interval "
+                    "differs from recomputed sources"
+                )
             metric_projections = tuple(
                 item for item in projections if item.metric is metric.metric
             )

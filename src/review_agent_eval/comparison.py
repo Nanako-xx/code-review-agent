@@ -16,7 +16,12 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 from .analysis_artifacts import AnalysisSourceBinding, bind_analysis_source
 from .artifacts import ArtifactIntegrityError
 from .cases import RunCaseSnapshot
-from .config import EvalRunConfig, MAX_TRIAL_COUNT, derive_trial_id
+from .config import (
+    EvalRunConfig,
+    MAX_TRIAL_COUNT,
+    derive_evaluation_id,
+    derive_trial_id,
+)
 from .metrics import CoreMetric, MetricKind, PPM_SCALE
 from .models import (
     SubmissionStatus,
@@ -1650,6 +1655,22 @@ class RunComparisonV1(_JsonModel):
             ),
         ):
             case_sources = statistics.metrics[0].case_contributions
+            try:
+                projected_evaluation_id = derive_evaluation_id(
+                    binding.run_id,
+                    projection.value("evaluator.execution.digest"),
+                    projection.value("evaluator.evaluation_revision"),
+                )
+            except (TypeError, ValueError) as exc:
+                raise _error(
+                    f"RunComparisonV1 {label} evaluator projection "
+                    "cannot derive a canonical Evaluation identity"
+                ) from exc
+            if projected_evaluation_id != binding.evaluation_id:
+                raise _error(
+                    f"RunComparisonV1 {label} evaluator projection differs "
+                    "from its source binding Evaluation identity"
+                )
             if (
                 projection.value("case_snapshot.digest")
                 != binding.case_snapshot_digest
@@ -1850,6 +1871,28 @@ def compare_runs(
         status = ComparisonStatus.COMPARABLE
         metric_deltas = _metric_deltas(baseline_statistics, candidate_statistics, canonical_policy.statistics_policy)
         case_deltas = _case_deltas(baseline_statistics, candidate_statistics, baseline_trials, candidate_trials)
+    final_baseline_binding = baseline.verify()
+    final_candidate_binding = candidate.verify()
+    if (
+        final_baseline_binding != baseline_binding
+        or final_candidate_binding != candidate_binding
+        or baseline_statistics.source_binding != baseline_binding
+        or candidate_statistics.source_binding != candidate_binding
+    ):
+        raise ArtifactIntegrityError(
+            "comparison source bindings changed during analysis"
+        )
+    if (
+        _compatibility_projection(baseline, canonical_policy)
+        != baseline_projection
+        or _compatibility_projection(candidate, canonical_policy)
+        != candidate_projection
+        or _agent_provenance(baseline) != baseline_agent
+        or _agent_provenance(candidate) != candidate_agent
+    ):
+        raise ArtifactIntegrityError(
+            "comparison compatibility sources changed during analysis"
+        )
     return RunComparisonV1.create(
         status=status,
         baseline_binding=baseline_binding,

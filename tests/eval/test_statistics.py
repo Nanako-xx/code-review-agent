@@ -796,6 +796,79 @@ def test_statistics_rejects_resealed_metric_coverage_tamper(
         RunStatisticsV1.from_dict(payload)
 
 
+def _tamper_reseal_confidence_interval(
+    payload: dict[str, Any],
+    metric_name: str,
+) -> None:
+    metric = next(
+        item for item in payload["metrics"] if item["metric"] == metric_name
+    )
+    interval = metric["confidence_interval"]
+    coverage = interval["coverage"]
+    coverage["available_case_count"] = 0
+    coverage["missing_case_count"] = coverage["total_case_count"]
+    interval.update(
+        status=ConfidenceIntervalStatus.AVAILABLE.value,
+        lower_bound=0,
+        upper_bound=0,
+    )
+    _reseal_stable_id(
+        interval,
+        "interval_id",
+        "confidence-interval-v1",
+    )
+    _reseal_stable_id(metric, "metric_id", "statistics-metric-v1")
+    _reseal_stable_id(payload, "statistics_id", "run-statistics-v1")
+
+
+def test_statistics_rejects_resealed_confidence_interval_tamper(
+    ratio_statistics: Any,
+) -> None:
+    payload = deepcopy(ratio_statistics.to_dict())
+    _tamper_reseal_confidence_interval(
+        payload,
+        CoreMetric.JUDGE_FAILURE_RATE.value,
+    )
+
+    with pytest.raises(
+        StatisticsError,
+        match="confidence interval|bootstrap|recomputed",
+    ):
+        RunStatisticsV1.from_dict(payload)
+
+
+def test_statistics_hydration_checks_total_budget_before_interval_replay(
+    ratio_statistics: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered_interval_replay = False
+
+    def reject_budget(**_kwargs: Any) -> int:
+        raise StatisticsError(
+            "total bootstrap work exceeds the Run resource budget"
+        )
+
+    def forbidden_interval(*_args: Any, **_kwargs: Any):
+        nonlocal entered_interval_replay
+        entered_interval_replay = True
+        raise AssertionError("interval replay must not start after budget rejection")
+
+    monkeypatch.setattr(
+        statistics_module,
+        "_validate_run_bootstrap_budget",
+        reject_budget,
+    )
+    monkeypatch.setattr(
+        statistics_module,
+        "paired_bootstrap_interval",
+        forbidden_interval,
+    )
+
+    with pytest.raises(StatisticsError, match="total bootstrap.*budget"):
+        RunStatisticsV1.from_dict(ratio_statistics.to_dict())
+    assert entered_interval_replay is False
+
+
 def test_statistics_rejects_post_binding_trial_score_digest_change(
     ratio_source: Any,
     monkeypatch: pytest.MonkeyPatch,
