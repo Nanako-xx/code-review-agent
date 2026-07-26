@@ -35,6 +35,7 @@ from .judge_exports import JUDGE_PUBLIC_NAMES as _judge_all
 from .review_exports import REVIEW_PUBLIC_NAMES as _review_all
 from .metrics_exports import METRICS_PUBLIC_NAMES as _metrics_all
 from .report_exports import REPORT_PUBLIC_NAMES as _report_all
+from .analysis_exports import ANALYSIS_PUBLIC_NAMES as _analysis_all
 from .materialization import (
     MaterializationError,
     MaterializationRequest,
@@ -70,7 +71,7 @@ __all__ = list(__all__) + [
     _assignment_all
 ) + list(_intent_evaluator_all) + list(_judge_all) + list(_review_all) + list(
     _metrics_all
-) + list(_report_all)
+) + list(_report_all) + list(_analysis_all)
 
 
 def __getattr__(name):
@@ -96,6 +97,12 @@ def __getattr__(name):
         from importlib import import_module
 
         value = getattr(import_module(".report", __name__), name)
+        globals()[name] = value
+        return value
+    if name in _analysis_all:
+        from importlib import import_module
+
+        value = getattr(import_module(".analysis_artifacts", __name__), name)
         globals()[name] = value
         return value
     raise AttributeError("module %r has no attribute %r" % (__name__, name))

@@ -2690,6 +2690,12 @@ def _unsafe_node(info: os.stat_result) -> bool:
     return stat.S_ISLNK(info.st_mode) or _is_reparse(info)
 
 
+def _hardlinked_file(info: os.stat_result) -> bool:
+    """Return whether a regular file has an externally reachable hardlink."""
+
+    return stat.S_ISREG(info.st_mode) and getattr(info, "st_nlink", 1) != 1
+
+
 def _file_identity(info: os.stat_result) -> Optional[Tuple[int, int]]:
     inode = getattr(info, "st_ino", 0)
     if not inode:
@@ -2992,6 +2998,30 @@ class ArtifactStore:
         max_total_read_bytes: int = DEFAULT_MAX_TOTAL_READ_BYTES,
         create_root: bool = True,
     ) -> None:
+        self._initialize_storage_root(
+            runs_root,
+            max_file_bytes=max_file_bytes,
+            max_total_read_bytes=max_total_read_bytes,
+            create_root=create_root,
+            required_root_name=".eval-runs",
+        )
+
+    def _initialize_storage_root(
+        self,
+        storage_root: os.PathLike[str] | str,
+        *,
+        max_file_bytes: int,
+        max_total_read_bytes: int,
+        create_root: bool,
+        required_root_name: Optional[str],
+    ) -> None:
+        """Initialize the shared fail-closed storage boundary.
+
+        ``required_root_name`` preserves the public Run-store contract while
+        allowing protocol-specific stores to reuse the exact same path and
+        publication defenses at a separate explicit root.
+        """
+
         if type(max_file_bytes) is not int or max_file_bytes <= 0:
             raise ValueError("max_file_bytes must be a positive integer")
         if type(max_total_read_bytes) is not int or max_total_read_bytes <= 0:
@@ -3000,9 +3030,12 @@ class ArtifactStore:
             raise ValueError("max_file_bytes may not exceed max_total_read_bytes")
         if type(create_root) is not bool:
             raise ValueError("create_root must be a bool")
-        root = _absolute_storage_path(runs_root)
-        if root.name != ".eval-runs":
-            raise ValueError("ArtifactStore root must be an explicit .eval-runs directory")
+        root = _absolute_storage_path(storage_root)
+        if required_root_name is not None and root.name != required_root_name:
+            raise ValueError(
+                "ArtifactStore root must be an explicit %s directory"
+                % required_root_name
+            )
         self.root = root
         self.max_file_bytes = max_file_bytes
         self.max_total_read_bytes = max_total_read_bytes
@@ -3265,6 +3298,8 @@ class ArtifactStore:
             raise ArtifactSecurityError(
                 "artifact is a symlink, reparse point, or special file"
             )
+        if _hardlinked_file(info):
+            raise ArtifactSecurityError("artifact has an unsafe hardlink count")
         return True
 
     def _run_dir(self, run_id: str) -> Path:
@@ -3422,6 +3457,10 @@ class ArtifactStore:
                 raise ArtifactSecurityError(
                     "writer lock is a symlink, reparse point, or special file"
                 )
+            if existing is not None and _hardlinked_file(existing):
+                raise ArtifactSecurityError(
+                    "writer lock has an unsafe hardlink count"
+                )
             flags = (
                 os.O_RDWR
                 | os.O_CREAT
@@ -3445,6 +3484,10 @@ class ArtifactStore:
                 info = os.fstat(descriptor)
                 if _unsafe_node(info) or not stat.S_ISREG(info.st_mode):
                     raise ArtifactSecurityError("writer lock is not a regular file")
+                if _hardlinked_file(info):
+                    raise ArtifactSecurityError(
+                        "writer lock has an unsafe hardlink count"
+                    )
                 opened_path = _windows_descriptor_path(descriptor)
                 if opened_path is not None and (
                     not _path_is_within(self.root, opened_path)
@@ -3562,6 +3605,8 @@ class ArtifactStore:
             raise ArtifactSecurityError(
                 "artifact is a symlink, reparse point, or special file"
             )
+        if _hardlinked_file(before):
+            raise ArtifactSecurityError("artifact has an unsafe hardlink count")
         if before.st_size > effective_maximum:
             raise ArtifactIntegrityError("artifact exceeds the single-file byte limit")
         if expected_size is not None and before.st_size != expected_size:
@@ -3578,6 +3623,8 @@ class ArtifactStore:
             opened = os.fstat(descriptor)
             if _unsafe_node(opened) or not stat.S_ISREG(opened.st_mode):
                 raise ArtifactSecurityError("artifact changed during safe open")
+            if _hardlinked_file(opened):
+                raise ArtifactSecurityError("artifact has an unsafe hardlink count")
             before_identity = _file_identity(before)
             opened_identity = _descriptor_identity(descriptor, opened)
             if (
@@ -3656,6 +3703,10 @@ class ArtifactStore:
                         raise ArtifactSecurityError(
                             "artifact path changed while it was open"
                         )
+                    if _hardlinked_file(recheck):
+                        raise ArtifactSecurityError(
+                            "artifact has an unsafe hardlink count"
+                        )
                     recheck_path = _windows_descriptor_path(recheck_descriptor)
                     if (
                         recheck_path is None
@@ -3693,6 +3744,8 @@ class ArtifactStore:
             raise ArtifactSecurityError(
                 "artifact path changed into a link, reparse point, or special file"
             )
+        if _hardlinked_file(path_after):
+            raise ArtifactSecurityError("artifact has an unsafe hardlink count")
         if (
             _file_identity(opened) is not None
             and _file_identity(path_after) is not None
