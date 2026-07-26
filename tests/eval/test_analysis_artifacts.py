@@ -15,6 +15,7 @@ import review_agent_eval.analysis_artifacts as analysis_artifact_module
 import review_agent_eval.artifacts as artifact_module
 from review_agent_eval.analysis_artifacts import (
     ANALYSIS_RECEIPT_SCHEMA_VERSION,
+    MAX_ANALYSIS_ARTIFACTS,
     AnalysisArtifactRef,
     AnalysisArtifactStore,
     AnalysisReceipt,
@@ -237,6 +238,45 @@ def test_analysis_bundle_is_create_only_and_reloads_identically(
         )
 
 
+def test_analysis_orphan_resume_preserves_security_error_taxonomy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    files = {"statistics.json": {"metrics": []}}
+    receipt = _receipt(files)
+    namespace = store.root / receipt.kind / receipt.artifact_id
+    namespace.mkdir(parents=True)
+    (namespace / "statistics.json").write_bytes(
+        canonical_json_bytes(files["statistics.json"])
+    )
+    calls = 0
+
+    def unsafe_orphan_read(*args: object, **kwargs: object) -> bytes:
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        raise ArtifactSecurityError(
+            "orphan artifact path was replaced by an unsafe hardlink"
+        )
+
+    monkeypatch.setattr(store._storage, "_read_bytes", unsafe_orphan_read)
+
+    with pytest.raises(
+        ArtifactSecurityError,
+        match="path|hardlink|unsafe|security",
+    ):
+        store.publish_json_bundle(
+            receipt.kind,
+            receipt.artifact_id,
+            files,
+            receipt,
+        )
+
+    assert calls == 1
+    assert not (namespace / "receipt.json").exists()
+
+
 def test_analysis_receipt_binds_run_evaluation_and_source_digests(
     tmp_path: Path,
 ) -> None:
@@ -415,6 +455,50 @@ def test_analysis_receipt_binds_run_evaluation_and_source_digests(
                 run_config=run.config,
                 case_snapshot=run.snapshot,
             )
+
+
+def test_analysis_source_computes_global_digests_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run, hydrated = _hydrated_bundle(
+        tmp_path,
+        instance="analysis-global-digest-cache",
+    )
+    expected_run_config_digest = run.config.digest()
+    expected_case_snapshot_digest = run.snapshot.digest()
+    calls = {"run_config": 0, "case_snapshot": 0}
+    run_config_type = type(run.config)
+    case_snapshot_type = type(run.snapshot)
+    original_run_config_digest = run_config_type.digest
+    original_case_snapshot_digest = case_snapshot_type.digest
+
+    def counted_run_config_digest(value: object) -> str:
+        if value is run.config:
+            calls["run_config"] += 1
+        return original_run_config_digest(value)
+
+    def counted_case_snapshot_digest(value: object) -> str:
+        if value is run.snapshot:
+            calls["case_snapshot"] += 1
+        return original_case_snapshot_digest(value)
+
+    monkeypatch.setattr(run_config_type, "digest", counted_run_config_digest)
+    monkeypatch.setattr(
+        case_snapshot_type,
+        "digest",
+        counted_case_snapshot_digest,
+    )
+
+    binding = bind_analysis_source(
+        hydrated,
+        run_config=run.config,
+        case_snapshot=run.snapshot,
+    )
+
+    assert binding.run_config_digest == expected_run_config_digest
+    assert binding.case_snapshot_digest == expected_case_snapshot_digest
+    assert calls == {"run_config": 1, "case_snapshot": 1}
 
 
 def test_analysis_source_order_uses_complete_canonical_identity() -> None:
@@ -1038,6 +1122,26 @@ def test_analysis_tamper_fails_closed(tmp_path: Path) -> None:
     payload["algorithm_digest"] = "0" * 64
     receipt_path.write_bytes(canonical_json_bytes(payload))
     with pytest.raises(ArtifactIntegrityError, match="ID|canonical|receipt"):
+        store.load_json_bundle(receipt.kind, receipt.artifact_id)
+
+
+def test_analysis_namespace_rejects_more_than_bounded_children(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    receipt = _receipt({"statistics.json": {"metrics": []}})
+    namespace = store.root / receipt.kind / receipt.artifact_id
+    namespace.mkdir(parents=True)
+    (namespace / "receipt.json").write_bytes(canonical_json_bytes({}))
+    for index in range(MAX_ANALYSIS_ARTIFACTS + 1):
+        (namespace / ("extra-%03d.json" % index)).write_bytes(
+            canonical_json_bytes({"index": index})
+        )
+
+    with pytest.raises(
+        ArtifactIntegrityError,
+        match="entries|children|limit|too many|excess",
+    ):
         store.load_json_bundle(receipt.kind, receipt.artifact_id)
 
 

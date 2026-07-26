@@ -611,32 +611,39 @@ class AnalysisArtifactStore:
         if not os.path.lexists(directory):
             return frozenset()
         self._storage._assert_directory(directory)
+        names = set()
         try:
-            entries = list(os.scandir(directory))
+            with os.scandir(directory) as entries:
+                for entry_count, entry in enumerate(entries, start=1):
+                    if entry_count > MAX_ANALYSIS_ARTIFACTS + 1:
+                        raise ArtifactIntegrityError(
+                            "analysis namespace exceeds its child entry limit"
+                        )
+                    try:
+                        # Windows DirEntry.stat may report st_nlink=0 even
+                        # though direct lstat reports the authoritative count.
+                        metadata = os.lstat(entry.path)
+                    except OSError as exc:
+                        raise ArtifactSecurityError(
+                            "could not inspect analysis artifact"
+                        ) from exc
+                    if _unsafe_node(metadata) or not stat.S_ISREG(
+                        metadata.st_mode
+                    ):
+                        raise ArtifactSecurityError(
+                            "analysis namespace contains a symlink, reparse point, or unsafe entry"
+                        )
+                    if _hardlinked_file(metadata):
+                        raise ArtifactSecurityError(
+                            "analysis artifact has an unsafe hardlink count"
+                        )
+                    names.add(entry.name)
+        except ArtifactIntegrityError:
+            raise
         except OSError as exc:
             raise ArtifactSecurityError(
                 "could not inspect analysis artifact namespace"
             ) from exc
-        names = set()
-        for entry in entries:
-            try:
-                # Windows DirEntry.stat may report st_nlink=0 even though a
-                # direct lstat of the same file reports the authoritative
-                # link count.  Use the path-based no-follow metadata here.
-                metadata = os.lstat(entry.path)
-            except OSError as exc:
-                raise ArtifactSecurityError(
-                    "could not inspect analysis artifact"
-                ) from exc
-            if _unsafe_node(metadata) or not stat.S_ISREG(metadata.st_mode):
-                raise ArtifactSecurityError(
-                    "analysis namespace contains a symlink, reparse point, or unsafe entry"
-                )
-            if _hardlinked_file(metadata):
-                raise ArtifactSecurityError(
-                    "analysis artifact has an unsafe hardlink count"
-                )
-            names.add(entry.name)
         return frozenset(names)
 
     def _read_receipt(
@@ -825,6 +832,8 @@ class AnalysisArtifactStore:
                             expected_size=ref.size_bytes,
                             budget=_ReadBudget(self.max_total_read_bytes),
                         )
+                    except ArtifactSecurityError:
+                        raise
                     except ArtifactIntegrityError as exc:
                         raise ArtifactConflictError(
                             "existing analysis orphan differs from requested bytes"
@@ -1068,6 +1077,13 @@ def bind_analysis_source(
         raise TypeError("run_config must be an EvalRunConfig")
     if type(case_snapshot) is not RunCaseSnapshot:
         raise TypeError("case_snapshot must be a RunCaseSnapshot")
+    try:
+        run_config_digest = run_config.digest()
+        case_snapshot_digest = case_snapshot.digest()
+    except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+        raise ArtifactIntegrityError(
+            "RunConfig or Case Snapshot digest is invalid"
+        ) from exc
     if bundle.run_id != run_config.run_id:
         raise ArtifactIntegrityError("hydrated Evaluation belongs to another RunConfig")
     try:
@@ -1088,7 +1104,7 @@ def bind_analysis_source(
         raise ArtifactIntegrityError("hydrated Evaluation ID differs from its sources")
     if (
         case_snapshot.snapshot_id != run_config.suite.case_snapshot_id
-        or case_snapshot.digest() != run_config.suite.case_snapshot_digest
+        or case_snapshot_digest != run_config.suite.case_snapshot_digest
     ):
         raise ArtifactIntegrityError("Case Snapshot differs from RunConfig sources")
 
@@ -1134,9 +1150,9 @@ def bind_analysis_source(
         ) from exc
     expected_summary_bindings = {
         "run_id": run_config.run_id,
-        "run_config_digest": run_config.digest(),
+        "run_config_digest": run_config_digest,
         "case_snapshot_id": case_snapshot.snapshot_id,
-        "case_snapshot_digest": case_snapshot.digest(),
+        "case_snapshot_digest": case_snapshot_digest,
         "evaluation_id": bundle.evaluation_id,
         "evaluation_revision": bundle.evaluation_revision,
         "evaluator_execution_digest": execution_digest,
@@ -1153,7 +1169,7 @@ def bind_analysis_source(
         "suite_version": run_config.suite.suite_version,
         "manifest_digest": run_config.suite.manifest_digest,
         "case_snapshot_id": case_snapshot.snapshot_id,
-        "case_snapshot_digest": case_snapshot.digest(),
+        "case_snapshot_digest": case_snapshot_digest,
     }
     evaluator_identity = (
         None
@@ -1294,7 +1310,7 @@ def bind_analysis_source(
             or compatibility.run_id != run_config.run_id
             or compatibility.evaluation_id != bundle.evaluation_id
             or compatibility.case_snapshot_id != case_snapshot.snapshot_id
-            or compatibility.case_snapshot_digest != case_snapshot.digest()
+            or compatibility.case_snapshot_digest != case_snapshot_digest
             or compatibility.trial_count != run_config.trial_count
             or compatibility.evaluator_execution_digest != execution_digest
         ):
@@ -1545,10 +1561,10 @@ def bind_analysis_source(
             ) from exc
         expected_inspection_bindings = {
             "run_id": run_config.run_id,
-            "run_config_digest": run_config.digest(),
+            "run_config_digest": run_config_digest,
             "run_manifest_digest": summary_manifest_digest,
             "case_snapshot_id": case_snapshot.snapshot_id,
-            "case_snapshot_digest": case_snapshot.digest(),
+            "case_snapshot_digest": case_snapshot_digest,
             "evaluation_id": bundle.evaluation_id,
             "evaluation_revision": bundle.evaluation_revision,
             "evaluator_execution_digest": execution_digest,
@@ -1657,8 +1673,8 @@ def bind_analysis_source(
             evaluation_id=bundle.evaluation_id,
             summary_id=summary_id,
             summary_digest=summary_digest,
-            run_config_digest=run_config.digest(),
-            case_snapshot_digest=case_snapshot.digest(),
+            run_config_digest=run_config_digest,
+            case_snapshot_digest=case_snapshot_digest,
             trial_score_digests=tuple(sorted(value for _key, value in keyed_scores)),
         )
     except (SchemaError, TypeError, ValueError) as exc:
