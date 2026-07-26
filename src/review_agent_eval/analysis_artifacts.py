@@ -1646,6 +1646,292 @@ class AnalysisArtifactStore:
             )
         return stored
 
+    def publish_gate_policy(
+        self,
+        policy: Any,
+        *,
+        baseline: Any,
+        candidate_run_config: Any,
+    ) -> AnalysisReceipt:
+        """Commit a prepared Gate Policy; this is its create-only freeze point."""
+
+        from .comparison import VerifiedRunEvaluation
+        from .gates import GatePolicyV1, prepare_gate_policy
+
+        if type(policy) is not GatePolicyV1:
+            raise TypeError("policy must be a GatePolicyV1")
+        if type(baseline) is not VerifiedRunEvaluation:
+            raise TypeError("baseline must be a VerifiedRunEvaluation")
+        if type(candidate_run_config) is not EvalRunConfig:
+            raise TypeError("candidate_run_config must be an EvalRunConfig")
+        try:
+            canonical = GatePolicyV1.from_dict(policy.to_dict())
+            replayed = prepare_gate_policy(
+                baseline,
+                candidate_run_config,
+                policy=canonical,
+            )
+        except ArtifactIntegrityError:
+            raise
+        except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "gate policy fails strict baseline/RunConfig replay"
+            ) from exc
+        if (
+            canonical != policy
+            or canonical_json_bytes(replayed.to_dict())
+            != canonical_json_bytes(canonical.to_dict())
+        ):
+            raise ArtifactIntegrityError(
+                "gate policy differs from its prepared canonical identity"
+            )
+        files = {"gate_policy.json": replayed.to_dict()}
+        receipt = AnalysisReceipt.create(
+            kind="gate-policy",
+            source_bindings=(replayed.baseline_binding,),
+            algorithm_digest=replayed.algorithm_digest,
+            files=files,
+        )
+        return self.publish_json_bundle(
+            receipt.kind,
+            receipt.artifact_id,
+            files,
+            receipt,
+        )
+
+    def _load_gate_policy_with_receipt(
+        self,
+        artifact_id: str,
+    ) -> tuple[AnalysisReceipt, Any]:
+        from .gates import GatePolicyV1
+
+        receipt, files = self._load_with_receipt(
+            "gate-policy",
+            _artifact_id(artifact_id),
+        )
+        if set(files) != {"gate_policy.json"}:
+            raise ArtifactIntegrityError(
+                "gate policy bundle has an invalid exact artifact set"
+            )
+        try:
+            policy = GatePolicyV1.from_dict(files["gate_policy.json"])
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "gate policy violates its strict canonical schema"
+            ) from exc
+        if (
+            receipt.source_bindings != (policy.baseline_binding,)
+            or receipt.algorithm_digest != policy.algorithm_digest
+        ):
+            raise ArtifactIntegrityError(
+                "gate policy receipt differs from baseline/Run plan bindings"
+            )
+        return receipt, policy
+
+    def load_gate_policy(self, artifact_id: str) -> Any:
+        """Hydrate a frozen policy without claiming baseline source replay."""
+
+        _receipt, policy = self._load_gate_policy_with_receipt(artifact_id)
+        return policy
+
+    def load_verified_gate_policy(
+        self,
+        artifact_id: str,
+        *,
+        baseline: Any,
+        candidate_run_config: Any,
+    ) -> Any:
+        """Re-prepare and byte-compare a stored policy from trusted inputs."""
+
+        from .comparison import VerifiedRunEvaluation
+        from .gates import prepare_gate_policy
+
+        if type(baseline) is not VerifiedRunEvaluation:
+            raise TypeError("baseline must be a VerifiedRunEvaluation")
+        if type(candidate_run_config) is not EvalRunConfig:
+            raise TypeError("candidate_run_config must be an EvalRunConfig")
+        receipt, stored = self._load_gate_policy_with_receipt(artifact_id)
+        try:
+            replayed = prepare_gate_policy(
+                baseline,
+                candidate_run_config,
+                policy=stored,
+            )
+            source_binding = baseline.verify()
+        except ArtifactIntegrityError:
+            raise
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError("gate policy source replay failed") from exc
+        if receipt.source_bindings != (source_binding,):
+            raise ArtifactIntegrityError(
+                "caller baseline differs from gate policy provenance"
+            )
+        if canonical_json_bytes(replayed.to_dict()) != canonical_json_bytes(
+            stored.to_dict()
+        ):
+            raise ArtifactIntegrityError(
+                "stored gate policy differs from exact source replay"
+            )
+        return stored
+
+    @staticmethod
+    def _gate_result_publication_digest(policy: Any, result: Any) -> str:
+        from .gates import GATE_ALGORITHM_VERSION
+
+        return hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "algorithm_version": GATE_ALGORITHM_VERSION,
+                    "policy_digest": result.policy_digest,
+                    "comparison_id": result.comparison_id,
+                    "calibration_result_digests": list(
+                        policy.calibration_result_digests
+                    ),
+                }
+            )
+        ).hexdigest()
+
+    def publish_gate_result(
+        self,
+        result: Any,
+        *,
+        policy: Any,
+        comparison: Any,
+        calibrations: Mapping[Any, Any],
+    ) -> AnalysisReceipt:
+        """Publish a result only after exact policy/comparison/calibration replay."""
+
+        from .comparison import RunComparisonV1
+        from .gates import GatePolicyV1, GateResultV1, evaluate_gate
+
+        if type(result) is not GateResultV1:
+            raise TypeError("result must be a GateResultV1")
+        if type(policy) is not GatePolicyV1:
+            raise TypeError("policy must be a GatePolicyV1")
+        if type(comparison) is not RunComparisonV1:
+            raise TypeError("comparison must be a RunComparisonV1")
+        try:
+            canonical_result = GateResultV1.from_dict(result.to_dict())
+            replayed = evaluate_gate(policy, comparison, calibrations)
+        except ArtifactIntegrityError:
+            raise
+        except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "gate result fails strict policy/comparison/calibration replay"
+            ) from exc
+        if (
+            canonical_result != result
+            or canonical_json_bytes(replayed.to_dict())
+            != canonical_json_bytes(canonical_result.to_dict())
+        ):
+            raise ArtifactIntegrityError(
+                "gate result differs from exact source replay"
+            )
+        files = {"gate_result.json": replayed.to_dict()}
+        receipt = AnalysisReceipt.create(
+            kind="gate-result",
+            source_bindings=(
+                comparison.baseline_binding,
+                comparison.candidate_binding,
+            ),
+            algorithm_digest=self._gate_result_publication_digest(
+                policy,
+                replayed,
+            ),
+            files=files,
+        )
+        return self.publish_json_bundle(
+            receipt.kind,
+            receipt.artifact_id,
+            files,
+            receipt,
+        )
+
+    def _load_gate_result_with_receipt(
+        self,
+        artifact_id: str,
+    ) -> tuple[AnalysisReceipt, Any]:
+        from .gates import GateResultV1
+
+        receipt, files = self._load_with_receipt(
+            "gate-result",
+            _artifact_id(artifact_id),
+        )
+        if set(files) != {"gate_result.json"}:
+            raise ArtifactIntegrityError(
+                "gate result bundle has an invalid exact artifact set"
+            )
+        try:
+            result = GateResultV1.from_dict(files["gate_result.json"])
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "gate result violates its strict canonical schema"
+            ) from exc
+        if (
+            len(receipt.source_bindings) != 2
+            or receipt.algorithm_digest != result.algorithm_digest
+        ):
+            raise ArtifactIntegrityError(
+                "gate result receipt differs from nested policy/comparison/calibrations"
+            )
+        return receipt, result
+
+    def load_gate_result(self, artifact_id: str) -> Any:
+        """Hydrate a result without claiming comparison/calibration replay."""
+
+        _receipt, result = self._load_gate_result_with_receipt(artifact_id)
+        return result
+
+    def load_verified_gate_result(
+        self,
+        artifact_id: str,
+        *,
+        policy: Any,
+        comparison: Any,
+        calibrations: Mapping[Any, Any],
+    ) -> Any:
+        """Re-evaluate and byte-compare a stored result from all trusted inputs."""
+
+        from .comparison import RunComparisonV1
+        from .gates import GatePolicyV1, evaluate_gate
+
+        if type(policy) is not GatePolicyV1:
+            raise TypeError("policy must be a GatePolicyV1")
+        if type(comparison) is not RunComparisonV1:
+            raise TypeError("comparison must be a RunComparisonV1")
+        receipt, stored = self._load_gate_result_with_receipt(artifact_id)
+        try:
+            replayed = evaluate_gate(policy, comparison, calibrations)
+            expected_sources = _canonical_source_bindings(
+                (
+                    comparison.baseline_binding,
+                    comparison.candidate_binding,
+                ),
+                "gate result receipt",
+            )
+            expected_algorithm = self._gate_result_publication_digest(
+                policy,
+                replayed,
+            )
+        except ArtifactIntegrityError:
+            raise
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError("gate result source replay failed") from exc
+        if (
+            receipt.source_bindings != expected_sources
+            or receipt.algorithm_digest != expected_algorithm
+        ):
+            raise ArtifactIntegrityError(
+                "gate result receipt differs from trusted source bindings"
+            )
+        if canonical_json_bytes(replayed.to_dict()) != canonical_json_bytes(
+            stored.to_dict()
+        ):
+            raise ArtifactIntegrityError(
+                "stored gate result differs from exact source replay"
+            )
+        return stored
+
 
 def _validate_review_judge_cross_binding(
     review_result: Any,

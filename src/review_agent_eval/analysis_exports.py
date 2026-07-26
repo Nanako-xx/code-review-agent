@@ -120,11 +120,38 @@ CALIBRATION_PUBLIC_NAMES = (
     "score_calibration",
 )
 
+GATE_PUBLIC_NAMES = (
+    "GATE_POLICY_SCHEMA_VERSION",
+    "GATE_RESULT_SCHEMA_VERSION",
+    "GATE_ALGORITHM_VERSION",
+    "GateError",
+    "GateEligibility",
+    "GateDecision",
+    "GateCheckStatus",
+    "GateConstraintScope",
+    "GateOperator",
+    "ConstraintScope",
+    "MetricConstraintScope",
+    "ConstraintOperator",
+    "MetricConstraintOperator",
+    "GateCheckReason",
+    "GateReferenceKind",
+    "MetricConstraintV1",
+    "GatePolicyV1",
+    "GateFailureRefV1",
+    "GateCheckV1",
+    "GateResultV1",
+    "SEMANTIC_METRIC_PROFILES",
+    "prepare_gate_policy",
+    "evaluate_gate",
+)
+
 ANALYSIS_PUBLIC_NAMES = (
     ANALYSIS_ARTIFACT_PUBLIC_NAMES
     + STATISTICS_PUBLIC_NAMES
     + COMPARISON_PUBLIC_NAMES
     + CALIBRATION_PUBLIC_NAMES
+    + GATE_PUBLIC_NAMES
 )
 
 __all__ = [
@@ -132,5 +159,6 @@ __all__ = [
     "STATISTICS_PUBLIC_NAMES",
     "COMPARISON_PUBLIC_NAMES",
     "CALIBRATION_PUBLIC_NAMES",
+    "GATE_PUBLIC_NAMES",
     "ANALYSIS_PUBLIC_NAMES",
 ]

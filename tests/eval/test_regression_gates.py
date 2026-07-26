@@ -1,0 +1,766 @@
+from __future__ import annotations
+
+import hashlib
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from review_agent_eval.analysis_artifacts import AnalysisArtifactStore
+from review_agent_eval.artifacts import ArtifactConflictError, ArtifactIntegrityError
+from review_agent_eval.calibration import (
+    CalibrationStatus,
+    HumanLabelSetV1,
+    ReviewerProvenanceKind,
+    score_calibration,
+)
+from review_agent_eval.cases import CaseSplit, RunCaseSnapshot, SuiteManifest
+from review_agent_eval.comparison import (
+    ComparisonStatus,
+    VerifiedRunEvaluation,
+    compare_runs,
+)
+from review_agent_eval.gates import (
+    GATE_POLICY_SCHEMA_VERSION,
+    GateCheckStatus,
+    GateConstraintScope,
+    GateDecision,
+    GateEligibility,
+    GateError,
+    GateOperator,
+    MetricConstraintV1,
+    GatePolicyV1,
+    evaluate_gate,
+    prepare_gate_policy,
+)
+from review_agent_eval.intent_evaluator import IntentTruth
+from review_agent_eval.judge import JudgeTask
+from review_agent_eval.metrics import CoreMetric
+from review_agent_eval.models import (
+    CaseOrigin,
+    IntentAuthority,
+    NovelFindingPolicy,
+    ReviewTruth,
+    TruthCompleteness,
+    canonical_json_bytes,
+    canonical_sha256,
+    stable_id,
+)
+from review_agent_eval.statistics import MetricUnit
+
+from .test_calibration import (
+    _export,
+    _human_label,
+    _matching_labels,
+    calibration_source,
+)
+from .test_comparison import (
+    POLICY as COMPARISON_POLICY,
+    _MixedOutcomeAdapter,
+    _comparison,
+    _evaluate_run,
+    _three_trial_config,
+    paired_sources,
+)
+from .test_judge import _execution
+from .test_orchestrator_target_replay_v2 import (
+    _RecordingJudge,
+    _expected,
+    _frozen_snapshot_and_case,
+    _prepared_bundle,
+)
+from .test_target_runner import _FrozenSuccessAdapter
+
+
+def _constraint(
+    metric: CoreMetric,
+    scope: GateConstraintScope,
+    operator: GateOperator,
+    threshold: int,
+    *,
+    required: bool = True,
+    min_coverage_ppm: int | None = None,
+) -> MetricConstraintV1:
+    return MetricConstraintV1(
+        metric=metric,
+        scope=scope,
+        operator=operator,
+        threshold=threshold,
+        unit=MetricUnit.PPM,
+        required=required,
+        min_coverage_ppm=min_coverage_ppm,
+    )
+
+
+def _policy(
+    source: VerifiedRunEvaluation,
+    candidate_config: Any,
+    *,
+    constraints: tuple[MetricConstraintV1, ...],
+    eligibility: GateEligibility = GateEligibility.DIAGNOSTIC_ONLY,
+    calibration_result_digests: tuple[str, ...] = (),
+) -> GatePolicyV1:
+    return GatePolicyV1.create(
+        baseline_binding=source.source_binding,
+        candidate_run_id=candidate_config.run_id,
+        candidate_run_config_digest=candidate_config.digest(),
+        case_snapshot_digest=source.case_snapshot.digest(),
+        trial_count=candidate_config.trial_count,
+        comparison_policy_digest=COMPARISON_POLICY.policy_digest,
+        calibration_result_digests=calibration_result_digests,
+        eligibility=eligibility,
+        constraints=constraints,
+    )
+
+
+def _core_snapshot(
+    prepared: Any,
+    *,
+    intent_truth: IntentTruth,
+    review_truth: ReviewTruth,
+) -> tuple[RunCaseSnapshot, Any]:
+    public_snapshot, public_case = _frozen_snapshot_and_case(
+        prepared,
+        intent_truth=intent_truth,
+        review_truth=review_truth,
+    )
+    case_payload = public_case.to_dict()
+    case_payload["source"] = {
+        "suite": "core-regression",
+        "origin": CaseOrigin.HAND_AUTHORED.value,
+        "source_id": "core-regression-fixture-case",
+        "source_version": "core-fixture-v1",
+        "source_uri": None,
+        "license": None,
+        "content_hash": canonical_sha256({"core": "fixture-case"}),
+    }
+    case = type(public_case).from_dict(case_payload)
+    case_bytes = case.to_json().encode("utf-8")
+    manifest_payload = public_snapshot.manifest.to_dict()
+    manifest_payload["suite_id"] = "core-regression"
+    manifest_payload["suite_version"] = "core-fixture-v1"
+    manifest_payload["source"] = {
+        "kind": "core",
+        "source_id": "core-regression-fixture",
+        "source_version": "core-fixture-v1",
+        "source_uri": None,
+        "license": None,
+        "content_hash": canonical_sha256({"core": "fixture-suite"}),
+        "preparation_binding": None,
+    }
+    manifest_payload["cases"] = [
+        {
+            **manifest_payload["cases"][0],
+            "split": CaseSplit.REGRESSION.value,
+            "raw_file_size_bytes": len(case_bytes),
+            "raw_file_sha256": hashlib.sha256(case_bytes).hexdigest(),
+            "canonical_case_digest": case.digest(),
+            "eval_input_digest": case.eval_input().digest(),
+            "truth_completeness": case.review_truth.completeness.value,
+        }
+    ]
+    manifest = SuiteManifest.from_dict(manifest_payload)
+    return RunCaseSnapshot.build(manifest, ((manifest.cases[0], case),)), case
+
+
+@pytest.fixture(scope="module")
+def core_gate_sources(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    root = tmp_path_factory.mktemp("regression-gate-core")
+    prepared_root = root / "prepared"
+    prepared_root.mkdir()
+    prepared = _prepared_bundle(prepared_root)
+    intent_truth = IntentTruth.from_dict(
+        {
+            "scorable": True,
+            "authority": IntentAuthority.EXPLICIT_AUTHOR_METADATA.value,
+            "expected_claims": [
+                {
+                    "truth_id": "expected-goal",
+                    "dimension": "goal",
+                    "text": "Preserve access control",
+                    "required": True,
+                }
+            ],
+            "forbidden_claims": [],
+            "clarification_policy": "not_required",
+        }
+    )
+    review_truth = ReviewTruth(
+        completeness=TruthCompleteness.CLOSED_WORLD,
+        novel_finding_policy=NovelFindingPolicy.FORBID,
+        expected_findings=(
+            _expected(
+                "expected-gate-finding",
+                "The frozen context demonstrates the expected gate defect.",
+            ),
+        ),
+        known_invalid_findings=(),
+    )
+    snapshot, case = _core_snapshot(
+        prepared,
+        intent_truth=intent_truth,
+        review_truth=review_truth,
+    )
+    execution = _execution()
+
+    def make_source(instance: str, adapter: Any, *, candidate: bool = False):
+        config = _three_trial_config(snapshot, instance=instance)
+        run, bundle, _ = _evaluate_run(
+            root / instance,
+            prepared=prepared,
+            snapshot=snapshot,
+            case=case,
+            config=config,
+            adapter=adapter,
+            execution=execution,
+            judge=_RecordingJudge(execution),
+        )
+        return {
+            "run": run,
+            "config": config,
+            "verified": VerifiedRunEvaluation.create(
+                bundle,
+                run_config=config,
+                case_snapshot=snapshot,
+            ),
+            "candidate": candidate,
+        }
+
+    baseline = make_source("core-gate-baseline", _FrozenSuccessAdapter())
+    promote = make_source(
+        "core-gate-promote-candidate",
+        _FrozenSuccessAdapter(),
+        candidate=True,
+    )
+    block = make_source(
+        "core-gate-block-candidate",
+        _MixedOutcomeAdapter(),
+        candidate=True,
+    )
+    return {
+        "baseline": baseline["verified"],
+        "promote": promote["verified"],
+        "block": block["verified"],
+        "promote_config": promote["config"],
+        "block_config": block["config"],
+    }
+
+
+def _calibration_result(
+    source: dict[str, Any],
+    tmp_path: Path,
+    profile: JudgeTask,
+    *,
+    labels: Any | None = None,
+    reviewer_kind: Any | None = None,
+):
+    package = _export(source, tmp_path / profile.value, profile)
+    if labels is None:
+        labels = _matching_labels(package, reviewer_kind=reviewer_kind) if reviewer_kind else _matching_labels(package)
+    from review_agent_eval.calibration import score_calibration
+
+    return score_calibration(
+        source["verified_by_profile"][profile],
+        package=package,
+        labels=labels,
+    )
+
+
+def _failing_constraint(
+    metric: CoreMetric,
+    scope: GateConstraintScope,
+    actual: int,
+) -> MetricConstraintV1:
+    if actual < 1_000_000:
+        return _constraint(metric, scope, GateOperator.AT_LEAST, actual + 1)
+    return _constraint(metric, scope, GateOperator.AT_MOST, actual - 1)
+
+
+def test_gate_policy_binds_candidate_run_plan_before_results_exist(
+    paired_sources: dict[str, Any],
+) -> None:
+    baseline = paired_sources["baseline"]
+    candidate_config = paired_sources["candidate_run"].config
+    policy = _policy(
+        baseline,
+        candidate_config,
+        constraints=(_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_MOST, 0),),
+    )
+
+    prepared = prepare_gate_policy(
+        baseline,
+        candidate_config,
+        policy=policy,
+    )
+
+    assert prepared.schema_version == GATE_POLICY_SCHEMA_VERSION
+    assert prepared.baseline_binding == baseline.source_binding
+    assert prepared.candidate_run_id == candidate_config.run_id
+    assert prepared.candidate_run_config_digest == candidate_config.digest()
+    assert prepared.case_snapshot_digest == baseline.case_snapshot.digest()
+    assert prepared.trial_count == candidate_config.trial_count
+    assert prepared.policy_id == policy.policy_id
+
+
+def test_gate_policy_cannot_be_overwritten_or_rebound(
+    paired_sources: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    baseline = paired_sources["baseline"]
+    candidate_config = paired_sources["candidate_run"].config
+    policy = _policy(
+        baseline,
+        candidate_config,
+        constraints=(_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_MOST, 0),),
+    )
+    prepared = prepare_gate_policy(baseline, candidate_config, policy=policy)
+    store = AnalysisArtifactStore(tmp_path / "analysis")
+    receipt = store.publish_gate_policy(
+        prepared,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    )
+    assert store.publish_gate_policy(
+        prepared,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    ) == receipt
+    assert store.load_verified_gate_policy(
+        receipt.artifact_id,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    ) == prepared
+
+    rebound = _policy(
+        baseline,
+        paired_sources["two_trial"].run_config,
+        constraints=prepared.constraints,
+    )
+    with pytest.raises(GateError, match="trial_count|compatible"):
+        prepare_gate_policy(
+            baseline,
+            paired_sources["two_trial"].run_config,
+            policy=rebound,
+        )
+
+    policy_path = store.root / "gate-policy" / receipt.artifact_id / "gate_policy.json"
+    policy_path.write_bytes(canonical_json_bytes({"tampered": True}))
+    with pytest.raises((ArtifactIntegrityError, ArtifactConflictError)):
+        store.publish_gate_policy(
+            prepared,
+            baseline=baseline,
+            candidate_run_config=candidate_config,
+        )
+
+
+def test_gate_checks_absolute_and_baseline_delta_constraints(
+    core_gate_sources: dict[str, Any],
+) -> None:
+    baseline = core_gate_sources["baseline"]
+    candidate = core_gate_sources["block"]
+    comparison = compare_runs(
+        baseline,
+        candidate,
+        COMPARISON_POLICY,
+    )
+    metric_delta = comparison.metric_delta(CoreMetric.AGENT_FAILURE_RATE)
+    assert metric_delta.candidate.value is not None
+    assert metric_delta.absolute_delta is not None
+    policy = _policy(
+        baseline,
+        core_gate_sources["block_config"],
+        eligibility=GateEligibility.RELEASE_BLOCKING,
+        constraints=(
+            _failing_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CANDIDATE_ABSOLUTE, metric_delta.candidate.value),
+            _failing_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.BASELINE_DELTA, metric_delta.absolute_delta),
+        ),
+    )
+    policy = prepare_gate_policy(
+        baseline,
+        core_gate_sources["block_config"],
+        policy=policy,
+    )
+    result = evaluate_gate(policy, comparison, {})
+
+    assert result.decision is GateDecision.BLOCK
+    by_scope = {check.scope: check for check in result.checks}
+    assert all(check.status is GateCheckStatus.FAIL for check in by_scope.values())
+    assert by_scope[GateConstraintScope.CANDIDATE_ABSOLUTE].actual == metric_delta.candidate.value
+    assert by_scope[GateConstraintScope.BASELINE_DELTA].actual == metric_delta.absolute_delta
+
+
+def test_gate_reports_case_and_trial_refs_for_each_failure(
+    core_gate_sources: dict[str, Any],
+) -> None:
+    baseline = core_gate_sources["baseline"]
+    candidate = core_gate_sources["block"]
+    comparison = compare_runs(baseline, candidate, COMPARISON_POLICY)
+    actual = comparison.metric_delta(CoreMetric.AGENT_FAILURE_RATE).candidate.value
+    assert actual is not None
+    policy = prepare_gate_policy(
+        baseline,
+        core_gate_sources["block_config"],
+        policy=_policy(
+            baseline,
+            core_gate_sources["block_config"],
+            eligibility=GateEligibility.RELEASE_BLOCKING,
+            constraints=(
+                _failing_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CANDIDATE_ABSOLUTE, actual),
+            ),
+        ),
+    )
+    result = evaluate_gate(policy, comparison, {})
+    check = result.checks[0]
+    assert check.status is GateCheckStatus.FAIL
+    assert check.case_refs
+    assert check.trial_refs
+    assert all("core-gate" not in ref for ref in (*check.case_refs, *check.trial_refs))
+    assert all(ref.startswith("gate-") for ref in (*check.case_refs, *check.trial_refs))
+
+
+def test_gate_requires_calibration_for_semantic_metrics(
+    core_gate_sources: dict[str, Any],
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    baseline = core_gate_sources["baseline"]
+    candidate_config = core_gate_sources["promote_config"]
+    comparison = compare_runs(baseline, core_gate_sources["promote"], COMPARISON_POLICY)
+    eligible = _calibration_result(
+        calibration_source,
+        tmp_path,
+        JudgeTask.FINDING_EQUIVALENCE,
+    )
+    assert eligible.status.value == "gate_eligible"
+    policy = prepare_gate_policy(
+        baseline,
+        candidate_config,
+        policy=_policy(
+            baseline,
+            candidate_config,
+            eligibility=GateEligibility.RELEASE_BLOCKING,
+            calibration_result_digests=(eligible.digest(),),
+            constraints=(
+                _constraint(CoreMetric.ISSUE_RECALL, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_LEAST, 0),
+            ),
+        ),
+    )
+    passed = evaluate_gate(
+        policy,
+        comparison,
+        {JudgeTask.FINDING_EQUIVALENCE.value: eligible},
+    )
+    assert passed.decision is GateDecision.PROMOTE
+
+    missing = _policy(
+        baseline,
+        candidate_config,
+        eligibility=GateEligibility.RELEASE_BLOCKING,
+        constraints=(
+            _constraint(CoreMetric.ISSUE_RECALL, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_LEAST, 0),
+        ),
+    )
+    missing = prepare_gate_policy(baseline, candidate_config, policy=missing)
+    missing_result = evaluate_gate(missing, comparison, {})
+    assert missing_result.decision is GateDecision.INELIGIBLE
+    assert missing_result.checks[0].status is GateCheckStatus.INELIGIBLE
+
+    profile = JudgeTask.FINDING_EQUIVALENCE
+    pending_package = _export(
+        calibration_source,
+        tmp_path / "pending",
+        profile,
+    )
+    pending = score_calibration(
+        calibration_source["verified_by_profile"][profile],
+        package=pending_package,
+        labels=HumanLabelSetV1.create(package=pending_package, labels=()),
+    )
+    fixture_package = _export(
+        calibration_source,
+        tmp_path / "fixture",
+        profile,
+    )
+    fixture = score_calibration(
+        calibration_source["verified_by_profile"][profile],
+        package=fixture_package,
+        labels=_matching_labels(
+            fixture_package,
+            reviewer_kind=ReviewerProvenanceKind.FIXTURE,
+        ),
+    )
+    failed_package = _export(
+        calibration_source,
+        tmp_path / "failed",
+        profile,
+    )
+    matching = _matching_labels(failed_package)
+    matching_by_item = {
+        item.calibration_item_id: item.label for item in matching.labels
+    }
+    failed_labels = HumanLabelSetV1.create(
+        package=failed_package,
+        labels=tuple(
+            _human_label(
+                failed_package,
+                item,
+                (
+                    "different"
+                    if matching_by_item[item.calibration_item_id] == "equivalent"
+                    else "equivalent"
+                ),
+            )
+            for item in failed_package.items
+        ),
+    )
+    failed = score_calibration(
+        calibration_source["verified_by_profile"][profile],
+        package=failed_package,
+        labels=failed_labels,
+    )
+    assert pending.status is CalibrationStatus.PENDING_HUMAN_LABELS
+    assert fixture.status is CalibrationStatus.PENDING_HUMAN_LABELS
+    assert failed.status is CalibrationStatus.FAILED_THRESHOLDS
+    for calibration in (pending, fixture, failed):
+        untrusted_policy = prepare_gate_policy(
+            baseline,
+            candidate_config,
+            policy=_policy(
+                baseline,
+                candidate_config,
+                eligibility=GateEligibility.RELEASE_BLOCKING,
+                calibration_result_digests=(calibration.digest(),),
+                constraints=(
+                    _constraint(
+                        CoreMetric.ISSUE_RECALL,
+                        GateConstraintScope.CANDIDATE_ABSOLUTE,
+                        GateOperator.AT_LEAST,
+                        0,
+                    ),
+                ),
+            ),
+        )
+        untrusted = evaluate_gate(
+            untrusted_policy,
+            comparison,
+            {profile.value: calibration},
+        )
+        assert untrusted.decision is GateDecision.INELIGIBLE
+        assert untrusted.checks[0].status is GateCheckStatus.INELIGIBLE
+
+
+def test_gate_marks_public_or_unscorable_data_diagnostic_only(
+    paired_sources: dict[str, Any],
+) -> None:
+    baseline = paired_sources["baseline"]
+    candidate_config = paired_sources["candidate_run"].config
+    requested = _policy(
+        baseline,
+        candidate_config,
+        eligibility=GateEligibility.RELEASE_BLOCKING,
+        constraints=(_constraint(CoreMetric.INTENT_CLAIM_RECALL, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_LEAST, 0),),
+    )
+    prepared = prepare_gate_policy(baseline, candidate_config, policy=requested)
+    assert prepared.eligibility is GateEligibility.DIAGNOSTIC_ONLY
+    assert prepared.policy_id != requested.policy_id
+    comparison = _comparison(paired_sources)
+    result = evaluate_gate(prepared, comparison, {})
+    assert result.decision is GateDecision.INELIGIBLE
+    assert result.checks[0].status is GateCheckStatus.INELIGIBLE
+
+    empty = _policy(
+        baseline,
+        candidate_config,
+        constraints=(),
+        eligibility=GateEligibility.DIAGNOSTIC_ONLY,
+    )
+    assert prepare_gate_policy(baseline, candidate_config, policy=empty).constraints == ()
+
+
+def test_gate_returns_promote_block_and_ineligible_without_overall_score(
+    core_gate_sources: dict[str, Any],
+    paired_sources: dict[str, Any],
+) -> None:
+    baseline = core_gate_sources["baseline"]
+    promote_config = core_gate_sources["promote_config"]
+    promote_comparison = compare_runs(
+        baseline,
+        core_gate_sources["promote"],
+        COMPARISON_POLICY,
+    )
+    promote_actual = promote_comparison.metric_delta(CoreMetric.AGENT_FAILURE_RATE).candidate.value
+    assert promote_actual is not None
+    promote_policy = prepare_gate_policy(
+        baseline,
+        promote_config,
+        policy=_policy(
+            baseline,
+            promote_config,
+            eligibility=GateEligibility.RELEASE_BLOCKING,
+            constraints=(_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_MOST, promote_actual),),
+        ),
+    )
+    promoted = evaluate_gate(promote_policy, promote_comparison, {})
+    assert promoted.decision is GateDecision.PROMOTE
+
+    block_config = core_gate_sources["block_config"]
+    block_comparison = compare_runs(
+        baseline,
+        core_gate_sources["block"],
+        COMPARISON_POLICY,
+    )
+    block_actual = block_comparison.metric_delta(CoreMetric.AGENT_FAILURE_RATE).candidate.value
+    assert block_actual is not None
+    block_policy = prepare_gate_policy(
+        baseline,
+        block_config,
+        policy=_policy(
+            baseline,
+            block_config,
+            eligibility=GateEligibility.RELEASE_BLOCKING,
+            constraints=(_failing_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CANDIDATE_ABSOLUTE, block_actual),),
+        ),
+    )
+    blocked = evaluate_gate(block_policy, block_comparison, {})
+    assert blocked.decision is GateDecision.BLOCK
+
+    public_baseline = paired_sources["baseline"]
+    changed_execution = replace(
+        paired_sources["execution"],
+        cache_policy_version="semantic-judge-cache-gate-mismatch-v1",
+    )
+    evaluated = paired_sources["candidate_orchestrator"].evaluate_run(
+        paired_sources["candidate_run"].config.run_id,
+        evaluator_execution=changed_execution,
+        evaluation_revision="gate-evaluator-mismatch-v1",
+    )
+    changed_bundle = paired_sources["candidate_orchestrator"].load_run_evaluation(
+        paired_sources["candidate_run"].config.run_id,
+        evaluated.evaluation_id,
+    )
+    public_candidate = VerifiedRunEvaluation.create(
+        changed_bundle,
+        run_config=paired_sources["candidate_run"].config,
+        case_snapshot=paired_sources["candidate_run"].snapshot,
+    )
+    public_config = public_candidate.run_config
+    incomparable = compare_runs(public_baseline, public_candidate, COMPARISON_POLICY)
+    assert incomparable.status is ComparisonStatus.NOT_COMPARABLE
+    ineligible_policy = prepare_gate_policy(
+        public_baseline,
+        public_config,
+        policy=_policy(
+            public_baseline,
+            public_config,
+            constraints=(_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_MOST, 0),),
+        ),
+    )
+    ineligible = evaluate_gate(ineligible_policy, incomparable, {})
+    assert ineligible.decision is GateDecision.INELIGIBLE
+    assert set(promoted.to_dict()) == {
+        "schema_version",
+        "gate_result_id",
+        "policy_digest",
+        "comparison_id",
+        "decision",
+        "checks",
+    }
+    assert all("overall" not in key.casefold() and "score" not in key.casefold() for key in promoted.to_dict())
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"unit": MetricUnit.COUNT},
+        {"operator": "arbitrary"},
+        {"threshold": True},
+        {"threshold": -1},
+        {"threshold": 1.5},
+        {"threshold": float("nan")},
+        {"threshold": float("inf")},
+        {"min_coverage_ppm": -1},
+    ),
+)
+def test_gate_constraint_rejects_noncanonical_threshold_metadata(kwargs: dict[str, Any]) -> None:
+    values: dict[str, Any] = {
+        "metric": CoreMetric.AGENT_FAILURE_RATE,
+        "scope": GateConstraintScope.CANDIDATE_ABSOLUTE,
+        "operator": GateOperator.AT_MOST,
+        "threshold": 0,
+        "unit": MetricUnit.PPM,
+        "required": True,
+        "min_coverage_ppm": None,
+    }
+    values.update(kwargs)
+    with pytest.raises((TypeError, ValueError)):
+        MetricConstraintV1(**values)
+
+
+def test_gate_artifact_result_replay_rejects_resealed_result(
+    core_gate_sources: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    baseline = core_gate_sources["baseline"]
+    candidate = core_gate_sources["promote"]
+    candidate_config = core_gate_sources["promote_config"]
+    comparison = compare_runs(baseline, candidate, COMPARISON_POLICY)
+    actual = comparison.metric_delta(CoreMetric.AGENT_FAILURE_RATE).candidate.value
+    assert actual is not None
+    policy = prepare_gate_policy(
+        baseline,
+        candidate_config,
+        policy=_policy(
+            baseline,
+            candidate_config,
+            eligibility=GateEligibility.RELEASE_BLOCKING,
+            constraints=(_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_MOST, actual),),
+        ),
+    )
+    result = evaluate_gate(policy, comparison, {})
+    store = AnalysisArtifactStore(tmp_path / "analysis")
+    receipt = store.publish_gate_result(
+        result,
+        policy=policy,
+        comparison=comparison,
+        calibrations={},
+    )
+    assert store.load_verified_gate_result(
+        receipt.artifact_id,
+        policy=policy,
+        comparison=comparison,
+        calibrations={},
+    ) == result
+    forged_decision = (
+        GateDecision.BLOCK
+        if result.decision is not GateDecision.BLOCK
+        else GateDecision.PROMOTE
+    )
+    forged_identity = result.to_dict()
+    forged_identity.pop("gate_result_id")
+    forged_identity["decision"] = forged_decision.value
+    forged = object.__new__(type(result))
+    object.__setattr__(forged, "schema_version", result.schema_version)
+    object.__setattr__(
+        forged,
+        "gate_result_id",
+        stable_id("gate-result-v1", forged_identity),
+    )
+    object.__setattr__(forged, "policy_digest", result.policy_digest)
+    object.__setattr__(forged, "comparison_id", result.comparison_id)
+    object.__setattr__(forged, "decision", forged_decision)
+    object.__setattr__(forged, "checks", result.checks)
+    with pytest.raises((ArtifactIntegrityError, ValueError)):
+        store.publish_gate_result(
+            forged,
+            policy=policy,
+            comparison=comparison,
+            calibrations={},
+        )
+
+
+def test_gate_symbols_are_available_through_lazy_root_exports() -> None:
+    import review_agent_eval
+
+    assert review_agent_eval.GatePolicyV1 is GatePolicyV1
+    assert review_agent_eval.evaluate_gate is evaluate_gate

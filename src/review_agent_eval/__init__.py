@@ -39,6 +39,7 @@ from .analysis_exports import (
     ANALYSIS_PUBLIC_NAMES as _analysis_all,
     CALIBRATION_PUBLIC_NAMES as _calibration_all,
     COMPARISON_PUBLIC_NAMES as _comparison_all,
+    GATE_PUBLIC_NAMES as _gate_all,
     STATISTICS_PUBLIC_NAMES as _statistics_all,
 )
 from .materialization import (
@@ -114,6 +115,8 @@ def __getattr__(name):
             if name in _comparison_all
             else ".calibration"
             if name in _calibration_all
+            else ".gates"
+            if name in _gate_all
             else ".analysis_artifacts"
         )
         value = getattr(import_module(module, __name__), name)
