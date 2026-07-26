@@ -7,6 +7,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -109,7 +110,7 @@ def _hydrated_bundle(tmp_path: Path, *, instance: str):
 
 
 def _reseal_report_projection(
-    value: object,
+    value: Any,
     *,
     id_field: str,
     stable_namespace: str,
@@ -117,6 +118,21 @@ def _reseal_report_projection(
 ):
     payload = value.to_dict()
     payload["source_bindings"] = source_bindings
+    return _reseal_report_payload(
+        value,
+        payload=payload,
+        id_field=id_field,
+        stable_namespace=stable_namespace,
+    )
+
+
+def _reseal_report_payload(
+    value: Any,
+    *,
+    payload: dict[str, object],
+    id_field: str,
+    stable_namespace: str,
+):
     identity = dict(payload)
     identity.pop(id_field)
     payload[id_field] = stable_id(stable_namespace, identity)
@@ -124,6 +140,30 @@ def _reseal_report_projection(
     object.__setattr__(sealed, "_canonical_json", canonical_json(payload))
     sealed.__post_init__()
     return sealed
+
+
+def _forge_dataclass(value: Any, **changes: object):
+    forged = object.__new__(type(value))
+    for name in value.__dataclass_fields__:
+        object.__setattr__(
+            forged,
+            name,
+            changes.get(name, getattr(value, name)),
+        )
+    return forged
+
+
+def _replace_json_scalars(value: Any, replacements: dict[str, str]) -> Any:
+    if type(value) is dict:
+        return {
+            key: _replace_json_scalars(item, replacements)
+            for key, item in value.items()
+        }
+    if type(value) is list:
+        return [_replace_json_scalars(item, replacements) for item in value]
+    if type(value) is str:
+        return replacements.get(value, value)
+    return value
 
 
 def test_analysis_bundle_is_create_only_and_reloads_identically(
@@ -477,6 +517,36 @@ def test_analysis_receipt_marker_collision_leaves_no_orphan_namespace(
     assert not (store.root / receipt.kind / receipt.artifact_id).exists()
 
 
+@pytest.mark.parametrize("tamper", ("schema", "identity"))
+def test_analysis_publish_rehydrates_concrete_receipt_before_namespace_write(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    store = _store(tmp_path)
+    files = {"statistics.json": {"status": "canonical"}}
+    receipt = _receipt(files)
+    changes = (
+        {"schema_version": "forged-analysis-receipt-v1"}
+        if tamper == "schema"
+        else {"algorithm_digest": "0" * 64}
+    )
+    forged_receipt = _forge_dataclass(receipt, **changes)
+
+    with pytest.raises(
+        ArtifactIntegrityError,
+        match="receipt|canonical|schema|identity",
+    ):
+        store.publish_json_bundle(
+            receipt.kind,
+            receipt.artifact_id,
+            files,
+            forged_receipt,
+        )
+
+    assert list(store.root.iterdir()) == []
+    assert not (store.root / receipt.kind / receipt.artifact_id).exists()
+
+
 def test_analysis_kinds_are_closed_to_the_planned_allowlist() -> None:
     expected = {
         "statistics",
@@ -728,6 +798,87 @@ def test_analysis_source_rejects_manifest_digest_tamper_and_disagreement(
         )
 
 
+def test_analysis_source_replays_forged_score_despite_synchronized_reports(
+    tmp_path: Path,
+) -> None:
+    run, hydrated = _hydrated_bundle(
+        tmp_path,
+        instance="analysis-score-replay-binding",
+    )
+    trial = hydrated.trials[0]
+    score = trial.trial_score
+    original_agent_digest = score.compatibility.agent_config_digest
+    forged_agent_digest = (
+        "0" * 64 if original_agent_digest != "0" * 64 else "1" * 64
+    )
+    forged_compatibility = replace(
+        score.compatibility,
+        agent_config_digest=forged_agent_digest,
+    )
+    score_identity = score.to_dict()
+    score_identity["compatibility"] = forged_compatibility.to_dict()
+    score_identity.pop("score_id")
+    forged_score_id = stable_id("trial-score-v1", score_identity)
+    forged_score = _forge_dataclass(
+        score,
+        compatibility=forged_compatibility,
+        score_id=forged_score_id,
+    )
+    forged_score.__post_init__()
+    original_score_digest = score.digest()
+    forged_score_digest = forged_score.digest()
+    assert forged_score_digest != original_score_digest
+
+    replacements = {
+        original_agent_digest: forged_agent_digest,
+        score.score_id: forged_score_id,
+        original_score_digest: forged_score_digest,
+    }
+    inspection_payload = _replace_json_scalars(
+        trial.inspection.to_dict(),
+        replacements,
+    )
+    forged_inspection = _reseal_report_payload(
+        trial.inspection,
+        payload=inspection_payload,
+        id_field="inspection_id",
+        stable_namespace="trial-inspection-v1",
+    )
+    forged_trial = replace(
+        trial,
+        trial_score=forged_score,
+        inspection=forged_inspection,
+        report=render_trial_markdown(forged_inspection),
+    )
+
+    summary_payload = _replace_json_scalars(
+        hydrated.summary.to_dict(),
+        replacements,
+    )
+    forged_summary = _reseal_report_payload(
+        hydrated.summary,
+        payload=summary_payload,
+        id_field="summary_id",
+        stable_namespace="run-report-summary-v1",
+    )
+    forged_bundle = replace(
+        hydrated,
+        trials=(forged_trial,),
+        summary=forged_summary,
+        report=render_run_markdown(forged_summary),
+    )
+
+    with pytest.raises(
+        ArtifactIntegrityError,
+        match="TrialScore|score|replay|source",
+    ):
+        bind_analysis_source(
+            forged_bundle,
+            run_config=run.config,
+            case_snapshot=run.snapshot,
+        )
+
+
 def test_analysis_tamper_fails_closed(tmp_path: Path) -> None:
     store = _store(tmp_path)
     files = {"statistics.json": {"metrics": [1]}}
@@ -789,8 +940,12 @@ def test_analysis_rejects_traversal_symlink_and_unknown_artifact_names(
     artifact.unlink()
     try:
         artifact.symlink_to(target)
-    except (NotImplementedError, OSError) as exc:
+    except NotImplementedError as exc:
         pytest.skip("symlink creation is unavailable: %s" % exc)
+    except OSError as exc:
+        if os.name == "nt" and exc.winerror == 1314:
+            pytest.skip("symlink creation requires Windows privilege: %s" % exc)
+        raise
     with pytest.raises(ArtifactSecurityError, match="symlink|reparse|unsafe"):
         store.load_json_bundle(receipt.kind, receipt.artifact_id)
 

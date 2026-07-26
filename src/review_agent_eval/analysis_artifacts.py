@@ -730,6 +730,25 @@ class AnalysisArtifactStore:
         canonical_id = _artifact_id(artifact_id)
         if type(receipt) is not AnalysisReceipt:
             raise TypeError("receipt must be an AnalysisReceipt")
+        try:
+            receipt_payload = receipt.to_dict()
+            replayed_receipt = AnalysisReceipt.from_dict(receipt_payload)
+            receipt_data = canonical_json_bytes(receipt_payload)
+            replayed_receipt_data = canonical_json_bytes(
+                replayed_receipt.to_dict()
+            )
+        except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "analysis receipt fails canonical source-bound hydration"
+            ) from exc
+        if (
+            replayed_receipt != receipt
+            or replayed_receipt_data != receipt_data
+        ):
+            raise ArtifactIntegrityError(
+                "analysis receipt differs from canonical hydration"
+            )
+        receipt = replayed_receipt
         if receipt.kind != canonical_kind or receipt.artifact_id != canonical_id:
             raise ArtifactIntegrityError(
                 "analysis receipt differs from the requested namespace"
@@ -752,7 +771,6 @@ class AnalysisArtifactStore:
             raise ArtifactIntegrityError(
                 "analysis receipt artifact digests differ from planned bytes"
             )
-        receipt_data = canonical_json_bytes(receipt.to_dict())
         validate_safe_json(receipt.to_dict(), "analysis receipt")
         if len(receipt_data) > self.max_file_bytes:
             raise ArtifactIntegrityError(
@@ -851,7 +869,12 @@ def bind_analysis_source(
     # orchestrator/report graph while still requiring concrete hydrated types.
     from .intent_evaluator import IntentEvaluationResult, IntentJudgeRelation
     from .judge import JudgeInputArtifact, JudgeOutputArtifact
-    from .metrics import IntentScoreBinding, ReviewScoreBinding, TrialScore
+    from .metrics import (
+        IntentScoreBinding,
+        ReviewScoreBinding,
+        TrialScore,
+        TrialScorer,
+    )
     from .orchestrator import RunEvaluationBundle, TrialEvaluationBundle
     from .report import (
         RunReportSummary,
@@ -1014,7 +1037,6 @@ def bind_analysis_source(
             task_id = trial.task_id
             trial_index = trial.trial_index
             trial_id = trial.trial_id
-            score_digest = trial.trial_score.digest()
             suite_case = run_config.suite.case(task_id)
             snapshot_entry = case_snapshot.case(task_id)
         except (AttributeError, TypeError, ValueError) as exc:
@@ -1059,6 +1081,30 @@ def bind_analysis_source(
             )
         score = trial.trial_score
         compatibility = score.compatibility
+        try:
+            source_scorer = TrialScorer(
+                compatibility.metrics_policy,
+                intent_evaluator_revision=(
+                    compatibility.intent_evaluator_revision
+                ),
+                review_evaluator_revision=(
+                    compatibility.review_evaluator_revision
+                ),
+                intent_policy_version=compatibility.intent_policy_version,
+                intent_normalization_version=(
+                    compatibility.intent_normalization_version
+                ),
+                review_policy_version=compatibility.review_policy_version,
+                assignment_policy_version=(
+                    compatibility.assignment_policy_version
+                ),
+                location_policy_version=compatibility.location_policy_version,
+                evidence_policy_version=compatibility.evidence_policy_version,
+            )
+        except (AttributeError, SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "hydrated TrialScore has an invalid scorer configuration"
+            ) from exc
         if (
             score.task_id != task_id
             or score.case_version != eval_case.case_version
@@ -1250,6 +1296,30 @@ def bind_analysis_source(
                 raise ArtifactIntegrityError(
                     "hydrated Review result differs from Submission/TrialScore bindings"
                 )
+        try:
+            replayed_score = TrialScore.from_dict(
+                score.to_dict(),
+                scorer=source_scorer,
+                run_config=run_config,
+                evaluator_execution=bundle.evaluator_execution,
+                evaluation_revision=bundle.evaluation_revision,
+                eval_case=eval_case,
+                submission=submission,
+                trial_index=trial_index,
+                intent_result=intent_result,
+                review_result=review_result,
+            )
+            if canonical_json_bytes(replayed_score.to_dict()) != canonical_json_bytes(
+                score.to_dict()
+            ):
+                raise ValueError("TrialScore canonical replay differs")
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "hydrated TrialScore differs from complete source-bound replay"
+            ) from exc
+        score = replayed_score
+        compatibility = replayed_score.compatibility
+        score_digest = replayed_score.digest()
         try:
             replayed_judge_input = JudgeInputArtifact.from_dict(
                 trial.judge_input.to_dict(),
