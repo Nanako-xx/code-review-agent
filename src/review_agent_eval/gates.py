@@ -8,6 +8,7 @@ comparison and the explicitly named calibration results.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -64,6 +65,9 @@ MAX_GATE_BYTES = 256 * 1024 * 1024
 # verified the receipt.  The public evaluator checks this seal before it ever
 # unwraps the policy.
 _FROZEN_GATE_POLICY_SEAL = object()
+_LEGACY_GATE_HYDRATION: ContextVar[bool] = ContextVar(
+    "legacy_gate_hydration", default=False
+)
 
 
 class GateError(ValueError):
@@ -125,6 +129,40 @@ class GateCheckReason(str, Enum):
     CALIBRATION_FAILED_THRESHOLDS = "calibration_failed_thresholds"
     UNIT_MISMATCH = "unit_mismatch"
     THRESHOLD_FAILED = "threshold_failed"
+
+
+_STATUS_REASONS = {
+    GateCheckStatus.NOT_COMPARABLE: frozenset(
+        {GateCheckReason.NOT_COMPARABLE, GateCheckReason.POLICY_MISMATCH}
+    ),
+    GateCheckStatus.NOT_SCORABLE: frozenset(
+        {
+            GateCheckReason.POLICY_MISMATCH,
+            GateCheckReason.NOT_SCORABLE,
+            GateCheckReason.ZERO_DENOMINATOR,
+            GateCheckReason.UNGRADED,
+            GateCheckReason.MISSING_VALUE,
+            GateCheckReason.AUTHORITY_INSUFFICIENT,
+            GateCheckReason.CALIBRATION_MISSING,
+            GateCheckReason.CALIBRATION_NOT_ELIGIBLE,
+            GateCheckReason.CALIBRATION_FAILED_THRESHOLDS,
+            GateCheckReason.UNIT_MISMATCH,
+        }
+    ),
+    GateCheckStatus.INSUFFICIENT_COVERAGE: frozenset(
+        {
+            GateCheckReason.INSUFFICIENT_COVERAGE,
+            GateCheckReason.FAILED_COVERAGE,
+            GateCheckReason.CALIBRATION_INSUFFICIENT_COVERAGE,
+        }
+    ),
+    GateCheckStatus.NOT_CONFIGURED: frozenset(
+        {GateCheckReason.NOT_CONFIGURED}
+    ),
+    GateCheckStatus.PENDING: frozenset(
+        {GateCheckReason.CALIBRATION_PENDING_HUMAN_LABELS}
+    ),
+}
 
 
 class GateReferenceKind(str, Enum):
@@ -866,6 +904,32 @@ class GateCheckV1(_JsonModel):
         reasons = tuple(_enum(GateCheckReason, item, "GateCheckV1.reason") for item in self.reasons)
         if len(reasons) != len(set(reasons)) or reasons != tuple(sorted(reasons, key=lambda item: item.value)):
             raise _error("GateCheckV1 reasons are not canonical")
+        legacy_status = status is GateCheckStatus.INELIGIBLE
+        if legacy_status and not _LEGACY_GATE_HYDRATION.get():
+            raise _error("legacy ineligible GateCheckV1 is hydration-only")
+        if not legacy_status:
+            if status is GateCheckStatus.PASS and reasons:
+                raise _error("passing GateCheckV1 may not carry reasons")
+            if status is GateCheckStatus.FAIL and reasons != (
+                GateCheckReason.THRESHOLD_FAILED,
+            ):
+                raise _error("failed GateCheckV1 requires only threshold_failed")
+            if status not in {GateCheckStatus.PASS, GateCheckStatus.FAIL}:
+                allowed_reasons = _STATUS_REASONS[status]
+                if not reasons or not set(reasons).issubset(allowed_reasons):
+                    raise _error("GateCheckV1 status and reasons are incompatible")
+                if status is GateCheckStatus.NOT_COMPARABLE and (
+                    GateCheckReason.NOT_COMPARABLE not in reasons
+                ):
+                    raise _error("not_comparable GateCheckV1 requires not_comparable")
+                if status is GateCheckStatus.NOT_CONFIGURED and reasons != (
+                    GateCheckReason.NOT_CONFIGURED,
+                ):
+                    raise _error("not_configured GateCheckV1 requires not_configured")
+                if status is GateCheckStatus.PENDING and reasons != (
+                    GateCheckReason.CALIBRATION_PENDING_HUMAN_LABELS,
+                ):
+                    raise _error("pending GateCheckV1 requires pending calibration")
         if status not in {GateCheckStatus.PASS, GateCheckStatus.FAIL} and not reasons:
             raise _error("unscored GateCheckV1 requires a typed reason")
         if status is GateCheckStatus.FAIL and GateCheckReason.THRESHOLD_FAILED not in reasons:
@@ -956,16 +1020,22 @@ class GateCheckV1(_JsonModel):
     def from_dict(cls, value: Any) -> "GateCheckV1":
         payload = _exact(value, ("check_id", "constraint_id", "metric", "scope", "operator", "required", "status", "actual", "threshold", "unit", "coverage_ppm", "min_coverage_ppm", "metric_ref", "failure_refs", "calibration_result_digests", "reasons"), "GateCheckV1")
         refs = _array(payload["failure_refs"], "GateCheckV1.failure_refs", MAX_GATE_REFS)
-        result = cls(
-            payload["constraint_id"], _enum(CoreMetric, payload["metric"], "check.metric"),
-            _scope(payload["scope"]), _operator(payload["operator"]), payload["required"],
-            _enum(GateCheckStatus, payload["status"], "check.status"), payload["actual"],
-            payload["threshold"], _enum(MetricUnit, payload["unit"], "check.unit"),
-            payload["coverage_ppm"], payload["min_coverage_ppm"], payload["metric_ref"],
-            tuple(GateFailureRefV1.from_dict(item) for item in refs),
-            tuple(_array(payload["calibration_result_digests"], "check.calibration_result_digests", MAX_GATE_CALIBRATIONS)),
-            tuple(_enum(GateCheckReason, item, "check.reason") for item in _array(payload["reasons"], "check.reasons", len(GateCheckReason))),
-        )
+        is_legacy = payload["status"] == GateCheckStatus.INELIGIBLE.value
+        token = _LEGACY_GATE_HYDRATION.set(True) if is_legacy else None
+        try:
+            result = cls(
+                payload["constraint_id"], _enum(CoreMetric, payload["metric"], "check.metric"),
+                _scope(payload["scope"]), _operator(payload["operator"]), payload["required"],
+                _enum(GateCheckStatus, payload["status"], "check.status"), payload["actual"],
+                payload["threshold"], _enum(MetricUnit, payload["unit"], "check.unit"),
+                payload["coverage_ppm"], payload["min_coverage_ppm"], payload["metric_ref"],
+                tuple(GateFailureRefV1.from_dict(item) for item in refs),
+                tuple(_array(payload["calibration_result_digests"], "check.calibration_result_digests", MAX_GATE_CALIBRATIONS)),
+                tuple(_enum(GateCheckReason, item, "check.reason") for item in _array(payload["reasons"], "check.reasons", len(GateCheckReason))),
+            )
+        finally:
+            if token is not None:
+                _LEGACY_GATE_HYDRATION.reset(token)
         if payload["check_id"] != result.check_id:
             raise _error("GateCheckV1 check_id is not canonical")
         return result
@@ -1007,6 +1077,11 @@ class GateResultV1(_JsonModel):
         if checks != tuple(sorted(checks, key=lambda item: item.constraint_id)) or len({item.constraint_id for item in checks}) != len(checks):
             raise _error("GateResultV1 checks are not canonical")
         required = tuple(item for item in checks if item.required)
+        if (
+            any(item.status is GateCheckStatus.INELIGIBLE for item in checks)
+            and not _LEGACY_GATE_HYDRATION.get()
+        ):
+            raise _error("legacy ineligible GateResultV1 is hydration-only")
         if checks and any(
             item.calibration_result_digests
             != checks[0].calibration_result_digests
@@ -1041,6 +1116,8 @@ class GateResultV1(_JsonModel):
     @classmethod
     def create(cls, **values: Any) -> "GateResultV1":
         checks = tuple(sorted(tuple(values["checks"]), key=lambda item: item.constraint_id))
+        if any(item.status is GateCheckStatus.INELIGIBLE for item in checks):
+            raise _error("legacy ineligible checks cannot create a new GateResultV1")
         identity = {
             "schema_version": GATE_RESULT_SCHEMA_VERSION,
             "policy_digest": values["policy_digest"],
@@ -1095,12 +1172,22 @@ class GateResultV1(_JsonModel):
     def from_dict(cls, value: Any) -> "GateResultV1":
         payload = _exact(value, ("schema_version", "gate_result_id", "policy_digest", "policy_artifact_id", "policy_receipt_digest", "comparison_id", "decision", "checks"), "GateResultV1")
         checks = _array(payload["checks"], "GateResultV1.checks", MAX_GATE_CONSTRAINTS)
-        return cls(
-            payload["schema_version"], payload["gate_result_id"], payload["policy_digest"],
-            payload["policy_artifact_id"], payload["policy_receipt_digest"],
-            payload["comparison_id"], _enum(GateDecision, payload["decision"], "result.decision"),
-            tuple(GateCheckV1.from_dict(item) for item in checks),
+        is_legacy = any(
+            type(item) is dict
+            and item.get("status") == GateCheckStatus.INELIGIBLE.value
+            for item in checks
         )
+        token = _LEGACY_GATE_HYDRATION.set(True) if is_legacy else None
+        try:
+            return cls(
+                payload["schema_version"], payload["gate_result_id"], payload["policy_digest"],
+                payload["policy_artifact_id"], payload["policy_receipt_digest"],
+                payload["comparison_id"], _enum(GateDecision, payload["decision"], "result.decision"),
+                tuple(GateCheckV1.from_dict(item) for item in checks),
+            )
+        finally:
+            if token is not None:
+                _LEGACY_GATE_HYDRATION.reset(token)
 
     @classmethod
     def from_json(cls, data: Any) -> "GateResultV1":
@@ -1367,6 +1454,25 @@ def _coverage_ppm(value: Any) -> int:
     return min(values) if values else 0
 
 
+def _coverage_disposition(
+    coverage_ppm: int,
+    minimum_ppm: int | None,
+) -> GateCheckStatus | None:
+    """Return the non-passing coverage state, if the policy does not allow it."""
+
+    if minimum_ppm is None:
+        return (
+            None
+            if coverage_ppm == PPM_SCALE
+            else GateCheckStatus.INSUFFICIENT_COVERAGE
+        )
+    return (
+        None
+        if coverage_ppm >= minimum_ppm
+        else GateCheckStatus.INSUFFICIENT_COVERAGE
+    )
+
+
 def _value_for_scope(delta: MetricDeltaV1, scope: GateConstraintScope) -> tuple[Any, Any, str]:
     if scope in {GateConstraintScope.BASELINE_DELTA, GateConstraintScope.CASE_DELTA, GateConstraintScope.TRIAL_DELTA}:
         return delta.absolute_delta, delta.candidate, "delta"
@@ -1605,14 +1711,17 @@ def _evaluate_frozen_policy(
             if local_source.status is not StatisticsMetricStatus.AVAILABLE
             or local_actual is None
         )
-        partial_coverage_allowed = (
-            constraint.min_coverage_ppm is not None
-            and coverage >= constraint.min_coverage_ppm
+        coverage_status = _coverage_disposition(
+            coverage,
+            constraint.min_coverage_ppm,
         )
-        if (
-            constraint.min_coverage_ppm is not None
-            and coverage < constraint.min_coverage_ppm
-        ) or (unavailable_refs and not partial_coverage_allowed):
+        partial_coverage_allowed = (
+            coverage_status is None
+            and constraint.min_coverage_ppm is not None
+        )
+        if coverage_status is not None or (
+            unavailable_refs and not partial_coverage_allowed
+        ):
             checks.append(
                 _ineligible_check(
                     constraint,

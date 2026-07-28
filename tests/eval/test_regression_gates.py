@@ -23,15 +23,21 @@ from review_agent_eval.comparison import (
 )
 from review_agent_eval.gates import (
     GATE_POLICY_SCHEMA_VERSION,
+    GateCheckReason,
     GateCheckStatus,
+    GateCheckV1,
     GateConstraintScope,
     GateDecision,
     GateEligibility,
     GateError,
+    GateFailureRefV1,
     GateOperator,
     FrozenGatePolicy,
     MetricConstraintV1,
     GatePolicyV1,
+    GateReferenceKind,
+    GateResultV1,
+    _coverage_disposition,
     evaluate_gate,
     prepare_gate_policy,
 )
@@ -112,6 +118,139 @@ def _policy(
         eligibility=eligibility,
         constraints=constraints,
     )
+
+
+@pytest.mark.parametrize(
+    ("coverage_ppm", "minimum_ppm", "expected"),
+    (
+        (333_333, None, GateCheckStatus.INSUFFICIENT_COVERAGE),
+        (666_666, None, GateCheckStatus.INSUFFICIENT_COVERAGE),
+        (333_333, 300_000, None),
+        (333_333, 400_000, GateCheckStatus.INSUFFICIENT_COVERAGE),
+    ),
+)
+def test_gate_coverage_disposition_requires_full_coverage_by_default(
+    coverage_ppm: int,
+    minimum_ppm: int | None,
+    expected: GateCheckStatus | None,
+) -> None:
+    assert _coverage_disposition(coverage_ppm, minimum_ppm) is expected
+
+
+def test_gate_check_status_reason_pairs_and_legacy_hydration_are_closed() -> None:
+    constraint = _constraint(
+        CoreMetric.AGENT_FAILURE_RATE,
+        GateConstraintScope.CANDIDATE_ABSOLUTE,
+        GateOperator.AT_MOST,
+        1_000_000,
+    )
+    pending = GateCheckV1(
+        constraint.constraint_id,
+        constraint.metric,
+        constraint.scope,
+        constraint.operator,
+        constraint.required,
+        GateCheckStatus.PENDING,
+        None,
+        constraint.threshold,
+        constraint.unit,
+        None,
+        constraint.min_coverage_ppm,
+        None,
+        (),
+        (),
+        (GateCheckReason.CALIBRATION_PENDING_HUMAN_LABELS,),
+    )
+    partial_ref = GateFailureRefV1(
+        GateReferenceKind.TRIAL,
+        "gate-trial-ref-v1-" + "3" * 64,
+        None,
+        constraint.threshold,
+        constraint.unit,
+        GateCheckReason.NOT_SCORABLE,
+    )
+    partial_constraint = _constraint(
+        CoreMetric.AGENT_FAILURE_RATE,
+        GateConstraintScope.CANDIDATE_ABSOLUTE,
+        GateOperator.AT_MOST,
+        1_000_000,
+        min_coverage_ppm=300_000,
+    )
+    partial = GateCheckV1(
+        partial_constraint.constraint_id,
+        partial_constraint.metric,
+        partial_constraint.scope,
+        partial_constraint.operator,
+        partial_constraint.required,
+        GateCheckStatus.PASS,
+        0,
+        partial_constraint.threshold,
+        partial_constraint.unit,
+        333_333,
+        300_000,
+        None,
+        (partial_ref,),
+        (),
+        (),
+    )
+    assert partial.failure_refs == (partial_ref,)
+    invalid = pending.to_dict()
+    invalid["reasons"] = [GateCheckReason.THRESHOLD_FAILED.value]
+    invalid["check_id"] = stable_id("gate-check-v1", {
+        key: value for key, value in invalid.items() if key != "check_id"
+    })
+    with pytest.raises(GateError, match="status|reason"):
+        GateCheckV1.from_dict(invalid)
+
+    legacy = pending.to_dict()
+    legacy["status"] = GateCheckStatus.INELIGIBLE.value
+    legacy["reasons"] = [GateCheckReason.NOT_SCORABLE.value]
+    legacy["check_id"] = stable_id("gate-check-v1", {
+        key: value for key, value in legacy.items() if key != "check_id"
+    })
+    hydrated_legacy = GateCheckV1.from_dict(legacy)
+    assert hydrated_legacy.status is GateCheckStatus.INELIGIBLE
+    hydrated_result = GateResultV1.create(
+        policy_digest="0" * 64,
+        policy_artifact_id="analysis-artifact-v1-" + "1" * 64,
+        policy_receipt_digest="2" * 64,
+        comparison_id="comparison-v1",
+        decision=GateDecision.INELIGIBLE,
+        checks=(pending,),
+    )
+    legacy_result = hydrated_result.to_dict()
+    legacy_result["checks"] = [legacy]
+    legacy_result["gate_result_id"] = stable_id("gate-result-v1", {
+        key: value for key, value in legacy_result.items() if key != "gate_result_id"
+    })
+    assert GateResultV1.from_dict(legacy_result).checks[0] == hydrated_legacy
+    with pytest.raises(GateError, match="legacy|ineligible"):
+        GateCheckV1(
+            constraint.constraint_id,
+            constraint.metric,
+            constraint.scope,
+            constraint.operator,
+            constraint.required,
+            GateCheckStatus.INELIGIBLE,
+            None,
+            constraint.threshold,
+            constraint.unit,
+            None,
+            constraint.min_coverage_ppm,
+            None,
+            (),
+            (),
+            (GateCheckReason.NOT_SCORABLE,),
+        )
+    with pytest.raises(GateError, match="legacy|ineligible"):
+        GateResultV1.create(
+            policy_digest="0" * 64,
+            policy_artifact_id="analysis-artifact-v1-" + "1" * 64,
+            policy_receipt_digest="2" * 64,
+            comparison_id="comparison-v1",
+            decision=GateDecision.INELIGIBLE,
+            checks=(hydrated_legacy,),
+        )
 
 
 @pytest.fixture(scope="module")
