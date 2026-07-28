@@ -179,7 +179,9 @@ Plans, receipts, Submissions, public prepared Suites, and evaluation namespaces 
 
 The Run root is a local evidence store, not a public report directory. Suite inputs, canonical EvalInputs, Submissions, Evidence excerpts, and evaluation artifacts can contain source code or review content and must be protected accordingly.
 
-`inspect` exposes stable source bindings, statuses, counts, coverage, usage, and digests. It does not emit raw repository context, raw Judge context, or a TraceRef value; trace references and unsafe paths are redacted. Generated reports use redacted artifact projections, and CLI failures avoid echoing provider exceptions, credentials, and arbitrary absolute paths.
+`inspect` exposes stable source bindings, statuses, counts, coverage, usage, and digests. It does not emit raw private truth, truth locations/evidence anchors, raw repository context, raw Judge context, or a TraceRef value; truth and Judge artifacts are represented by opaque IDs, safe metadata, counts, and digests, while trace references and unsafe paths are redacted. Generated reports use redacted artifact projections, and CLI failures avoid echoing provider exceptions, credentials, and arbitrary absolute paths.
+
+Judge metadata refs distinguish `source_request_digest` from the digest of a complete rubric-bound blind request. If an evaluator projection contains only the source request, as with pending Intent matching, the full `request_digest` and `blind_request_id` remain null instead of being guessed; the persisted Judge input/output artifacts remain authoritative.
 
 Redaction at the inspection/report boundary does not erase sensitive bytes from the underlying local Suite, Submission, trace, or evaluator artifacts. Control access to `--suite-root`, `--runs-root`, `--data-root`, and `--workspace-root`, and review provider data-handling terms before using a network-backed Agent or Judge.
 

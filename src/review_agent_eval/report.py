@@ -425,9 +425,51 @@ def _safe_eval_input_projection(value: Any) -> Dict[str, Any]:
     )
 
 
+def _intent_truth_refs(value: IntentEvaluationResult) -> list[Dict[str, Any]]:
+    return [
+        {
+            "truth_id": item.truth_id,
+            "dimension": item.dimension.value,
+            "kind": item.kind.value,
+            "required": item.required,
+        }
+        for item in value.truth_claims
+    ]
+
+
+def _expected_finding_refs(value: ReviewEvaluationResult) -> list[Dict[str, Any]]:
+    return [
+        {
+            "truth_id": item.truth_id,
+            "severity": None if item.severity is None else item.severity.value,
+            "category": item.category,
+            "required": item.required,
+            "metric_authority": item.metric_authority.to_dict(),
+            "required_context_level": item.required_context_level.value,
+            "location_count": len(item.locations),
+            "evidence_anchor_count": len(item.evidence_anchors),
+        }
+        for item in value.expected_truth_findings
+    ]
+
+
+def _known_invalid_finding_refs(
+    value: ReviewEvaluationResult,
+) -> list[Dict[str, Any]]:
+    return [
+        {
+            "truth_id": item.truth_id,
+            "category": item.category,
+            "location_count": len(item.locations),
+        }
+        for item in value.known_invalid_truth_findings
+    ]
+
+
 def _safe_intent_evaluation_projection(value: IntentEvaluationResult) -> Dict[str, Any]:
     digest = value.digest()
     source = value.to_dict()
+    source["truth_claims"] = _intent_truth_refs(value)
     for field in (
         "judge_requests",
         "judge_decisions",
@@ -441,13 +483,22 @@ def _safe_intent_evaluation_projection(value: IntentEvaluationResult) -> Dict[st
         source_digest=digest,
         source_id="intent-evaluation-" + digest,
     )
-    projection["redactions"].append("judge_payloads:judge_artifact_refs")
+    projection["redactions"].extend(
+        (
+            "truth_claims:text",
+            "judge_payloads:judge_artifact_refs",
+        )
+    )
     return projection
 
 
 def _safe_review_evaluation_projection(value: ReviewEvaluationResult) -> Dict[str, Any]:
     digest = value.digest()
     source = value.to_dict()
+    source["expected_truth_findings"] = _expected_finding_refs(value)
+    source["known_invalid_truth_findings"] = _known_invalid_finding_refs(value)
+    for item in source["location_candidates"]:
+        item.pop("truth_location", None)
     for field in (
         "judge_requests",
         "judge_decisions",
@@ -461,7 +512,14 @@ def _safe_review_evaluation_projection(value: ReviewEvaluationResult) -> Dict[st
         source_digest=digest,
         source_id="review-evaluation-" + digest,
     )
-    projection["redactions"].append("judge_payloads:judge_artifact_refs")
+    projection["redactions"].extend(
+        (
+            "expected_truth_findings:claim,locations,evidence_anchors,rationale",
+            "known_invalid_truth_findings:claim,locations,rationale",
+            "location_candidates:truth_location",
+            "judge_payloads:judge_artifact_refs",
+        )
+    )
     return projection
 
 
@@ -1059,21 +1117,40 @@ def _judge_reference(
     parent_result_digest: str,
 ) -> Dict[str, Any]:
     raw = _object(value, f"{phase} Judge {kind}")
+    nested_request = raw.get("request")
+    nested_request = nested_request if type(nested_request) is dict else None
+    task = raw.get("task")
+    if task is None and nested_request is not None:
+        task = nested_request.get("task")
+    if task is None:
+        task = "intent_equivalence" if phase == "intent" else phase
+    source_request_digest = raw.get("source_request_digest")
+    request_digest = raw.get("request_digest")
+    blind_request_id = raw.get("blind_request_id")
+    if nested_request is not None:
+        if source_request_digest is None:
+            source_request_digest = nested_request.get("source_request_digest")
+        if request_digest is None:
+            request_digest = canonical_sha256(nested_request)
+        if blind_request_id is None:
+            blind_request_id = nested_request.get("request_id")
+    elif kind == "request" and source_request_digest is None:
+        # IntentSemanticJudgeRequest is the source request itself; the full
+        # rubric-bound BlindJudgeInput is persisted separately and is not
+        # available from this evaluator projection alone.
+        source_request_digest = canonical_sha256(raw)
     result: Dict[str, Any] = {
         "phase": phase,
         "kind": kind,
         "request_id": raw.get("request_id"),
-        "task": raw.get("task", phase),
-        "request_digest": raw.get("request_digest"),
+        "task": task,
+        "source_request_digest": source_request_digest,
+        "request_digest": request_digest,
         "evaluator_execution_digest": raw.get("evaluator_execution_digest"),
         "judge_result_digest": raw.get("judge_result_digest"),
-        "blind_request_id": raw.get("blind_request_id"),
+        "blind_request_id": blind_request_id,
         "parent_result_digest": parent_result_digest,
     }
-    if result["request_digest"] is None:
-        request = raw.get("request")
-        if request is not None:
-            result["request_digest"] = canonical_sha256(request)
     if kind == "decision":
         decision = raw.get("decision", raw)
         result["decision_digest"] = canonical_sha256(decision)
@@ -1107,8 +1184,28 @@ def _judge_artifact_refs(
         }
         if evaluation is not None:
             parent_digest = evaluation.digest()
+            request_refs = [
+                _judge_reference(
+                    item,
+                    phase=phase,
+                    kind="request",
+                    parent_result_digest=parent_digest,
+                )
+                for item in evaluation.judge_requests
+            ]
+            request_refs.sort(
+                key=lambda item: (
+                    item.get("request_id") or "",
+                    canonical_json(item),
+                )
+            )
+            phase_result["requests"] = request_refs
+            request_by_id = {
+                item["request_id"]: item
+                for item in request_refs
+                if item.get("request_id") is not None
+            }
             for attr, kind in (
-                ("judge_requests", "request"),
                 ("judge_decisions", "decision"),
                 ("judge_failures", "failure"),
                 ("judge_ungraded", "ungraded"),
@@ -1122,6 +1219,18 @@ def _judge_artifact_refs(
                     )
                     for item in getattr(evaluation, attr)
                 ]
+                for item in projected:
+                    request_ref = request_by_id.get(item.get("request_id"))
+                    if request_ref is None:
+                        continue
+                    for field in (
+                        "task",
+                        "source_request_digest",
+                        "request_digest",
+                        "blind_request_id",
+                    ):
+                        if item.get(field) is None:
+                            item[field] = request_ref.get(field)
                 projected.sort(
                     key=lambda item: (
                         item.get("request_id") or "",
@@ -1905,7 +2014,6 @@ class ReportBuilder:
                     "truth_id": truth.truth_id,
                     "severity": truth.severity.value,
                     "category": truth.category,
-                    "claim": truth.claim,
                     "required": truth.required,
                     "required_context_level": truth.required_context_level.value,
                     "source_status": source_status,
