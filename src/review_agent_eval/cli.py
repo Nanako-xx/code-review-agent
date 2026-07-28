@@ -1920,36 +1920,26 @@ def _handle_calibrate_score(args: argparse.Namespace) -> int:
 
 def _handle_gate_prepare(args: argparse.Namespace) -> int:
     from .gates import GatePolicyV1
-    from .models import TrialStatus
 
     with _analysis_evaluation_loader(args) as (load, run_store, analysis_root):
         baseline = load(args.baseline_run_id, args.baseline_evaluation_id)
-        candidate = run_store.load_run_config(args.candidate_run_id)
-        candidate_snapshot = run_store.load_case_snapshot(args.candidate_run_id)
-        if candidate_snapshot != baseline.case_snapshot:
-            raise CliIntegrityError(
-                "candidate Run Case Snapshot differs from the baseline"
-            )
-        state = run_store.load_run_state(args.candidate_run_id)
-        if any(
-            trial.status is not TrialStatus.PENDING
-            or trial.active_attempt is not None
-            or trial.completed_stages
-            or trial.terminal_receipt is not None
-            for trial in state.trials
-        ):
-            raise CliPreconditionError(
-                "gate policy must be frozen before candidate execution"
-            )
         proposal = GatePolicyV1.from_dict(
             _read_json(_path(args.policy, name="gate_policy"), context="Gate policy")
         )
-    store = _analysis_store(analysis_root, create=True)
-    frozen = store.publish_gate_policy(
-        proposal,
-        baseline=baseline,
-        candidate_run_config=candidate,
-    )
+        store = _analysis_store(analysis_root, create=True)
+        with run_store.reserve_run_before_execution(
+            args.candidate_run_id
+        ) as reservation:
+            candidate = reservation.config
+            if reservation.case_snapshot != baseline.case_snapshot:
+                raise CliIntegrityError(
+                    "candidate Run Case Snapshot differs from the baseline"
+                )
+            frozen = store.publish_gate_policy(
+                proposal,
+                baseline=baseline,
+                candidate_run_config=candidate,
+            )
     _emit(
         args,
         "gate prepare",

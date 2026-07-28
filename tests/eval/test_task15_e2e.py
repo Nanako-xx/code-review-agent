@@ -10,11 +10,16 @@ from pathlib import Path
 import pytest
 
 from review_agent_eval.analysis_artifacts import AnalysisArtifactStore
+from review_agent_eval.artifacts import StageName
 from review_agent_eval.calibration import (
     CALIBRATION_ALGORITHM_VERSION,
     CALIBRATION_SELECTION_POLICY_SCHEMA_VERSION,
     CalibrationSelectionPolicyV1,
+    CalibrationStatus,
     HumanLabelSetV1,
+    HumanLabelV1,
+    HumanReviewerProvenanceV1,
+    ReviewerProvenanceKind,
     build_calibration_package,
     score_calibration,
 )
@@ -43,6 +48,7 @@ from review_agent_eval.statistics import (
 )
 
 from .test_cli import _root_arguments, _write_cli_suite
+from .test_datasets import write_suite
 
 
 def _output(capsys: pytest.CaptureFixture[str]) -> dict:
@@ -60,7 +66,6 @@ def _tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
     files = []
     for current, directories, names in os.walk(root):
-        directories[:] = [name for name in directories if name != ".locks"]
         files.extend(Path(current) / name for name in names)
     for path in sorted(files):
         digest.update(path.relative_to(root).as_posix().encode("utf-8"))
@@ -153,6 +158,12 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     roots, program = _write_cli_suite(tmp_path)
+    case_path = roots["suite"] / "cases" / "task-001.json"
+    case_payload = json.loads(case_path.read_text(encoding="utf-8"))
+    case_payload["intent_truth"]["expected_claims"][0]["text"] = (
+        "Assess the requested change for correctness"
+    )
+    write_suite(roots["suite"], [case_payload])
     analysis = tmp_path / ".eval-analyses"
     external = tmp_path / "external-calibration"
     common = [
@@ -206,7 +217,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
         program,
         instance="task15-baseline",
         agent_id="task15-baseline-agent",
-        mode="nonzero",
+        mode="success",
         capsys=capsys,
     )
     baseline_evaluation = _run_and_evaluate(roots, baseline_run, capsys)
@@ -215,7 +226,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
         program,
         instance="task15-candidate",
         agent_id="task15-candidate-agent",
-        mode="success",
+        mode="nonzero",
         capsys=capsys,
     )
 
@@ -229,12 +240,39 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
             profile=JudgeTask.INTENT_EQUIVALENCE,
             policy=calibration_policy,
         )
-        labels = HumanLabelSetV1.create(package=package, labels=())
+        assert package.items
+        fixture_reviewer = HumanReviewerProvenanceV1.create(
+            kind=ReviewerProvenanceKind.FIXTURE,
+            reviewer_id="task15-fixture-reviewer",
+            provenance_ref="task15-scripted-fixture",
+            attestation_ref=None,
+        )
+        fixture_label = HumanLabelV1.create(
+            package=package,
+            item=package.items[0],
+            label=package.items[0].allowed_labels[0],
+            severity_assessment=None,
+            actionability=None,
+            reviewer_provenance=fixture_reviewer,
+            blind_attestation=True,
+            labeled_at="2026-07-28T00:00:00Z",
+            disputed=False,
+            adjudication=None,
+        )
+        labels = HumanLabelSetV1.create(
+            package=package,
+            labels=(fixture_label,),
+        )
         expected_calibration = score_calibration(
             baseline,
             package=package,
             labels=labels,
         )
+        expected_profile = expected_calibration.profiles[0]
+        assert expected_profile.selected_count >= 1
+        assert expected_profile.labeled_count == 1
+        assert expected_profile.eligible_labeled_count == 0
+        assert expected_calibration.status is CalibrationStatus.PENDING_HUMAN_LABELS
         gate_policy = GatePolicyV1.create(
             baseline_binding=baseline.source_binding,
             candidate_run_id=candidate_config.run_id,
@@ -256,12 +294,15 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
                 ),
             ),
         )
+        baseline_task_id = baseline.trials[0].task_id
+        baseline_trial_id = baseline.trials[0].trial_id
     gate_policy_path = _write_json(
         tmp_path / "gate-policy.json",
         gate_policy.to_dict(),
     )
 
     # The policy artifact is committed before the candidate has any attempt.
+    runs_before_gate_prepare = _tree_digest(roots["runs"])
     assert main(
         [
             "gate",
@@ -278,6 +319,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
         ]
     ) == EXIT_OK
     gate_prepare = _output(capsys)
+    assert _tree_digest(roots["runs"]) == runs_before_gate_prepare
     gate_policy_artifact = gate_prepare["artifact_id"]
     policy_mtime = (
         analysis
@@ -307,6 +349,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     ) == EXIT_OK
     compared = _output(capsys)
     assert compared["comparison_status"] == ComparisonStatus.COMPARABLE.value
+    assert _tree_digest(roots["runs"]) == runs_before_analysis
 
     assert main(
         [
@@ -327,7 +370,8 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     ) == EXIT_OK
     exported = _output(capsys)
     assert exported["calibration_status"] == "pending_human_labels"
-    assert exported["selected_count"] == 0
+    assert exported["selected_count"] >= 1
+    assert _tree_digest(roots["runs"]) == runs_before_analysis
 
     labels_path = _write_json(tmp_path / "labels.json", labels.to_dict())
     assert main(
@@ -350,7 +394,8 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
         ]
     ) == EXIT_OK
     imported = _output(capsys)
-    assert imported["label_count"] == 0
+    assert imported["label_count"] == 1
+    assert _tree_digest(roots["runs"]) == runs_before_analysis
 
     assert main(
         [
@@ -373,6 +418,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     ) == EXIT_OK
     scored = _output(capsys)
     assert scored["calibration_status"] == "pending_human_labels"
+    assert _tree_digest(roots["runs"]) == runs_before_analysis
 
     binding_path = _write_json(
         tmp_path / "calibration-binding.json",
@@ -410,17 +456,55 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
         ]
     ) == EXIT_OK
     gated = _output(capsys)
-    assert gated["decision"] == GateDecision.PROMOTE.value
+    assert gated["decision"] == GateDecision.INELIGIBLE.value
+    assert _tree_digest(roots["runs"]) == runs_before_analysis
 
     store = AnalysisArtifactStore(analysis, create_root=False)
-    with _analysis_evaluation_loader(namespace) as (load, _run_store, _root):
+    with _analysis_evaluation_loader(namespace) as (load, run_store, _root):
         baseline = load(baseline_run, baseline_evaluation)
         candidate = load(candidate_run, candidate_evaluation)
+        candidate_config = run_store.load_run_config(candidate_run)
         reloaded = store.load_verified_comparison(
             compared["artifact_id"],
             baseline=baseline,
             candidate=candidate,
             policy=comparison_policy,
+        )
+        package_manifest = store.load_verified_calibration_package_manifest(
+            exported["artifact_id"],
+            evaluation=baseline,
+            policy=calibration_policy,
+            package=package,
+        )
+        loaded_labels = store.load_verified_human_label_set(
+            imported["artifact_id"],
+            evaluation=baseline,
+            policy=calibration_policy,
+            package=package,
+            labels=labels,
+        )
+        assert len(loaded_labels.labels) == 1
+        assert (
+            loaded_labels.labels[0].reviewer_provenance.kind
+            is ReviewerProvenanceKind.FIXTURE
+        )
+        loaded_calibration = store.load_verified_calibration_result(
+            scored["artifact_id"],
+            evaluation=baseline,
+            policy=calibration_policy,
+            package=package,
+            labels=loaded_labels,
+        )
+        frozen_policy = store.load_verified_gate_policy(
+            gate_policy_artifact,
+            baseline=baseline,
+            candidate_run_config=candidate_config,
+        )
+        loaded_gate = store.load_verified_gate_result(
+            gated["artifact_id"],
+            policy=frozen_policy,
+            comparison=reloaded,
+            calibrations={JudgeTask.INTENT_EQUIVALENCE: loaded_calibration},
         )
     assert reloaded.baseline_statistics.trial_count == 3
     assert reloaded.candidate_statistics.trial_count == 3
@@ -432,16 +516,20 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
         ]
     ) == 3
     assert (
-        reloaded.baseline_statistics.metric(
+        reloaded.candidate_statistics.metric(
             CoreMetric.AGENT_FAILURE_RATE
         ).coverage.agent_failure_count
         == 3
     )
+    baseline_coverage = reloaded.baseline_statistics.metric(
+        CoreMetric.AGENT_FAILURE_RATE
+    ).coverage
+    assert baseline_coverage.judge_request_count > 0
     assert (
-        reloaded.candidate_statistics.metric(
-            CoreMetric.AGENT_FAILURE_RATE
-        ).coverage.judge_ungraded_count
-        >= 0
+        baseline_coverage.judge_failure_count
+        + baseline_coverage.judge_ungraded_count
+        + baseline_coverage.judge_semantic_unknown_count
+        > 0
     )
     assert {
         (item.canonical_case_digest, item.trial_index)
@@ -452,13 +540,69 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
         (baseline.trials[0].eval_case.digest(), 2),
         (baseline.trials[0].eval_case.digest(), 3),
     }
-    comparison_bytes = (
-        analysis
-        / "comparison"
-        / compared["artifact_id"]
-        / "comparison_result.json"
-    ).read_bytes()
-    assert comparison_bytes == canonical_json_bytes(reloaded.to_dict())
+    artifacts = (
+        (
+            "comparison",
+            compared["artifact_id"],
+            "comparison_result.json",
+            reloaded.to_dict(),
+        ),
+        (
+            "calibration-package",
+            exported["artifact_id"],
+            "calibration_package_manifest.json",
+            package_manifest.to_dict(),
+        ),
+        (
+            "calibration-result",
+            imported["artifact_id"],
+            "human_label_set.json",
+            loaded_labels.to_dict(),
+        ),
+        (
+            "calibration-result",
+            scored["artifact_id"],
+            "calibration_result.json",
+            loaded_calibration.to_dict(),
+        ),
+        (
+            "gate-policy",
+            gate_policy_artifact,
+            "gate_policy.json",
+            frozen_policy.policy.to_dict(),
+        ),
+        (
+            "gate-result",
+            gated["artifact_id"],
+            "gate_result.json",
+            loaded_gate.to_dict(),
+        ),
+    )
+    for kind, artifact_id, filename, expected in artifacts:
+        assert store.load_json_bundle(kind, artifact_id) == {filename: expected}
+        directory = analysis / kind / artifact_id
+        assert (directory / filename).read_bytes() == canonical_json_bytes(expected)
+        receipt_bytes = (directory / "receipt.json").read_bytes()
+        assert receipt_bytes == canonical_json_bytes(json.loads(receipt_bytes))
+
+    assert main(
+        [
+            "inspect",
+            baseline_run,
+            *_root_arguments(roots),
+            "--task-id",
+            baseline_task_id,
+            "--trial-id",
+            baseline_trial_id,
+            "--evaluation-id",
+            baseline_evaluation,
+            "--format",
+            "json",
+        ]
+    ) == EXIT_OK
+    inspected = _output(capsys)
+    assert inspected["command"] == "inspect"
+    assert inspected["inspection"]["source_bindings"]["run_id"] == baseline_run
     assert _tree_digest(roots["runs"]) == runs_before_analysis
     assert (
         analysis
@@ -466,6 +610,31 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
         / gate_policy_artifact
         / "receipt.json"
     ).stat().st_mtime_ns == policy_mtime
+    candidate_starts = []
+    for entry in run_store.load_run_manifest(candidate_run).trials:
+        trial = run_store.load_trial_manifest(
+            candidate_run,
+            entry.task_id,
+            entry.trial_id,
+        )
+        state = run_store.load_trial_state(
+            candidate_run,
+            entry.task_id,
+            entry.trial_id,
+        )
+        assert state.active_attempt == 1
+        candidate_starts.append(
+            run_store._target(
+                candidate_run,
+                run_store._receipt_path(
+                    trial,
+                    StageName.START,
+                    state.active_attempt,
+                ),
+            )
+        )
+    assert len(candidate_starts) == 3
+    assert policy_mtime <= min(path.stat().st_mtime_ns for path in candidate_starts)
     assert not any(
         key in reloaded.to_dict()
         for key in ("overall_score", "case_pass")

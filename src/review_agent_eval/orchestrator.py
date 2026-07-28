@@ -42,6 +42,7 @@ from .judge import (
     JudgeExecutionResult,
     JudgeInputArtifact,
     JudgeOutputArtifact,
+    JudgeTask,
     SemanticJudge,
     build_intent_judge_input,
     intent_resolution_from_judge_result,
@@ -798,7 +799,11 @@ class EvaluationOrchestrator:
                 submission=submission,
                 review_truth=case.review_truth,
                 evaluator=reviewer,
-                judge_results=judge_output.results,
+                judge_results=tuple(
+                    result
+                    for result in judge_output.results
+                    if result.request.task is not JudgeTask.INTENT_EQUIVALENCE
+                ),
             )
         score = TrialScore.from_dict(
             stored.score,

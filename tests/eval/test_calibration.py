@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -1398,6 +1400,75 @@ def test_export_rejects_repository_paths_and_tampered_resume(
             tmp_path,
             JudgeTask.INTENT_EQUIVALENCE,
         )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="short paths are Windows-specific")
+def test_external_export_rejects_short_run_store_alias_before_missing_child_creation(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    def snapshot(root: Path) -> tuple[tuple[str, str, str | None], ...]:
+        values = []
+        for current, directories, files in os.walk(root):
+            current_path = Path(current)
+            for name in directories:
+                path = current_path / name
+                values.append((path.relative_to(root).as_posix(), "directory", None))
+            for name in files:
+                path = current_path / name
+                values.append(
+                    (
+                        path.relative_to(root).as_posix(),
+                        "file",
+                        hashlib.sha256(path.read_bytes()).hexdigest(),
+                    )
+                )
+        return tuple(sorted(values))
+
+    run_root = tmp_path / "run store alias parent" / ".eval-runs"
+    analysis_root = tmp_path / ".eval-analyses"
+    run_root.mkdir(parents=True)
+    analysis_root.mkdir()
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        written = ctypes.windll.kernel32.GetShortPathNameW(
+            str(run_root),
+            buffer,
+            len(buffer),
+        )
+        if not written or os.path.normcase(buffer.value) == os.path.normcase(
+            str(run_root)
+        ):
+            raise NotImplementedError("8.3 short path aliases are unavailable")
+        alias = Path(buffer.value)
+        if any(part.casefold().rstrip(" .") == ".eval-runs" for part in alias.parts):
+            raise NotImplementedError("Run Store segment has no distinct 8.3 alias")
+    except NotImplementedError as exc:
+        pytest.skip(str(exc))
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip(f"short path capability is unavailable: {exc}")
+        raise
+
+    output_root = alias / "missing-child"
+    before_run = snapshot(run_root)
+    before_analysis = snapshot(analysis_root)
+    with pytest.raises(
+        (ValueError, ArtifactSecurityError),
+        match="Run Store|eval-runs|final|path|ancestor",
+    ):
+        export_calibration_package(
+            calibration_source["verified_by_profile"][
+                JudgeTask.INTENT_EQUIVALENCE
+            ],
+            profile=JudgeTask.INTENT_EQUIVALENCE,
+            policy=POLICY,
+            output_root=output_root,
+        )
+
+    assert not output_root.exists()
+    assert snapshot(run_root) == before_run
+    assert snapshot(analysis_root) == before_analysis
 
 
 def test_export_entry_limit_stops_at_third_scandir_item(

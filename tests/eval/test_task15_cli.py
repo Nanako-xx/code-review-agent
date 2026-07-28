@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import json
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +22,7 @@ from review_agent_eval.cli import (
 )
 from review_agent_eval.comparison import ComparisonStatus
 from review_agent_eval.gates import GateDecision
+from review_agent_eval.artifacts import ArtifactConflictError
 
 
 def _command_choices(parser: Any) -> dict[str, Any]:
@@ -385,3 +388,94 @@ def test_gate_block_and_ineligible_publish_before_optional_ci_exit(
     assert payload["status"] == "ok"
     assert payload["decision"] == decision.value
     assert payload["artifact_id"] == _Receipt.artifact_id
+
+
+def test_gate_prepare_holds_candidate_start_lock_through_policy_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from review_agent_eval.gates import GateEligibility, GatePolicyV1
+
+    from .test_artifacts import make_store
+
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    run_store, candidate, _manifest, plan, _trial = make_store(run_root)
+    snapshot = run_store.load_case_snapshot(candidate.run_id)
+    baseline = SimpleNamespace(case_snapshot=snapshot)
+    proposal = object()
+    entered_publish = threading.Event()
+    release_publish = threading.Event()
+    policy_receipt = tmp_path / "analysis" / "gate-policy" / "policy" / "receipt.json"
+
+    class Store:
+        def publish_gate_policy(self, *_args: Any, **_kwargs: Any):
+            entered_publish.set()
+            assert release_publish.wait(timeout=10)
+            policy_receipt.parent.mkdir(parents=True)
+            policy_receipt.write_bytes(b"{}")
+            return SimpleNamespace(
+                policy=SimpleNamespace(
+                    policy_id="gate-policy-v1-" + "5" * 64,
+                    eligibility=GateEligibility.RELEASE_BLOCKING,
+                ),
+                artifact_id="analysis-artifact-v1-" + "6" * 64,
+                receipt_digest="7" * 64,
+            )
+
+    @contextmanager
+    def loader(_args: Any):
+        yield lambda _run, _evaluation: baseline, run_store, tmp_path / "analysis"
+
+    monkeypatch.setattr(cli_module, "_analysis_evaluation_loader", loader)
+    monkeypatch.setattr(cli_module, "_analysis_store", lambda *_args, **_kwargs: Store())
+    monkeypatch.setattr(cli_module, "_read_json", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        GatePolicyV1,
+        "from_dict",
+        classmethod(lambda _cls, _value: proposal),
+    )
+    args = argparse.Namespace(
+        baseline_run_id="run-" + "1" * 64,
+        baseline_evaluation_id="evaluation-" + "2" * 64,
+        candidate_run_id=candidate.run_id,
+        policy="policy.json",
+        json=True,
+    )
+    outcome: list[Any] = []
+
+    def prepare_gate() -> None:
+        try:
+            outcome.append(cli_module._handle_gate_prepare(args))
+        except BaseException as exc:  # preserve the exact competing outcome
+            outcome.append(exc)
+
+    worker = threading.Thread(target=prepare_gate)
+    worker.start()
+    assert entered_publish.wait(timeout=10)
+    try:
+        try:
+            run_store.start_trial(candidate.run_id, plan.task_id, plan.trial_id)
+        except BaseException as exc:
+            start_outcome: Any = exc
+        else:
+            start_outcome = "started"
+    finally:
+        release_publish.set()
+        worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert outcome == [EXIT_OK]
+    assert isinstance(start_outcome, ArtifactConflictError)
+
+    # Once Policy publication releases the reservation, Trial execution may start.
+    started = run_store.start_trial(candidate.run_id, plan.task_id, plan.trial_id)
+    assert started.active_attempt == 1
+    start_receipts = tuple(run_store.root.rglob("start.json"))
+    assert len(start_receipts) == 1
+    assert policy_receipt.stat().st_mtime_ns <= start_receipts[0].stat().st_mtime_ns
+    with pytest.raises(ArtifactConflictError, match="already started"):
+        with run_store.reserve_run_before_execution(candidate.run_id):
+            raise AssertionError("started Run must never enter gate reservation")
+    capsys.readouterr()

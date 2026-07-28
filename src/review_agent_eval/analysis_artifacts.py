@@ -210,7 +210,14 @@ def _nearest_existing_directory(path: Path) -> Path:
         return current
 
 
-def _validate_windows_final_root_boundary(root: Path) -> None:
+def _validate_windows_existing_ancestor_boundary(
+    root: Path,
+    *,
+    forbidden_segments: Tuple[str, ...],
+    context: str,
+) -> None:
+    """Resolve the nearest existing ancestor before any child is created."""
+
     if os.name != "nt":
         return
     ancestor = _nearest_existing_directory(root)
@@ -222,12 +229,27 @@ def _validate_windows_final_root_boundary(root: Path) -> None:
         _windows_close_handle(handle)
     if attributes & 0x400 or not attributes & 0x10:
         raise ArtifactSecurityError(
-            "Analysis root ancestor handle is a reparse point or non-directory"
+            "%s ancestor handle is a reparse point or non-directory" % context
         )
-    if _path_contains_portable_run_root(final_ancestor):
+    forbidden = {
+        _windows_portable_path_segment_key(item) for item in forbidden_segments
+    }
+    if any(
+        _windows_portable_path_segment_key(part) in forbidden
+        for part in final_ancestor.parts
+    ):
         raise ArtifactSecurityError(
-            "Analysis root final path may not be the Run Store or descend from .eval-runs"
+            "%s final path may not be the Run Store or Analysis Store"
+            % context
         )
+
+
+def _validate_windows_final_root_boundary(root: Path) -> None:
+    _validate_windows_existing_ancestor_boundary(
+        root,
+        forbidden_segments=(".eval-runs",),
+        context="Analysis root",
+    )
 
 
 def _validate_analysis_root_boundary(root: os.PathLike[str] | str) -> None:

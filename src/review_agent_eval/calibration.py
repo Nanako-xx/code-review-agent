@@ -26,6 +26,7 @@ from .artifacts import (
     _unsafe_node,
 )
 from .comparison import VerifiedRunEvaluation
+from .analysis_artifacts import _validate_windows_existing_ancestor_boundary
 from .config import JudgeKind, validate_path_segment
 from .intent_evaluator import IntentJudgeRelation, IntentMatchKind
 from .judge import (
@@ -224,6 +225,9 @@ _BASELINE_CANDIDATE_IDENTITY_FIELDS = frozenset(
         "candidate_identity",
     }
 )
+_NON_UNIQUE_IDENTITY_PLACEHOLDERS = frozenset(
+    {"fake", "local", "none", "unknown", "working-tree"}
+)
 
 
 def _error(message: str) -> CalibrationError:
@@ -419,7 +423,16 @@ def _forbidden_identity_values(
 
     for root in roots:
         visit(root)
-    return tuple(sorted(values, key=lambda item: (item.casefold(), item)))
+    return tuple(
+        sorted(
+            (
+                item
+                for item in values
+                if item.casefold() not in _NON_UNIQUE_IDENTITY_PLACEHOLDERS
+            ),
+            key=lambda item: (item.casefold(), item),
+        )
+    )
 
 
 def _assert_blind_payload(
@@ -3340,6 +3353,11 @@ def _validate_external_root(value: Path) -> Path:
         if current.parent == current:
             break
         current = current.parent
+    _validate_windows_existing_ancestor_boundary(
+        absolute,
+        forbidden_segments=(".eval-runs", ".eval-analyses"),
+        context="calibration output root",
+    )
     return absolute
 
 

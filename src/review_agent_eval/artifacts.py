@@ -18,7 +18,7 @@ import re
 import stat
 import unicodedata
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import islice
@@ -2276,6 +2276,15 @@ class RunState:
     run_id: str
     status: RunStatus
     trials: Tuple[TrialState, ...]
+
+
+@dataclass(frozen=True)
+class RunPreexecutionReservation:
+    """Immutable candidate plan held under every Trial execution lock."""
+
+    config: EvalRunConfig
+    case_snapshot: RunCaseSnapshot
+    manifest: RunManifest
 
 
 @dataclass(frozen=True)
@@ -5419,6 +5428,72 @@ class ArtifactStore:
             status = RunStatus.PENDING
         return RunState(run_id=run_id, status=status, trials=tuple(states))
 
+    @contextmanager
+    def reserve_run_before_execution(
+        self,
+        run_id: str,
+    ) -> Iterator[RunPreexecutionReservation]:
+        """Hold the complete Run at its immutable pre-execution boundary.
+
+        ``start_trial`` and every subsequent Trial writer use the same
+        per-Trial locks.  Acquiring all of them in canonical plan order makes
+        the final precondition replay and a caller-owned publication one
+        indivisible operation with respect to Agent execution.
+        """
+
+        initial = self._load_verified_run_bundle(run_id)
+        initial_plans = tuple(
+            self._load_trial_manifest(
+                initial,
+                item.task_id,
+                item.trial_id,
+                budget=_ReadBudget(self.max_total_read_bytes),
+            )
+            for item in initial.manifest.trials
+        )
+        with ExitStack() as locks:
+            for plan in initial_plans:
+                locks.enter_context(self._lock(self._trial_lock_path(plan)))
+
+            locked = self._load_verified_run_bundle(run_id)
+            locked_plans = tuple(
+                self._load_trial_manifest(
+                    locked,
+                    item.task_id,
+                    item.trial_id,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                )
+                for item in locked.manifest.trials
+            )
+            if locked != initial or locked_plans != initial_plans:
+                raise ArtifactIntegrityError(
+                    "candidate immutable Run plan changed while reserving execution"
+                )
+            for plan in locked_plans:
+                state, _submission = self._load_trial_state(
+                    locked,
+                    plan,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                )
+                if (
+                    state.status is not TrialStatus.PENDING
+                    or state.active_attempt is not None
+                    or state.completed_stages
+                    or state.terminal_receipt is not None
+                ):
+                    raise ArtifactConflictError(
+                        "candidate Run has already started execution"
+                    )
+            if self.list_evaluations(run_id) or self.list_run_evaluations(run_id):
+                raise ArtifactConflictError(
+                    "candidate Run already contains evaluation results"
+                )
+            yield RunPreexecutionReservation(
+                config=locked.config,
+                case_snapshot=locked.case_snapshot,
+                manifest=locked.manifest,
+            )
+
     def _trial_lock_path(self, plan: TrialManifest) -> Path:
         return self._trial_dir(plan) / ".locks" / "trial.lock"
 
@@ -7649,6 +7724,7 @@ __all__ = [
     "TrialState",
     "VerifiedTrialMaterialization",
     "RunState",
+    "RunPreexecutionReservation",
     "ResumePlan",
     "EvaluationNamespace",
     "EvaluationArtifactBundle",
