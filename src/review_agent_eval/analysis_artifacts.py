@@ -1804,13 +1804,17 @@ class AnalysisArtifactStore:
         )
 
     def _require_frozen_gate_policy(self, policy: Any) -> Any:
-        """Verify a frozen policy is issued by this Store and still present."""
+        """Live-verify and reconstruct a frozen policy from this Store."""
 
-        from .gates import FrozenGatePolicy, _validate_frozen_gate_policy
+        from .gates import (
+            FrozenGatePolicy,
+            _freeze_gate_policy,
+            _validate_frozen_gate_policy,
+        )
 
         if type(policy) is not FrozenGatePolicy:
             raise TypeError(
-                "gate result publication requires a Store-issued FrozenGatePolicy"
+                "gate evaluation requires a Store-issued FrozenGatePolicy"
             )
         _validate_frozen_gate_policy(
             policy,
@@ -1827,7 +1831,11 @@ class AnalysisArtifactStore:
             raise ArtifactIntegrityError(
                 "FrozenGatePolicy does not match this Store's published receipt"
             )
-        return policy
+        return _freeze_gate_policy(
+            stored,
+            receipt,
+            store_identity_digest=self._gate_store_identity_digest(),
+        )
 
     @staticmethod
     def _gate_result_publication_digest(policy: Any, result: Any) -> str:
@@ -1869,10 +1877,9 @@ class AnalysisArtifactStore:
             )
         if type(comparison) is not RunComparisonV1:
             raise TypeError("comparison must be a RunComparisonV1")
-        self._require_frozen_gate_policy(policy)
         try:
             canonical_result = GateResultV1.from_dict(result.to_dict())
-            replayed = evaluate_gate(policy, comparison, calibrations)
+            replayed = evaluate_gate(self, policy, comparison, calibrations)
         except ArtifactIntegrityError:
             raise
         except (AttributeError, SchemaError, TypeError, ValueError) as exc:
@@ -1961,10 +1968,9 @@ class AnalysisArtifactStore:
             )
         if type(comparison) is not RunComparisonV1:
             raise TypeError("comparison must be a RunComparisonV1")
-        self._require_frozen_gate_policy(policy)
         receipt, stored = self._load_gate_result_with_receipt(artifact_id)
         try:
-            replayed = evaluate_gate(policy, comparison, calibrations)
+            replayed = evaluate_gate(self, policy, comparison, calibrations)
             expected_sources = _canonical_source_bindings(
                 (
                     comparison.baseline_binding,

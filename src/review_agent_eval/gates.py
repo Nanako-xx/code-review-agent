@@ -15,7 +15,11 @@ import hashlib
 import re
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
-from .analysis_artifacts import AnalysisReceipt, AnalysisSourceBinding
+from .analysis_artifacts import (
+    AnalysisArtifactStore,
+    AnalysisReceipt,
+    AnalysisSourceBinding,
+)
 from .artifacts import ArtifactIntegrityError
 from .calibration import CalibrationResultV1, CalibrationStatus
 from .cases import CaseSplit, SuiteKind
@@ -1428,17 +1432,14 @@ def _ineligible_check(
     )
 
 
-def _evaluate_prepared_policy(
-    policy: GatePolicyV1,
+def _evaluate_frozen_policy(
+    policy: FrozenGatePolicy,
     comparison: RunComparisonV1,
     calibrations: Mapping[Any, CalibrationResultV1],
-    *,
-    policy_artifact_id: str,
-    policy_receipt_digest: str,
 ) -> GateResultV1:
-    """Evaluate a Store-verified policy using source-bound analysis inputs."""
+    """Pure gate logic for a policy already live-verified by its Store."""
 
-    canonical_policy = _canonical_policy(policy)
+    canonical_policy = _validate_frozen_gate_policy(policy)
     canonical_comparison = _canonical_comparison(comparison)
     canonical_calibrations = _normalize_calibrations(calibrations)
     global_reasons = _global_mismatch_reasons(canonical_policy, canonical_comparison, canonical_calibrations)
@@ -1593,8 +1594,8 @@ def _evaluate_prepared_policy(
         decision = GateDecision.PROMOTE
     return GateResultV1.create(
         policy_digest=canonical_policy.policy_digest,
-        policy_artifact_id=policy_artifact_id,
-        policy_receipt_digest=policy_receipt_digest,
+        policy_artifact_id=policy.artifact_id,
+        policy_receipt_digest=policy.receipt_digest,
         comparison_id=canonical_comparison.comparison_id,
         decision=decision,
         checks=tuple(checks),
@@ -1602,25 +1603,22 @@ def _evaluate_prepared_policy(
 
 
 def evaluate_gate(
+    store: AnalysisArtifactStore,
     policy: FrozenGatePolicy,
     comparison: RunComparisonV1,
     calibrations: Mapping[Any, CalibrationResultV1],
 ) -> GateResultV1:
-    """Evaluate only a Store-issued, verified frozen policy.
+    """Live-verify and evaluate only a Store-published frozen policy.
 
     The raw ``GatePolicyV1`` remains proposal/serialization data and is
-    intentionally rejected here.  This keeps the release decision downstream
-    of the receipt-last publication and source replay boundary.
+    intentionally rejected here.  Every call re-opens the policy artifact and
+    receipt through the concrete Store before any comparison is evaluated.
     """
 
-    canonical_policy = _validate_frozen_gate_policy(policy)
-    return _evaluate_prepared_policy(
-        canonical_policy,
-        comparison,
-        calibrations,
-        policy_artifact_id=policy.artifact_id,
-        policy_receipt_digest=policy.receipt_digest,
-    )
+    if type(store) is not AnalysisArtifactStore:
+        raise TypeError("store must be a concrete AnalysisArtifactStore")
+    verified_policy = store._require_frozen_gate_policy(policy)
+    return _evaluate_frozen_policy(verified_policy, comparison, calibrations)
 
 
 __all__ = [

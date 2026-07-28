@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from review_agent_eval.analysis_artifacts import AnalysisArtifactStore
+from review_agent_eval.analysis_artifacts import AnalysisArtifactStore, AnalysisReceipt
 from review_agent_eval.artifacts import ArtifactConflictError, ArtifactIntegrityError
 from review_agent_eval.calibration import (
     CalibrationStatus,
@@ -399,7 +399,7 @@ def test_gate_checks_absolute_and_baseline_delta_constraints(
         baseline=baseline,
         candidate_run_config=core_gate_sources["block_config"],
     )
-    result = evaluate_gate(frozen, comparison, {})
+    result = evaluate_gate(gate_policy_store, frozen, comparison, {})
 
     assert result.decision is GateDecision.BLOCK
     by_scope = {check.scope: check for check in result.checks}
@@ -434,7 +434,7 @@ def test_gate_reports_case_and_trial_refs_for_each_failure(
         baseline=baseline,
         candidate_run_config=core_gate_sources["block_config"],
     )
-    result = evaluate_gate(frozen, comparison, {})
+    result = evaluate_gate(gate_policy_store, frozen, comparison, {})
     check = result.checks[0]
     assert check.status is GateCheckStatus.FAIL
     assert check.case_refs
@@ -477,6 +477,7 @@ def test_gate_requires_calibration_for_semantic_metrics(
         candidate_run_config=candidate_config,
     )
     passed = evaluate_gate(
+        gate_policy_store,
         frozen,
         comparison,
         {JudgeTask.FINDING_EQUIVALENCE.value: eligible},
@@ -497,7 +498,12 @@ def test_gate_requires_calibration_for_semantic_metrics(
         baseline=baseline,
         candidate_run_config=candidate_config,
     )
-    missing_result = evaluate_gate(missing_frozen, comparison, {})
+    missing_result = evaluate_gate(
+        gate_policy_store,
+        missing_frozen,
+        comparison,
+        {},
+    )
     assert missing_result.decision is GateDecision.INELIGIBLE
     assert missing_result.checks[0].status is GateCheckStatus.INELIGIBLE
 
@@ -582,6 +588,7 @@ def test_gate_requires_calibration_for_semantic_metrics(
             candidate_run_config=candidate_config,
         )
         untrusted = evaluate_gate(
+            gate_policy_store,
             untrusted_frozen,
             comparison,
             {profile.value: calibration},
@@ -611,7 +618,7 @@ def test_gate_marks_public_or_unscorable_data_diagnostic_only(
         baseline=baseline,
         candidate_run_config=candidate_config,
     )
-    result = evaluate_gate(frozen, comparison, {})
+    result = evaluate_gate(gate_policy_store, frozen, comparison, {})
     assert result.decision is GateDecision.INELIGIBLE
     assert result.checks[0].status is GateCheckStatus.INELIGIBLE
 
@@ -653,7 +660,12 @@ def test_gate_returns_promote_block_and_ineligible_without_overall_score(
         baseline=baseline,
         candidate_run_config=promote_config,
     )
-    promoted = evaluate_gate(promote_frozen, promote_comparison, {})
+    promoted = evaluate_gate(
+        gate_policy_store,
+        promote_frozen,
+        promote_comparison,
+        {},
+    )
     assert promoted.decision is GateDecision.PROMOTE
 
     block_config = core_gate_sources["block_config"]
@@ -679,7 +691,12 @@ def test_gate_returns_promote_block_and_ineligible_without_overall_score(
         baseline=baseline,
         candidate_run_config=block_config,
     )
-    blocked = evaluate_gate(block_frozen, block_comparison, {})
+    blocked = evaluate_gate(
+        gate_policy_store,
+        block_frozen,
+        block_comparison,
+        {},
+    )
     assert blocked.decision is GateDecision.BLOCK
 
     public_baseline = paired_sources["baseline"]
@@ -718,7 +735,12 @@ def test_gate_returns_promote_block_and_ineligible_without_overall_score(
         baseline=public_baseline,
         candidate_run_config=public_config,
     )
-    ineligible = evaluate_gate(ineligible_frozen, incomparable, {})
+    ineligible = evaluate_gate(
+        gate_policy_store,
+        ineligible_frozen,
+        incomparable,
+        {},
+    )
     assert ineligible.decision is GateDecision.INELIGIBLE
     assert set(promoted.to_dict()) == {
         "schema_version",
@@ -787,7 +809,7 @@ def test_gate_artifact_result_replay_rejects_resealed_result(
         baseline=baseline,
         candidate_run_config=candidate_config,
     )
-    result = evaluate_gate(policy, comparison, {})
+    result = evaluate_gate(store, policy, comparison, {})
     receipt = store.publish_gate_result(
         result,
         policy=policy,
@@ -868,10 +890,10 @@ def test_gate_rejects_raw_policy_bypass_and_only_frozen_public_policy_is_ineligi
         ),
     )
 
-    with pytest.raises(TypeError, match="FrozenGatePolicy|frozen"):
-        evaluate_gate(raw_release, comparison, {})
-
     store = AnalysisArtifactStore(tmp_path / "analysis")
+    with pytest.raises(TypeError, match="FrozenGatePolicy|frozen"):
+        evaluate_gate(store, raw_release, comparison, {})
+
     frozen = store.publish_gate_policy(
         raw_release,
         baseline=baseline,
@@ -879,10 +901,12 @@ def test_gate_rejects_raw_policy_bypass_and_only_frozen_public_policy_is_ineligi
     )
     assert type(frozen) is FrozenGatePolicy
     assert frozen.policy.eligibility is GateEligibility.DIAGNOSTIC_ONLY
-    result = evaluate_gate(frozen, comparison, {})
+    result = evaluate_gate(store, frozen, comparison, {})
     assert result.decision is GateDecision.INELIGIBLE
     assert result.policy_artifact_id == frozen.artifact_id
     assert result.policy_receipt_digest == frozen.receipt_digest
+    with pytest.raises(TypeError, match="store|AnalysisArtifactStore"):
+        evaluate_gate(object(), frozen, comparison, {})
     with pytest.raises(TypeError, match="Store-issued|AnalysisArtifactStore"):
         FrozenGatePolicy()
     with pytest.raises((TypeError, ArtifactIntegrityError), match="FrozenGatePolicy|frozen"):
@@ -892,6 +916,83 @@ def test_gate_rejects_raw_policy_bypass_and_only_frozen_public_policy_is_ineligi
             comparison=comparison,
             calibrations={},
         )
+
+
+def test_gate_live_store_check_rejects_copied_seal_forgery_without_policy_artifact(
+    paired_sources: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    baseline = paired_sources["baseline"]
+    candidate = paired_sources["candidate"]
+    candidate_config = paired_sources["candidate_run"].config
+    comparison = compare_runs(baseline, candidate, COMPARISON_POLICY)
+    raw_release = _policy(
+        baseline,
+        candidate_config,
+        eligibility=GateEligibility.RELEASE_BLOCKING,
+        constraints=(
+            _constraint(
+                CoreMetric.AGENT_FAILURE_RATE,
+                GateConstraintScope.CANDIDATE_ABSOLUTE,
+                GateOperator.AT_MOST,
+                1_000_000,
+            ),
+        ),
+    )
+    store = AnalysisArtifactStore(tmp_path / "analysis")
+    legitimate = store.publish_gate_policy(
+        raw_release,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    )
+    assert legitimate.policy.eligibility is GateEligibility.DIAGNOSTIC_ONLY
+
+    forged_receipt = AnalysisReceipt.create(
+        kind="gate-policy",
+        source_bindings=(raw_release.baseline_binding,),
+        algorithm_digest=raw_release.algorithm_digest,
+        files={"gate_policy.json": raw_release.to_dict()},
+    )
+
+    def copied_seal_forgery(receipt: AnalysisReceipt) -> FrozenGatePolicy:
+        forged = object.__new__(FrozenGatePolicy)
+        object.__setattr__(forged, "policy", raw_release)
+        object.__setattr__(forged, "receipt", receipt)
+        object.__setattr__(forged, "receipt_digest", receipt.digest())
+        object.__setattr__(forged, "artifact_id", receipt.artifact_id)
+        object.__setattr__(forged, "baseline_binding", raw_release.baseline_binding)
+        object.__setattr__(
+            forged,
+            "candidate_run_config_digest",
+            raw_release.candidate_run_config_digest,
+        )
+        object.__setattr__(
+            forged,
+            "_store_identity_digest",
+            legitimate._store_identity_digest,
+        )
+        object.__setattr__(forged, "_seal", legitimate._seal)
+        return forged
+
+    absent = copied_seal_forgery(forged_receipt)
+    assert absent.artifact_id != legitimate.artifact_id
+    with pytest.raises(ArtifactIntegrityError):
+        evaluate_gate(store, absent, comparison, {})
+
+    aliases_other_policy = copied_seal_forgery(legitimate.receipt)
+    assert aliases_other_policy.artifact_id == legitimate.artifact_id
+    with pytest.raises(ArtifactIntegrityError):
+        evaluate_gate(store, aliases_other_policy, comparison, {})
+
+    policy_path = (
+        store.root
+        / "gate-policy"
+        / legitimate.artifact_id
+        / "gate_policy.json"
+    )
+    policy_path.write_bytes(canonical_json_bytes({"tampered": True}))
+    with pytest.raises(ArtifactIntegrityError):
+        evaluate_gate(store, legitimate, comparison, {})
 
 
 def test_gate_rejects_frozen_policy_from_another_analysis_store_even_with_same_receipt_digest(
@@ -928,7 +1029,7 @@ def test_gate_rejects_frozen_policy_from_another_analysis_store_even_with_same_r
     )
     assert first.artifact_id == second.artifact_id
     assert first.receipt_digest == second.receipt_digest
-    result = evaluate_gate(second, comparison, {})
+    result = evaluate_gate(second_store, second, comparison, {})
 
     with pytest.raises(ArtifactIntegrityError, match="Store|store|receipt|frozen"):
         first_store.publish_gate_result(
@@ -978,6 +1079,6 @@ def test_release_policy_rejects_all_optional_constraints(
         core_gate_sources["promote"],
         COMPARISON_POLICY,
     )
-    result = evaluate_gate(frozen, comparison, {})
+    result = evaluate_gate(gate_policy_store, frozen, comparison, {})
     assert result.decision is GateDecision.INELIGIBLE
     assert result.checks[0].status is GateCheckStatus.PASS
