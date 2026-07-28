@@ -1,7 +1,8 @@
 # Code Review Agent Task 15：重复试验、配对比较、Judge 校准与回归门禁设计
 
 日期：2026-07-26  
-状态：设计已确认，等待用户审阅书面稿  
+状态：设计已确认并完成本地实现；PR #12 已合并，正式发布仍等待真实模型、独立真人 Reviewer B、真人 Judge calibration 与 Private Held-out 外部证据
+
 基线：Eval v2 `d33775f`（PR #11 合并后的 `master`）
 
 ## 1. 设计结论

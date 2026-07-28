@@ -1,6 +1,8 @@
 # Core Code Review Eval System 实施计划
 
-**状态：** Task 1–12 已完成；Task 13 本地实现与可执行回归已完成，等待独立真人盲审和真实模型重复 baseline 两项外部门禁；Task 14+ 尚未开始
+**状态：** Task 1–15 的本地工程实现与可执行回归已完成；Task 16 的本地 E2E、安全、兼容性和用户文档验收已由 Eval Protocol v2 与 Task 15 专项实现覆盖。正式发布仍等待独立真人 Reviewer B、真实模型重复 baseline、真人 Judge calibration 和 Private Held-out 四类外部门禁。
+
+**后续设计关系：** 本计划保留 2026-07-16 时的历史任务清单。Task 14 的最终协议与验收由 `docs/superpowers/specs/2026-07-22-focused-eval-v2-completion-design.md` 和 `docs/superpowers/plans/2026-07-21-eval-protocol-v2.md` 取代；Task 15 的最终口径与实施步骤由 `docs/superpowers/specs/2026-07-26-code-review-agent-task15-eval-analysis-design.md` 和 `docs/superpowers/plans/2026-07-26-code-review-agent-task15-eval-analysis.md` 取代。下方旧清单中未勾选或后来删除的指标，不代表最终实现缺失；应以对应专项设计、完成记录和当前测试为准。
 
 **设计来源：** `docs/superpowers/specs/2026-07-16-core-code-review-eval-system-design.md`
 
@@ -776,6 +778,8 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 
 **提交边界：** `feat(eval): adapt aacr and swe pr review benchmarks`
 
+**完成记录（2026-07-28）：** Task 14 已按 Eval Protocol v2 的最终协议完成。系统实现了严格 public source/filter manifest、逐文件 size/SHA-256 校验、record-level provenance、create-only Suite 发布、显式 `prepare-public` acquisition 边界，以及 AACR-Bench/SWE-PRBench 的 Repository 与 Frozen Context 能力声明。AACR 固定口径保留 200 个 Case，并将 1 条反向行号和 3 条 expected/known-invalid canonical claim 冲突按 exact pointer+digest 隔离；SWE 固定口径区分 native Repository 与 official Frozen Context，4 条空 truth 和 1 条超长 claim fail closed。两种执行协议、Metric Authority 与不可评分字段分别记录，公共原始数据不提交 Git，Trial 阶段不联网。
+
 ---
 
 # Batch E：重复 Trial、比较、校准与发布门禁
@@ -826,6 +830,8 @@ Wave E2       Task 16 E2E/security/compatibility/docs
 ```
 
 **提交边界：** `feat(eval): compare repeated trials and enforce calibrated gates`
+
+**完成记录（2026-07-28）：** Task 15 已按 2026-07-26 专项设计完成并通过 PR #12 合并。最终实现包含独立 create-only Analysis Store、source-bound repeated-trial statistics、严格 baseline/candidate 配对比较、四类盲化 Judge calibration、candidate 运行前冻结的 Regression Gate Policy、逐条件 Gate 结果、CLI、E2E、安全回归和用户文档。最终设计明确不新增 `pass@1`、`pass^k`、Case Pass 或 Overall Score；它直接统计现有核心指标的 Trial 分布、Coverage、Case 变化和确定性置信区间，因此本节早期草案中的对应条目已被取代，而不是待实现功能。fake/scripted E2E 只证明协议与制品机制；真实模型语义质量、独立真人标签和正式发布资格仍由外部门禁决定。
 
 ## Wave E2：端到端、安全与文档
 
@@ -879,6 +885,8 @@ $env:PYTHONDONTWRITEBYTECODE='1'; $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 ```
 
 **提交边界：** `docs(eval): complete harness integration and operating guide`
+
+**本地验收记录（2026-07-28）：** 本节的本地自动化范围已分布在 Eval v2 Repository/Frozen E2E、CLI/security、architecture boundary、Task 15 E2E 与 `docs/eval-system.md` 中完成；最终文件名随协议设计演进，与上方早期所有权列表不完全相同。尚未完成的是不能由代码或 fake provider 代替的外部证据：Core Case 的 Reviewer B 盲审、每个 Regression Case 至少三次真实模型 Trial、真实人工 Judge calibration，以及不泄漏内容的 Private Held-out 运行。
 
 ---
 

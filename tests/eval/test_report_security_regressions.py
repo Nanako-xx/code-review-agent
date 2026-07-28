@@ -8,13 +8,15 @@ from review_agent_eval.artifacts import ArtifactStore
 from review_agent_eval.intent_evaluator import IntentEvaluator
 from review_agent_eval.judge import JudgeContextKind, repository_context
 from review_agent_eval.metrics import MetricsAggregator, TrialScore
-from review_agent_eval.models import TraceRef, TraceType
+from review_agent_eval.models import TraceRef, TraceType, canonical_sha256
 from review_agent_eval.report import (
     ReportBuilder,
     ReportError,
     RunReportSummary,
     TrialEvaluationSource,
     TrialInspection,
+    render_run_markdown,
+    render_trial_markdown,
 )
 from review_agent_eval.review_evaluator import (
     ReviewContextBundle,
@@ -39,12 +41,16 @@ class _ForgedReplay:
         return self._payload
 
 
-def test_inspection_replaces_raw_judge_payloads_with_digest_refs() -> None:
+def test_reports_redact_private_truth_and_judge_payloads_but_keep_refs() -> None:
     case, replay, execution, config = _score_sources()
     base_submission = _completed_submission(config, 1)
     finding_id = base_submission.review.findings[0].finding_id
     submission = replace(
         base_submission,
+        intent=replace(
+            base_submission.intent,
+            goal="Let users preview branch behavior.",
+        ),
         review=replace(
             base_submission.review,
             findings=(
@@ -76,6 +82,7 @@ def test_inspection_replaces_raw_judge_payloads_with_digest_refs() -> None:
         case.intent_truth,
         case.clarification_script,
     )
+    assert intent_result.judge_requests
     review_result = ReviewEvaluator(
         eval_input=case.eval_input(),
         replay=replay,
@@ -86,16 +93,25 @@ def test_inspection_replaces_raw_judge_payloads_with_digest_refs() -> None:
     ).evaluate(submission, case.review_truth)
     assert review_result.judge_requests
 
-    inspection = ReportBuilder().build_inspection(
+    source = TrialEvaluationSource(
+        eval_case=case,
+        submission=submission,
+        intent_result=intent_result,
+        review_result=review_result,
+    )
+    builder = ReportBuilder()
+    inspection = builder.build_inspection(
         config,
         execution,
         "metrics-eval-v1",
-        trial_source=TrialEvaluationSource(
-            eval_case=case,
-            submission=submission,
-            intent_result=intent_result,
-            review_result=review_result,
-        ),
+        trial_source=source,
+    )
+    summary = builder.build_summary(
+        config,
+        execution,
+        "metrics-eval-v1",
+        eval_cases=(case,),
+        trial_sources=(source,),
     )
     payload = inspection.to_dict()
 
@@ -115,12 +131,98 @@ def test_inspection_replaces_raw_judge_payloads_with_digest_refs() -> None:
         ):
             assert field not in projection["payload"]
 
-    request_refs = payload["judge_artifact_refs"]["review"]["requests"]
-    assert len(request_refs) == 1
-    assert request_refs[0]["request_id"] == review_result.judge_requests[0].request_id
-    assert request_refs[0]["request_digest"]
-    assert request_refs[0]["parent_result_digest"] == review_result.digest()
-    assert context_content not in inspection.to_json()
+    intent_truth_refs = payload["intent_evaluation"]["payload"]["truth_claims"]
+    assert intent_truth_refs
+    assert all("text" not in item for item in intent_truth_refs)
+
+    review_projection = payload["review_evaluation"]["payload"]
+    expected_truth_refs = review_projection["expected_truth_findings"]
+    assert expected_truth_refs
+    for item in expected_truth_refs:
+        assert not {"claim", "locations", "evidence_anchors", "rationale"}.intersection(item)
+    for item in review_projection["known_invalid_truth_findings"]:
+        assert not {"claim", "locations", "rationale"}.intersection(item)
+    assert all(
+        "truth_location" not in item
+        for item in review_projection["location_candidates"]
+    )
+
+    for phase, result in (("intent", intent_result), ("review", review_result)):
+        request_refs = payload["judge_artifact_refs"][phase]["requests"]
+        assert len(request_refs) == 1
+        assert request_refs[0]["request_id"] == result.judge_requests[0].request_id
+        assert request_refs[0]["parent_result_digest"] == result.digest()
+
+    intent_request = intent_result.judge_requests[0]
+    intent_ref = payload["judge_artifact_refs"]["intent"]["requests"][0]
+    assert intent_ref["task"] == "intent_equivalence"
+    assert intent_ref["source_request_digest"] == canonical_sha256(
+        intent_request.to_dict()
+    )
+    assert intent_ref["request_digest"] is None
+    assert intent_ref["blind_request_id"] is None
+
+    review_request = review_result.judge_requests[0]
+    review_ref = payload["judge_artifact_refs"]["review"]["requests"][0]
+    assert review_ref["task"] == review_request.task.value
+    assert (
+        review_ref["source_request_digest"]
+        == review_request.request.source_request_digest
+    )
+    assert review_ref["request_digest"] == review_request.request.digest()
+    assert review_ref["blind_request_id"] == review_request.blind_request_id
+
+    private_values = (
+        case.intent_truth.expected_claims[0].text,
+        case.review_truth.expected_findings[0].claim,
+        case.review_truth.expected_findings[0].rationale,
+        context_content,
+    )
+    rendered_outputs = (
+        inspection.to_json(),
+        summary.to_json(),
+        render_trial_markdown(inspection),
+        render_run_markdown(summary),
+    )
+    for private_value in private_values:
+        assert all(private_value not in output for output in rendered_outputs)
+
+
+def test_summary_redacts_private_truth_from_severe_miss_diagnostics() -> None:
+    case, replay, execution, config = _score_sources()
+    submission = _completed_submission(config, 1, finding_count=0)
+    intent_result = IntentEvaluator().evaluate(
+        submission.intent,
+        case.intent_truth,
+        case.clarification_script,
+    )
+    review_result = ReviewEvaluator(
+        eval_input=case.eval_input(),
+        replay=replay,
+        trial_id=submission.trial_id,
+        target_materialization_id=TARGET_MATERIALIZATION_ID,
+        evaluator_execution=execution,
+    ).evaluate(submission, case.review_truth)
+    source = TrialEvaluationSource(
+        eval_case=case,
+        submission=submission,
+        intent_result=intent_result,
+        review_result=review_result,
+    )
+    summary = ReportBuilder().build_summary(
+        config,
+        execution,
+        "metrics-eval-v1",
+        eval_cases=(case,),
+        trial_sources=(source,),
+    )
+
+    misses = summary.diagnostics["critical_high_misses"]
+    assert len(misses) == 1
+    assert "claim" not in misses[0]
+    private_claim = case.review_truth.expected_findings[0].claim
+    assert private_claim not in summary.to_json()
+    assert private_claim not in render_run_markdown(summary)
 
 
 def test_inspection_rejects_an_uninspected_trial_manifest_ref_tampering(

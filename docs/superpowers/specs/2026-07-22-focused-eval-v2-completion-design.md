@@ -1,7 +1,7 @@
 # Focused Eval v2 Completion Design
 
 - 日期：2026-07-22
-- 状态：已确认，等待书面快速复核
+- 状态：已确认并完成本地实现；PR #11 已合并
 - 基线分支：`codex/eval-protocol-v2`
 - 基线提交：`0000d76`
 - 前置完成：Eval Protocol v2 Task 1–3
