@@ -116,6 +116,7 @@ CALIBRATION_PUBLIC_NAMES = (
     "AuxiliaryCalibrationV1",
     "ProfileCalibrationV1",
     "CalibrationResultV1",
+    "build_calibration_package",
     "export_calibration_package",
     "score_calibration",
 )

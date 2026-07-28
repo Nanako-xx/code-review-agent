@@ -231,6 +231,9 @@ def _validate_windows_final_root_boundary(root: Path) -> None:
 
 
 def _validate_analysis_root_boundary(root: os.PathLike[str] | str) -> None:
+    raw_path = Path(os.fspath(root))
+    if ".." in raw_path.parts:
+        raise ArtifactSecurityError("Analysis root contains traversal")
     try:
         absolute = _absolute_storage_path(root)
     except (TypeError, ValueError) as exc:

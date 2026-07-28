@@ -3284,6 +3284,23 @@ def _build_package(
     return package
 
 
+def build_calibration_package(
+    evaluation: VerifiedRunEvaluation,
+    *,
+    profile: JudgeTask,
+    policy: CalibrationSelectionPolicyV1,
+) -> CalibrationPackageV1:
+    """Build the canonical blind package without publishing external bytes.
+
+    CLI import and scoring commands must replay a package from its verified
+    Evaluation and selection policy, but must not rewrite the operator's
+    external package directory.  This public, side-effect-free boundary keeps
+    those commands out of the private selection implementation.
+    """
+
+    return _build_package(evaluation, profile=profile, policy=policy)
+
+
 def _portable_key(value: str) -> str:
     return unicodedata.normalize("NFKC", value).casefold().rstrip(" .")
 
@@ -3428,7 +3445,11 @@ def export_calibration_package(
 ) -> CalibrationPackageV1:
     """Export a create-only blind package from persisted Evaluation artifacts."""
 
-    package = _build_package(evaluation, profile=profile, policy=policy)
+    package = build_calibration_package(
+        evaluation,
+        profile=profile,
+        policy=policy,
+    )
     _assert_blind_payload(
         package.to_blind_dict(),
         forbidden_identity_values=_forbidden_identity_values(evaluation),
@@ -3874,6 +3895,7 @@ __all__ = [
     "AuxiliaryCalibrationV1",
     "ProfileCalibrationV1",
     "CalibrationResultV1",
+    "build_calibration_package",
     "export_calibration_package",
     "score_calibration",
 ]

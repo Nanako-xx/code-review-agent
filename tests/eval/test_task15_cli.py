@@ -1,0 +1,387 @@
+from __future__ import annotations
+
+import json
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+import review_agent_eval.cli as cli_module
+from review_agent_eval.cli import (
+    EXIT_INTEGRITY,
+    EXIT_OK,
+    EXIT_POLICY,
+    EXIT_PRECONDITION,
+    EXIT_USAGE,
+    _build_parser,
+    main,
+)
+from review_agent_eval.comparison import ComparisonStatus
+from review_agent_eval.gates import GateDecision
+
+
+def _command_choices(parser: Any) -> dict[str, Any]:
+    action = next(item for item in parser._actions if item.dest == "command")
+    return action.choices
+
+
+def _nested_choices(parser: Any, destination: str) -> set[str]:
+    action = next(item for item in parser._actions if item.dest == destination)
+    return set(action.choices)
+
+
+def test_parser_exposes_complete_task15_analysis_lifecycle() -> None:
+    commands = _command_choices(_build_parser())
+
+    assert {"compare", "calibrate", "gate"} <= set(commands)
+    assert _nested_choices(commands["calibrate"], "calibrate_command") == {
+        "export",
+        "import-labels",
+        "score",
+    }
+    assert _nested_choices(commands["gate"], "gate_command") == {
+        "prepare",
+        "evaluate",
+    }
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["compare"],
+        ["calibrate", "export"],
+        ["calibrate", "import-labels"],
+        ["calibrate", "score"],
+        ["gate", "prepare"],
+        ["gate", "evaluate"],
+    ),
+)
+def test_analysis_commands_require_source_arguments_and_accept_analysis_root(
+    arguments: list[str],
+) -> None:
+    parser = _build_parser()
+    with pytest.raises(SystemExit) as missing:
+        parser.parse_args(arguments)
+    assert missing.value.code == EXIT_USAGE
+
+    command = _command_choices(parser)[arguments[0]]
+    if len(arguments) == 2:
+        nested = next(
+            item
+            for item in command._actions
+            if item.dest == arguments[0] + "_command"
+        )
+        command = nested.choices[arguments[1]]
+    destinations = {item.dest for item in command._actions}
+    assert "analysis_root" in destinations
+    assert destinations.isdisjoint(
+        {
+            "agent_provider",
+            "agent_command",
+            "agent_config",
+            "judge_provider",
+            "judge_model",
+            "source_root",
+            "git_executable",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["compare"],
+        ["calibrate", "export"],
+        ["calibrate", "import-labels"],
+        ["calibrate", "score"],
+        ["gate", "prepare"],
+        ["gate", "evaluate"],
+    ),
+)
+def test_analysis_commands_reject_provider_and_acquisition_options(
+    arguments: list[str],
+    tmp_path: Path,
+) -> None:
+    for forbidden in (
+        "--agent-provider",
+        "--judge-provider",
+        "--agent-command",
+        "--source-root",
+        "--git-executable",
+    ):
+        assert main([*arguments, forbidden, "fake"]) == EXIT_USAGE
+
+
+def test_compare_missing_run_root_is_precondition_and_does_not_create_analysis(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    analysis = tmp_path / ".eval-analyses"
+    policy = tmp_path / "comparison-policy.json"
+    policy.write_text("{}", encoding="utf-8")
+
+    code = main(
+        [
+            "compare",
+            "--suite-root",
+            str(suite),
+            "--runs-root",
+            str(tmp_path / ".eval-runs"),
+            "--analysis-root",
+            str(analysis),
+            "--baseline-run-id",
+            "run-" + "1" * 64,
+            "--baseline-evaluation-id",
+            "evaluation-" + "2" * 64,
+            "--candidate-run-id",
+            "run-" + "3" * 64,
+            "--candidate-evaluation-id",
+            "evaluation-" + "4" * 64,
+            "--policy",
+            str(policy),
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == EXIT_PRECONDITION
+    assert payload["error_code"] == "precondition"
+    assert not analysis.exists()
+
+
+@pytest.mark.parametrize("malformed", ("../run", "evaluation/not-an-id"))
+def test_compare_malformed_source_ids_are_integrity_errors_without_path_echo(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    malformed: str,
+) -> None:
+    @contextmanager
+    def loader(_args: Any):
+        def reject(_run: str, _evaluation: str):
+            raise ValueError("private/path/" + malformed)
+
+        yield reject, object(), Path("analysis")
+
+    monkeypatch.setattr(cli_module, "_analysis_evaluation_loader", loader)
+    code = main(
+        [
+            "compare",
+            "--suite-root",
+            "suite",
+            "--baseline-run-id",
+            malformed,
+            "--baseline-evaluation-id",
+            "evaluation-" + "2" * 64,
+            "--candidate-run-id",
+            "run-" + "3" * 64,
+            "--candidate-evaluation-id",
+            "evaluation-" + "4" * 64,
+            "--policy",
+            "comparison.json",
+            "--json",
+        ]
+    )
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert code == EXIT_INTEGRITY
+    assert payload["error_code"] == "integrity"
+    assert "private/path" not in output
+
+
+@pytest.mark.parametrize(
+    ("decision", "ci", "expected"),
+    (
+        ("promote", False, EXIT_OK),
+        ("promote", True, EXIT_OK),
+        ("block", False, EXIT_OK),
+        ("block", True, EXIT_POLICY),
+        ("ineligible", False, EXIT_OK),
+        ("ineligible", True, EXIT_POLICY),
+    ),
+)
+def test_gate_policy_exit_mapping_is_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+    ci: bool,
+    expected: int,
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "_handle_gate_evaluate",
+        lambda args: cli_module._gate_exit_code(decision, ci=args.ci),
+    )
+    arguments = [
+        "gate",
+        "evaluate",
+        "--suite-root",
+        "suite",
+        "--baseline-run-id",
+        "run-" + "1" * 64,
+        "--baseline-evaluation-id",
+        "evaluation-" + "2" * 64,
+        "--candidate-run-id",
+        "run-" + "3" * 64,
+        "--candidate-evaluation-id",
+        "evaluation-" + "4" * 64,
+        "--comparison-id",
+        "analysis-artifact-v1-" + "5" * 64,
+        "--comparison-policy",
+        "comparison.json",
+        "--gate-policy-id",
+        "analysis-artifact-v1-" + "6" * 64,
+    ]
+    if ci:
+        arguments.append("--ci")
+
+    assert main(arguments) == expected
+
+
+class _Receipt:
+    artifact_id = "analysis-artifact-v1-" + "a" * 64
+
+    @staticmethod
+    def digest() -> str:
+        return "b" * 64
+
+
+def _analysis_arguments(command: list[str]) -> list[str]:
+    return [
+        *command,
+        "--suite-root",
+        "suite",
+        "--baseline-run-id",
+        "run-" + "1" * 64,
+        "--baseline-evaluation-id",
+        "evaluation-" + "2" * 64,
+        "--candidate-run-id",
+        "run-" + "3" * 64,
+        "--candidate-evaluation-id",
+        "evaluation-" + "4" * 64,
+    ]
+
+
+def test_compare_publishes_not_comparable_as_normal_result(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline = SimpleNamespace(run_id="run-" + "1" * 64)
+    candidate = SimpleNamespace(run_id="run-" + "3" * 64)
+
+    @contextmanager
+    def loader(_args: Any):
+        values = iter((baseline, candidate))
+        yield lambda _run, _evaluation: next(values), object(), Path("analysis")
+
+    result = SimpleNamespace(
+        comparison_id="comparison-v1-" + "9" * 64,
+        status=ComparisonStatus.NOT_COMPARABLE,
+        incompatibilities=("trial.count",),
+    )
+    store = SimpleNamespace(
+        publish_comparison=lambda _comparison, policy: _Receipt()
+    )
+    monkeypatch.setattr(cli_module, "_analysis_evaluation_loader", loader)
+    monkeypatch.setattr(cli_module, "_analysis_store", lambda *_args, **_kwargs: store)
+    monkeypatch.setattr(cli_module, "_comparison_policy", lambda _path: object())
+    import review_agent_eval.comparison as comparison_module
+
+    monkeypatch.setattr(
+        comparison_module,
+        "compare_runs",
+        lambda _baseline, _candidate, _policy: result,
+    )
+    code = main(
+        [
+            *_analysis_arguments(["compare"]),
+            "--policy",
+            "comparison.json",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == EXIT_OK
+    assert payload["comparison_status"] == "not_comparable"
+    assert payload["incompatibilities"] == ["trial.count"]
+    assert payload["artifact_id"] == _Receipt.artifact_id
+
+
+@pytest.mark.parametrize(
+    ("decision", "ci", "expected"),
+    (
+        (GateDecision.BLOCK, False, EXIT_OK),
+        (GateDecision.BLOCK, True, EXIT_POLICY),
+        (GateDecision.INELIGIBLE, False, EXIT_OK),
+        (GateDecision.INELIGIBLE, True, EXIT_POLICY),
+    ),
+)
+def test_gate_block_and_ineligible_publish_before_optional_ci_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    decision: GateDecision,
+    ci: bool,
+    expected: int,
+) -> None:
+    baseline = object()
+    candidate = object()
+    policy = SimpleNamespace(artifact_id="analysis-artifact-v1-" + "6" * 64)
+    comparison = SimpleNamespace(comparison_id="comparison-v1-" + "5" * 64)
+    result = SimpleNamespace(
+        gate_result_id="gate-result-v1-" + "7" * 64,
+        decision=decision,
+        checks=(),
+    )
+
+    class Store:
+        def load_verified_comparison(self, *_args: Any, **_kwargs: Any):
+            return comparison
+
+        def load_verified_gate_policy(self, *_args: Any, **_kwargs: Any):
+            return policy
+
+        def publish_gate_result(self, *_args: Any, **_kwargs: Any):
+            return _Receipt()
+
+    store = Store()
+    run_store = SimpleNamespace(load_run_config=lambda _run: object())
+
+    @contextmanager
+    def loader(_args: Any):
+        values = iter((baseline, candidate))
+        yield lambda _run, _evaluation: next(values), run_store, Path("analysis")
+
+    monkeypatch.setattr(cli_module, "_analysis_evaluation_loader", loader)
+    monkeypatch.setattr(cli_module, "_analysis_store", lambda *_args, **_kwargs: store)
+    monkeypatch.setattr(cli_module, "_comparison_policy", lambda _path: object())
+    import review_agent_eval.gates as gates_module
+
+    monkeypatch.setattr(
+        gates_module,
+        "evaluate_gate",
+        lambda _store, _policy, _comparison, _calibrations: result,
+    )
+    arguments = [
+        *_analysis_arguments(["gate", "evaluate"]),
+        "--comparison-id",
+        "analysis-artifact-v1-" + "5" * 64,
+        "--comparison-policy",
+        "comparison.json",
+        "--gate-policy-id",
+        policy.artifact_id,
+        "--json",
+    ]
+    if ci:
+        arguments.append("--ci")
+
+    code = main(arguments)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == expected
+    assert payload["status"] == "ok"
+    assert payload["decision"] == decision.value
+    assert payload["artifact_id"] == _Receipt.artifact_id
