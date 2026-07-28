@@ -84,6 +84,12 @@ class GateDecision(str, Enum):
 class GateCheckStatus(str, Enum):
     PASS = "pass"
     FAIL = "fail"
+    NOT_COMPARABLE = "not_comparable"
+    NOT_SCORABLE = "not_scorable"
+    INSUFFICIENT_COVERAGE = "insufficient_coverage"
+    NOT_CONFIGURED = "not_configured"
+    PENDING = "pending"
+    # Artifact compatibility only; evaluators never emit this legacy spelling.
     INELIGIBLE = "ineligible"
 
 
@@ -105,6 +111,7 @@ class GateCheckReason(str, Enum):
     POLICY_MISMATCH = "policy_mismatch"
     NOT_COMPARABLE = "not_comparable"
     NOT_SCORABLE = "not_scorable"
+    NOT_CONFIGURED = "not_configured"
     ZERO_DENOMINATOR = "zero_denominator"
     UNGRADED = "ungraded"
     INSUFFICIENT_COVERAGE = "insufficient_coverage"
@@ -859,14 +866,12 @@ class GateCheckV1(_JsonModel):
         reasons = tuple(_enum(GateCheckReason, item, "GateCheckV1.reason") for item in self.reasons)
         if len(reasons) != len(set(reasons)) or reasons != tuple(sorted(reasons, key=lambda item: item.value)):
             raise _error("GateCheckV1 reasons are not canonical")
-        if status is GateCheckStatus.INELIGIBLE and not reasons:
-            raise _error("ineligible GateCheckV1 requires a typed reason")
+        if status not in {GateCheckStatus.PASS, GateCheckStatus.FAIL} and not reasons:
+            raise _error("unscored GateCheckV1 requires a typed reason")
         if status is GateCheckStatus.FAIL and GateCheckReason.THRESHOLD_FAILED not in reasons:
             raise _error("failed GateCheckV1 requires threshold_failed")
         if status is GateCheckStatus.PASS and self.actual is None:
             raise _error("passing GateCheckV1 requires an actual value")
-        if status is GateCheckStatus.PASS and refs:
-            raise _error("passing GateCheckV1 may not contain failure refs")
         if status is GateCheckStatus.FAIL and not refs:
             raise _error("failed GateCheckV1 requires source-bound failure refs")
         if status is GateCheckStatus.PASS and not _satisfies(operator, self.actual, threshold):
@@ -874,20 +879,27 @@ class GateCheckV1(_JsonModel):
         if status is GateCheckStatus.FAIL and _satisfies(operator, self.actual, threshold):
             raise _error("failed GateCheckV1 satisfies its threshold")
         if (
-            status is not GateCheckStatus.INELIGIBLE
+            status in {GateCheckStatus.PASS, GateCheckStatus.FAIL}
             and minimum is not None
             and (coverage is None or coverage < minimum)
         ):
             raise _error("scored GateCheckV1 does not meet configured coverage")
-        expected_constraint_id = stable_id("gate-constraint-v1", {
-            "metric": metric.value,
-            "scope": scope.value,
-            "operator": operator.value,
-            "threshold": threshold,
-            "unit": unit.value,
-            "required": self.required,
-            "min_coverage_ppm": minimum,
-        })
+        if status is GateCheckStatus.NOT_CONFIGURED:
+            if self.required or self.actual is not None or coverage is not None or minimum is not None:
+                raise _error("not_configured GateCheckV1 carries configured data")
+            expected_constraint_id = stable_id(
+                "gate-not-configured-v1", {"metric": metric.value}
+            )
+        else:
+            expected_constraint_id = stable_id("gate-constraint-v1", {
+                "metric": metric.value,
+                "scope": scope.value,
+                "operator": operator.value,
+                "threshold": threshold,
+                "unit": unit.value,
+                "required": self.required,
+                "min_coverage_ppm": minimum,
+            })
         if self.constraint_id != expected_constraint_id:
             raise _error("GateCheckV1 constraint_id is not canonical")
         object.__setattr__(self, "metric", metric)
@@ -1001,6 +1013,11 @@ class GateResultV1(_JsonModel):
             for item in checks[1:]
         ):
             raise _error("GateResultV1 checks disagree on calibration bindings")
+        unscored_required = tuple(
+            item
+            for item in required
+            if item.status not in {GateCheckStatus.PASS, GateCheckStatus.FAIL}
+        )
         if decision is GateDecision.PROMOTE and any(
             item.status is not GateCheckStatus.PASS for item in required
         ):
@@ -1013,9 +1030,7 @@ class GateResultV1(_JsonModel):
             item.status is GateCheckStatus.FAIL for item in required
         ):
             raise _error("block GateResultV1 has no failed required check")
-        if decision is GateDecision.BLOCK and any(
-            item.status is GateCheckStatus.INELIGIBLE for item in required
-        ):
+        if decision is GateDecision.BLOCK and unscored_required:
             raise _error("ineligible required checks take precedence over block")
         object.__setattr__(self, "decision", decision)
         object.__setattr__(self, "checks", checks)
@@ -1414,6 +1429,7 @@ def _ineligible_check(
     constraint: MetricConstraintV1,
     reasons: Sequence[GateCheckReason],
     *,
+    status: GateCheckStatus = GateCheckStatus.NOT_SCORABLE,
     metric_ref: str | None = None,
     actual: Any = None,
     coverage_ppm: int | None = None,
@@ -1422,7 +1438,7 @@ def _ineligible_check(
 ) -> GateCheckV1:
     return _make_check(
         constraint,
-        status=GateCheckStatus.INELIGIBLE,
+        status=status,
         actual=actual,
         coverage_ppm=coverage_ppm,
         metric_ref=metric_ref,
@@ -1430,6 +1446,58 @@ def _ineligible_check(
         calibration_result_digests=calibrations,
         reasons=reasons,
     )
+
+
+def _not_configured_check(
+    metric: CoreMetric,
+    calibration_result_digests: Sequence[str],
+) -> GateCheckV1:
+    """Surface an omitted metric without synthesizing a business threshold."""
+
+    # The placeholder operator/threshold are schema transport only.  The
+    # status-specific constraint ID above makes this explicitly distinct from
+    # a configured MetricConstraintV1 and it is never evaluated.
+    constraint = MetricConstraintV1(
+        metric,
+        GateConstraintScope.CANDIDATE_ABSOLUTE,
+        GateOperator.AT_LEAST,
+        0,
+        _expected_unit(metric),
+        False,
+        None,
+    )
+    return GateCheckV1(
+        stable_id("gate-not-configured-v1", {"metric": metric.value}),
+        constraint.metric,
+        constraint.scope,
+        constraint.operator,
+        False,
+        GateCheckStatus.NOT_CONFIGURED,
+        None,
+        constraint.threshold,
+        constraint.unit,
+        None,
+        None,
+        None,
+        (),
+        tuple(sorted(calibration_result_digests)),
+        (GateCheckReason.NOT_CONFIGURED,),
+    )
+
+
+def _unavailable_status(reasons: Sequence[GateCheckReason]) -> GateCheckStatus:
+    values = set(reasons)
+    if GateCheckReason.NOT_COMPARABLE in values:
+        return GateCheckStatus.NOT_COMPARABLE
+    if GateCheckReason.CALIBRATION_PENDING_HUMAN_LABELS in values:
+        return GateCheckStatus.PENDING
+    if (
+        GateCheckReason.INSUFFICIENT_COVERAGE in values
+        or GateCheckReason.FAILED_COVERAGE in values
+        or GateCheckReason.CALIBRATION_INSUFFICIENT_COVERAGE in values
+    ):
+        return GateCheckStatus.INSUFFICIENT_COVERAGE
+    return GateCheckStatus.NOT_SCORABLE
 
 
 def _evaluate_frozen_policy(
@@ -1446,7 +1514,14 @@ def _evaluate_frozen_policy(
     checks: list[GateCheckV1] = []
     for constraint in canonical_policy.constraints:
         if global_reasons:
-            checks.append(_ineligible_check(constraint, global_reasons, calibrations=canonical_policy.calibration_result_digests))
+            checks.append(
+                _ineligible_check(
+                    constraint,
+                    global_reasons,
+                    status=_unavailable_status(global_reasons),
+                    calibrations=canonical_policy.calibration_result_digests,
+                )
+            )
             continue
         delta = canonical_comparison.metric_delta(constraint.metric)
         metric_ref = delta.delta_id
@@ -1468,7 +1543,15 @@ def _evaluate_frozen_policy(
                     )
                 )
         if calibration_reasons:
-            checks.append(_ineligible_check(constraint, calibration_reasons, metric_ref=metric_ref, calibrations=canonical_policy.calibration_result_digests))
+            checks.append(
+                _ineligible_check(
+                    constraint,
+                    calibration_reasons,
+                    status=_unavailable_status(calibration_reasons),
+                    metric_ref=metric_ref,
+                    calibrations=canonical_policy.calibration_result_digests,
+                )
+            )
             continue
         baseline_value = delta.baseline
         candidate_value = delta.candidate
@@ -1492,21 +1575,57 @@ def _evaluate_frozen_policy(
                             reason,
                         )
                     )
-            checks.append(_ineligible_check(constraint, statuses, metric_ref=metric_ref, failure_refs=invalid_refs, calibrations=canonical_policy.calibration_result_digests))
+            checks.append(
+                _ineligible_check(
+                    constraint,
+                    statuses,
+                    status=_unavailable_status(statuses),
+                    metric_ref=metric_ref,
+                    failure_refs=invalid_refs,
+                    calibrations=canonical_policy.calibration_result_digests,
+                )
+            )
             continue
         if delta.unit is not constraint.unit:
             checks.append(_ineligible_check(constraint, (GateCheckReason.UNIT_MISMATCH,), metric_ref=metric_ref, calibrations=canonical_policy.calibration_result_digests))
             continue
         actual, source, _ = _value_for_scope(delta, constraint.scope)
         coverage = min(_coverage_ppm(baseline_value), _coverage_ppm(candidate_value))
-        if constraint.min_coverage_ppm is not None and coverage < constraint.min_coverage_ppm:
-            refs = []
-            for kind, ref, local_actual, local_source in _local_values(canonical_comparison, constraint):
-                if local_source.status is not StatisticsMetricStatus.AVAILABLE or local_actual is None:
-                    refs.append(GateFailureRefV1(kind, ref, local_actual, constraint.threshold, constraint.unit, GateCheckReason.FAILED_COVERAGE))
-            checks.append(_ineligible_check(constraint, (GateCheckReason.FAILED_COVERAGE,), metric_ref=metric_ref, actual=actual, coverage_ppm=coverage, failure_refs=refs, calibrations=canonical_policy.calibration_result_digests))
-            continue
         local = _local_values(canonical_comparison, constraint)
+        unavailable_refs = tuple(
+            GateFailureRefV1(
+                kind,
+                ref,
+                local_actual,
+                constraint.threshold,
+                constraint.unit,
+                _status_reason(local_source.status),
+            )
+            for kind, ref, local_actual, local_source in local
+            if local_source.status is not StatisticsMetricStatus.AVAILABLE
+            or local_actual is None
+        )
+        partial_coverage_allowed = (
+            constraint.min_coverage_ppm is not None
+            and coverage >= constraint.min_coverage_ppm
+        )
+        if (
+            constraint.min_coverage_ppm is not None
+            and coverage < constraint.min_coverage_ppm
+        ) or (unavailable_refs and not partial_coverage_allowed):
+            checks.append(
+                _ineligible_check(
+                    constraint,
+                    (GateCheckReason.INSUFFICIENT_COVERAGE,),
+                    status=GateCheckStatus.INSUFFICIENT_COVERAGE,
+                    metric_ref=metric_ref,
+                    actual=actual,
+                    coverage_ppm=coverage,
+                    failure_refs=unavailable_refs,
+                    calibrations=canonical_policy.calibration_result_digests,
+                )
+            )
+            continue
         relevant_kind = (
             GateReferenceKind.CASE
             if constraint.scope in {
@@ -1524,66 +1643,68 @@ def _evaluate_frozen_policy(
             item for item in local if relevant_kind is None or item[0] is relevant_kind
         )
         if relevant_kind is not None:
-            unavailable = tuple(
+            scorable_relevant = tuple(
                 item
                 for item in relevant
-                if item[3].status is not StatisticsMetricStatus.AVAILABLE
-                or item[2] is None
+                if item[3].status is StatisticsMetricStatus.AVAILABLE
+                and item[2] is not None
             )
-            if unavailable:
-                refs = tuple(
-                    GateFailureRefV1(
-                        kind,
-                        ref,
-                        local_actual,
-                        constraint.threshold,
-                        constraint.unit,
-                        _status_reason(local_source.status),
-                    )
-                    for kind, ref, local_actual, local_source in unavailable
-                )
+            if not scorable_relevant:
                 checks.append(
                     _ineligible_check(
                         constraint,
-                        tuple(item.reason for item in refs),
+                        (GateCheckReason.INSUFFICIENT_COVERAGE,),
+                        status=GateCheckStatus.INSUFFICIENT_COVERAGE,
                         metric_ref=metric_ref,
                         coverage_ppm=coverage,
-                        failure_refs=refs,
+                        failure_refs=unavailable_refs,
                         calibrations=canonical_policy.calibration_result_digests,
                     )
                 )
                 continue
-            local_actuals = tuple(item[2] for item in relevant)
+            local_actuals = tuple(item[2] for item in scorable_relevant)
             if local_actuals:
                 actual = (
                     min(local_actuals)
                     if constraint.operator is GateOperator.AT_LEAST
                     else max(local_actuals)
                 )
-        local_failures: list[GateFailureRefV1] = []
+        local_failures: list[GateFailureRefV1] = list(unavailable_refs)
         for kind, ref, local_actual, local_source in local:
             if local_source.status is not StatisticsMetricStatus.AVAILABLE or local_actual is None:
-                reason = _status_reason(local_source.status)
-                local_failures.append(GateFailureRefV1(kind, ref, local_actual, constraint.threshold, constraint.unit, reason))
+                continue
             elif not _satisfies(constraint.operator, local_actual, constraint.threshold):
                 local_failures.append(GateFailureRefV1(kind, ref, local_actual, constraint.threshold, constraint.unit, GateCheckReason.THRESHOLD_FAILED))
+        threshold_values = (
+            scorable_relevant if relevant_kind is not None else relevant
+        )
         passed = (
             all(
                 _satisfies(constraint.operator, item[2], constraint.threshold)
-                for item in relevant
+                for item in threshold_values
             )
             if relevant_kind is not None
             else _satisfies(constraint.operator, actual, constraint.threshold)
         )
         if passed:
-            checks.append(_make_check(constraint, status=GateCheckStatus.PASS, actual=actual, coverage_ppm=coverage, metric_ref=metric_ref, calibration_result_digests=canonical_policy.calibration_result_digests))
+            checks.append(_make_check(constraint, status=GateCheckStatus.PASS, actual=actual, coverage_ppm=coverage, metric_ref=metric_ref, failure_refs=local_failures, calibration_result_digests=canonical_policy.calibration_result_digests))
         else:
             if not local_failures and local:
                 local_failures = [GateFailureRefV1(kind, ref, local_actual, constraint.threshold, constraint.unit, GateCheckReason.THRESHOLD_FAILED) for kind, ref, local_actual, _source in local]
             checks.append(_make_check(constraint, status=GateCheckStatus.FAIL, actual=actual, coverage_ppm=coverage, metric_ref=metric_ref, failure_refs=local_failures, calibration_result_digests=canonical_policy.calibration_result_digests, reasons=(GateCheckReason.THRESHOLD_FAILED,)))
+    configured_metrics = {item.metric for item in canonical_policy.constraints}
+    checks.extend(
+        _not_configured_check(metric, canonical_policy.calibration_result_digests)
+        for metric in CoreMetric
+        if metric not in configured_metrics
+    )
     if canonical_policy.eligibility is GateEligibility.DIAGNOSTIC_ONLY:
         decision = GateDecision.INELIGIBLE
-    elif global_reasons or any(item.status is GateCheckStatus.INELIGIBLE and item.required for item in checks):
+    elif global_reasons or any(
+        item.required
+        and item.status not in {GateCheckStatus.PASS, GateCheckStatus.FAIL}
+        for item in checks
+    ):
         decision = GateDecision.INELIGIBLE
     elif not any(item.required for item in checks):
         # Defensive non-vacuity rule for a forged/legacy prepared policy.

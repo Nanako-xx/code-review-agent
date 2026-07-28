@@ -402,7 +402,7 @@ def test_gate_checks_absolute_and_baseline_delta_constraints(
     result = evaluate_gate(gate_policy_store, frozen, comparison, {})
 
     assert result.decision is GateDecision.BLOCK
-    by_scope = {check.scope: check for check in result.checks}
+    by_scope = {check.scope: check for check in result.checks if check.required}
     assert all(check.status is GateCheckStatus.FAIL for check in by_scope.values())
     assert by_scope[GateConstraintScope.CANDIDATE_ABSOLUTE].actual == metric_delta.candidate.value
     assert by_scope[GateConstraintScope.BASELINE_DELTA].actual == metric_delta.absolute_delta
@@ -505,7 +505,7 @@ def test_gate_requires_calibration_for_semantic_metrics(
         {},
     )
     assert missing_result.decision is GateDecision.INELIGIBLE
-    assert missing_result.checks[0].status is GateCheckStatus.INELIGIBLE
+    assert missing_result.checks[0].status is GateCheckStatus.NOT_SCORABLE
 
     profile = JudgeTask.FINDING_EQUIVALENCE
     pending_package = _export(
@@ -563,7 +563,11 @@ def test_gate_requires_calibration_for_semantic_metrics(
     assert pending.status is CalibrationStatus.PENDING_HUMAN_LABELS
     assert fixture.status is CalibrationStatus.PENDING_HUMAN_LABELS
     assert failed.status is CalibrationStatus.FAILED_THRESHOLDS
-    for calibration in (pending, fixture, failed):
+    for calibration, expected_status in (
+        (pending, GateCheckStatus.PENDING),
+        (fixture, GateCheckStatus.PENDING),
+        (failed, GateCheckStatus.NOT_SCORABLE),
+    ):
         untrusted_policy = prepare_gate_policy(
             baseline,
             candidate_config,
@@ -594,7 +598,7 @@ def test_gate_requires_calibration_for_semantic_metrics(
             {profile.value: calibration},
         )
         assert untrusted.decision is GateDecision.INELIGIBLE
-        assert untrusted.checks[0].status is GateCheckStatus.INELIGIBLE
+        assert untrusted.checks[0].status is expected_status
 
 
 def test_gate_marks_public_or_unscorable_data_diagnostic_only(
@@ -620,7 +624,7 @@ def test_gate_marks_public_or_unscorable_data_diagnostic_only(
     )
     result = evaluate_gate(gate_policy_store, frozen, comparison, {})
     assert result.decision is GateDecision.INELIGIBLE
-    assert result.checks[0].status is GateCheckStatus.INELIGIBLE
+    assert result.checks[0].status is GateCheckStatus.NOT_SCORABLE
 
     empty = _policy(
         baseline,
@@ -1082,3 +1086,10 @@ def test_release_policy_rejects_all_optional_constraints(
     result = evaluate_gate(gate_policy_store, frozen, comparison, {})
     assert result.decision is GateDecision.INELIGIBLE
     assert result.checks[0].status is GateCheckStatus.PASS
+    unconfigured = tuple(
+        check for check in result.checks if check.status is GateCheckStatus.NOT_CONFIGURED
+    )
+    assert {check.metric for check in unconfigured} == set(CoreMetric) - {
+        CoreMetric.AGENT_FAILURE_RATE
+    }
+    assert all(not check.required for check in unconfigured)
