@@ -1635,6 +1635,24 @@ def _evaluate_frozen_policy(
             continue
         delta = canonical_comparison.metric_delta(constraint.metric)
         metric_ref = delta.delta_id
+        local = _local_values(canonical_comparison, constraint)
+        relevant_kind = (
+            GateReferenceKind.CASE
+            if constraint.scope in {
+                GateConstraintScope.CASE_ABSOLUTE,
+                GateConstraintScope.CASE_DELTA,
+            }
+            else GateReferenceKind.TRIAL
+            if constraint.scope in {
+                GateConstraintScope.TRIAL_ABSOLUTE,
+                GateConstraintScope.TRIAL_DELTA,
+            }
+            else None
+        )
+        relevant = tuple(
+            item for item in local if relevant_kind is None or item[0] is relevant_kind
+        )
+        unavailable_ref_values = relevant if relevant_kind is not None else ()
         required_profiles = _SEMANTIC_PROFILES.get(constraint.metric, ())
         calibration_reasons: list[GateCheckReason] = []
         for profile in required_profiles:
@@ -1671,7 +1689,7 @@ def _evaluate_frozen_policy(
                 if status is not StatisticsMetricStatus.AVAILABLE
             )
             invalid_refs = []
-            for kind, ref, local_actual, local_source in _local_values(canonical_comparison, constraint):
+            for kind, ref, local_actual, local_source in unavailable_ref_values:
                 if local_source.status is not StatisticsMetricStatus.AVAILABLE or local_actual is None:
                     reason = _status_reason(local_source.status)
                     invalid_refs.append(
@@ -1699,23 +1717,6 @@ def _evaluate_frozen_policy(
             continue
         actual, source, _ = _value_for_scope(delta, constraint.scope)
         coverage = min(_coverage_ppm(baseline_value), _coverage_ppm(candidate_value))
-        local = _local_values(canonical_comparison, constraint)
-        relevant_kind = (
-            GateReferenceKind.CASE
-            if constraint.scope in {
-                GateConstraintScope.CASE_ABSOLUTE,
-                GateConstraintScope.CASE_DELTA,
-            }
-            else GateReferenceKind.TRIAL
-            if constraint.scope in {
-                GateConstraintScope.TRIAL_ABSOLUTE,
-                GateConstraintScope.TRIAL_DELTA,
-            }
-            else None
-        )
-        relevant = tuple(
-            item for item in local if relevant_kind is None or item[0] is relevant_kind
-        )
         ref_values = relevant if relevant_kind is not None else local
         unavailable_refs = tuple(
             GateFailureRefV1(

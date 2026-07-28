@@ -818,7 +818,10 @@ def test_gate_marks_public_or_unscorable_data_diagnostic_only(
         baseline,
         candidate_config,
         eligibility=GateEligibility.RELEASE_BLOCKING,
-        constraints=(_constraint(CoreMetric.INTENT_CLAIM_RECALL, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_LEAST, 0),),
+        constraints=(
+            _constraint(CoreMetric.CLARIFICATION_ACCURACY, GateConstraintScope.CASE_ABSOLUTE, GateOperator.AT_LEAST, 0),
+            _constraint(CoreMetric.CLARIFICATION_ACCURACY, GateConstraintScope.TRIAL_ABSOLUTE, GateOperator.AT_LEAST, 0),
+        ),
     )
     prepared = prepare_gate_policy(baseline, candidate_config, policy=requested)
     assert prepared.eligibility is GateEligibility.DIAGNOSTIC_ONLY
@@ -831,7 +834,17 @@ def test_gate_marks_public_or_unscorable_data_diagnostic_only(
     )
     result = evaluate_gate(gate_policy_store, frozen, comparison, {})
     assert result.decision is GateDecision.INELIGIBLE
-    assert result.checks[0].status is GateCheckStatus.NOT_SCORABLE
+    scoped = {
+        check.scope: check
+        for check in result.checks
+        if check.metric is CoreMetric.CLARIFICATION_ACCURACY
+    }
+    assert scoped[GateConstraintScope.CASE_ABSOLUTE].status is GateCheckStatus.NOT_SCORABLE
+    assert scoped[GateConstraintScope.TRIAL_ABSOLUTE].status is GateCheckStatus.NOT_SCORABLE
+    assert scoped[GateConstraintScope.CASE_ABSOLUTE].case_refs
+    assert not scoped[GateConstraintScope.CASE_ABSOLUTE].trial_refs
+    assert scoped[GateConstraintScope.TRIAL_ABSOLUTE].trial_refs
+    assert not scoped[GateConstraintScope.TRIAL_ABSOLUTE].case_refs
 
     empty = _policy(
         baseline,
