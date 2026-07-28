@@ -25,6 +25,7 @@ from .artifacts import (
     _ReadBudget,
     _absolute_storage_path,
     _hardlinked_file,
+    _normalized_filesystem_path,
     _strict_json_loads,
     _unsafe_node,
     _windows_close_handle,
@@ -230,6 +231,14 @@ def _validate_windows_existing_ancestor_boundary(
     if attributes & 0x400 or not attributes & 0x10:
         raise ArtifactSecurityError(
             "%s ancestor handle is a reparse point or non-directory" % context
+        )
+    if (
+        _normalized_filesystem_path(ancestor)
+        != _normalized_filesystem_path(final_ancestor)
+    ):
+        raise ArtifactSecurityError(
+            "%s ancestor uses an alias, reparse point, or unexpected final path"
+            % context
         )
     forbidden = {
         _windows_portable_path_segment_key(item) for item in forbidden_segments

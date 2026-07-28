@@ -3264,10 +3264,19 @@ class ArtifactStore:
             raise
 
     @contextmanager
-    def _guard_parent_directory(self, path: Path) -> Iterator[Optional[int]]:
+    def _guard_parent_directory(
+        self,
+        path: Path,
+        *,
+        create: bool = True,
+    ) -> Iterator[Optional[int]]:
         path = self._within_root(path)
         parent = path.parent
-        self._ensure_directory(parent)
+        if create:
+            self._ensure_directory(parent)
+        else:
+            self._assert_parent_chain(path)
+            self._assert_directory(parent)
         if os.name != "nt":
             descriptor = self._open_posix_directory_descriptor(parent)
             try:
@@ -3449,9 +3458,12 @@ class ArtifactStore:
                     pass
 
     @contextmanager
-    def _lock(self, path: Path) -> Iterator[None]:
+    def _lock(self, path: Path, *, create: bool = True) -> Iterator[None]:
         path = self._within_root(path)
-        with self._guard_parent_directory(path) as parent_descriptor:
+        with self._guard_parent_directory(
+            path,
+            create=create,
+        ) as parent_descriptor:
             try:
                 if parent_descriptor is None:
                     existing = os.lstat(path)
@@ -3465,6 +3477,8 @@ class ArtifactStore:
                 existing = None
             except OSError as exc:
                 raise ArtifactSecurityError("could not inspect writer lock") from exc
+            if existing is None and not create:
+                raise ArtifactIntegrityError("required writer lock is missing")
             if existing is not None and (
                 _unsafe_node(existing) or not stat.S_ISREG(existing.st_mode)
             ):
@@ -3481,7 +3495,7 @@ class ArtifactStore:
                 )
             flags = (
                 os.O_RDWR
-                | os.O_CREAT
+                | (os.O_CREAT if create else 0)
                 | getattr(os, "O_BINARY", 0)
                 | getattr(os, "O_NOFOLLOW", 0)
             )
@@ -3515,7 +3529,17 @@ class ArtifactStore:
                     raise ArtifactSecurityError(
                         "writer lock resolved to an unexpected path"
                     )
-                if info.st_size == 0:
+                if not create:
+                    if info.st_size != 1:
+                        raise ArtifactIntegrityError(
+                            "required writer lock has invalid bytes"
+                        )
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    if os.read(descriptor, 1) != b"\0":
+                        raise ArtifactIntegrityError(
+                            "required writer lock has invalid bytes"
+                        )
+                elif info.st_size == 0:
                     os.lseek(descriptor, 0, os.SEEK_SET)
                     os.write(descriptor, b"\0")
                     os.fsync(descriptor)
@@ -4156,6 +4180,13 @@ class ArtifactStore:
                 self._ensure_directory(
                     self._target(config.run_id, relative_base) / suffix
                 )
+            # Writer locks are stable prepared-plan artifacts.  Analysis
+            # reservations may only open these existing bytes; they never
+            # create or repair lock state in the immutable Run Store.
+            self._write_bytes_exclusive(
+                self._trial_lock_path(trial_manifest),
+                b"\0",
+            )
             written = self._write_json(
                 config.run_id,
                 "%s/trial_manifest.json" % relative_base,
@@ -5428,6 +5459,70 @@ class ArtifactStore:
             status = RunStatus.PENDING
         return RunState(run_id=run_id, status=status, trials=tuple(states))
 
+    def _assert_prepared_trial_inventory(self, plan: TrialManifest) -> None:
+        """Require the exact filesystem projection committed by ``create_run``."""
+
+        root = self._trial_dir(plan)
+        expected_directories = frozenset(
+            {".locks", "evaluations", "materializations", "receipts"}
+        )
+        expected_files = frozenset(
+            {"trial_manifest.json", ".locks/trial.lock"}
+        )
+        observed_directories: set[str] = set()
+        observed_files: set[str] = set()
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            self._assert_directory(directory)
+            try:
+                entries = sorted(os.scandir(directory), key=lambda item: item.name)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "could not inspect prepared Trial inventory"
+                ) from exc
+            for entry in entries:
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise ArtifactSecurityError(
+                        "could not inspect prepared Trial inventory"
+                    ) from exc
+                if _unsafe_node(metadata):
+                    raise ArtifactSecurityError(
+                        "prepared Trial inventory contains a link or reparse point"
+                    )
+                path = Path(entry.path)
+                relative = path.relative_to(root).as_posix()
+                if stat.S_ISDIR(metadata.st_mode):
+                    if relative not in expected_directories:
+                        raise ArtifactIntegrityError(
+                            "prepared Trial inventory contains an unknown directory"
+                        )
+                    observed_directories.add(relative)
+                    pending.append(path)
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ArtifactSecurityError(
+                        "prepared Trial inventory contains a special file"
+                    )
+                if self._reject_hardlinks and _hardlinked_file(metadata):
+                    raise ArtifactSecurityError(
+                        "prepared Trial inventory contains a hardlinked file"
+                    )
+                if relative not in expected_files:
+                    raise ArtifactIntegrityError(
+                        "prepared Trial inventory contains an unknown file"
+                    )
+                observed_files.add(relative)
+        if (
+            observed_directories != expected_directories
+            or observed_files != expected_files
+        ):
+            raise ArtifactIntegrityError(
+                "prepared Trial inventory is incomplete"
+            )
+
     @contextmanager
     def reserve_run_before_execution(
         self,
@@ -5453,7 +5548,9 @@ class ArtifactStore:
         )
         with ExitStack() as locks:
             for plan in initial_plans:
-                locks.enter_context(self._lock(self._trial_lock_path(plan)))
+                locks.enter_context(
+                    self._lock(self._trial_lock_path(plan), create=False)
+                )
 
             locked = self._load_verified_run_bundle(run_id)
             locked_plans = tuple(
@@ -5484,6 +5581,7 @@ class ArtifactStore:
                     raise ArtifactConflictError(
                         "candidate Run has already started execution"
                     )
+                self._assert_prepared_trial_inventory(plan)
             if self.list_evaluations(run_id) or self.list_run_evaluations(run_id):
                 raise ArtifactConflictError(
                     "candidate Run already contains evaluation results"

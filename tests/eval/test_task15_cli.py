@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,7 +24,39 @@ from review_agent_eval.cli import (
 )
 from review_agent_eval.comparison import ComparisonStatus
 from review_agent_eval.gates import GateDecision
-from review_agent_eval.artifacts import ArtifactConflictError
+from review_agent_eval.artifacts import ArtifactConflictError, ArtifactIntegrityError
+
+
+def _strict_tree_snapshot(root: Path) -> tuple[tuple[str, str, bytes | None], ...]:
+    """Inventory every reachable entry and fail instead of skipping scan errors."""
+
+    scan_root = root
+    if os.name == "nt":
+        absolute = os.path.abspath(os.fspath(root))
+        if not absolute.startswith("\\\\?\\"):
+            scan_root = Path("\\\\?\\" + absolute)
+    root_info = os.lstat(scan_root)
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise AssertionError("snapshot root is not a directory")
+    pending = [scan_root]
+    values: list[tuple[str, str, bytes | None]] = []
+    while pending:
+        directory = pending.pop()
+        entries = sorted(os.scandir(directory), key=lambda item: item.name)
+        for entry in entries:
+            metadata = entry.stat(follow_symlinks=False)
+            relative = Path(entry.path).relative_to(scan_root).as_posix()
+            is_reparse = bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+            if is_reparse:
+                raise AssertionError("snapshot tree contains a reparse point")
+            if stat.S_ISDIR(metadata.st_mode):
+                values.append((relative, "directory", None))
+                pending.append(Path(entry.path))
+            elif stat.S_ISREG(metadata.st_mode):
+                values.append((relative, "file", Path(entry.path).read_bytes()))
+            else:
+                raise AssertionError("snapshot tree contains a special entry")
+    return tuple(sorted(values))
 
 
 def _command_choices(parser: Any) -> dict[str, Any]:
@@ -402,6 +436,9 @@ def test_gate_prepare_holds_candidate_start_lock_through_policy_commit(
     run_root = tmp_path / "run"
     run_root.mkdir()
     run_store, candidate, _manifest, plan, _trial = make_store(run_root)
+    trial_lock = run_store._trial_lock_path(_trial)
+    assert trial_lock.read_bytes() == b"\0"
+    run_tree_before_reservation = _strict_tree_snapshot(run_store.root)
     snapshot = run_store.load_case_snapshot(candidate.run_id)
     baseline = SimpleNamespace(case_snapshot=snapshot)
     proposal = object()
@@ -468,6 +505,7 @@ def test_gate_prepare_holds_candidate_start_lock_through_policy_commit(
     assert not worker.is_alive()
     assert outcome == [EXIT_OK]
     assert isinstance(start_outcome, ArtifactConflictError)
+    assert _strict_tree_snapshot(run_store.root) == run_tree_before_reservation
 
     # Once Policy publication releases the reservation, Trial execution may start.
     started = run_store.start_trial(candidate.run_id, plan.task_id, plan.trial_id)
@@ -479,3 +517,120 @@ def test_gate_prepare_holds_candidate_start_lock_through_policy_commit(
         with run_store.reserve_run_before_execution(candidate.run_id):
             raise AssertionError("started Run must never enter gate reservation")
     capsys.readouterr()
+
+
+def _configure_gate_prepare_test(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_store: Any,
+    candidate: Any,
+    snapshot: Any,
+) -> tuple[argparse.Namespace, Any]:
+    from review_agent_eval.gates import GateEligibility, GatePolicyV1
+
+    proposal = object()
+
+    class Store:
+        published = False
+
+        def publish_gate_policy(self, *_args: Any, **_kwargs: Any):
+            self.published = True
+            return SimpleNamespace(
+                policy=SimpleNamespace(
+                    policy_id="gate-policy-v1-" + "5" * 64,
+                    eligibility=GateEligibility.RELEASE_BLOCKING,
+                ),
+                artifact_id="analysis-artifact-v1-" + "6" * 64,
+                receipt_digest="7" * 64,
+            )
+
+    store = Store()
+
+    @contextmanager
+    def loader(_args: Any):
+        baseline = SimpleNamespace(case_snapshot=snapshot)
+        yield lambda _run, _evaluation: baseline, run_store, Path("analysis")
+
+    monkeypatch.setattr(cli_module, "_analysis_evaluation_loader", loader)
+    monkeypatch.setattr(cli_module, "_analysis_store", lambda *_args, **_kwargs: store)
+    monkeypatch.setattr(cli_module, "_read_json", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        GatePolicyV1,
+        "from_dict",
+        classmethod(lambda _cls, _value: proposal),
+    )
+    return (
+        argparse.Namespace(
+            baseline_run_id="run-" + "1" * 64,
+            baseline_evaluation_id="evaluation-" + "2" * 64,
+            candidate_run_id=candidate.run_id,
+            policy="policy.json",
+            json=True,
+        ),
+        store,
+    )
+
+
+def test_gate_prepare_missing_precreated_lock_fails_without_run_store_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from .test_artifacts import make_store
+
+    run_store, candidate, _manifest, _plan, trial = make_store(tmp_path)
+    run_store._trial_lock_path(trial).unlink(missing_ok=True)
+    before = _strict_tree_snapshot(run_store.root)
+    args, analysis_store = _configure_gate_prepare_test(
+        monkeypatch,
+        run_store=run_store,
+        candidate=candidate,
+        snapshot=run_store.load_case_snapshot(candidate.run_id),
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="writer lock"):
+        cli_module._handle_gate_prepare(args)
+
+    assert analysis_store.published is False
+    assert _strict_tree_snapshot(run_store.root) == before
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "submission.json",
+        "runner/orphan.json",
+        "materializations/orphan.json",
+        "trace.json",
+        "evaluations/orphan.json",
+        "results/orphan.json",
+        "receipts/orphan.json",
+        "unknown.bin",
+    ),
+)
+def test_gate_prepare_rejects_every_orphan_execution_artifact_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+) -> None:
+    from .test_artifacts import make_store
+
+    run_store, candidate, _manifest, _plan, trial = make_store(tmp_path)
+    orphan = run_store._trial_dir(trial) / relative_path
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_bytes(b"orphan")
+    before = _strict_tree_snapshot(run_store.root)
+    args, analysis_store = _configure_gate_prepare_test(
+        monkeypatch,
+        run_store=run_store,
+        candidate=candidate,
+        snapshot=run_store.load_case_snapshot(candidate.run_id),
+    )
+
+    with pytest.raises(
+        ArtifactIntegrityError,
+        match="prepared Trial inventory|Trial receipts",
+    ):
+        cli_module._handle_gate_prepare(args)
+
+    assert analysis_store.published is False
+    assert _strict_tree_snapshot(run_store.root) == before

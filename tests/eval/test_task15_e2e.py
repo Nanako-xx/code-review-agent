@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -49,6 +47,7 @@ from review_agent_eval.statistics import (
 
 from .test_cli import _root_arguments, _write_cli_suite
 from .test_datasets import write_suite
+from .test_task15_cli import _strict_tree_snapshot
 
 
 def _output(capsys: pytest.CaptureFixture[str]) -> dict:
@@ -60,19 +59,6 @@ def _output(capsys: pytest.CaptureFixture[str]) -> dict:
 def _write_json(path: Path, value: object) -> Path:
     path.write_bytes(canonical_json_bytes(value))
     return path
-
-
-def _tree_digest(root: Path) -> str:
-    digest = hashlib.sha256()
-    files = []
-    for current, directories, names in os.walk(root):
-        files.extend(Path(current) / name for name in names)
-    for path in sorted(files):
-        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
 
 
 def _analysis_namespace(roots: dict[str, Path], analysis: Path) -> argparse.Namespace:
@@ -234,6 +220,17 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     with _analysis_evaluation_loader(namespace) as (load, run_store, _root):
         baseline = load(baseline_run, baseline_evaluation)
         candidate_config = run_store.load_run_config(candidate_run)
+        candidate_manifest = run_store.load_run_manifest(candidate_run)
+        candidate_trial_locks = []
+        for entry in candidate_manifest.trials:
+            trial = run_store.load_trial_manifest(
+                candidate_run,
+                entry.task_id,
+                entry.trial_id,
+            )
+            candidate_trial_locks.append(run_store._trial_lock_path(trial))
+        assert len(candidate_trial_locks) == 3
+        assert all(path.read_bytes() == b"\0" for path in candidate_trial_locks)
         assert len(baseline.trials) == 3
         package = build_calibration_package(
             baseline,
@@ -302,7 +299,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     )
 
     # The policy artifact is committed before the candidate has any attempt.
-    runs_before_gate_prepare = _tree_digest(roots["runs"])
+    runs_before_gate_prepare = _strict_tree_snapshot(roots["runs"])
     assert main(
         [
             "gate",
@@ -319,7 +316,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
         ]
     ) == EXIT_OK
     gate_prepare = _output(capsys)
-    assert _tree_digest(roots["runs"]) == runs_before_gate_prepare
+    assert _strict_tree_snapshot(roots["runs"]) == runs_before_gate_prepare
     gate_policy_artifact = gate_prepare["artifact_id"]
     policy_mtime = (
         analysis
@@ -329,7 +326,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     ).stat().st_mtime_ns
 
     candidate_evaluation = _run_and_evaluate(roots, candidate_run, capsys)
-    runs_before_analysis = _tree_digest(roots["runs"])
+    runs_before_analysis = _strict_tree_snapshot(roots["runs"])
 
     assert main(
         [
@@ -349,7 +346,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     ) == EXIT_OK
     compared = _output(capsys)
     assert compared["comparison_status"] == ComparisonStatus.COMPARABLE.value
-    assert _tree_digest(roots["runs"]) == runs_before_analysis
+    assert _strict_tree_snapshot(roots["runs"]) == runs_before_analysis
 
     assert main(
         [
@@ -371,7 +368,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     exported = _output(capsys)
     assert exported["calibration_status"] == "pending_human_labels"
     assert exported["selected_count"] >= 1
-    assert _tree_digest(roots["runs"]) == runs_before_analysis
+    assert _strict_tree_snapshot(roots["runs"]) == runs_before_analysis
 
     labels_path = _write_json(tmp_path / "labels.json", labels.to_dict())
     assert main(
@@ -395,7 +392,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     ) == EXIT_OK
     imported = _output(capsys)
     assert imported["label_count"] == 1
-    assert _tree_digest(roots["runs"]) == runs_before_analysis
+    assert _strict_tree_snapshot(roots["runs"]) == runs_before_analysis
 
     assert main(
         [
@@ -418,7 +415,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     ) == EXIT_OK
     scored = _output(capsys)
     assert scored["calibration_status"] == "pending_human_labels"
-    assert _tree_digest(roots["runs"]) == runs_before_analysis
+    assert _strict_tree_snapshot(roots["runs"]) == runs_before_analysis
 
     binding_path = _write_json(
         tmp_path / "calibration-binding.json",
@@ -457,7 +454,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     ) == EXIT_OK
     gated = _output(capsys)
     assert gated["decision"] == GateDecision.INELIGIBLE.value
-    assert _tree_digest(roots["runs"]) == runs_before_analysis
+    assert _strict_tree_snapshot(roots["runs"]) == runs_before_analysis
 
     store = AnalysisArtifactStore(analysis, create_root=False)
     with _analysis_evaluation_loader(namespace) as (load, run_store, _root):
@@ -603,7 +600,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
     inspected = _output(capsys)
     assert inspected["command"] == "inspect"
     assert inspected["inspection"]["source_bindings"]["run_id"] == baseline_run
-    assert _tree_digest(roots["runs"]) == runs_before_analysis
+    assert _strict_tree_snapshot(roots["runs"]) == runs_before_analysis
     assert (
         analysis
         / "gate-policy"

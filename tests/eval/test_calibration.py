@@ -1471,6 +1471,56 @@ def test_external_export_rejects_short_run_store_alias_before_missing_child_crea
     assert snapshot(analysis_root) == before_analysis
 
 
+@pytest.mark.skipif(os.name != "nt", reason="short paths are Windows-specific")
+def test_external_export_rejects_ordinary_short_alias_before_creating_child(
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    long_root = tmp_path / "ordinary external calibration root"
+    long_root.mkdir()
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        written = ctypes.windll.kernel32.GetShortPathNameW(
+            str(long_root),
+            buffer,
+            len(buffer),
+        )
+        if not written or os.path.normcase(buffer.value) == os.path.normcase(
+            str(long_root)
+        ):
+            raise NotImplementedError("8.3 short path aliases are unavailable")
+        short_root = Path(buffer.value)
+    except NotImplementedError as exc:
+        pytest.skip(str(exc))
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip(f"short path capability is unavailable: {exc}")
+        raise
+
+    missing_child = short_root / "missing-child"
+    with pytest.raises(ArtifactSecurityError, match="alias|final|unexpected"):
+        export_calibration_package(
+            calibration_source["verified_by_profile"][
+                JudgeTask.INTENT_EQUIVALENCE
+            ],
+            profile=JudgeTask.INTENT_EQUIVALENCE,
+            policy=POLICY,
+            output_root=missing_child,
+        )
+    assert not missing_child.exists()
+
+    normal_output = long_root / "long-path-child"
+    package = export_calibration_package(
+        calibration_source["verified_by_profile"][JudgeTask.INTENT_EQUIVALENCE],
+        profile=JudgeTask.INTENT_EQUIVALENCE,
+        policy=POLICY,
+        output_root=normal_output,
+    )
+    assert (
+        normal_output / package.package_id / "calibration_package.json"
+    ).is_file()
+
+
 def test_export_entry_limit_stops_at_third_scandir_item(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
