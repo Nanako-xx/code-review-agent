@@ -1635,7 +1635,6 @@ def _evaluate_frozen_policy(
             continue
         delta = canonical_comparison.metric_delta(constraint.metric)
         metric_ref = delta.delta_id
-        local = _local_values(canonical_comparison, constraint)
         relevant_kind = (
             GateReferenceKind.CASE
             if constraint.scope in {
@@ -1649,10 +1648,13 @@ def _evaluate_frozen_policy(
             }
             else None
         )
-        relevant = tuple(
-            item for item in local if relevant_kind is None or item[0] is relevant_kind
-        )
-        unavailable_ref_values = relevant if relevant_kind is not None else ()
+        local_values: tuple[tuple[GateReferenceKind, str, Any, Any], ...] | None = None
+
+        def scoped_local_values() -> tuple[tuple[GateReferenceKind, str, Any, Any], ...]:
+            nonlocal local_values
+            if local_values is None:
+                local_values = tuple(_local_values(canonical_comparison, constraint))
+            return local_values
         required_profiles = _SEMANTIC_PROFILES.get(constraint.metric, ())
         calibration_reasons: list[GateCheckReason] = []
         for profile in required_profiles:
@@ -1689,19 +1691,13 @@ def _evaluate_frozen_policy(
                 if status is not StatisticsMetricStatus.AVAILABLE
             )
             invalid_refs = []
-            for kind, ref, local_actual, local_source in unavailable_ref_values:
-                if local_source.status is not StatisticsMetricStatus.AVAILABLE or local_actual is None:
-                    reason = _status_reason(local_source.status)
-                    invalid_refs.append(
-                        GateFailureRefV1(
-                            kind,
-                            ref,
-                            local_actual,
-                            constraint.threshold,
-                            constraint.unit,
-                            reason,
-                        )
-                    )
+            if relevant_kind is not None:
+                for kind, ref, local_actual, local_source in scoped_local_values():
+                    if kind is relevant_kind and (
+                        local_source.status is not StatisticsMetricStatus.AVAILABLE
+                        or local_actual is None
+                    ):
+                        invalid_refs.append(GateFailureRefV1(kind, ref, local_actual, constraint.threshold, constraint.unit, _status_reason(local_source.status)))
             checks.append(
                 _ineligible_check(
                     constraint,
@@ -1717,6 +1713,10 @@ def _evaluate_frozen_policy(
             continue
         actual, source, _ = _value_for_scope(delta, constraint.scope)
         coverage = min(_coverage_ppm(baseline_value), _coverage_ppm(candidate_value))
+        local = scoped_local_values()
+        relevant = tuple(
+            item for item in local if relevant_kind is None or item[0] is relevant_kind
+        )
         ref_values = relevant if relevant_kind is not None else local
         unavailable_refs = tuple(
             GateFailureRefV1(

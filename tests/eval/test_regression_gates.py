@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import review_agent_eval.gates as gates_module
 
 from review_agent_eval.analysis_artifacts import AnalysisArtifactStore, AnalysisReceipt
 from review_agent_eval.artifacts import ArtifactConflictError, ArtifactIntegrityError
@@ -319,6 +320,58 @@ def test_gate_unavailable_reason_resolver_preserves_mixed_reasons(
     })
     with pytest.raises(GateError, match="status.*reasons"):
         GateCheckV1.from_dict(invalid)
+
+
+def test_gate_local_values_are_lazy_by_exit_path(
+    core_gate_sources: dict[str, Any],
+    paired_sources: dict[str, Any],
+    gate_policy_store: AnalysisArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = gates_module._local_values
+
+    def counted(*args: Any, **kwargs: Any):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(gates_module, "_local_values", counted)
+
+    baseline = core_gate_sources["baseline"]
+    config = core_gate_sources["promote_config"]
+    comparison = compare_runs(baseline, core_gate_sources["promote"], COMPARISON_POLICY)
+    calibration_missing = prepare_gate_policy(baseline, config, policy=_policy(
+        baseline, config, eligibility=GateEligibility.RELEASE_BLOCKING,
+        constraints=(_constraint(CoreMetric.ISSUE_RECALL, GateConstraintScope.CANDIDATE_ABSOLUTE, GateOperator.AT_LEAST, 0),),
+    ))
+    frozen = gate_policy_store.publish_gate_policy(calibration_missing, baseline=baseline, candidate_run_config=config)
+    evaluate_gate(gate_policy_store, frozen, comparison, {})
+    assert calls == 0
+
+    calls = 0
+    available = prepare_gate_policy(baseline, config, policy=_policy(
+        baseline, config, eligibility=GateEligibility.RELEASE_BLOCKING,
+        constraints=(_constraint(CoreMetric.AGENT_FAILURE_RATE, GateConstraintScope.CASE_ABSOLUTE, GateOperator.AT_MOST, 1_000_000),),
+    ))
+    frozen = gate_policy_store.publish_gate_policy(available, baseline=baseline, candidate_run_config=config)
+    evaluate_gate(gate_policy_store, frozen, comparison, {})
+    assert calls == 1
+
+    calls = 0
+    baseline = paired_sources["baseline"]
+    config = paired_sources["candidate_run"].config
+    comparison = _comparison(paired_sources)
+    unavailable = prepare_gate_policy(baseline, config, policy=_policy(
+        baseline, config,
+        constraints=(
+            _constraint(CoreMetric.CLARIFICATION_ACCURACY, GateConstraintScope.CASE_ABSOLUTE, GateOperator.AT_LEAST, 0),
+            _constraint(CoreMetric.CLARIFICATION_ACCURACY, GateConstraintScope.TRIAL_ABSOLUTE, GateOperator.AT_LEAST, 0),
+        ),
+    ))
+    frozen = gate_policy_store.publish_gate_policy(unavailable, baseline=baseline, candidate_run_config=config)
+    evaluate_gate(gate_policy_store, frozen, comparison, {})
+    assert calls == 2
 
 
 @pytest.fixture(scope="module")
