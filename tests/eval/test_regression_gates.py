@@ -38,6 +38,7 @@ from review_agent_eval.gates import (
     GateReferenceKind,
     GateResultV1,
     _coverage_disposition,
+    _ineligible_check,
     evaluate_gate,
     prepare_gate_policy,
 )
@@ -251,6 +252,63 @@ def test_gate_check_status_reason_pairs_and_legacy_hydration_are_closed() -> Non
             decision=GateDecision.INELIGIBLE,
             checks=(hydrated_legacy,),
         )
+
+
+@pytest.mark.parametrize(
+    ("reasons", "expected_status"),
+    (
+        (
+            (
+                GateCheckReason.CALIBRATION_PENDING_HUMAN_LABELS,
+                GateCheckReason.CALIBRATION_FAILED_THRESHOLDS,
+            ),
+            GateCheckStatus.PENDING,
+        ),
+        (
+            (
+                GateCheckReason.FAILED_COVERAGE,
+                GateCheckReason.ZERO_DENOMINATOR,
+            ),
+            GateCheckStatus.INSUFFICIENT_COVERAGE,
+        ),
+    ),
+)
+def test_gate_unavailable_reason_resolver_preserves_mixed_reasons(
+    reasons: tuple[GateCheckReason, ...],
+    expected_status: GateCheckStatus,
+) -> None:
+    constraint = _constraint(
+        CoreMetric.AGENT_FAILURE_RATE,
+        GateConstraintScope.CANDIDATE_ABSOLUTE,
+        GateOperator.AT_MOST,
+        1_000_000,
+    )
+    check = _ineligible_check(constraint, reasons)
+
+    assert check.status is expected_status
+    assert check.reasons == tuple(sorted(reasons, key=lambda item: item.value))
+    assert GateCheckV1.from_dict(check.to_dict()) == check
+    replayed = GateResultV1.create(
+        policy_digest="0" * 64,
+        policy_artifact_id="analysis-artifact-v1-" + "1" * 64,
+        policy_receipt_digest="2" * 64,
+        comparison_id="comparison-v1",
+        decision=GateDecision.INELIGIBLE,
+        checks=(check,),
+    )
+    assert GateResultV1.from_dict(replayed.to_dict()) == replayed
+
+    invalid = check.to_dict()
+    invalid["status"] = (
+        GateCheckStatus.NOT_SCORABLE.value
+        if expected_status is not GateCheckStatus.NOT_SCORABLE
+        else GateCheckStatus.PENDING.value
+    )
+    invalid["check_id"] = stable_id("gate-check-v1", {
+        key: value for key, value in invalid.items() if key != "check_id"
+    })
+    with pytest.raises(GateError, match="status.*reasons"):
+        GateCheckV1.from_dict(invalid)
 
 
 @pytest.fixture(scope="module")

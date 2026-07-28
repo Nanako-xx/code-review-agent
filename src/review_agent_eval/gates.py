@@ -131,38 +131,25 @@ class GateCheckReason(str, Enum):
     THRESHOLD_FAILED = "threshold_failed"
 
 
-_STATUS_REASONS = {
-    GateCheckStatus.NOT_COMPARABLE: frozenset(
-        {GateCheckReason.NOT_COMPARABLE, GateCheckReason.POLICY_MISMATCH}
-    ),
-    GateCheckStatus.NOT_SCORABLE: frozenset(
-        {
-            GateCheckReason.POLICY_MISMATCH,
-            GateCheckReason.NOT_SCORABLE,
-            GateCheckReason.ZERO_DENOMINATOR,
-            GateCheckReason.UNGRADED,
-            GateCheckReason.MISSING_VALUE,
-            GateCheckReason.AUTHORITY_INSUFFICIENT,
-            GateCheckReason.CALIBRATION_MISSING,
-            GateCheckReason.CALIBRATION_NOT_ELIGIBLE,
-            GateCheckReason.CALIBRATION_FAILED_THRESHOLDS,
-            GateCheckReason.UNIT_MISMATCH,
-        }
-    ),
-    GateCheckStatus.INSUFFICIENT_COVERAGE: frozenset(
-        {
-            GateCheckReason.INSUFFICIENT_COVERAGE,
-            GateCheckReason.FAILED_COVERAGE,
-            GateCheckReason.CALIBRATION_INSUFFICIENT_COVERAGE,
-        }
-    ),
-    GateCheckStatus.NOT_CONFIGURED: frozenset(
-        {GateCheckReason.NOT_CONFIGURED}
-    ),
-    GateCheckStatus.PENDING: frozenset(
-        {GateCheckReason.CALIBRATION_PENDING_HUMAN_LABELS}
-    ),
-}
+_UNAVAILABLE_REASONS = frozenset(
+    {
+        GateCheckReason.POLICY_MISMATCH,
+        GateCheckReason.NOT_COMPARABLE,
+        GateCheckReason.NOT_SCORABLE,
+        GateCheckReason.ZERO_DENOMINATOR,
+        GateCheckReason.UNGRADED,
+        GateCheckReason.INSUFFICIENT_COVERAGE,
+        GateCheckReason.FAILED_COVERAGE,
+        GateCheckReason.MISSING_VALUE,
+        GateCheckReason.AUTHORITY_INSUFFICIENT,
+        GateCheckReason.CALIBRATION_MISSING,
+        GateCheckReason.CALIBRATION_NOT_ELIGIBLE,
+        GateCheckReason.CALIBRATION_PENDING_HUMAN_LABELS,
+        GateCheckReason.CALIBRATION_INSUFFICIENT_COVERAGE,
+        GateCheckReason.CALIBRATION_FAILED_THRESHOLDS,
+        GateCheckReason.UNIT_MISMATCH,
+    }
+)
 
 
 class GateReferenceKind(str, Enum):
@@ -915,21 +902,19 @@ class GateCheckV1(_JsonModel):
             ):
                 raise _error("failed GateCheckV1 requires only threshold_failed")
             if status not in {GateCheckStatus.PASS, GateCheckStatus.FAIL}:
-                allowed_reasons = _STATUS_REASONS[status]
-                if not reasons or not set(reasons).issubset(allowed_reasons):
-                    raise _error("GateCheckV1 status and reasons are incompatible")
-                if status is GateCheckStatus.NOT_COMPARABLE and (
-                    GateCheckReason.NOT_COMPARABLE not in reasons
+                if status is not GateCheckStatus.NOT_CONFIGURED and (
+                    not reasons or not set(reasons).issubset(_UNAVAILABLE_REASONS)
                 ):
-                    raise _error("not_comparable GateCheckV1 requires not_comparable")
+                    raise _error("GateCheckV1 status and reasons are incompatible")
+                if (
+                    status is not GateCheckStatus.NOT_CONFIGURED
+                    and status is not _unavailable_status(reasons)
+                ):
+                    raise _error("GateCheckV1 status does not match unavailable reasons")
                 if status is GateCheckStatus.NOT_CONFIGURED and reasons != (
                     GateCheckReason.NOT_CONFIGURED,
                 ):
                     raise _error("not_configured GateCheckV1 requires not_configured")
-                if status is GateCheckStatus.PENDING and reasons != (
-                    GateCheckReason.CALIBRATION_PENDING_HUMAN_LABELS,
-                ):
-                    raise _error("pending GateCheckV1 requires pending calibration")
         if status not in {GateCheckStatus.PASS, GateCheckStatus.FAIL} and not reasons:
             raise _error("unscored GateCheckV1 requires a typed reason")
         if status is GateCheckStatus.FAIL and GateCheckReason.THRESHOLD_FAILED not in reasons:
@@ -1535,7 +1520,6 @@ def _ineligible_check(
     constraint: MetricConstraintV1,
     reasons: Sequence[GateCheckReason],
     *,
-    status: GateCheckStatus = GateCheckStatus.NOT_SCORABLE,
     metric_ref: str | None = None,
     actual: Any = None,
     coverage_ppm: int | None = None,
@@ -1544,7 +1528,7 @@ def _ineligible_check(
 ) -> GateCheckV1:
     return _make_check(
         constraint,
-        status=status,
+        status=_unavailable_status(reasons),
         actual=actual,
         coverage_ppm=coverage_ppm,
         metric_ref=metric_ref,
@@ -1595,14 +1579,14 @@ def _unavailable_status(reasons: Sequence[GateCheckReason]) -> GateCheckStatus:
     values = set(reasons)
     if GateCheckReason.NOT_COMPARABLE in values:
         return GateCheckStatus.NOT_COMPARABLE
-    if GateCheckReason.CALIBRATION_PENDING_HUMAN_LABELS in values:
-        return GateCheckStatus.PENDING
     if (
         GateCheckReason.INSUFFICIENT_COVERAGE in values
         or GateCheckReason.FAILED_COVERAGE in values
         or GateCheckReason.CALIBRATION_INSUFFICIENT_COVERAGE in values
     ):
         return GateCheckStatus.INSUFFICIENT_COVERAGE
+    if GateCheckReason.CALIBRATION_PENDING_HUMAN_LABELS in values:
+        return GateCheckStatus.PENDING
     return GateCheckStatus.NOT_SCORABLE
 
 
@@ -1624,7 +1608,6 @@ def _evaluate_frozen_policy(
                 _ineligible_check(
                     constraint,
                     global_reasons,
-                    status=_unavailable_status(global_reasons),
                     calibrations=canonical_policy.calibration_result_digests,
                 )
             )
@@ -1653,7 +1636,6 @@ def _evaluate_frozen_policy(
                 _ineligible_check(
                     constraint,
                     calibration_reasons,
-                    status=_unavailable_status(calibration_reasons),
                     metric_ref=metric_ref,
                     calibrations=canonical_policy.calibration_result_digests,
                 )
@@ -1685,7 +1667,6 @@ def _evaluate_frozen_policy(
                 _ineligible_check(
                     constraint,
                     statuses,
-                    status=_unavailable_status(statuses),
                     metric_ref=metric_ref,
                     failure_refs=invalid_refs,
                     calibrations=canonical_policy.calibration_result_digests,
@@ -1726,7 +1707,6 @@ def _evaluate_frozen_policy(
                 _ineligible_check(
                     constraint,
                     (GateCheckReason.INSUFFICIENT_COVERAGE,),
-                    status=GateCheckStatus.INSUFFICIENT_COVERAGE,
                     metric_ref=metric_ref,
                     actual=actual,
                     coverage_ppm=coverage,
@@ -1763,7 +1743,6 @@ def _evaluate_frozen_policy(
                     _ineligible_check(
                         constraint,
                         (GateCheckReason.INSUFFICIENT_COVERAGE,),
-                        status=GateCheckStatus.INSUFFICIENT_COVERAGE,
                         metric_ref=metric_ref,
                         coverage_ppm=coverage,
                         failure_refs=unavailable_refs,
