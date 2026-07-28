@@ -18,7 +18,7 @@ import re
 import stat
 import unicodedata
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import islice
@@ -214,6 +214,15 @@ _INTERNAL_DIRECTORIES = frozenset(
         "preflights",
         "materializations",
     }
+)
+_PREPARED_TRIAL_DIRECTORY_NAMES = frozenset(
+    {".locks", "evaluations", "materializations", "receipts"}
+)
+_PREPARED_TRIAL_FILE_NAMES = frozenset(
+    {"trial_manifest.json", ".locks/trial.lock"}
+)
+_MAX_PREPARED_TRIAL_INVENTORY_ENTRIES = (
+    len(_PREPARED_TRIAL_DIRECTORY_NAMES) + len(_PREPARED_TRIAL_FILE_NAMES)
 )
 
 
@@ -2279,6 +2288,15 @@ class RunState:
 
 
 @dataclass(frozen=True)
+class RunPreexecutionReservation:
+    """Immutable candidate plan held under every Trial execution lock."""
+
+    config: EvalRunConfig
+    case_snapshot: RunCaseSnapshot
+    manifest: RunManifest
+
+
+@dataclass(frozen=True)
 class ResumePlan:
     trial_id: str
     status: TrialStatus
@@ -2690,6 +2708,12 @@ def _unsafe_node(info: os.stat_result) -> bool:
     return stat.S_ISLNK(info.st_mode) or _is_reparse(info)
 
 
+def _hardlinked_file(info: os.stat_result) -> bool:
+    """Return whether a regular file has an externally reachable hardlink."""
+
+    return stat.S_ISREG(info.st_mode) and getattr(info, "st_nlink", 1) != 1
+
+
 def _file_identity(info: os.stat_result) -> Optional[Tuple[int, int]]:
     inode = getattr(info, "st_ino", 0)
     if not inode:
@@ -2992,6 +3016,32 @@ class ArtifactStore:
         max_total_read_bytes: int = DEFAULT_MAX_TOTAL_READ_BYTES,
         create_root: bool = True,
     ) -> None:
+        self._initialize_storage_root(
+            runs_root,
+            max_file_bytes=max_file_bytes,
+            max_total_read_bytes=max_total_read_bytes,
+            create_root=create_root,
+            required_root_name=".eval-runs",
+            reject_hardlinks=False,
+        )
+
+    def _initialize_storage_root(
+        self,
+        storage_root: os.PathLike[str] | str,
+        *,
+        max_file_bytes: int,
+        max_total_read_bytes: int,
+        create_root: bool,
+        required_root_name: Optional[str],
+        reject_hardlinks: bool,
+    ) -> None:
+        """Initialize the shared fail-closed storage boundary.
+
+        ``required_root_name`` preserves the public Run-store contract while
+        allowing protocol-specific stores to reuse the exact same path and
+        publication defenses at a separate explicit root.
+        """
+
         if type(max_file_bytes) is not int or max_file_bytes <= 0:
             raise ValueError("max_file_bytes must be a positive integer")
         if type(max_total_read_bytes) is not int or max_total_read_bytes <= 0:
@@ -3000,12 +3050,18 @@ class ArtifactStore:
             raise ValueError("max_file_bytes may not exceed max_total_read_bytes")
         if type(create_root) is not bool:
             raise ValueError("create_root must be a bool")
-        root = _absolute_storage_path(runs_root)
-        if root.name != ".eval-runs":
-            raise ValueError("ArtifactStore root must be an explicit .eval-runs directory")
+        if type(reject_hardlinks) is not bool:
+            raise ValueError("reject_hardlinks must be a bool")
+        root = _absolute_storage_path(storage_root)
+        if required_root_name is not None and root.name != required_root_name:
+            raise ValueError(
+                "ArtifactStore root must be an explicit %s directory"
+                % required_root_name
+            )
         self.root = root
         self.max_file_bytes = max_file_bytes
         self.max_total_read_bytes = max_total_read_bytes
+        self._reject_hardlinks = reject_hardlinks
         if create_root:
             self._prepare_root()
         else:
@@ -3217,10 +3273,19 @@ class ArtifactStore:
             raise
 
     @contextmanager
-    def _guard_parent_directory(self, path: Path) -> Iterator[Optional[int]]:
+    def _guard_parent_directory(
+        self,
+        path: Path,
+        *,
+        create: bool = True,
+    ) -> Iterator[Optional[int]]:
         path = self._within_root(path)
         parent = path.parent
-        self._ensure_directory(parent)
+        if create:
+            self._ensure_directory(parent)
+        else:
+            self._assert_parent_chain(path)
+            self._assert_directory(parent)
         if os.name != "nt":
             descriptor = self._open_posix_directory_descriptor(parent)
             try:
@@ -3265,6 +3330,8 @@ class ArtifactStore:
             raise ArtifactSecurityError(
                 "artifact is a symlink, reparse point, or special file"
             )
+        if self._reject_hardlinks and _hardlinked_file(info):
+            raise ArtifactSecurityError("artifact has an unsafe hardlink count")
         return True
 
     def _run_dir(self, run_id: str) -> Path:
@@ -3400,9 +3467,19 @@ class ArtifactStore:
                     pass
 
     @contextmanager
-    def _lock(self, path: Path) -> Iterator[None]:
+    def _lock(
+        self,
+        path: Path,
+        *,
+        create: bool = True,
+        require_single_link: bool = False,
+    ) -> Iterator[None]:
         path = self._within_root(path)
-        with self._guard_parent_directory(path) as parent_descriptor:
+        reject_hardlinks = self._reject_hardlinks or require_single_link
+        with self._guard_parent_directory(
+            path,
+            create=create,
+        ) as parent_descriptor:
             try:
                 if parent_descriptor is None:
                     existing = os.lstat(path)
@@ -3416,15 +3493,25 @@ class ArtifactStore:
                 existing = None
             except OSError as exc:
                 raise ArtifactSecurityError("could not inspect writer lock") from exc
+            if existing is None and not create:
+                raise ArtifactIntegrityError("required writer lock is missing")
             if existing is not None and (
                 _unsafe_node(existing) or not stat.S_ISREG(existing.st_mode)
             ):
                 raise ArtifactSecurityError(
                     "writer lock is a symlink, reparse point, or special file"
                 )
+            if (
+                reject_hardlinks
+                and existing is not None
+                and _hardlinked_file(existing)
+            ):
+                raise ArtifactSecurityError(
+                    "writer lock has an unsafe hardlink count"
+                )
             flags = (
                 os.O_RDWR
-                | os.O_CREAT
+                | (os.O_CREAT if create else 0)
                 | getattr(os, "O_BINARY", 0)
                 | getattr(os, "O_NOFOLLOW", 0)
             )
@@ -3445,6 +3532,10 @@ class ArtifactStore:
                 info = os.fstat(descriptor)
                 if _unsafe_node(info) or not stat.S_ISREG(info.st_mode):
                     raise ArtifactSecurityError("writer lock is not a regular file")
+                if reject_hardlinks and _hardlinked_file(info):
+                    raise ArtifactSecurityError(
+                        "writer lock has an unsafe hardlink count"
+                    )
                 opened_path = _windows_descriptor_path(descriptor)
                 if opened_path is not None and (
                     not _path_is_within(self.root, opened_path)
@@ -3454,7 +3545,17 @@ class ArtifactStore:
                     raise ArtifactSecurityError(
                         "writer lock resolved to an unexpected path"
                     )
-                if info.st_size == 0:
+                if not create:
+                    if info.st_size != 1:
+                        raise ArtifactIntegrityError(
+                            "required writer lock has invalid bytes"
+                        )
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    if os.read(descriptor, 1) != b"\0":
+                        raise ArtifactIntegrityError(
+                            "required writer lock has invalid bytes"
+                        )
+                elif info.st_size == 0:
                     os.lseek(descriptor, 0, os.SEEK_SET)
                     os.write(descriptor, b"\0")
                     os.fsync(descriptor)
@@ -3562,6 +3663,8 @@ class ArtifactStore:
             raise ArtifactSecurityError(
                 "artifact is a symlink, reparse point, or special file"
             )
+        if self._reject_hardlinks and _hardlinked_file(before):
+            raise ArtifactSecurityError("artifact has an unsafe hardlink count")
         if before.st_size > effective_maximum:
             raise ArtifactIntegrityError("artifact exceeds the single-file byte limit")
         if expected_size is not None and before.st_size != expected_size:
@@ -3578,6 +3681,8 @@ class ArtifactStore:
             opened = os.fstat(descriptor)
             if _unsafe_node(opened) or not stat.S_ISREG(opened.st_mode):
                 raise ArtifactSecurityError("artifact changed during safe open")
+            if self._reject_hardlinks and _hardlinked_file(opened):
+                raise ArtifactSecurityError("artifact has an unsafe hardlink count")
             before_identity = _file_identity(before)
             opened_identity = _descriptor_identity(descriptor, opened)
             if (
@@ -3656,6 +3761,10 @@ class ArtifactStore:
                         raise ArtifactSecurityError(
                             "artifact path changed while it was open"
                         )
+                    if self._reject_hardlinks and _hardlinked_file(recheck):
+                        raise ArtifactSecurityError(
+                            "artifact has an unsafe hardlink count"
+                        )
                     recheck_path = _windows_descriptor_path(recheck_descriptor)
                     if (
                         recheck_path is None
@@ -3693,6 +3802,8 @@ class ArtifactStore:
             raise ArtifactSecurityError(
                 "artifact path changed into a link, reparse point, or special file"
             )
+        if self._reject_hardlinks and _hardlinked_file(path_after):
+            raise ArtifactSecurityError("artifact has an unsafe hardlink count")
         if (
             _file_identity(opened) is not None
             and _file_identity(path_after) is not None
@@ -4085,6 +4196,13 @@ class ArtifactStore:
                 self._ensure_directory(
                     self._target(config.run_id, relative_base) / suffix
                 )
+            # Writer locks are stable prepared-plan artifacts.  Analysis
+            # reservations may only open these existing bytes; they never
+            # create or repair lock state in the immutable Run Store.
+            self._write_bytes_exclusive(
+                self._trial_lock_path(trial_manifest),
+                b"\0",
+            )
             written = self._write_json(
                 config.run_id,
                 "%s/trial_manifest.json" % relative_base,
@@ -5356,6 +5474,276 @@ class ArtifactStore:
         else:
             status = RunStatus.PENDING
         return RunState(run_id=run_id, status=status, trials=tuple(states))
+
+    def _assert_prepared_trial_inventory(self, plan: TrialManifest) -> None:
+        """Require the exact filesystem projection committed by ``create_run``."""
+
+        root = self._trial_dir(plan)
+        expected_directories = _PREPARED_TRIAL_DIRECTORY_NAMES
+        expected_files = _PREPARED_TRIAL_FILE_NAMES
+        directory_entry_limits = {
+            "": len(expected_directories) + 1,
+            ".locks": 1,
+            "evaluations": 0,
+            "materializations": 0,
+            "receipts": 0,
+        }
+        observed_directories: set[str] = set()
+        observed_files: set[str] = set()
+        total_entries = 0
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            self._assert_directory(directory)
+            directory_key = (
+                ""
+                if directory == root
+                else directory.relative_to(root).as_posix()
+            )
+            directory_limit = directory_entry_limits[directory_key]
+            directory_entries = 0
+            child_directories: List[Path] = []
+            try:
+                entries_context = os.scandir(directory)
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "could not inspect prepared Trial inventory"
+                ) from exc
+            try:
+                with entries_context as entries:
+                    for entry in entries:
+                        directory_entries += 1
+                        total_entries += 1
+                        if (
+                            directory_entries > directory_limit
+                            or total_entries
+                            > _MAX_PREPARED_TRIAL_INVENTORY_ENTRIES
+                        ):
+                            raise ArtifactIntegrityError(
+                                "prepared Trial inventory exceeds its entry limit"
+                            )
+                        try:
+                            metadata = entry.stat(follow_symlinks=False)
+                        except OSError as exc:
+                            raise ArtifactSecurityError(
+                                "could not inspect prepared Trial inventory"
+                            ) from exc
+                        if _unsafe_node(metadata):
+                            raise ArtifactSecurityError(
+                                "prepared Trial inventory contains a link or reparse point"
+                            )
+                        path = Path(entry.path)
+                        relative = path.relative_to(root).as_posix()
+                        if stat.S_ISDIR(metadata.st_mode):
+                            if relative not in expected_directories:
+                                raise ArtifactIntegrityError(
+                                    "prepared Trial inventory contains an unknown directory"
+                                )
+                            observed_directories.add(relative)
+                            child_directories.append(path)
+                            continue
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise ArtifactSecurityError(
+                                "prepared Trial inventory contains a special file"
+                            )
+                        try:
+                            file_metadata = os.lstat(path)
+                        except OSError as exc:
+                            raise ArtifactSecurityError(
+                                "could not verify prepared Trial file link count"
+                            ) from exc
+                        if (
+                            _unsafe_node(file_metadata)
+                            or not stat.S_ISREG(file_metadata.st_mode)
+                        ):
+                            raise ArtifactSecurityError(
+                                "prepared Trial file changed during inventory"
+                            )
+                        if _hardlinked_file(file_metadata):
+                            raise ArtifactSecurityError(
+                                "prepared Trial inventory contains a hardlinked file"
+                            )
+                        if relative not in expected_files:
+                            raise ArtifactIntegrityError(
+                                "prepared Trial inventory contains an unknown file"
+                            )
+                        observed_files.add(relative)
+            except ArtifactError:
+                raise
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "could not inspect prepared Trial inventory"
+                ) from exc
+            pending.extend(
+                reversed(
+                    sorted(
+                        child_directories,
+                        key=lambda item: item.relative_to(root).as_posix(),
+                    )
+                )
+            )
+        if (
+            observed_directories != expected_directories
+            or observed_files != expected_files
+        ):
+            raise ArtifactIntegrityError(
+                "prepared Trial inventory is incomplete"
+            )
+
+    def _assert_single_link_control_file(self, path: Path) -> None:
+        """Verify one immutable control file through its opened descriptor."""
+
+        path = self._within_root(path)
+        try:
+            before = os.lstat(path)
+        except OSError as exc:
+            raise ArtifactIntegrityError(
+                "required Run control file is unavailable"
+            ) from exc
+        if _unsafe_node(before) or not stat.S_ISREG(before.st_mode):
+            raise ArtifactSecurityError(
+                "Run control file is a link, reparse point, or special file"
+            )
+        if _hardlinked_file(before):
+            raise ArtifactSecurityError(
+                "Run control file has an unsafe hardlink count"
+            )
+        try:
+            descriptor = self._open_read_descriptor(path)
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "Run control file could not be safely opened"
+            ) from exc
+        try:
+            opened = os.fstat(descriptor)
+            if _unsafe_node(opened) or not stat.S_ISREG(opened.st_mode):
+                raise ArtifactSecurityError(
+                    "Run control file changed during safe open"
+                )
+            if _hardlinked_file(opened):
+                raise ArtifactSecurityError(
+                    "Run control file has an unsafe hardlink count"
+                )
+            before_identity = _file_identity(before)
+            opened_identity = _descriptor_identity(descriptor, opened)
+            if (
+                before_identity is not None
+                and opened_identity is not None
+                and before_identity != opened_identity
+            ):
+                raise ArtifactSecurityError(
+                    "Run control file changed during safe open"
+                )
+            opened_path = _windows_descriptor_path(descriptor)
+            if opened_path is not None and (
+                not _path_is_within(self.root, opened_path)
+                or _normalized_filesystem_path(opened_path)
+                != _normalized_filesystem_path(path)
+            ):
+                raise ArtifactSecurityError(
+                    "Run control file resolved to an unexpected path"
+                )
+            if opened_path is None and (
+                before_identity is None or opened_identity is None
+            ):
+                raise ArtifactSecurityError(
+                    "Run control file identity could not be verified"
+                )
+        finally:
+            os.close(descriptor)
+
+    def _assert_run_control_files_single_link(
+        self,
+        bundle: _VerifiedRunBundle,
+    ) -> None:
+        run_id = bundle.config.run_id
+        paths = [
+            self._target(run_id, bundle.manifest.run_config.relative_path),
+            self._target(run_id, bundle.manifest.case_snapshot.relative_path),
+            self._run_dir(run_id) / "run_manifest.json",
+        ]
+        preflight = self._target(
+            run_id,
+            "receipts/capability_preflight.json",
+        )
+        if self._exists_regular(preflight):
+            paths.append(preflight)
+        for path in paths:
+            self._assert_single_link_control_file(path)
+
+    @contextmanager
+    def reserve_run_before_execution(
+        self,
+        run_id: str,
+    ) -> Iterator[RunPreexecutionReservation]:
+        """Hold the complete Run at its immutable pre-execution boundary.
+
+        ``start_trial`` and every subsequent Trial writer use the same
+        per-Trial locks.  Acquiring all of them in canonical plan order makes
+        the final precondition replay and a caller-owned publication one
+        indivisible operation with respect to Agent execution.
+        """
+
+        initial = self._load_verified_run_bundle(run_id)
+        initial_plans = tuple(
+            self._load_trial_manifest(
+                initial,
+                item.task_id,
+                item.trial_id,
+                budget=_ReadBudget(self.max_total_read_bytes),
+            )
+            for item in initial.manifest.trials
+        )
+        with ExitStack() as locks:
+            for plan in initial_plans:
+                locks.enter_context(
+                    self._lock(
+                        self._trial_lock_path(plan),
+                        create=False,
+                        require_single_link=True,
+                    )
+                )
+
+            locked = self._load_verified_run_bundle(run_id)
+            locked_plans = tuple(
+                self._load_trial_manifest(
+                    locked,
+                    item.task_id,
+                    item.trial_id,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                )
+                for item in locked.manifest.trials
+            )
+            if locked != initial or locked_plans != initial_plans:
+                raise ArtifactIntegrityError(
+                    "candidate immutable Run plan changed while reserving execution"
+                )
+            self._assert_run_control_files_single_link(locked)
+            for plan in locked_plans:
+                state, _submission = self._load_trial_state(
+                    locked,
+                    plan,
+                    budget=_ReadBudget(self.max_total_read_bytes),
+                )
+                if (
+                    state.status is not TrialStatus.PENDING
+                    or state.active_attempt is not None
+                    or state.completed_stages
+                    or state.terminal_receipt is not None
+                ):
+                    raise ArtifactConflictError(
+                        "candidate Run has already started execution"
+                    )
+                self._assert_prepared_trial_inventory(plan)
+            if self.list_evaluations(run_id) or self.list_run_evaluations(run_id):
+                raise ArtifactConflictError(
+                    "candidate Run already contains evaluation results"
+                )
+            yield RunPreexecutionReservation(
+                config=locked.config,
+                case_snapshot=locked.case_snapshot,
+                manifest=locked.manifest,
+            )
 
     def _trial_lock_path(self, plan: TrialManifest) -> Path:
         return self._trial_dir(plan) / ".locks" / "trial.lock"
@@ -7587,6 +7975,7 @@ __all__ = [
     "TrialState",
     "VerifiedTrialMaterialization",
     "RunState",
+    "RunPreexecutionReservation",
     "ResumePlan",
     "EvaluationNamespace",
     "EvaluationArtifactBundle",

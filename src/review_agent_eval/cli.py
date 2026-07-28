@@ -15,6 +15,10 @@ The product command remains ``review-agent``.  This module exposes a separate
 ``prepare-public``
     verify local public-dataset control files and publish one immutable Suite;
     this command is deliberately offline and has no acquisition options.
+``compare`` / ``calibrate`` / ``gate``
+    replay verified completed evaluations into a separate immutable Analysis
+    Store without constructing an Agent, Judge, acquisition client or network
+    provider.
 
 The parser is intentionally boring.  All domain behavior lives in the
 existing CaseBank, Runner, Evaluators, Metrics, ReportBuilder and ArtifactStore
@@ -25,6 +29,7 @@ a second scoring implementation.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -43,6 +48,9 @@ EXIT_PRECONDITION = 10
 EXIT_CONFLICT = 11
 EXIT_INTEGRITY = 12
 EXIT_OPERATIONAL = 13
+# A valid Gate decision is an ordinary result.  CI callers can opt into one
+# separate non-zero policy status without changing the published artifact.
+EXIT_POLICY = 20
 
 
 class CliUsageError(ValueError):
@@ -189,6 +197,43 @@ def _common_paths(parser: argparse.ArgumentParser, *, suite: bool = False) -> No
     parser.add_argument("--json", action="store_true", help="emit stable JSON")
 
 
+def _analysis_paths(parser: argparse.ArgumentParser) -> None:
+    """Add read-only source roots and the separate Analysis Store root.
+
+    Deliberately omit provider, adapter, acquisition and executable options.
+    Analysis commands replay committed sources and cannot construct an Agent
+    or Judge.
+    """
+
+    parser.add_argument("--suite-root", required=True)
+    parser.add_argument("--manifest", default="suite_manifest.json")
+    parser.add_argument("--expected-manifest-digest")
+    parser.add_argument("--runs-root", default=".eval-runs")
+    parser.add_argument("--data-root", default=".eval-data")
+    parser.add_argument("--workspace-root", default=".eval-workspaces")
+    parser.add_argument("--analysis-root", default=".eval-analyses")
+    parser.add_argument("--json", action="store_true", help="emit stable JSON")
+
+
+def _evaluation_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    prefix: str = "",
+) -> None:
+    option = (prefix + "-") if prefix else ""
+    destination = (prefix.replace("-", "_") + "_") if prefix else ""
+    parser.add_argument(
+        "--" + option + "run-id",
+        dest=destination + "run_id",
+        required=True,
+    )
+    parser.add_argument(
+        "--" + option + "evaluation-id",
+        dest=destination + "evaluation_id",
+        required=True,
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="review-agent-eval",
@@ -324,6 +369,75 @@ def _build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--evaluation-id", required=True)
     inspect.add_argument("--format", choices=("json", "markdown"), default="json")
     inspect.add_argument("--dry-run", action="store_true")
+
+    compare = sub.add_parser(
+        "compare",
+        help="compare two source-bound completed Run evaluations",
+    )
+    _analysis_paths(compare)
+    _evaluation_arguments(compare, prefix="baseline")
+    _evaluation_arguments(compare, prefix="candidate")
+    compare.add_argument("--policy", required=True)
+
+    calibrate = sub.add_parser(
+        "calibrate",
+        help="export, import, and score blind Judge calibration artifacts",
+    )
+    calibrate_sub = calibrate.add_subparsers(
+        dest="calibrate_command",
+        required=True,
+    )
+    calibration_commands = {}
+    for name, help_text in (
+        ("export", "export one blind external calibration package"),
+        ("import-labels", "validate and publish external human labels"),
+        ("score", "score persisted Judge output against human labels"),
+    ):
+        command = calibrate_sub.add_parser(name, help=help_text)
+        _analysis_paths(command)
+        _evaluation_arguments(command)
+        command.add_argument("--profile", required=True)
+        command.add_argument("--selection-policy", required=True)
+        calibration_commands[name] = command
+    calibration_commands["export"].add_argument("--output-root", required=True)
+    calibration_commands["import-labels"].add_argument(
+        "--package-id", required=True
+    )
+    calibration_commands["import-labels"].add_argument("--labels", required=True)
+    calibration_commands["score"].add_argument("--package-id", required=True)
+    calibration_commands["score"].add_argument("--label-set-id", required=True)
+
+    gate = sub.add_parser(
+        "gate",
+        help="freeze and evaluate preregistered regression policies",
+    )
+    gate_sub = gate.add_subparsers(dest="gate_command", required=True)
+    gate_prepare = gate_sub.add_parser(
+        "prepare",
+        help="freeze a policy before candidate execution",
+    )
+    _analysis_paths(gate_prepare)
+    _evaluation_arguments(gate_prepare, prefix="baseline")
+    gate_prepare.add_argument("--candidate-run-id", required=True)
+    gate_prepare.add_argument("--policy", required=True)
+
+    gate_evaluate = gate_sub.add_parser(
+        "evaluate",
+        help="evaluate a frozen policy from verified analysis artifacts",
+    )
+    _analysis_paths(gate_evaluate)
+    _evaluation_arguments(gate_evaluate, prefix="baseline")
+    _evaluation_arguments(gate_evaluate, prefix="candidate")
+    gate_evaluate.add_argument("--comparison-id", required=True)
+    gate_evaluate.add_argument("--comparison-policy", required=True)
+    gate_evaluate.add_argument("--gate-policy-id", required=True)
+    gate_evaluate.add_argument(
+        "--calibration-binding",
+        action="append",
+        default=[],
+        help="JSON source-binding file for one calibration result",
+    )
+    gate_evaluate.add_argument("--ci", action="store_true")
 
     return parser
 
@@ -583,6 +697,91 @@ def _artifact_store(path: Path, *, create: bool):
         raise CliPreconditionError("Eval artifact root is unavailable") from exc
 
 
+def _analysis_roots(
+    args: argparse.Namespace,
+) -> tuple[tuple[Path, Path, Path, Path], Path]:
+    roots = (
+        _path(args.suite_root, name="suite_root"),
+        _path(args.runs_root, name="runs_root", required_name=".eval-runs"),
+        _path(args.data_root, name="data_root", required_name=".eval-data"),
+        _path(
+            args.workspace_root,
+            name="workspace_root",
+            required_name=".eval-workspaces",
+        ),
+    )
+    return roots, _path(args.analysis_root, name="analysis_root")
+
+
+def _analysis_store(path: Path, *, create: bool):
+    from .analysis_artifacts import AnalysisArtifactStore
+
+    if not create and not path.exists():
+        raise CliPreconditionError("Analysis artifact root is unavailable")
+    try:
+        return AnalysisArtifactStore(path, create_root=create)
+    except OSError as exc:
+        raise CliPreconditionError("Analysis artifact root is unavailable") from exc
+
+
+@contextmanager
+def _analysis_evaluation_loader(args: argparse.Namespace):
+    """Yield a source-bound Evaluation loader with no Agent/Judge factory.
+
+    Repository replay is cache-only and Frozen replay is rooted in the same
+    verified Suite.  No acquisition mode or network-capable option is exposed
+    by an analysis parser.
+    """
+
+    roots, analysis_root = _analysis_roots(args)
+    suite_root, runs_root, _data_root, _workspace_root = roots
+    store = _artifact_store(runs_root, create=False)
+    bank = _load_case_bank(args, suite_root)
+    suite_snapshot = bank.snapshot()
+    from .comparison import VerifiedRunEvaluation
+    from .config import SuiteRunConfig
+    from .datasets import DatasetError
+    from .orchestrator import EvaluationOrchestrator
+
+    with _repository_preparer_context(
+        args,
+        roots,
+        suite_snapshot,
+        cache_only=True,
+    ) as preparer:
+        orchestrator = EvaluationOrchestrator(
+            store,
+            bank,
+            repository_preparer=preparer,
+            target_replay_resolvers=_frozen_target_replay_resolvers(
+                suite_snapshot,
+                suite_root=suite_root,
+            ),
+        )
+
+        def load(run_id: str, evaluation_id: str):
+            config = store.load_run_config(run_id)
+            snapshot = store.load_case_snapshot(run_id)
+            if config.suite != SuiteRunConfig.from_case_snapshot(snapshot):
+                raise CliIntegrityError(
+                    "Run Config differs from its persisted Case Snapshot"
+                )
+            try:
+                bank.verify_snapshot_subset(snapshot)
+            except DatasetError as exc:
+                raise CliIntegrityError(
+                    "Run Case Snapshot is not a verified trusted Suite subset"
+                ) from exc
+            bundle = orchestrator.load_run_evaluation(run_id, evaluation_id)
+            return VerifiedRunEvaluation.create(
+                bundle,
+                run_config=config,
+                case_snapshot=snapshot,
+            )
+
+        yield load, store, analysis_root
+
+
 def _repository_preparer(
     args: argparse.Namespace,
     roots: tuple[Path, Path, Path, Path],
@@ -594,7 +793,7 @@ def _repository_preparer(
     from .repository import RepositoryMode, RepositoryPreparer
 
     suite_root, _runs_root, data_root, workspace_root = roots
-    git_executable = args.git_executable
+    git_executable = getattr(args, "git_executable", "git")
     if not Path(git_executable).is_absolute():
         resolved = shutil.which(git_executable)
         if resolved is None:
@@ -1524,6 +1723,362 @@ def _handle_inspect(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _comparison_policy(path: str):
+    from .comparison import ComparisonPolicyV1
+
+    return ComparisonPolicyV1.from_dict(
+        _read_json(_path(path, name="comparison_policy"), context="Comparison policy")
+    )
+
+
+def _calibration_policy(path: str):
+    from .calibration import CalibrationSelectionPolicyV1
+
+    return CalibrationSelectionPolicyV1.from_dict(
+        _read_json(
+            _path(path, name="calibration_selection_policy"),
+            context="Calibration selection policy",
+        )
+    )
+
+
+def _calibration_profile(value: str):
+    from .judge import JudgeTask
+
+    try:
+        return JudgeTask(value)
+    except (TypeError, ValueError) as exc:
+        raise CliUsageError("calibration profile is invalid") from exc
+
+
+def _handle_compare(args: argparse.Namespace) -> int:
+    from .comparison import compare_runs
+
+    with _analysis_evaluation_loader(args) as (load, _run_store, analysis_root):
+        baseline = load(args.baseline_run_id, args.baseline_evaluation_id)
+        candidate = load(args.candidate_run_id, args.candidate_evaluation_id)
+        policy = _comparison_policy(args.policy)
+        comparison = compare_runs(baseline, candidate, policy)
+    store = _analysis_store(analysis_root, create=True)
+    receipt = store.publish_comparison(comparison, policy=policy)
+    _emit(
+        args,
+        "compare",
+        "ok",
+        message="verified Run evaluations compared and published",
+        comparison_id=comparison.comparison_id,
+        artifact_id=receipt.artifact_id,
+        receipt_digest=receipt.digest(),
+        comparison_status=comparison.status.value,
+        incompatibilities=list(comparison.incompatibilities),
+        baseline_run_id=baseline.run_id,
+        candidate_run_id=candidate.run_id,
+    )
+    return EXIT_OK
+
+
+def _calibration_sources(args: argparse.Namespace):
+    policy = _calibration_policy(args.selection_policy)
+    profile = _calibration_profile(args.profile)
+    return policy, profile
+
+
+def _handle_calibrate_export(args: argparse.Namespace) -> int:
+    from .calibration import export_calibration_package
+
+    with _analysis_evaluation_loader(args) as (load, _run_store, analysis_root):
+        evaluation = load(args.run_id, args.evaluation_id)
+        policy, profile = _calibration_sources(args)
+        package = export_calibration_package(
+            evaluation,
+            profile=profile,
+            policy=policy,
+            output_root=_path(args.output_root, name="calibration_output_root"),
+        )
+    store = _analysis_store(analysis_root, create=True)
+    receipt = store.publish_calibration_package(
+        package,
+        evaluation=evaluation,
+        policy=policy,
+    )
+    _emit(
+        args,
+        "calibrate export",
+        "ok",
+        message="blind external calibration package exported",
+        package_id=package.package_id,
+        artifact_id=receipt.artifact_id,
+        receipt_digest=receipt.digest(),
+        calibration_status=package.status.value,
+        profile=package.profile.value,
+        selected_count=len(package.selection_records),
+    )
+    return EXIT_OK
+
+
+def _replay_calibration_package(
+    *,
+    evaluation: Any,
+    policy: Any,
+    profile: Any,
+    store: Any,
+    package_artifact_id: str,
+):
+    from .calibration import build_calibration_package
+
+    package = build_calibration_package(
+        evaluation,
+        profile=profile,
+        policy=policy,
+    )
+    store.load_verified_calibration_package_manifest(
+        package_artifact_id,
+        evaluation=evaluation,
+        policy=policy,
+        package=package,
+    )
+    return package
+
+
+def _handle_calibrate_import_labels(args: argparse.Namespace) -> int:
+    from .calibration import HumanLabelSetV1
+
+    with _analysis_evaluation_loader(args) as (load, _run_store, analysis_root):
+        evaluation = load(args.run_id, args.evaluation_id)
+        policy, profile = _calibration_sources(args)
+    store = _analysis_store(analysis_root, create=False)
+    package = _replay_calibration_package(
+        evaluation=evaluation,
+        policy=policy,
+        profile=profile,
+        store=store,
+        package_artifact_id=args.package_id,
+    )
+    labels = HumanLabelSetV1.from_dict(
+        _read_json(_path(args.labels, name="labels"), context="Human labels"),
+        package=package,
+    )
+    receipt = store.publish_human_label_set(
+        labels,
+        evaluation=evaluation,
+        policy=policy,
+        package=package,
+    )
+    _emit(
+        args,
+        "calibrate import-labels",
+        "ok",
+        message="external labels validated and published",
+        label_set_id=labels.label_set_id,
+        artifact_id=receipt.artifact_id,
+        receipt_digest=receipt.digest(),
+        profile=labels.profile.value,
+        label_count=len(labels.labels),
+    )
+    return EXIT_OK
+
+
+def _handle_calibrate_score(args: argparse.Namespace) -> int:
+    from .calibration import score_calibration
+
+    with _analysis_evaluation_loader(args) as (load, _run_store, analysis_root):
+        evaluation = load(args.run_id, args.evaluation_id)
+        policy, profile = _calibration_sources(args)
+    store = _analysis_store(analysis_root, create=False)
+    package = _replay_calibration_package(
+        evaluation=evaluation,
+        policy=policy,
+        profile=profile,
+        store=store,
+        package_artifact_id=args.package_id,
+    )
+    labels = store.load_human_label_set(args.label_set_id, package=package)
+    labels = store.load_verified_human_label_set(
+        args.label_set_id,
+        evaluation=evaluation,
+        policy=policy,
+        package=package,
+        labels=labels,
+    )
+    result = score_calibration(
+        evaluation,
+        package=package,
+        labels=labels,
+    )
+    receipt = store.publish_calibration_result(
+        result,
+        evaluation=evaluation,
+        policy=policy,
+        package=package,
+        labels=labels,
+    )
+    _emit(
+        args,
+        "calibrate score",
+        "ok",
+        message="Judge calibration scored and published",
+        calibration_result_id=result.calibration_result_id,
+        artifact_id=receipt.artifact_id,
+        receipt_digest=receipt.digest(),
+        calibration_status=result.status.value,
+        profile=result.profiles[0].profile.value,
+    )
+    return EXIT_OK
+
+
+def _handle_gate_prepare(args: argparse.Namespace) -> int:
+    from .gates import GatePolicyV1
+
+    with _analysis_evaluation_loader(args) as (load, run_store, analysis_root):
+        baseline = load(args.baseline_run_id, args.baseline_evaluation_id)
+        proposal = GatePolicyV1.from_dict(
+            _read_json(_path(args.policy, name="gate_policy"), context="Gate policy")
+        )
+        store = _analysis_store(analysis_root, create=True)
+        with run_store.reserve_run_before_execution(
+            args.candidate_run_id
+        ) as reservation:
+            candidate = reservation.config
+            if reservation.case_snapshot != baseline.case_snapshot:
+                raise CliIntegrityError(
+                    "candidate Run Case Snapshot differs from the baseline"
+                )
+            frozen = store.publish_gate_policy(
+                proposal,
+                baseline=baseline,
+                candidate_run_config=candidate,
+            )
+    _emit(
+        args,
+        "gate prepare",
+        "ok",
+        message="candidate Gate policy frozen before execution",
+        policy_id=frozen.policy.policy_id,
+        artifact_id=frozen.artifact_id,
+        receipt_digest=frozen.receipt_digest,
+        eligibility=frozen.policy.eligibility.value,
+        candidate_run_id=candidate.run_id,
+    )
+    return EXIT_OK
+
+
+_CALIBRATION_BINDING_FIELDS = frozenset(
+    {
+        "profile",
+        "artifact_id",
+        "run_id",
+        "evaluation_id",
+        "selection_policy",
+        "package_id",
+        "label_set_id",
+    }
+)
+
+
+def _load_gate_calibrations(
+    paths: Sequence[str],
+    *,
+    load: Any,
+    store: Any,
+) -> dict[Any, Any]:
+    result = {}
+    for raw_path in paths:
+        payload = _read_json(
+            _path(raw_path, name="calibration_binding"),
+            context="Calibration binding",
+        )
+        if type(payload) is not dict or set(payload) != _CALIBRATION_BINDING_FIELDS:
+            raise CliIntegrityError("Calibration binding has invalid exact fields")
+        profile = _calibration_profile(payload["profile"])
+        if profile in result:
+            raise CliIntegrityError("Calibration bindings contain a duplicate profile")
+        evaluation = load(payload["run_id"], payload["evaluation_id"])
+        policy = _calibration_policy(payload["selection_policy"])
+        package = _replay_calibration_package(
+            evaluation=evaluation,
+            policy=policy,
+            profile=profile,
+            store=store,
+            package_artifact_id=payload["package_id"],
+        )
+        labels = store.load_human_label_set(
+            payload["label_set_id"],
+            package=package,
+        )
+        labels = store.load_verified_human_label_set(
+            payload["label_set_id"],
+            evaluation=evaluation,
+            policy=policy,
+            package=package,
+            labels=labels,
+        )
+        stored = store.load_calibration_result(payload["artifact_id"])
+        result[profile] = store.load_verified_calibration_result(
+            payload["artifact_id"],
+            evaluation=evaluation,
+            policy=policy,
+            package=package,
+            labels=labels,
+        )
+        if result[profile].result != stored:
+            raise CliIntegrityError("Calibration result replay changed")
+    return result
+
+
+def _gate_exit_code(decision: str, *, ci: bool) -> int:
+    if ci and decision in {"block", "ineligible"}:
+        return EXIT_POLICY
+    return EXIT_OK
+
+
+def _handle_gate_evaluate(args: argparse.Namespace) -> int:
+    from .gates import evaluate_gate
+
+    with _analysis_evaluation_loader(args) as (load, run_store, analysis_root):
+        baseline = load(args.baseline_run_id, args.baseline_evaluation_id)
+        candidate = load(args.candidate_run_id, args.candidate_evaluation_id)
+        candidate_config = run_store.load_run_config(args.candidate_run_id)
+        comparison_policy = _comparison_policy(args.comparison_policy)
+        store = _analysis_store(analysis_root, create=False)
+        comparison = store.load_verified_comparison(
+            args.comparison_id,
+            baseline=baseline,
+            candidate=candidate,
+            policy=comparison_policy,
+        )
+        policy = store.load_verified_gate_policy(
+            args.gate_policy_id,
+            baseline=baseline,
+            candidate_run_config=candidate_config,
+        )
+        calibrations = _load_gate_calibrations(
+            args.calibration_binding,
+            load=load,
+            store=store,
+        )
+        gate_result = evaluate_gate(store, policy, comparison, calibrations)
+    receipt = store.publish_gate_result(
+        gate_result,
+        policy=policy,
+        comparison=comparison,
+        calibrations=calibrations,
+    )
+    _emit(
+        args,
+        "gate evaluate",
+        "ok",
+        message="frozen Gate policy evaluated and published",
+        gate_result_id=gate_result.gate_result_id,
+        artifact_id=receipt.artifact_id,
+        receipt_digest=receipt.digest(),
+        decision=gate_result.decision.value,
+        check_count=len(gate_result.checks),
+        policy_artifact_id=policy.artifact_id,
+        comparison_id=comparison.comparison_id,
+    )
+    return _gate_exit_code(gate_result.decision.value, ci=args.ci)
+
+
 def _inspection_status(value: Any) -> Optional[dict[str, Any]]:
     if value is None:
         return None
@@ -1735,7 +2290,19 @@ def _dispatch(args: argparse.Namespace) -> int:
         "run-agent": _handle_run_agent,
         "evaluate": _handle_evaluate,
         "inspect": _handle_inspect,
+        "compare": _handle_compare,
     }
+    if args.command == "calibrate":
+        return {
+            "export": _handle_calibrate_export,
+            "import-labels": _handle_calibrate_import_labels,
+            "score": _handle_calibrate_score,
+        }[args.calibrate_command](args)
+    if args.command == "gate":
+        return {
+            "prepare": _handle_gate_prepare,
+            "evaluate": _handle_gate_evaluate,
+        }[args.gate_command](args)
     return handlers[args.command](args)
 
 
@@ -1842,5 +2409,6 @@ __all__ = [
     "EXIT_CONFLICT",
     "EXIT_INTEGRITY",
     "EXIT_OPERATIONAL",
+    "EXIT_POLICY",
     "main",
 ]
