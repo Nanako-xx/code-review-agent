@@ -11,6 +11,7 @@ import hashlib
 import os
 import stat
 import unicodedata
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
@@ -669,8 +670,11 @@ class AnalysisArtifactStore:
         self.root = self._storage.root
         self.max_file_bytes = self._storage.max_file_bytes
         self.max_total_read_bytes = self._storage.max_total_read_bytes
+        self._verified_calibration_capabilities: weakref.WeakValueDictionary[
+            int, Any
+        ] = weakref.WeakValueDictionary()
 
-    def _gate_store_identity_digest(self) -> str:
+    def _store_identity_digest(self) -> str:
         """Return an in-process-independent identity for this Store root."""
 
         normalized = os.path.normcase(os.path.abspath(os.fspath(self.root)))
@@ -680,6 +684,9 @@ class AnalysisArtifactStore:
                 "analysis_store_identity_version": "v1",
             }
         )
+
+    def _gate_store_identity_digest(self) -> str:
+        return self._store_identity_digest()
 
     def _directory(self, kind: str, artifact_id: str) -> Path:
         canonical_kind = _kind(kind)
@@ -1552,6 +1559,7 @@ class AnalysisArtifactStore:
                 "payload_digest": replayed_result.payload_digest,
                 "label_set_id": replayed_result.label_set_id,
                 "label_set_digest": replayed_result.label_set_digest,
+                "calibration_target_digest": replayed_result.target_digest,
                 "calibration_result_id": replayed_result.calibration_result_id,
                 "calibration_result_digest": replayed_result.digest(),
             },
@@ -1598,6 +1606,7 @@ class AnalysisArtifactStore:
                     "payload_digest": result.payload_digest,
                     "label_set_id": result.label_set_id,
                     "label_set_digest": result.label_set_digest,
+                    "calibration_target_digest": result.target_digest,
                     "calibration_result_id": result.calibration_result_id,
                     "calibration_result_digest": result.digest(),
                 },
@@ -1690,7 +1699,60 @@ class AnalysisArtifactStore:
             raise ArtifactIntegrityError(
                 "stored calibration result differs from exact source replay"
             )
-        return stored
+        from .calibration import _issue_verified_calibration_result
+
+        verified = _issue_verified_calibration_result(
+            stored,
+            receipt,
+            store_identity_digest=self._store_identity_digest(),
+        )
+        self._verified_calibration_capabilities[id(verified)] = verified
+        return verified
+
+    def _require_verified_calibration_result(self, value: Any) -> Any:
+        """Live-verify a registered calibration capability against this Store."""
+
+        from .calibration import (
+            VerifiedCalibrationResult,
+            _issue_verified_calibration_result,
+            _validate_verified_calibration_result,
+        )
+
+        if type(value) is not VerifiedCalibrationResult:
+            raise TypeError(
+                "gate calibration values must be Store-issued "
+                "VerifiedCalibrationResult capabilities"
+            )
+        if self._verified_calibration_capabilities.get(id(value)) is not value:
+            raise ArtifactIntegrityError(
+                "VerifiedCalibrationResult capability is not registered by this Store"
+            )
+        _validate_verified_calibration_result(
+            value,
+            store_identity_digest=self._store_identity_digest(),
+        )
+        receipt, stored = self._load_calibration_result_with_receipt(
+            value.artifact_id
+        )
+        if (
+            receipt != value.receipt
+            or receipt.digest() != value.receipt_digest
+            or stored != value.result
+            or stored.target != value.target
+            or stored.target_digest != value.target_digest
+            or canonical_json_bytes(stored.to_dict())
+            != canonical_json_bytes(value.result.to_dict())
+        ):
+            raise ArtifactIntegrityError(
+                "VerifiedCalibrationResult does not match this Store's live artifact"
+            )
+        verified = _issue_verified_calibration_result(
+            stored,
+            receipt,
+            store_identity_digest=self._store_identity_digest(),
+        )
+        self._verified_calibration_capabilities[id(verified)] = verified
+        return verified
 
     def publish_gate_policy(
         self,

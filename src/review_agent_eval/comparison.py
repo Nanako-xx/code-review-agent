@@ -52,7 +52,7 @@ COMPARISON_POLICY_SCHEMA_VERSION = "comparison_policy_v1"
 COMPARISON_COMPATIBILITY_SCHEMA_VERSION = "comparison_compatibility_v1"
 RUN_COMPARISON_SCHEMA_VERSION = "run_comparison_v1"
 COMPARISON_ALGORITHM_VERSION = "strict-paired-comparison-v1"
-MIN_COMPARISON_TRIAL_COUNT = 3
+MIN_COMPARISON_TRIAL_COUNT = 1
 MAX_COMPARISON_BYTES = 768 * 1024 * 1024
 
 REQUIRED_CASE_FIELDS = (
@@ -1333,6 +1333,96 @@ def _trial_map(source: VerifiedRunEvaluation) -> Dict[tuple[str, int, str, int],
     return result
 
 
+_CALIBRATION_TARGET_EVALUATOR_FIELDS = (
+    "evaluator.evaluation_revision",
+    "evaluator.execution.digest",
+    "evaluator.configuration.digest",
+    "evaluator.judge_profiles.digest",
+    "evaluator.judge_rubrics.digest",
+    "evaluator.judge_execution.digest",
+)
+
+
+def _evaluator_compatibility_values(
+    source: VerifiedRunEvaluation,
+) -> Dict[str, Any]:
+    """Derive the closed evaluator projection used by compare and calibration."""
+
+    source.verify()
+    judge_profiles = source.bundle.evaluator_execution.evaluator.judge_profiles
+    return {
+        "evaluator.evaluation_revision": source.bundle.evaluation_revision,
+        "evaluator.execution.digest": source.bundle.evaluator_execution.digest(),
+        "evaluator.configuration.digest": (
+            source.bundle.evaluator_execution.evaluator_config_digest
+        ),
+        "evaluator.judge_profiles.digest": canonical_sha256(
+            [item.to_dict() for item in judge_profiles]
+        ),
+        "evaluator.judge_rubrics.digest": canonical_sha256(
+            [
+                {
+                    "kind": item.kind.value,
+                    "rubric_id": item.rubric_id,
+                    "rubric_version": item.rubric_version,
+                    "rubric_digest": item.rubric_digest,
+                }
+                for item in judge_profiles
+            ]
+        ),
+        "evaluator.judge_execution.digest": canonical_sha256(
+            {
+                "judge_budgets": (
+                    source.bundle.evaluator_execution.judge_budgets.to_dict()
+                ),
+                "cache_policy_version": (
+                    source.bundle.evaluator_execution.cache_policy_version
+                ),
+            }
+        ),
+    }
+
+
+def _calibration_target_projection(
+    source: VerifiedRunEvaluation | CompatibilityProjectionV1,
+    *,
+    profile: str,
+) -> Dict[str, Any]:
+    """Return one canonical target projection from an Evaluation or Comparison."""
+
+    if type(profile) is not str or not profile:
+        raise TypeError("profile must be a non-empty string")
+    if type(source) is VerifiedRunEvaluation:
+        available = {
+            item.kind.value
+            for item in source.bundle.evaluator_execution.evaluator.judge_profiles
+        }
+        if profile not in available:
+            raise ArtifactIntegrityError(
+                "calibration profile is absent from the Evaluation evaluator"
+            )
+        values = _evaluator_compatibility_values(source)
+    elif type(source) is CompatibilityProjectionV1:
+        values = {
+            path: source.value(path)
+            for path in _CALIBRATION_TARGET_EVALUATOR_FIELDS
+        }
+    else:
+        raise TypeError(
+            "calibration target source must be a VerifiedRunEvaluation or "
+            "CompatibilityProjectionV1"
+        )
+    return {
+        "profile": profile,
+        "evaluation_revision": values["evaluator.evaluation_revision"],
+        "evaluator_execution_digest": values["evaluator.execution.digest"],
+        "evaluator_config_digest": values["evaluator.configuration.digest"],
+        "judge_profiles_digest": values["evaluator.judge_profiles.digest"],
+        "judge_rubrics_digest": values["evaluator.judge_rubrics.digest"],
+        "judge_execution_digest": values["evaluator.judge_execution.digest"],
+    }
+
+
 def _compatibility_projection(
     source: VerifiedRunEvaluation,
     policy: ComparisonPolicyV1,
@@ -1347,7 +1437,7 @@ def _compatibility_projection(
         score_by_task.setdefault(trial.task_id, trial.trial_score)
     cases = tuple(by_task[key] for key in sorted(by_task))
     snapshot_entries = tuple(source.case_snapshot.case(case.task_id) for case in cases)
-    judge_profiles = source.bundle.evaluator_execution.evaluator.judge_profiles
+    evaluator_values = _evaluator_compatibility_values(source)
     scoring_policy = {
         name: getattr(compatibility, name)
         for name in (
@@ -1396,12 +1486,7 @@ def _compatibility_projection(
         "materialization.protocol": source.run_config.materializer_protocol,
         "isolation.profile": compatibility.isolation_profile,
         "clarification_matcher.digest": compatibility.clarification_matcher_config_digest,
-        "evaluator.evaluation_revision": source.bundle.evaluation_revision,
-        "evaluator.execution.digest": source.bundle.evaluator_execution.digest(),
-        "evaluator.configuration.digest": source.bundle.evaluator_execution.evaluator_config_digest,
-        "evaluator.judge_profiles.digest": canonical_sha256([item.to_dict() for item in judge_profiles]),
-        "evaluator.judge_rubrics.digest": canonical_sha256([{"kind": item.kind.value, "rubric_id": item.rubric_id, "rubric_version": item.rubric_version, "rubric_digest": item.rubric_digest} for item in judge_profiles]),
-        "evaluator.judge_execution.digest": canonical_sha256({"judge_budgets": source.bundle.evaluator_execution.judge_budgets.to_dict(), "cache_policy_version": source.bundle.evaluator_execution.cache_policy_version}),
+        **evaluator_values,
         "metrics_policy.digest": compatibility.metrics_policy_digest,
         "metric_authority.profile.digest": compatibility.metric_authority_profile_digest,
         "metric_authority.policy.digest": compatibility.metric_authority_policy_digest,

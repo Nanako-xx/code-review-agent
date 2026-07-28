@@ -245,6 +245,33 @@ def paired_sources(tmp_path_factory: pytest.TempPathFactory):
         run_config=two_run.config,
         case_snapshot=two_run.snapshot,
     )
+    diagnostic_pairs = {}
+    for trial_count in (1, 2):
+        sources = []
+        for role in ("baseline", "candidate"):
+            config = _three_trial_config(
+                snapshot,
+                instance=f"strict-comparison-diagnostic-{trial_count}-{role}",
+                trial_count=trial_count,
+            )
+            run, bundle, _ = _evaluate_run(
+                root / f"diagnostic-{trial_count}-{role}",
+                prepared=prepared,
+                snapshot=snapshot,
+                case=case,
+                config=config,
+                adapter=_FrozenSuccessAdapter(),
+                execution=execution,
+                judge=_CountingJudge(),
+            )
+            sources.append(
+                VerifiedRunEvaluation.create(
+                    bundle,
+                    run_config=run.config,
+                    case_snapshot=run.snapshot,
+                )
+            )
+        diagnostic_pairs[trial_count] = tuple(sources)
     return {
         "root": root,
         "prepared": prepared,
@@ -256,6 +283,7 @@ def paired_sources(tmp_path_factory: pytest.TempPathFactory):
         "candidate_run": candidate_run,
         "candidate_orchestrator": candidate_orchestrator,
         "two_trial": two_trial,
+        "diagnostic_pairs": diagnostic_pairs,
     }
 
 
@@ -336,6 +364,36 @@ def test_compare_reports_metric_and_case_deltas_without_overall_score(
     assert result.judge_coverage_delta != result.case_deltas[0].metric_delta(
         CoreMetric.JUDGE_UNGRADED_RATE
     )
+
+
+@pytest.mark.parametrize("trial_count", (1, 2))
+def test_compare_allows_diagnostic_one_and_two_trial_runs_with_real_deltas(
+    paired_sources: dict[str, Any],
+    tmp_path: Path,
+    trial_count: int,
+) -> None:
+    baseline, candidate = paired_sources["diagnostic_pairs"][trial_count]
+
+    result = compare_runs(baseline, candidate, POLICY)
+    store = AnalysisArtifactStore(tmp_path / f"analysis-{trial_count}")
+    receipt = store.publish_comparison(result, policy=POLICY)
+    replayed = store.load_verified_comparison(
+        receipt.artifact_id,
+        baseline=baseline,
+        candidate=candidate,
+        policy=POLICY,
+    )
+
+    assert result.status is ComparisonStatus.COMPARABLE
+    assert result.baseline_statistics.trial_count == trial_count
+    assert result.candidate_statistics.trial_count == trial_count
+    assert result.metric_deltas
+    assert len(result.case_deltas) == 1
+    assert tuple(
+        paired.trial_index
+        for paired in result.case_deltas[0].paired_trials
+    ) == tuple(range(1, trial_count + 1))
+    assert replayed == result
 
 
 def test_compare_rejects_case_digest_trial_count_and_evaluator_mismatch(

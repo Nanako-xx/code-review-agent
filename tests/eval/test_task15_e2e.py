@@ -560,7 +560,7 @@ def test_task15_scripted_analysis_lifecycle_is_source_bound_and_write_separated(
             "calibration-result",
             scored["artifact_id"],
             "calibration_result.json",
-            loaded_calibration.to_dict(),
+            loaded_calibration.result.to_dict(),
         ),
         (
             "gate-policy",

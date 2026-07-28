@@ -29,11 +29,14 @@ from review_agent_eval.calibration import (
     CalibrationResultV1,
     CalibrationSelectionPolicyV1,
     CalibrationStatus,
+    CalibrationTargetV1,
     HumanAdjudicationV1,
     HumanLabelSetV1,
     HumanLabelV1,
     HumanReviewerProvenanceV1,
     ReviewerProvenanceKind,
+    VerifiedCalibrationResult,
+    calibration_target,
     export_calibration_package,
     score_calibration,
 )
@@ -1093,6 +1096,15 @@ def test_calibration_profiles_are_scored_independently(
         result.status is CalibrationStatus.PENDING_HUMAN_LABELS
         for result in results.values()
     )
+    for profile, result in results.items():
+        target = calibration_target(
+            calibration_source["verified_by_profile"][profile],
+            profile,
+        )
+        assert type(target) is CalibrationTargetV1
+        assert result.target == target
+        assert result.target_digest == target.target_digest
+        assert CalibrationTargetV1.from_dict(target.to_dict()) == target
 
 
 def test_authoritative_auxiliary_labels_are_scored_and_gate_independently(
@@ -1654,7 +1666,7 @@ def test_recomputed_result_ids_cannot_bypass_status_or_disagreement_metrics(
     result_identity = dict(pending)
     del result_identity["calibration_result_id"]
     pending["calibration_result_id"] = stable_id(
-        "calibration-result-v1",
+        "calibration-result-v2",
         result_identity,
     )
     with pytest.raises(ValueError, match="status|coverage|threshold"):
@@ -1687,7 +1699,7 @@ def test_recomputed_result_ids_cannot_bypass_status_or_disagreement_metrics(
     result_identity = dict(disagreement)
     del result_identity["calibration_result_id"]
     disagreement["calibration_result_id"] = stable_id(
-        "calibration-result-v1",
+        "calibration-result-v2",
         result_identity,
     )
     with pytest.raises(ValueError, match="disagreement"):
@@ -1803,13 +1815,19 @@ def test_analysis_manifest_omits_raw_payload_and_verified_load_replays_sources(
         package=package,
         labels=labels,
     )
-    assert store.load_verified_calibration_result(
+    verified = store.load_verified_calibration_result(
         result_receipt.artifact_id,
         evaluation=calibration_source["verified_by_profile"][package.profile],
         policy=POLICY,
         package=package,
         labels=labels,
-    ) == result
+    )
+    assert type(verified) is VerifiedCalibrationResult
+    assert verified.result == result
+    assert verified.target == result.target
+    assert verified.target_digest == result.target_digest
+    assert verified.artifact_id == result_receipt.artifact_id
+    assert verified.receipt_digest == result_receipt.digest()
 
 
 def test_score_and_export_do_not_call_judge(

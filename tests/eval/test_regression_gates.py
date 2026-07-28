@@ -7,6 +7,9 @@ from typing import Any
 
 import pytest
 import review_agent_eval.gates as gates_module
+import review_agent_eval.judge as judge_module
+import review_agent_eval.orchestrator as orchestrator_module
+import review_agent_eval.review_evaluator as review_evaluator_module
 
 from review_agent_eval.analysis_artifacts import AnalysisArtifactStore, AnalysisReceipt
 from review_agent_eval.artifacts import ArtifactConflictError, ArtifactIntegrityError
@@ -14,6 +17,8 @@ from review_agent_eval.calibration import (
     CalibrationStatus,
     HumanLabelSetV1,
     ReviewerProvenanceKind,
+    VerifiedCalibrationResult,
+    calibration_target,
     score_calibration,
 )
 from review_agent_eval.cases import CaseSplit, RunCaseSnapshot, SuiteManifest
@@ -44,7 +49,13 @@ from review_agent_eval.gates import (
     prepare_gate_policy,
 )
 from review_agent_eval.intent_evaluator import IntentTruth
-from review_agent_eval.judge import JudgeTask
+from review_agent_eval.judge import (
+    DEFAULT_JUDGE_RUBRICS,
+    GLOBAL_JUDGE_SYSTEM_PROMPT,
+    JudgeRubric,
+    JudgeRubricCatalog,
+    JudgeTask,
+)
 from review_agent_eval.metrics import CoreMetric
 from review_agent_eval.models import (
     CaseOrigin,
@@ -59,6 +70,8 @@ from review_agent_eval.models import (
 from review_agent_eval.statistics import MetricUnit
 
 from .test_calibration import (
+    POLICY as CALIBRATION_POLICY,
+    _ProfileScriptJudge,
     _export,
     _human_label,
     _matching_labels,
@@ -76,6 +89,7 @@ from .test_judge import _execution
 from .test_orchestrator_target_replay_v2 import (
     _RecordingJudge,
     _expected,
+    _frozen_orchestrator,
     _frozen_snapshot_and_case,
     _prepared_bundle,
 )
@@ -484,6 +498,7 @@ def core_gate_sources(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any
             adapter=adapter,
             execution=execution,
             judge=_RecordingJudge(execution),
+            revision="calibration-source-v1",
         )
         return {
             "run": run,
@@ -534,6 +549,55 @@ def _calibration_result(
         package=package,
         labels=labels,
     )
+
+
+def _published_calibration(
+    store: AnalysisArtifactStore,
+    evaluation: VerifiedRunEvaluation,
+    root: Path,
+    profile: JudgeTask,
+    *,
+    labels: Any | None = None,
+    reviewer_kind: ReviewerProvenanceKind | None = None,
+) -> tuple[Any, VerifiedCalibrationResult]:
+    source = {"verified_by_profile": {profile: evaluation}}
+    package = _export(source, root, profile)
+    if labels is None:
+        labels = (
+            _matching_labels(package, reviewer_kind=reviewer_kind)
+            if reviewer_kind is not None
+            else _matching_labels(package)
+        )
+    return _verify_scored_calibration(
+        store,
+        evaluation,
+        package,
+        labels,
+    )
+
+
+def _verify_scored_calibration(
+    store: AnalysisArtifactStore,
+    evaluation: VerifiedRunEvaluation,
+    package: Any,
+    labels: Any,
+) -> tuple[Any, VerifiedCalibrationResult]:
+    result = score_calibration(evaluation, package=package, labels=labels)
+    receipt = store.publish_calibration_result(
+        result,
+        evaluation=evaluation,
+        policy=CALIBRATION_POLICY,
+        package=package,
+        labels=labels,
+    )
+    verified = store.load_verified_calibration_result(
+        receipt.artifact_id,
+        evaluation=evaluation,
+        policy=CALIBRATION_POLICY,
+        package=package,
+        labels=labels,
+    )
+    return result, verified
 
 
 def _failing_constraint(
@@ -711,11 +775,15 @@ def test_gate_requires_calibration_for_semantic_metrics(
 ) -> None:
     baseline = core_gate_sources["baseline"]
     candidate_config = core_gate_sources["promote_config"]
-    comparison = compare_runs(baseline, core_gate_sources["promote"], COMPARISON_POLICY)
-    eligible = _calibration_result(
-        calibration_source,
-        tmp_path,
-        JudgeTask.FINDING_EQUIVALENCE,
+    candidate = core_gate_sources["promote"]
+    comparison = compare_runs(baseline, candidate, COMPARISON_POLICY)
+    profile = JudgeTask.FINDING_EQUIVALENCE
+    evaluation = calibration_source["verified_by_profile"][profile]
+    eligible, eligible_verified = _published_calibration(
+        gate_policy_store,
+        evaluation,
+        tmp_path / "eligible",
+        profile,
     )
     assert eligible.status.value == "gate_eligible"
     prepared = prepare_gate_policy(
@@ -740,7 +808,7 @@ def test_gate_requires_calibration_for_semantic_metrics(
         gate_policy_store,
         frozen,
         comparison,
-        {JudgeTask.FINDING_EQUIVALENCE.value: eligible},
+        {profile.value: eligible_verified},
     )
     assert passed.decision is GateDecision.PROMOTE
 
@@ -767,32 +835,34 @@ def test_gate_requires_calibration_for_semantic_metrics(
     assert missing_result.decision is GateDecision.INELIGIBLE
     assert missing_result.checks[0].status is GateCheckStatus.NOT_SCORABLE
 
-    profile = JudgeTask.FINDING_EQUIVALENCE
+    source = {"verified_by_profile": {profile: evaluation}}
     pending_package = _export(
-        calibration_source,
+        source,
         tmp_path / "pending",
         profile,
     )
-    pending = score_calibration(
-        calibration_source["verified_by_profile"][profile],
-        package=pending_package,
-        labels=HumanLabelSetV1.create(package=pending_package, labels=()),
+    pending, pending_verified = _verify_scored_calibration(
+        gate_policy_store,
+        evaluation,
+        pending_package,
+        HumanLabelSetV1.create(package=pending_package, labels=()),
     )
     fixture_package = _export(
-        calibration_source,
+        source,
         tmp_path / "fixture",
         profile,
     )
-    fixture = score_calibration(
-        calibration_source["verified_by_profile"][profile],
-        package=fixture_package,
-        labels=_matching_labels(
+    fixture, fixture_verified = _verify_scored_calibration(
+        gate_policy_store,
+        evaluation,
+        fixture_package,
+        _matching_labels(
             fixture_package,
             reviewer_kind=ReviewerProvenanceKind.FIXTURE,
         ),
     )
     failed_package = _export(
-        calibration_source,
+        source,
         tmp_path / "failed",
         profile,
     )
@@ -815,18 +885,19 @@ def test_gate_requires_calibration_for_semantic_metrics(
             for item in failed_package.items
         ),
     )
-    failed = score_calibration(
-        calibration_source["verified_by_profile"][profile],
-        package=failed_package,
-        labels=failed_labels,
+    failed, failed_verified = _verify_scored_calibration(
+        gate_policy_store,
+        evaluation,
+        failed_package,
+        failed_labels,
     )
     assert pending.status is CalibrationStatus.PENDING_HUMAN_LABELS
     assert fixture.status is CalibrationStatus.PENDING_HUMAN_LABELS
     assert failed.status is CalibrationStatus.FAILED_THRESHOLDS
-    for calibration, expected_status in (
-        (pending, GateCheckStatus.PENDING),
-        (fixture, GateCheckStatus.PENDING),
-        (failed, GateCheckStatus.NOT_SCORABLE),
+    for calibration, verified, expected_status in (
+        (pending, pending_verified, GateCheckStatus.PENDING),
+        (fixture, fixture_verified, GateCheckStatus.PENDING),
+        (failed, failed_verified, GateCheckStatus.NOT_SCORABLE),
     ):
         untrusted_policy = prepare_gate_policy(
             baseline,
@@ -855,10 +926,218 @@ def test_gate_requires_calibration_for_semantic_metrics(
             gate_policy_store,
             untrusted_frozen,
             comparison,
-            {profile.value: calibration},
+            {profile.value: verified},
         )
         assert untrusted.decision is GateDecision.INELIGIBLE
         assert untrusted.checks[0].status is expected_status
+
+
+@pytest.mark.parametrize(
+    "target_change",
+    (
+        "model",
+        "rubric",
+        "context_builder",
+        "parser",
+        "evaluation_revision",
+        "evaluator_config",
+    ),
+)
+def test_gate_rejects_calibration_scored_for_a_different_evaluator_target(
+    core_gate_sources: dict[str, Any],
+    calibration_source: dict[str, Any],
+    tmp_path: Path,
+    target_change: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = JudgeTask.FINDING_EQUIVALENCE
+    store = AnalysisArtifactStore(tmp_path / "analysis")
+    baseline = core_gate_sources["baseline"]
+    candidate = core_gate_sources["promote"]
+    candidate_config = core_gate_sources["promote_config"]
+    comparison = compare_runs(baseline, candidate, COMPARISON_POLICY)
+    calibration_evaluation = calibration_source["verified_by_profile"][profile]
+    execution = calibration_evaluation.bundle.evaluator_execution
+    revision = "calibration-source-v1"
+    if target_change == "evaluation_revision":
+        revision = "calibration-target-j2-revision"
+    else:
+        evaluator = execution.evaluator
+        if target_change == "evaluator_config":
+            evaluator = replace(
+                evaluator,
+                evaluator_version="calibration-target-j2-evaluator-v2",
+            )
+        else:
+            profiles = list(evaluator.judge_profiles)
+            index = next(
+                index
+                for index, item in enumerate(profiles)
+                if item.kind.value == profile.value
+            )
+            if target_change == "rubric":
+                current = DEFAULT_JUDGE_RUBRICS.for_task(profile)
+                changed_rubric = JudgeRubric.create(
+                    task=profile,
+                    rubric_id=current.rubric_id,
+                    rubric_version="finding-equivalence-v2",
+                    response_schema=current.response_schema,
+                    instruction=current.instruction + " J2 calibration variant.",
+                )
+                catalog = JudgeRubricCatalog.create(
+                    "judge-rubric-catalog-j2-v2",
+                    tuple(
+                        changed_rubric if item.task is profile else item
+                        for item in DEFAULT_JUDGE_RUBRICS.rubrics
+                    ),
+                )
+                original_review_evaluator = orchestrator_module.ReviewEvaluator
+
+                def review_evaluator_with_j2_rubric(*args: Any, **kwargs: Any):
+                    kwargs["rubrics"] = catalog
+                    return original_review_evaluator(*args, **kwargs)
+
+                monkeypatch.setattr(
+                    orchestrator_module,
+                    "ReviewEvaluator",
+                    review_evaluator_with_j2_rubric,
+                )
+                changes = {
+                    "rubric_version": changed_rubric.rubric_version,
+                    "rubric_digest": changed_rubric.rubric_digest,
+                    "system_prompt_digest": canonical_sha256(
+                        GLOBAL_JUDGE_SYSTEM_PROMPT
+                        + "\nTask rubric:\n"
+                        + changed_rubric.instruction
+                    ),
+                }
+            elif target_change == "context_builder":
+                version = "calibration-target-j2-context-v2"
+                monkeypatch.setattr(
+                    review_evaluator_module,
+                    "JUDGE_CONTEXT_BUILDER_VERSION",
+                    version,
+                )
+                monkeypatch.setattr(
+                    judge_module,
+                    "JUDGE_CONTEXT_BUILDER_VERSION",
+                    version,
+                )
+                changes = {"context_builder_version": version}
+            elif target_change == "parser":
+                version = "calibration-target-j2-parser-v2"
+                monkeypatch.setattr(
+                    review_evaluator_module,
+                    "JUDGE_PARSER_VERSION",
+                    version,
+                )
+                monkeypatch.setattr(
+                    judge_module,
+                    "JUDGE_PARSER_VERSION",
+                    version,
+                )
+                changes = {"parser_version": version}
+            else:
+                changes = {"model": "calibration-target-j2-model"}
+            if target_change in {"context_builder", "parser"}:
+                profiles = [replace(item, **changes) for item in profiles]
+            else:
+                profiles[index] = replace(profiles[index], **changes)
+            evaluator = replace(evaluator, judge_profiles=tuple(profiles))
+        execution = type(execution).create(
+            evaluator=evaluator,
+            evaluator_timeout_seconds=execution.evaluator_timeout_seconds,
+            max_execution_artifact_file_bytes=(
+                execution.max_execution_artifact_file_bytes
+            ),
+            max_execution_artifact_total_bytes=(
+                execution.max_execution_artifact_total_bytes
+            ),
+            judge_budgets=execution.judge_budgets,
+            cache_policy_version=execution.cache_policy_version,
+            review_evaluator_context_policy_version=(
+                execution.review_evaluator_context_policy_version
+            ),
+            metric_authority_policy_version=(
+                execution.metric_authority_policy_version
+            ),
+        )
+    calibration_run = calibration_source["runs"][profile]
+    orchestrator = _frozen_orchestrator(
+        calibration_run,
+        judge=_ProfileScriptJudge(execution),
+    )
+    evaluated = orchestrator.evaluate_run(
+        calibration_run.config.run_id,
+        evaluator_execution=execution,
+        evaluation_revision=revision,
+    )
+    j2_evaluation = VerifiedRunEvaluation.create(
+        evaluated,
+        run_config=calibration_run.config,
+        case_snapshot=calibration_run.snapshot,
+    )
+    raw, verified = _published_calibration(
+        store,
+        j2_evaluation,
+        tmp_path / "j2",
+        profile,
+    )
+    assert comparison.compatibility.shared_projection is not None
+    assert verified.target != calibration_target(
+        comparison.compatibility.shared_projection,
+        profile,
+    )
+    prepared = prepare_gate_policy(
+        baseline,
+        candidate_config,
+        policy=_policy(
+            baseline,
+            candidate_config,
+            eligibility=GateEligibility.RELEASE_BLOCKING,
+            calibration_result_digests=(raw.digest(),),
+            constraints=(
+                _constraint(
+                    CoreMetric.ISSUE_RECALL,
+                    GateConstraintScope.CANDIDATE_ABSOLUTE,
+                    GateOperator.AT_LEAST,
+                    0,
+                ),
+            ),
+        ),
+    )
+    frozen = store.publish_gate_policy(
+        prepared,
+        baseline=baseline,
+        candidate_run_config=candidate_config,
+    )
+
+    result = evaluate_gate(store, frozen, comparison, {profile: verified})
+
+    assert result.decision is GateDecision.INELIGIBLE
+    assert result.checks[0].status is GateCheckStatus.NOT_SCORABLE
+    assert GateCheckReason.CALIBRATION_TARGET_MISMATCH in result.checks[0].reasons
+
+    with pytest.raises(TypeError, match="VerifiedCalibrationResult|Store-issued"):
+        evaluate_gate(store, frozen, comparison, {profile: raw})
+
+    forged = object.__new__(VerifiedCalibrationResult)
+    for name in verified.__dataclass_fields__:
+        object.__setattr__(forged, name, getattr(verified, name))
+    with pytest.raises(ArtifactIntegrityError, match="capability|Store-issued|registered"):
+        evaluate_gate(store, frozen, comparison, {profile: forged})
+    if target_change == "evaluation_revision":
+        alias_store = AnalysisArtifactStore(store.root, create_root=False)
+        with pytest.raises(
+            ArtifactIntegrityError,
+            match="capability|Store-issued|registered",
+        ):
+            evaluate_gate(
+                alias_store,
+                frozen,
+                comparison,
+                {profile: verified},
+            )
 
 
 def test_gate_marks_public_or_unscorable_data_diagnostic_only(
@@ -906,6 +1185,46 @@ def test_gate_marks_public_or_unscorable_data_diagnostic_only(
         eligibility=GateEligibility.DIAGNOSTIC_ONLY,
     )
     assert prepare_gate_policy(baseline, candidate_config, policy=empty).constraints == ()
+
+
+@pytest.mark.parametrize("trial_count", (1, 2))
+def test_release_gate_keeps_one_and_two_trial_comparisons_diagnostic_only(
+    paired_sources: dict[str, Any],
+    tmp_path: Path,
+    trial_count: int,
+) -> None:
+    baseline, candidate = paired_sources["diagnostic_pairs"][trial_count]
+    comparison = compare_runs(baseline, candidate, COMPARISON_POLICY)
+    proposal = _policy(
+        baseline,
+        candidate.run_config,
+        eligibility=GateEligibility.RELEASE_BLOCKING,
+        constraints=(
+            _constraint(
+                CoreMetric.AGENT_FAILURE_RATE,
+                GateConstraintScope.CANDIDATE_ABSOLUTE,
+                GateOperator.AT_MOST,
+                1_000_000,
+            ),
+        ),
+    )
+    prepared = prepare_gate_policy(
+        baseline,
+        candidate.run_config,
+        policy=proposal,
+    )
+    store = AnalysisArtifactStore(tmp_path / f"analysis-{trial_count}")
+    frozen = store.publish_gate_policy(
+        prepared,
+        baseline=baseline,
+        candidate_run_config=candidate.run_config,
+    )
+
+    result = evaluate_gate(store, frozen, comparison, {})
+
+    assert comparison.status is ComparisonStatus.COMPARABLE
+    assert prepared.eligibility is GateEligibility.DIAGNOSTIC_ONLY
+    assert result.decision is GateDecision.INELIGIBLE
 
 
 def test_gate_returns_promote_block_and_ineligible_without_overall_score(

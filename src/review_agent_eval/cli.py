@@ -2020,7 +2020,7 @@ def _load_gate_calibrations(
             package=package,
             labels=labels,
         )
-        if result[profile] != stored:
+        if result[profile].result != stored:
             raise CliIntegrityError("Calibration result replay changed")
     return result
 

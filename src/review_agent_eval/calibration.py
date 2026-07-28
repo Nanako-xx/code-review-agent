@@ -10,7 +10,7 @@ import hashlib
 import os
 import stat
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -25,8 +25,15 @@ from .artifacts import (
     _hardlinked_file,
     _unsafe_node,
 )
-from .comparison import VerifiedRunEvaluation
-from .analysis_artifacts import _validate_windows_existing_ancestor_boundary
+from .comparison import (
+    CompatibilityProjectionV1,
+    VerifiedRunEvaluation,
+    _calibration_target_projection,
+)
+from .analysis_artifacts import (
+    AnalysisReceipt,
+    _validate_windows_existing_ancestor_boundary,
+)
 from .config import JudgeKind, validate_path_segment
 from .intent_evaluator import IntentJudgeRelation, IntentMatchKind
 from .judge import (
@@ -66,8 +73,9 @@ ADJUDICATION_SCHEMA_VERSION = "adjudication_v1"
 HUMAN_ADJUDICATION_SCHEMA_VERSION = ADJUDICATION_SCHEMA_VERSION
 PROFILE_CALIBRATION_SCHEMA_VERSION = "profile_calibration_v1"
 AUXILIARY_CALIBRATION_SCHEMA_VERSION = "auxiliary_calibration_v1"
-CALIBRATION_RESULT_SCHEMA_VERSION = "calibration_result_v1"
-CALIBRATION_ALGORITHM_VERSION = "blind-judge-calibration-v1"
+CALIBRATION_TARGET_SCHEMA_VERSION = "calibration_target_v1"
+CALIBRATION_RESULT_SCHEMA_VERSION = "calibration_result_v2"
+CALIBRATION_ALGORITHM_VERSION = "blind-judge-calibration-v2"
 CALIBRATION_BLINDED_REQUEST_SCHEMA_VERSION = "calibration_blinded_request_v1"
 CALIBRATION_EXPORT_RECEIPT_SCHEMA_VERSION = "calibration_export_receipt_v1"
 
@@ -82,6 +90,10 @@ _RESERVED_OUTCOME_SENTINELS = (
     JUDGE_FAILED_OUTCOME,
     JUDGE_UNGRADED_OUTCOME,
 )
+
+# A verified calibration is an in-memory capability issued only after an
+# AnalysisArtifactStore has replayed its Evaluation/package/labels and receipt.
+_VERIFIED_CALIBRATION_RESULT_SEAL = object()
 
 
 class CalibrationError(ValueError):
@@ -2723,6 +2735,110 @@ class ProfileCalibrationV1(_JsonModel):
 
 
 @dataclass(frozen=True)
+class CalibrationTargetV1(_JsonModel):
+    """Canonical Judge/Evaluator identity calibrated by one scored result."""
+
+    schema_version: str
+    profile: JudgeTask
+    evaluation_revision: str
+    evaluator_execution_digest: str
+    evaluator_config_digest: str
+    judge_profiles_digest: str
+    judge_rubrics_digest: str
+    judge_execution_digest: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != CALIBRATION_TARGET_SCHEMA_VERSION:
+            raise _error("CalibrationTargetV1 schema_version is unsupported")
+        if type(self.profile) is not JudgeTask:
+            raise _error("CalibrationTargetV1 profile is invalid")
+        _text(
+            self.evaluation_revision,
+            "CalibrationTargetV1.evaluation_revision",
+            256,
+        )
+        for name in (
+            "evaluator_execution_digest",
+            "evaluator_config_digest",
+            "judge_profiles_digest",
+            "judge_rubrics_digest",
+            "judge_execution_digest",
+        ):
+            _digest(getattr(self, name), f"CalibrationTargetV1.{name}")
+
+    @property
+    def target_digest(self) -> str:
+        return canonical_sha256(self._identity_dict())
+
+    def _identity_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "profile": self.profile.value,
+            "evaluation_revision": self.evaluation_revision,
+            "evaluator_execution_digest": self.evaluator_execution_digest,
+            "evaluator_config_digest": self.evaluator_config_digest,
+            "judge_profiles_digest": self.judge_profiles_digest,
+            "judge_rubrics_digest": self.judge_rubrics_digest,
+            "judge_execution_digest": self.judge_execution_digest,
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {**self._identity_dict(), "target_digest": self.target_digest}
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "CalibrationTargetV1":
+        payload = _exact(
+            value,
+            (
+                "schema_version",
+                "profile",
+                "evaluation_revision",
+                "evaluator_execution_digest",
+                "evaluator_config_digest",
+                "judge_profiles_digest",
+                "judge_rubrics_digest",
+                "judge_execution_digest",
+                "target_digest",
+            ),
+            "CalibrationTargetV1",
+        )
+        result = cls(
+            schema_version=payload["schema_version"],
+            profile=_enum(JudgeTask, payload["profile"], "CalibrationTargetV1.profile"),
+            evaluation_revision=payload["evaluation_revision"],
+            evaluator_execution_digest=payload["evaluator_execution_digest"],
+            evaluator_config_digest=payload["evaluator_config_digest"],
+            judge_profiles_digest=payload["judge_profiles_digest"],
+            judge_rubrics_digest=payload["judge_rubrics_digest"],
+            judge_execution_digest=payload["judge_execution_digest"],
+        )
+        if payload["target_digest"] != result.target_digest:
+            raise _error("CalibrationTargetV1 target_digest is not canonical")
+        return result
+
+
+def calibration_target(
+    source: VerifiedRunEvaluation | CompatibilityProjectionV1,
+    profile: JudgeTask,
+) -> CalibrationTargetV1:
+    """Build the same evaluator target from a verified run or shared projection."""
+
+    if type(profile) is not JudgeTask:
+        raise TypeError("profile must be a JudgeTask")
+    fields = _calibration_target_projection(source, profile=profile.value)
+    return CalibrationTargetV1(
+        schema_version=CALIBRATION_TARGET_SCHEMA_VERSION,
+        profile=profile,
+        evaluation_revision=fields["evaluation_revision"],
+        evaluator_execution_digest=fields["evaluator_execution_digest"],
+        evaluator_config_digest=fields["evaluator_config_digest"],
+        judge_profiles_digest=fields["judge_profiles_digest"],
+        judge_rubrics_digest=fields["judge_rubrics_digest"],
+        judge_execution_digest=fields["judge_execution_digest"],
+    )
+
+
+@dataclass(frozen=True)
 class CalibrationResultV1(_JsonModel):
     schema_version: str
     calibration_result_id: str
@@ -2734,6 +2850,7 @@ class CalibrationResultV1(_JsonModel):
     policy: CalibrationSelectionPolicyV1
     label_set_id: str
     label_set_digest: str
+    target: CalibrationTargetV1
     profiles: Tuple[ProfileCalibrationV1, ...]
     status: CalibrationStatus
 
@@ -2749,6 +2866,8 @@ class CalibrationResultV1(_JsonModel):
             _digest(getattr(self, name), f"CalibrationResultV1.{name}")
         if type(self.policy) is not CalibrationSelectionPolicyV1:
             raise _error("CalibrationResultV1.policy is invalid")
+        if type(self.target) is not CalibrationTargetV1:
+            raise _error("CalibrationResultV1.target is invalid")
         profiles = tuple(self.profiles)
         if len(profiles) != 1 or type(profiles[0]) is not ProfileCalibrationV1:
             raise _error("CalibrationResultV1 must contain exactly one independent profile")
@@ -2759,6 +2878,7 @@ class CalibrationResultV1(_JsonModel):
             or profile.policy_digest != self.policy.digest()
             or profile.label_set_id != self.label_set_id
             or profile.label_set_digest != self.label_set_digest
+            or profile.profile is not self.target.profile
             or profile.status is not self.status
         ):
             raise _error("CalibrationResultV1 nested bindings are inconsistent")
@@ -2781,7 +2901,7 @@ class CalibrationResultV1(_JsonModel):
             )
         identity = self.to_dict()
         identity.pop("calibration_result_id")
-        if self.calibration_result_id != stable_id("calibration-result-v1", identity):
+        if self.calibration_result_id != stable_id("calibration-result-v2", identity):
             raise _error("CalibrationResultV1 calibration_result_id is not canonical")
         object.__setattr__(self, "profiles", profiles)
 
@@ -2795,11 +2915,12 @@ class CalibrationResultV1(_JsonModel):
         serialized = {
             **identity,
             "policy": identity["policy"].to_dict(),
+            "target": identity["target"].to_dict(),
             "profiles": [item.to_dict() for item in identity["profiles"]],
             "status": identity["status"].value,
         }
         return cls(
-            calibration_result_id=stable_id("calibration-result-v1", serialized),
+            calibration_result_id=stable_id("calibration-result-v2", serialized),
             **identity,
         )
 
@@ -2811,6 +2932,7 @@ class CalibrationResultV1(_JsonModel):
                 "schema_version", "calibration_result_id", "algorithm_version",
                 "source_digest", "package_id", "package_digest", "payload_digest",
                 "policy", "label_set_id", "label_set_digest", "profiles", "status",
+                "target",
             ),
             "CalibrationResultV1",
         )
@@ -2819,6 +2941,7 @@ class CalibrationResultV1(_JsonModel):
             **{
                 **payload,
                 "policy": CalibrationSelectionPolicyV1.from_dict(payload["policy"]),
+                "target": CalibrationTargetV1.from_dict(payload["target"]),
                 "profiles": tuple(ProfileCalibrationV1.from_dict(item) for item in profiles),
                 "status": _enum(CalibrationStatus, payload["status"], "status"),
             }
@@ -2836,9 +2959,190 @@ class CalibrationResultV1(_JsonModel):
             "policy": self.policy.to_dict(),
             "label_set_id": self.label_set_id,
             "label_set_digest": self.label_set_digest,
+            "target": self.target.to_dict(),
             "profiles": [item.to_dict() for item in self.profiles],
             "status": self.status.value,
         }
+
+    @property
+    def target_digest(self) -> str:
+        return self.target.target_digest
+
+
+@dataclass(frozen=True, init=False)
+class VerifiedCalibrationResult:
+    """Store-issued capability for one replayed Calibration Result."""
+
+    result: CalibrationResultV1
+    receipt: AnalysisReceipt
+    receipt_digest: str
+    artifact_id: str
+    target: CalibrationTargetV1
+    target_digest: str
+    _store_identity_digest: str = field(repr=False)
+    _seal: object = field(repr=False, compare=False)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError(
+            "VerifiedCalibrationResult is Store-issued; use AnalysisArtifactStore"
+        )
+
+    @classmethod
+    def _issue(
+        cls,
+        *,
+        result: CalibrationResultV1,
+        receipt: AnalysisReceipt,
+        store_identity_digest: str,
+        seal: object,
+    ) -> "VerifiedCalibrationResult":
+        if seal is not _VERIFIED_CALIBRATION_RESULT_SEAL:
+            raise TypeError(
+                "VerifiedCalibrationResult can only be issued by its Store"
+            )
+        _validate_verified_calibration_result_parts(
+            result=result,
+            receipt=receipt,
+            receipt_digest=receipt.digest(),
+            artifact_id=receipt.artifact_id,
+            target=result.target,
+            target_digest=result.target_digest,
+            store_identity_digest=store_identity_digest,
+            seal=seal,
+        )
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "result", result)
+        object.__setattr__(instance, "receipt", receipt)
+        object.__setattr__(instance, "receipt_digest", receipt.digest())
+        object.__setattr__(instance, "artifact_id", receipt.artifact_id)
+        object.__setattr__(instance, "target", result.target)
+        object.__setattr__(instance, "target_digest", result.target_digest)
+        object.__setattr__(instance, "_store_identity_digest", store_identity_digest)
+        object.__setattr__(instance, "_seal", seal)
+        return instance
+
+    @property
+    def calibration_result_id(self) -> str:
+        return self.result.calibration_result_id
+
+    @property
+    def profiles(self) -> Tuple[ProfileCalibrationV1, ...]:
+        return self.result.profiles
+
+    @property
+    def status(self) -> CalibrationStatus:
+        return self.result.status
+
+    def digest(self) -> str:
+        return self.result.digest()
+
+
+def _validate_verified_calibration_result_parts(
+    *,
+    result: Any,
+    receipt: Any,
+    receipt_digest: Any,
+    artifact_id: Any,
+    target: Any,
+    target_digest: Any,
+    store_identity_digest: Any,
+    seal: Any,
+) -> None:
+    if seal is not _VERIFIED_CALIBRATION_RESULT_SEAL:
+        raise ArtifactIntegrityError("VerifiedCalibrationResult seal is invalid")
+    if type(result) is not CalibrationResultV1:
+        raise ArtifactIntegrityError("VerifiedCalibrationResult result is invalid")
+    if type(receipt) is not AnalysisReceipt or receipt.kind != "calibration-result":
+        raise ArtifactIntegrityError("VerifiedCalibrationResult receipt is invalid")
+    if type(target) is not CalibrationTargetV1 or target != result.target:
+        raise ArtifactIntegrityError("VerifiedCalibrationResult target is invalid")
+    _digest(target_digest, "VerifiedCalibrationResult.target_digest")
+    _digest(receipt_digest, "VerifiedCalibrationResult.receipt_digest")
+    _digest(store_identity_digest, "VerifiedCalibrationResult.store_identity_digest")
+    if target_digest != result.target_digest:
+        raise ArtifactIntegrityError(
+            "VerifiedCalibrationResult target digest is invalid"
+        )
+    if artifact_id != receipt.artifact_id or receipt_digest != receipt.digest():
+        raise ArtifactIntegrityError(
+            "VerifiedCalibrationResult artifact/receipt identity is invalid"
+        )
+    try:
+        canonical_result = CalibrationResultV1.from_dict(result.to_dict())
+        canonical_receipt = AnalysisReceipt.from_dict(receipt.to_dict())
+    except (SchemaError, TypeError, ValueError) as exc:
+        raise ArtifactIntegrityError(
+            "VerifiedCalibrationResult nested values are not canonical"
+        ) from exc
+    if canonical_result != result or canonical_receipt != receipt:
+        raise ArtifactIntegrityError(
+            "VerifiedCalibrationResult nested values differ from canonical replay"
+        )
+    refs = [
+        item
+        for item in receipt.artifacts
+        if item.relative_path.rsplit("/", 1)[-1] == "calibration_result.json"
+    ]
+    data = canonical_json_bytes(result.to_dict())
+    if (
+        len(refs) != 1
+        or refs[0].sha256 != hashlib.sha256(data).hexdigest()
+        or refs[0].size_bytes != len(data)
+    ):
+        raise ArtifactIntegrityError(
+            "VerifiedCalibrationResult receipt does not bind calibration_result.json"
+        )
+
+
+def _validate_verified_calibration_result(
+    value: Any,
+    *,
+    store_identity_digest: str | None = None,
+) -> CalibrationResultV1:
+    if type(value) is not VerifiedCalibrationResult:
+        raise TypeError(
+            "gate calibration values must be Store-issued "
+            "VerifiedCalibrationResult capabilities"
+        )
+    try:
+        _validate_verified_calibration_result_parts(
+            result=value.result,
+            receipt=value.receipt,
+            receipt_digest=value.receipt_digest,
+            artifact_id=value.artifact_id,
+            target=value.target,
+            target_digest=value.target_digest,
+            store_identity_digest=value._store_identity_digest,
+            seal=value._seal,
+        )
+    except ArtifactIntegrityError:
+        raise
+    except (AttributeError, CalibrationError, SchemaError, TypeError, ValueError) as exc:
+        raise ArtifactIntegrityError(
+            "VerifiedCalibrationResult provenance is malformed"
+        ) from exc
+    if (
+        store_identity_digest is not None
+        and value._store_identity_digest != store_identity_digest
+    ):
+        raise ArtifactIntegrityError(
+            "VerifiedCalibrationResult belongs to another AnalysisArtifactStore"
+        )
+    return value.result
+
+
+def _issue_verified_calibration_result(
+    result: CalibrationResultV1,
+    receipt: AnalysisReceipt,
+    *,
+    store_identity_digest: str,
+) -> VerifiedCalibrationResult:
+    return VerifiedCalibrationResult._issue(
+        result=result,
+        receipt=receipt,
+        store_identity_digest=store_identity_digest,
+        seal=_VERIFIED_CALIBRATION_RESULT_SEAL,
+    )
 
 
 @dataclass(frozen=True)
@@ -3869,6 +4173,7 @@ def score_calibration(
         policy=package.policy,
         label_set_id=labels.label_set_id,
         label_set_digest=labels.digest(),
+        target=calibration_target(evaluation, package.profile),
         profiles=(profile_result,),
         status=status,
     )
@@ -3887,6 +4192,7 @@ __all__ = [
     "HUMAN_ADJUDICATION_SCHEMA_VERSION",
     "PROFILE_CALIBRATION_SCHEMA_VERSION",
     "AUXILIARY_CALIBRATION_SCHEMA_VERSION",
+    "CALIBRATION_TARGET_SCHEMA_VERSION",
     "CALIBRATION_RESULT_SCHEMA_VERSION",
     "CALIBRATION_ALGORITHM_VERSION",
     "CalibrationError",
@@ -3912,7 +4218,10 @@ __all__ = [
     "LabelCountV1",
     "AuxiliaryCalibrationV1",
     "ProfileCalibrationV1",
+    "CalibrationTargetV1",
     "CalibrationResultV1",
+    "VerifiedCalibrationResult",
+    "calibration_target",
     "build_calibration_package",
     "export_calibration_package",
     "score_calibration",

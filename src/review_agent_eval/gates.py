@@ -22,7 +22,12 @@ from .analysis_artifacts import (
     AnalysisSourceBinding,
 )
 from .artifacts import ArtifactIntegrityError
-from .calibration import CalibrationResultV1, CalibrationStatus
+from .calibration import (
+    CalibrationStatus,
+    VerifiedCalibrationResult,
+    _validate_verified_calibration_result,
+    calibration_target,
+)
 from .cases import CaseSplit, SuiteKind
 from .comparison import (
     ComparisonStatus,
@@ -128,6 +133,7 @@ class GateCheckReason(str, Enum):
     CALIBRATION_PENDING_HUMAN_LABELS = "calibration_pending_human_labels"
     CALIBRATION_INSUFFICIENT_COVERAGE = "calibration_insufficient_coverage"
     CALIBRATION_FAILED_THRESHOLDS = "calibration_failed_thresholds"
+    CALIBRATION_TARGET_MISMATCH = "calibration_target_mismatch"
     UNIT_MISMATCH = "unit_mismatch"
     THRESHOLD_FAILED = "threshold_failed"
 
@@ -148,6 +154,7 @@ _UNAVAILABLE_REASONS = frozenset(
         GateCheckReason.CALIBRATION_PENDING_HUMAN_LABELS,
         GateCheckReason.CALIBRATION_INSUFFICIENT_COVERAGE,
         GateCheckReason.CALIBRATION_FAILED_THRESHOLDS,
+        GateCheckReason.CALIBRATION_TARGET_MISMATCH,
         GateCheckReason.UNIT_MISMATCH,
     }
 )
@@ -1393,29 +1400,33 @@ def prepare_gate_policy(
     )
 
 
-def _normalize_calibrations(calibrations: Mapping[Any, CalibrationResultV1]) -> Dict[JudgeTask, CalibrationResultV1]:
+def _normalize_calibrations(
+    calibrations: Mapping[Any, VerifiedCalibrationResult],
+) -> Dict[JudgeTask, VerifiedCalibrationResult]:
     if not isinstance(calibrations, Mapping):
         raise TypeError("calibrations must be a mapping")
-    result: Dict[JudgeTask, CalibrationResultV1] = {}
+    result: Dict[JudgeTask, VerifiedCalibrationResult] = {}
     for raw_profile, raw_result in calibrations.items():
         profile = raw_profile if type(raw_profile) is JudgeTask else _enum(JudgeTask, raw_profile, "calibration profile")
-        if type(raw_result) is not CalibrationResultV1:
-            raise TypeError("calibration mapping values must be CalibrationResultV1")
-        try:
-            canonical = CalibrationResultV1.from_dict(raw_result.to_dict())
-        except (SchemaError, TypeError, ValueError) as exc:
-            raise ArtifactIntegrityError("calibration result fails canonical hydration") from exc
-        if canonical != raw_result:
-            raise ArtifactIntegrityError("calibration result differs from canonical hydration")
+        if type(raw_result) is not VerifiedCalibrationResult:
+            raise TypeError(
+                "calibration mapping values must be Store-issued "
+                "VerifiedCalibrationResult capabilities"
+            )
+        canonical = _validate_verified_calibration_result(raw_result)
         if len(canonical.profiles) != 1 or canonical.profiles[0].profile is not profile:
             raise _error("calibration mapping key does not match its typed profile")
         if profile in result:
             raise _error("calibration profiles are duplicated")
-        result[profile] = canonical
+        result[profile] = raw_result
     return result
 
 
-def _global_mismatch_reasons(policy: GatePolicyV1, comparison: RunComparisonV1, calibrations: Mapping[JudgeTask, CalibrationResultV1]) -> Tuple[GateCheckReason, ...]:
+def _global_mismatch_reasons(
+    policy: GatePolicyV1,
+    comparison: RunComparisonV1,
+    calibrations: Mapping[JudgeTask, VerifiedCalibrationResult],
+) -> Tuple[GateCheckReason, ...]:
     reasons = []
     if comparison.baseline_binding != policy.baseline_binding:
         reasons.append(GateCheckReason.POLICY_MISMATCH)
@@ -1427,7 +1438,9 @@ def _global_mismatch_reasons(policy: GatePolicyV1, comparison: RunComparisonV1, 
         reasons.append(GateCheckReason.POLICY_MISMATCH)
     if comparison.compatibility.policy_digest != policy.comparison_policy_digest:
         reasons.append(GateCheckReason.POLICY_MISMATCH)
-    actual_digests = tuple(sorted(result.digest() for result in calibrations.values()))
+    actual_digests = tuple(
+        sorted(result.result.digest() for result in calibrations.values())
+    )
     if actual_digests != policy.calibration_result_digests:
         reasons.append(GateCheckReason.POLICY_MISMATCH)
     if comparison.status is ComparisonStatus.NOT_COMPARABLE:
@@ -1614,7 +1627,7 @@ def _unavailable_status(reasons: Sequence[GateCheckReason]) -> GateCheckStatus:
 def _evaluate_frozen_policy(
     policy: FrozenGatePolicy,
     comparison: RunComparisonV1,
-    calibrations: Mapping[Any, CalibrationResultV1],
+    calibrations: Mapping[Any, VerifiedCalibrationResult],
 ) -> GateResultV1:
     """Pure gate logic for a policy already live-verified by its Store."""
 
@@ -1658,9 +1671,20 @@ def _evaluate_frozen_policy(
         required_profiles = _SEMANTIC_PROFILES.get(constraint.metric, ())
         calibration_reasons: list[GateCheckReason] = []
         for profile in required_profiles:
-            result = canonical_calibrations.get(profile)
-            if result is None:
+            verified_result = canonical_calibrations.get(profile)
+            if verified_result is None:
                 calibration_reasons.append(GateCheckReason.CALIBRATION_MISSING)
+                continue
+            result = verified_result.result
+            shared_projection = canonical_comparison.compatibility.shared_projection
+            if (
+                shared_projection is None
+                or verified_result.target
+                != calibration_target(shared_projection, profile)
+            ):
+                calibration_reasons.append(
+                    GateCheckReason.CALIBRATION_TARGET_MISMATCH
+                )
             elif result.status is not CalibrationStatus.GATE_ELIGIBLE or result.profiles[0].status is not CalibrationStatus.GATE_ELIGIBLE:
                 calibration_reasons.append(
                     {
@@ -1836,7 +1860,7 @@ def evaluate_gate(
     store: AnalysisArtifactStore,
     policy: FrozenGatePolicy,
     comparison: RunComparisonV1,
-    calibrations: Mapping[Any, CalibrationResultV1],
+    calibrations: Mapping[Any, VerifiedCalibrationResult],
 ) -> GateResultV1:
     """Live-verify and evaluate only a Store-published frozen policy.
 
@@ -1848,7 +1872,17 @@ def evaluate_gate(
     if type(store) is not AnalysisArtifactStore:
         raise TypeError("store must be a concrete AnalysisArtifactStore")
     verified_policy = store._require_frozen_gate_policy(policy)
-    return _evaluate_frozen_policy(verified_policy, comparison, calibrations)
+    if not isinstance(calibrations, Mapping):
+        raise TypeError("calibrations must be a mapping")
+    live_calibrations = {
+        profile: store._require_verified_calibration_result(result)
+        for profile, result in calibrations.items()
+    }
+    return _evaluate_frozen_policy(
+        verified_policy,
+        comparison,
+        live_calibrations,
+    )
 
 
 __all__ = [
