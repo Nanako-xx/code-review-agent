@@ -215,6 +215,15 @@ _INTERNAL_DIRECTORIES = frozenset(
         "materializations",
     }
 )
+_PREPARED_TRIAL_DIRECTORY_NAMES = frozenset(
+    {".locks", "evaluations", "materializations", "receipts"}
+)
+_PREPARED_TRIAL_FILE_NAMES = frozenset(
+    {"trial_manifest.json", ".locks/trial.lock"}
+)
+_MAX_PREPARED_TRIAL_INVENTORY_ENTRIES = (
+    len(_PREPARED_TRIAL_DIRECTORY_NAMES) + len(_PREPARED_TRIAL_FILE_NAMES)
+)
 
 
 def _bounded_tuple(
@@ -5470,71 +5479,109 @@ class ArtifactStore:
         """Require the exact filesystem projection committed by ``create_run``."""
 
         root = self._trial_dir(plan)
-        expected_directories = frozenset(
-            {".locks", "evaluations", "materializations", "receipts"}
-        )
-        expected_files = frozenset(
-            {"trial_manifest.json", ".locks/trial.lock"}
-        )
+        expected_directories = _PREPARED_TRIAL_DIRECTORY_NAMES
+        expected_files = _PREPARED_TRIAL_FILE_NAMES
+        directory_entry_limits = {
+            "": len(expected_directories) + 1,
+            ".locks": 1,
+            "evaluations": 0,
+            "materializations": 0,
+            "receipts": 0,
+        }
         observed_directories: set[str] = set()
         observed_files: set[str] = set()
+        total_entries = 0
         pending = [root]
         while pending:
             directory = pending.pop()
             self._assert_directory(directory)
+            directory_key = (
+                ""
+                if directory == root
+                else directory.relative_to(root).as_posix()
+            )
+            directory_limit = directory_entry_limits[directory_key]
+            directory_entries = 0
+            child_directories: List[Path] = []
             try:
-                entries = sorted(os.scandir(directory), key=lambda item: item.name)
+                entries_context = os.scandir(directory)
             except OSError as exc:
                 raise ArtifactSecurityError(
                     "could not inspect prepared Trial inventory"
                 ) from exc
-            for entry in entries:
-                try:
-                    metadata = entry.stat(follow_symlinks=False)
-                except OSError as exc:
-                    raise ArtifactSecurityError(
-                        "could not inspect prepared Trial inventory"
-                    ) from exc
-                if _unsafe_node(metadata):
-                    raise ArtifactSecurityError(
-                        "prepared Trial inventory contains a link or reparse point"
+            try:
+                with entries_context as entries:
+                    for entry in entries:
+                        directory_entries += 1
+                        total_entries += 1
+                        if (
+                            directory_entries > directory_limit
+                            or total_entries
+                            > _MAX_PREPARED_TRIAL_INVENTORY_ENTRIES
+                        ):
+                            raise ArtifactIntegrityError(
+                                "prepared Trial inventory exceeds its entry limit"
+                            )
+                        try:
+                            metadata = entry.stat(follow_symlinks=False)
+                        except OSError as exc:
+                            raise ArtifactSecurityError(
+                                "could not inspect prepared Trial inventory"
+                            ) from exc
+                        if _unsafe_node(metadata):
+                            raise ArtifactSecurityError(
+                                "prepared Trial inventory contains a link or reparse point"
+                            )
+                        path = Path(entry.path)
+                        relative = path.relative_to(root).as_posix()
+                        if stat.S_ISDIR(metadata.st_mode):
+                            if relative not in expected_directories:
+                                raise ArtifactIntegrityError(
+                                    "prepared Trial inventory contains an unknown directory"
+                                )
+                            observed_directories.add(relative)
+                            child_directories.append(path)
+                            continue
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise ArtifactSecurityError(
+                                "prepared Trial inventory contains a special file"
+                            )
+                        try:
+                            file_metadata = os.lstat(path)
+                        except OSError as exc:
+                            raise ArtifactSecurityError(
+                                "could not verify prepared Trial file link count"
+                            ) from exc
+                        if (
+                            _unsafe_node(file_metadata)
+                            or not stat.S_ISREG(file_metadata.st_mode)
+                        ):
+                            raise ArtifactSecurityError(
+                                "prepared Trial file changed during inventory"
+                            )
+                        if _hardlinked_file(file_metadata):
+                            raise ArtifactSecurityError(
+                                "prepared Trial inventory contains a hardlinked file"
+                            )
+                        if relative not in expected_files:
+                            raise ArtifactIntegrityError(
+                                "prepared Trial inventory contains an unknown file"
+                            )
+                        observed_files.add(relative)
+            except ArtifactError:
+                raise
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "could not inspect prepared Trial inventory"
+                ) from exc
+            pending.extend(
+                reversed(
+                    sorted(
+                        child_directories,
+                        key=lambda item: item.relative_to(root).as_posix(),
                     )
-                path = Path(entry.path)
-                relative = path.relative_to(root).as_posix()
-                if stat.S_ISDIR(metadata.st_mode):
-                    if relative not in expected_directories:
-                        raise ArtifactIntegrityError(
-                            "prepared Trial inventory contains an unknown directory"
-                        )
-                    observed_directories.add(relative)
-                    pending.append(path)
-                    continue
-                if not stat.S_ISREG(metadata.st_mode):
-                    raise ArtifactSecurityError(
-                        "prepared Trial inventory contains a special file"
-                    )
-                try:
-                    file_metadata = os.lstat(path)
-                except OSError as exc:
-                    raise ArtifactSecurityError(
-                        "could not verify prepared Trial file link count"
-                    ) from exc
-                if (
-                    _unsafe_node(file_metadata)
-                    or not stat.S_ISREG(file_metadata.st_mode)
-                ):
-                    raise ArtifactSecurityError(
-                        "prepared Trial file changed during inventory"
-                    )
-                if _hardlinked_file(file_metadata):
-                    raise ArtifactSecurityError(
-                        "prepared Trial inventory contains a hardlinked file"
-                    )
-                if relative not in expected_files:
-                    raise ArtifactIntegrityError(
-                        "prepared Trial inventory contains an unknown file"
-                    )
-                observed_files.add(relative)
+                )
+            )
         if (
             observed_directories != expected_directories
             or observed_files != expected_files
@@ -5542,6 +5589,87 @@ class ArtifactStore:
             raise ArtifactIntegrityError(
                 "prepared Trial inventory is incomplete"
             )
+
+    def _assert_single_link_control_file(self, path: Path) -> None:
+        """Verify one immutable control file through its opened descriptor."""
+
+        path = self._within_root(path)
+        try:
+            before = os.lstat(path)
+        except OSError as exc:
+            raise ArtifactIntegrityError(
+                "required Run control file is unavailable"
+            ) from exc
+        if _unsafe_node(before) or not stat.S_ISREG(before.st_mode):
+            raise ArtifactSecurityError(
+                "Run control file is a link, reparse point, or special file"
+            )
+        if _hardlinked_file(before):
+            raise ArtifactSecurityError(
+                "Run control file has an unsafe hardlink count"
+            )
+        try:
+            descriptor = self._open_read_descriptor(path)
+        except OSError as exc:
+            raise ArtifactSecurityError(
+                "Run control file could not be safely opened"
+            ) from exc
+        try:
+            opened = os.fstat(descriptor)
+            if _unsafe_node(opened) or not stat.S_ISREG(opened.st_mode):
+                raise ArtifactSecurityError(
+                    "Run control file changed during safe open"
+                )
+            if _hardlinked_file(opened):
+                raise ArtifactSecurityError(
+                    "Run control file has an unsafe hardlink count"
+                )
+            before_identity = _file_identity(before)
+            opened_identity = _descriptor_identity(descriptor, opened)
+            if (
+                before_identity is not None
+                and opened_identity is not None
+                and before_identity != opened_identity
+            ):
+                raise ArtifactSecurityError(
+                    "Run control file changed during safe open"
+                )
+            opened_path = _windows_descriptor_path(descriptor)
+            if opened_path is not None and (
+                not _path_is_within(self.root, opened_path)
+                or _normalized_filesystem_path(opened_path)
+                != _normalized_filesystem_path(path)
+            ):
+                raise ArtifactSecurityError(
+                    "Run control file resolved to an unexpected path"
+                )
+            if opened_path is None and (
+                before_identity is None or opened_identity is None
+            ):
+                raise ArtifactSecurityError(
+                    "Run control file identity could not be verified"
+                )
+        finally:
+            os.close(descriptor)
+
+    def _assert_run_control_files_single_link(
+        self,
+        bundle: _VerifiedRunBundle,
+    ) -> None:
+        run_id = bundle.config.run_id
+        paths = [
+            self._target(run_id, bundle.manifest.run_config.relative_path),
+            self._target(run_id, bundle.manifest.case_snapshot.relative_path),
+            self._run_dir(run_id) / "run_manifest.json",
+        ]
+        preflight = self._target(
+            run_id,
+            "receipts/capability_preflight.json",
+        )
+        if self._exists_regular(preflight):
+            paths.append(preflight)
+        for path in paths:
+            self._assert_single_link_control_file(path)
 
     @contextmanager
     def reserve_run_before_execution(
@@ -5590,6 +5718,7 @@ class ArtifactStore:
                 raise ArtifactIntegrityError(
                     "candidate immutable Run plan changed while reserving execution"
                 )
+            self._assert_run_control_files_single_link(locked)
             for plan in locked_plans:
                 state, _submission = self._load_trial_state(
                     locked,

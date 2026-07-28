@@ -5,13 +5,14 @@ import json
 import os
 import stat
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+import review_agent_eval.artifacts as artifact_module
 import review_agent_eval.cli as cli_module
 from review_agent_eval.cli import (
     EXIT_INTEGRITY,
@@ -28,6 +29,7 @@ from review_agent_eval.artifacts import (
     ArtifactConflictError,
     ArtifactIntegrityError,
     ArtifactSecurityError,
+    ArtifactStore,
 )
 
 
@@ -61,6 +63,123 @@ def _strict_tree_snapshot(root: Path) -> tuple[tuple[str, str, bytes | None], ..
             else:
                 raise AssertionError("snapshot tree contains a special entry")
     return tuple(sorted(values))
+
+
+def _analysis_loader_args(tmp_path: Path) -> argparse.Namespace:
+    return argparse.Namespace(
+        suite_root=str(tmp_path / "suite"),
+        manifest="suite_manifest.json",
+        expected_manifest_digest=None,
+        runs_root=str(tmp_path / ".eval-runs"),
+        data_root=str(tmp_path / ".eval-data"),
+        workspace_root=str(tmp_path / ".eval-workspaces"),
+        analysis_root=str(tmp_path / ".eval-analyses"),
+    )
+
+
+def test_real_analysis_loader_accepts_different_verified_suite_subsets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from review_agent_eval.orchestrator import EvaluationOrchestrator
+
+    from .test_artifacts import make_config
+    from .test_datasets import case_payload, write_suite
+
+    args = _analysis_loader_args(tmp_path)
+    write_suite(
+        Path(args.suite_root),
+        (case_payload("task-kept"), case_payload("task-filtered")),
+    )
+    from review_agent_eval.datasets import CaseBank
+
+    bank = CaseBank.open(Path(args.suite_root))
+    subset = bank.snapshot(("task-kept",))
+    other_subset = bank.snapshot(("task-filtered",))
+    assert subset != other_subset
+    config = make_config(
+        instance="analysis-filtered-subset",
+        case_snapshot=subset,
+    )
+    other_config = make_config(
+        instance="analysis-other-filtered-subset",
+        case_snapshot=other_subset,
+    )
+    store = ArtifactStore(Path(args.runs_root))
+    store.create_run(config, subset)
+    store.create_run(other_config, other_subset)
+
+    class HydrationReached(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        cli_module,
+        "_repository_preparer_context",
+        lambda *_args, **_kwargs: nullcontext(None),
+    )
+    hydration_calls = []
+
+    def hydration_reached(_self: Any, run_id: str, _evaluation_id: str):
+        hydration_calls.append(run_id)
+        raise HydrationReached()
+
+    monkeypatch.setattr(
+        EvaluationOrchestrator,
+        "load_run_evaluation",
+        hydration_reached,
+    )
+
+    with cli_module._analysis_evaluation_loader(args) as (load, _store, _root):
+        for index, run in enumerate((config, other_config), start=1):
+            with pytest.raises(HydrationReached):
+                load(run.run_id, "evaluation-" + str(index) * 64)
+    assert hydration_calls == [config.run_id, other_config.run_id]
+
+
+@pytest.mark.parametrize("mutation", ("unknown", "rewritten"))
+def test_real_analysis_loader_rejects_untrusted_snapshot_cases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    from review_agent_eval.orchestrator import EvaluationOrchestrator
+
+    from .test_artifacts import make_config
+    from .test_datasets import case_payload, write_suite
+
+    args = _analysis_loader_args(tmp_path)
+    trusted = case_payload("task-kept")
+    write_suite(Path(args.suite_root), (trusted, case_payload("task-other")))
+    foreign_root = tmp_path / "foreign-suite"
+    foreign = case_payload("unknown-task" if mutation == "unknown" else "task-kept")
+    if mutation == "rewritten":
+        foreign["input"]["review_target"]["review_request"]["user_intent"] = (
+            "rewritten persisted input"
+        )
+    write_suite(foreign_root, (foreign,))
+    from review_agent_eval.datasets import CaseBank
+
+    foreign_snapshot = CaseBank.open(foreign_root).snapshot()
+    config = make_config(
+        instance="analysis-untrusted-" + mutation,
+        case_snapshot=foreign_snapshot,
+    )
+    store = ArtifactStore(Path(args.runs_root))
+    store.create_run(config, foreign_snapshot)
+    monkeypatch.setattr(
+        cli_module,
+        "_repository_preparer_context",
+        lambda *_args, **_kwargs: nullcontext(None),
+    )
+    monkeypatch.setattr(
+        EvaluationOrchestrator,
+        "load_run_evaluation",
+        lambda *_args, **_kwargs: pytest.fail("untrusted snapshot reached hydration"),
+    )
+
+    with cli_module._analysis_evaluation_loader(args) as (load, _store, _root):
+        with pytest.raises(cli_module.CliIntegrityError, match="trusted Suite"):
+            load(config.run_id, "evaluation-" + "2" * 64)
 
 
 def _command_choices(parser: Any) -> dict[str, Any]:
@@ -640,6 +759,68 @@ def test_gate_prepare_rejects_every_orphan_execution_artifact_before_publish(
     assert _strict_tree_snapshot(run_store.root) == before
 
 
+def test_prepared_inventory_stops_at_directory_limit_plus_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from .test_artifacts import make_store
+
+    run_store, candidate, _manifest, _plan, trial = make_store(tmp_path)
+    trial_root = run_store._trial_dir(trial)
+    original_scandir = os.scandir
+    with original_scandir(trial_root) as entries:
+        expected_entries = list(entries)
+    assert len(expected_entries) == 5
+    observed = {"count": 0}
+
+    class BoundedEntries:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            observed["count"] += 1
+            index = observed["count"] - 1
+            if index < len(expected_entries):
+                return expected_entries[index]
+            if index == len(expected_entries):
+                return SimpleNamespace(name="limit-plus-one")
+            raise AssertionError("prepared inventory read beyond limit+1")
+
+    def bounded_scandir(path: Any):
+        if os.path.normcase(os.fspath(path)) == os.path.normcase(
+            os.fspath(trial_root)
+        ):
+            return BoundedEntries()
+        return original_scandir(path)
+
+    monkeypatch.setattr(artifact_module.os, "scandir", bounded_scandir)
+    with pytest.raises(ArtifactIntegrityError, match="entry limit"):
+        with run_store.reserve_run_before_execution(candidate.run_id):
+            raise AssertionError("overflowed inventory must not reserve")
+    assert observed["count"] == 6
+
+
+def test_prepared_inventory_rejects_large_orphan_set(
+    tmp_path: Path,
+) -> None:
+    from .test_artifacts import make_store
+
+    run_store, candidate, _manifest, _plan, trial = make_store(tmp_path)
+    trial_root = run_store._trial_dir(trial)
+    for index in range(128):
+        (trial_root / ("orphan-%04d.json" % index)).write_bytes(b"orphan")
+
+    with pytest.raises(ArtifactIntegrityError, match="entry limit|unknown file"):
+        with run_store.reserve_run_before_execution(candidate.run_id):
+            raise AssertionError("orphan inventory must not reserve")
+
+
 @pytest.mark.parametrize("artifact_name", ("trial.lock", "trial_manifest.json"))
 def test_gate_prepare_rejects_external_hardlinks_independent_of_store_policy(
     tmp_path: Path,
@@ -675,6 +856,65 @@ def test_gate_prepare_rejects_external_hardlinks_independent_of_store_policy(
     )
 
     with pytest.raises(ArtifactSecurityError, match="hardlink"):
+        cli_module._handle_gate_prepare(args)
+
+    assert analysis_store.published is False
+    assert _strict_tree_snapshot(run_store.root) == before
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "run_config.json",
+        "case_snapshot.json",
+        "run_manifest.json",
+        "receipts/capability_preflight.json",
+    ),
+)
+def test_gate_prepare_rejects_hardlinked_run_control_files_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+) -> None:
+    from .test_artifacts import make_case_snapshot, make_config, make_store
+
+    if relative_path == "receipts/capability_preflight.json":
+        run_store = ArtifactStore(tmp_path / ".eval-runs")
+        snapshot = make_case_snapshot()
+        candidate = make_config(
+            instance="hardlinked-run-preflight",
+            case_snapshot=snapshot,
+        )
+        run_store.create_run(
+            candidate,
+            snapshot,
+            run_preflight={"capability": "verified"},
+        )
+    else:
+        run_store, candidate, _manifest, _plan, _trial = make_store(tmp_path)
+    source = run_store._run_dir(candidate.run_id) / relative_path
+    external_alias = tmp_path / (
+        "external-" + relative_path.replace("/", "-")
+    )
+    try:
+        os.link(source, external_alias)
+    except NotImplementedError as exc:
+        pytest.skip(f"hardlink capability is unavailable: {exc}")
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip(f"hardlink capability is unavailable: {exc}")
+        raise
+    assert os.stat(source).st_nlink == 2
+
+    before = _strict_tree_snapshot(run_store.root)
+    args, analysis_store = _configure_gate_prepare_test(
+        monkeypatch,
+        run_store=run_store,
+        candidate=candidate,
+        snapshot=run_store.load_case_snapshot(candidate.run_id),
+    )
+
+    with pytest.raises(ArtifactSecurityError, match="hardlink|link count"):
         cli_module._handle_gate_prepare(args)
 
     assert analysis_store.published is False

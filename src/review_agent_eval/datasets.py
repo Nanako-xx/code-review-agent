@@ -541,6 +541,26 @@ class CaseBank(_JsonModel):
         _verify_manifest_current(selected[0])
         return RunCaseSnapshot.build(self.manifest, loaded)
 
+    def verify_snapshot_subset(
+        self,
+        snapshot: RunCaseSnapshot,
+    ) -> None:
+        """Verify a persisted Run snapshot as an exact current-Suite subset."""
+
+        if not isinstance(snapshot, RunCaseSnapshot):
+            raise DatasetError("snapshot must be a RunCaseSnapshot")
+        task_ids = tuple(item.task_id for item in snapshot.cases)
+        try:
+            expected = self.snapshot(task_ids)
+        except (DatasetError, SchemaError) as exc:
+            raise CaseIntegrityError(
+                "Run Case Snapshot contains a Case outside the trusted Suite"
+            ) from exc
+        if snapshot != expected:
+            raise CaseIntegrityError(
+                "Run Case Snapshot differs from its trusted Suite subset"
+            )
+
     def to_dict(self) -> Dict[str, Any]:
         # The bank serializes only immutable inventory metadata, never root
         # paths or private EvalCase payloads.

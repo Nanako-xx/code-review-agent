@@ -739,6 +739,8 @@ def _analysis_evaluation_loader(args: argparse.Namespace):
     bank = _load_case_bank(args, suite_root)
     suite_snapshot = bank.snapshot()
     from .comparison import VerifiedRunEvaluation
+    from .config import SuiteRunConfig
+    from .datasets import DatasetError
     from .orchestrator import EvaluationOrchestrator
 
     with _repository_preparer_context(
@@ -760,10 +762,16 @@ def _analysis_evaluation_loader(args: argparse.Namespace):
         def load(run_id: str, evaluation_id: str):
             config = store.load_run_config(run_id)
             snapshot = store.load_case_snapshot(run_id)
-            if snapshot != suite_snapshot or config.suite.case_snapshot_digest != snapshot.digest():
+            if config.suite != SuiteRunConfig.from_case_snapshot(snapshot):
                 raise CliIntegrityError(
-                    "Run Case Snapshot differs from the verified Suite"
+                    "Run Config differs from its persisted Case Snapshot"
                 )
+            try:
+                bank.verify_snapshot_subset(snapshot)
+            except DatasetError as exc:
+                raise CliIntegrityError(
+                    "Run Case Snapshot is not a verified trusted Suite subset"
+                ) from exc
             bundle = orchestrator.load_run_evaluation(run_id, evaluation_id)
             return VerifiedRunEvaluation.create(
                 bundle,
