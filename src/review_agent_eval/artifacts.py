@@ -3458,8 +3458,15 @@ class ArtifactStore:
                     pass
 
     @contextmanager
-    def _lock(self, path: Path, *, create: bool = True) -> Iterator[None]:
+    def _lock(
+        self,
+        path: Path,
+        *,
+        create: bool = True,
+        require_single_link: bool = False,
+    ) -> Iterator[None]:
         path = self._within_root(path)
+        reject_hardlinks = self._reject_hardlinks or require_single_link
         with self._guard_parent_directory(
             path,
             create=create,
@@ -3486,7 +3493,7 @@ class ArtifactStore:
                     "writer lock is a symlink, reparse point, or special file"
                 )
             if (
-                self._reject_hardlinks
+                reject_hardlinks
                 and existing is not None
                 and _hardlinked_file(existing)
             ):
@@ -3516,7 +3523,7 @@ class ArtifactStore:
                 info = os.fstat(descriptor)
                 if _unsafe_node(info) or not stat.S_ISREG(info.st_mode):
                     raise ArtifactSecurityError("writer lock is not a regular file")
-                if self._reject_hardlinks and _hardlinked_file(info):
+                if reject_hardlinks and _hardlinked_file(info):
                     raise ArtifactSecurityError(
                         "writer lock has an unsafe hardlink count"
                     )
@@ -5506,7 +5513,20 @@ class ArtifactStore:
                     raise ArtifactSecurityError(
                         "prepared Trial inventory contains a special file"
                     )
-                if self._reject_hardlinks and _hardlinked_file(metadata):
+                try:
+                    file_metadata = os.lstat(path)
+                except OSError as exc:
+                    raise ArtifactSecurityError(
+                        "could not verify prepared Trial file link count"
+                    ) from exc
+                if (
+                    _unsafe_node(file_metadata)
+                    or not stat.S_ISREG(file_metadata.st_mode)
+                ):
+                    raise ArtifactSecurityError(
+                        "prepared Trial file changed during inventory"
+                    )
+                if _hardlinked_file(file_metadata):
                     raise ArtifactSecurityError(
                         "prepared Trial inventory contains a hardlinked file"
                     )
@@ -5549,7 +5569,11 @@ class ArtifactStore:
         with ExitStack() as locks:
             for plan in initial_plans:
                 locks.enter_context(
-                    self._lock(self._trial_lock_path(plan), create=False)
+                    self._lock(
+                        self._trial_lock_path(plan),
+                        create=False,
+                        require_single_link=True,
+                    )
                 )
 
             locked = self._load_verified_run_bundle(run_id)

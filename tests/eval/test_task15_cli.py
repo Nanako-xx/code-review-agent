@@ -24,7 +24,11 @@ from review_agent_eval.cli import (
 )
 from review_agent_eval.comparison import ComparisonStatus
 from review_agent_eval.gates import GateDecision
-from review_agent_eval.artifacts import ArtifactConflictError, ArtifactIntegrityError
+from review_agent_eval.artifacts import (
+    ArtifactConflictError,
+    ArtifactIntegrityError,
+    ArtifactSecurityError,
+)
 
 
 def _strict_tree_snapshot(root: Path) -> tuple[tuple[str, str, bytes | None], ...]:
@@ -630,6 +634,47 @@ def test_gate_prepare_rejects_every_orphan_execution_artifact_before_publish(
         ArtifactIntegrityError,
         match="prepared Trial inventory|Trial receipts",
     ):
+        cli_module._handle_gate_prepare(args)
+
+    assert analysis_store.published is False
+    assert _strict_tree_snapshot(run_store.root) == before
+
+
+@pytest.mark.parametrize("artifact_name", ("trial.lock", "trial_manifest.json"))
+def test_gate_prepare_rejects_external_hardlinks_independent_of_store_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
+) -> None:
+    from .test_artifacts import make_store
+
+    run_store, candidate, _manifest, _plan, trial = make_store(tmp_path)
+    assert run_store._reject_hardlinks is False
+    source = (
+        run_store._trial_lock_path(trial)
+        if artifact_name == "trial.lock"
+        else run_store._trial_dir(trial) / artifact_name
+    )
+    external_alias = tmp_path / ("external-" + artifact_name)
+    try:
+        os.link(source, external_alias)
+    except NotImplementedError as exc:
+        pytest.skip(f"hardlink capability is unavailable: {exc}")
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip(f"hardlink capability is unavailable: {exc}")
+        raise
+    assert os.stat(source).st_nlink == 2
+
+    before = _strict_tree_snapshot(run_store.root)
+    args, analysis_store = _configure_gate_prepare_test(
+        monkeypatch,
+        run_store=run_store,
+        candidate=candidate,
+        snapshot=run_store.load_case_snapshot(candidate.run_id),
+    )
+
+    with pytest.raises(ArtifactSecurityError, match="hardlink"):
         cli_module._handle_gate_prepare(args)
 
     assert analysis_store.published is False
