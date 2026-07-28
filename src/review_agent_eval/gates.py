@@ -54,6 +54,7 @@ GATE_POLICY_SCHEMA_VERSION = "gate_policy_v1"
 GATE_RESULT_SCHEMA_VERSION = "gate_result_v1"
 GATE_ALGORITHM_VERSION = "preregistered-regression-gate-v1"
 MAX_GATE_CONSTRAINTS = len(CoreMetric) * 6
+MAX_GATE_CHECKS = MAX_GATE_CONSTRAINTS + len(CoreMetric)
 MAX_GATE_CALIBRATIONS = 16
 MAX_GATE_REFS = 65_536
 MAX_GATE_INTEGER = (1 << 63) - 1
@@ -882,6 +883,15 @@ class GateCheckV1(_JsonModel):
             raise _error("GateCheckV1 failure_refs contain duplicates")
         if any(item.threshold != threshold or item.unit is not unit for item in refs):
             raise _error("GateCheckV1 failure refs differ from the configured threshold")
+        if any(
+            item.reason is GateCheckReason.THRESHOLD_FAILED
+            and (
+                item.actual is None
+                or _satisfies(operator, item.actual, threshold)
+            )
+            for item in refs
+        ):
+            raise _error("threshold_failed GateCheckV1 ref satisfies its threshold")
         digests = tuple(self.calibration_result_digests)
         if type(self.calibration_result_digests) not in (tuple, list):
             raise _error("GateCheckV1 calibration refs are invalid")
@@ -921,8 +931,8 @@ class GateCheckV1(_JsonModel):
             raise _error("failed GateCheckV1 requires threshold_failed")
         if status is GateCheckStatus.PASS and self.actual is None:
             raise _error("passing GateCheckV1 requires an actual value")
-        if status is GateCheckStatus.FAIL and not refs:
-            raise _error("failed GateCheckV1 requires source-bound failure refs")
+        if status is GateCheckStatus.FAIL and not refs and self.metric_ref is None:
+            raise _error("failed GateCheckV1 requires a metric or source ref")
         if status is GateCheckStatus.PASS and not _satisfies(operator, self.actual, threshold):
             raise _error("passing GateCheckV1 does not satisfy its threshold")
         if status is GateCheckStatus.FAIL and _satisfies(operator, self.actual, threshold):
@@ -977,6 +987,15 @@ class GateCheckV1(_JsonModel):
 
     @property
     def reason(self) -> GateCheckReason | None:
+        if self.status not in {GateCheckStatus.PASS, GateCheckStatus.FAIL, GateCheckStatus.NOT_CONFIGURED, GateCheckStatus.INELIGIBLE}:
+            return next(
+                (
+                    item
+                    for item in self.reasons
+                    if _unavailable_status((item,)) is self.status
+                ),
+                self.reasons[0] if self.reasons else None,
+            )
         return self.reasons[0] if self.reasons else None
 
     def _identity_dict(self) -> Dict[str, Any]:
@@ -1059,6 +1078,8 @@ class GateResultV1(_JsonModel):
         checks = tuple(self.checks)
         if type(self.checks) not in (tuple, list) or any(type(item) is not GateCheckV1 for item in checks):
             raise _error("GateResultV1 checks are invalid")
+        if len(checks) > MAX_GATE_CHECKS:
+            raise _error("GateResultV1 checks are excessive")
         if checks != tuple(sorted(checks, key=lambda item: item.constraint_id)) or len({item.constraint_id for item in checks}) != len(checks):
             raise _error("GateResultV1 checks are not canonical")
         required = tuple(item for item in checks if item.required)
@@ -1156,7 +1177,7 @@ class GateResultV1(_JsonModel):
     @classmethod
     def from_dict(cls, value: Any) -> "GateResultV1":
         payload = _exact(value, ("schema_version", "gate_result_id", "policy_digest", "policy_artifact_id", "policy_receipt_digest", "comparison_id", "decision", "checks"), "GateResultV1")
-        checks = _array(payload["checks"], "GateResultV1.checks", MAX_GATE_CONSTRAINTS)
+        checks = _array(payload["checks"], "GateResultV1.checks", MAX_GATE_CHECKS)
         is_legacy = any(
             type(item) is dict
             and item.get("status") == GateCheckStatus.INELIGIBLE.value
@@ -1679,6 +1700,23 @@ def _evaluate_frozen_policy(
         actual, source, _ = _value_for_scope(delta, constraint.scope)
         coverage = min(_coverage_ppm(baseline_value), _coverage_ppm(candidate_value))
         local = _local_values(canonical_comparison, constraint)
+        relevant_kind = (
+            GateReferenceKind.CASE
+            if constraint.scope in {
+                GateConstraintScope.CASE_ABSOLUTE,
+                GateConstraintScope.CASE_DELTA,
+            }
+            else GateReferenceKind.TRIAL
+            if constraint.scope in {
+                GateConstraintScope.TRIAL_ABSOLUTE,
+                GateConstraintScope.TRIAL_DELTA,
+            }
+            else None
+        )
+        relevant = tuple(
+            item for item in local if relevant_kind is None or item[0] is relevant_kind
+        )
+        ref_values = relevant if relevant_kind is not None else local
         unavailable_refs = tuple(
             GateFailureRefV1(
                 kind,
@@ -1688,7 +1726,7 @@ def _evaluate_frozen_policy(
                 constraint.unit,
                 _status_reason(local_source.status),
             )
-            for kind, ref, local_actual, local_source in local
+            for kind, ref, local_actual, local_source in ref_values
             if local_source.status is not StatisticsMetricStatus.AVAILABLE
             or local_actual is None
         )
@@ -1715,22 +1753,6 @@ def _evaluate_frozen_policy(
                 )
             )
             continue
-        relevant_kind = (
-            GateReferenceKind.CASE
-            if constraint.scope in {
-                GateConstraintScope.CASE_ABSOLUTE,
-                GateConstraintScope.CASE_DELTA,
-            }
-            else GateReferenceKind.TRIAL
-            if constraint.scope in {
-                GateConstraintScope.TRIAL_ABSOLUTE,
-                GateConstraintScope.TRIAL_DELTA,
-            }
-            else None
-        )
-        relevant = tuple(
-            item for item in local if relevant_kind is None or item[0] is relevant_kind
-        )
         if relevant_kind is not None:
             scorable_relevant = tuple(
                 item
@@ -1758,7 +1780,7 @@ def _evaluate_frozen_policy(
                     else max(local_actuals)
                 )
         local_failures: list[GateFailureRefV1] = list(unavailable_refs)
-        for kind, ref, local_actual, local_source in local:
+        for kind, ref, local_actual, local_source in ref_values:
             if local_source.status is not StatisticsMetricStatus.AVAILABLE or local_actual is None:
                 continue
             elif not _satisfies(constraint.operator, local_actual, constraint.threshold):
@@ -1777,8 +1799,6 @@ def _evaluate_frozen_policy(
         if passed:
             checks.append(_make_check(constraint, status=GateCheckStatus.PASS, actual=actual, coverage_ppm=coverage, metric_ref=metric_ref, failure_refs=local_failures, calibration_result_digests=canonical_policy.calibration_result_digests))
         else:
-            if not local_failures and local:
-                local_failures = [GateFailureRefV1(kind, ref, local_actual, constraint.threshold, constraint.unit, GateCheckReason.THRESHOLD_FAILED) for kind, ref, local_actual, _source in local]
             checks.append(_make_check(constraint, status=GateCheckStatus.FAIL, actual=actual, coverage_ppm=coverage, metric_ref=metric_ref, failure_refs=local_failures, calibration_result_digests=canonical_policy.calibration_result_digests, reasons=(GateCheckReason.THRESHOLD_FAILED,)))
     configured_metrics = {item.metric for item in canonical_policy.constraints}
     checks.extend(

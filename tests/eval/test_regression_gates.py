@@ -195,6 +195,13 @@ def test_gate_check_status_reason_pairs_and_legacy_hydration_are_closed() -> Non
         (),
     )
     assert partial.failure_refs == (partial_ref,)
+    forged_ref = partial.to_dict()
+    forged_ref["failure_refs"][0]["reason"] = GateCheckReason.THRESHOLD_FAILED.value
+    forged_ref["check_id"] = stable_id("gate-check-v1", {
+        key: value for key, value in forged_ref.items() if key != "check_id"
+    })
+    with pytest.raises(GateError, match="threshold_failed.*satisfies"):
+        GateCheckV1.from_dict(forged_ref)
     invalid = pending.to_dict()
     invalid["reasons"] = [GateCheckReason.THRESHOLD_FAILED.value]
     invalid["check_id"] = stable_id("gate-check-v1", {
@@ -287,6 +294,9 @@ def test_gate_unavailable_reason_resolver_preserves_mixed_reasons(
 
     assert check.status is expected_status
     assert check.reasons == tuple(sorted(reasons, key=lambda item: item.value))
+    assert check.reason is next(
+        item for item in check.reasons if _ineligible_check(constraint, (item,)).status is expected_status
+    )
     assert GateCheckV1.from_dict(check.to_dict()) == check
     replayed = GateResultV1.create(
         policy_digest="0" * 64,
