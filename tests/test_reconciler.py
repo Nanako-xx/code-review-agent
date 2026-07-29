@@ -321,6 +321,64 @@ def test_reconciler_boundary_marks_memory_feedback_sources_and_evidence_as_untru
     assert run.reconciliation.rejected_findings == ()
 
 
+def test_reconciler_system_prompt_declares_the_exact_proposal_contract():
+    candidate = _candidate("protocol", claim="Candidate must be preserved")
+    prepass, observations, _ = _packet([candidate])
+    adapter = FakeToolCallingAdapter(
+        [
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(_proposal_payload([candidate])),
+            )
+        ]
+    )
+
+    reconcile_semantically(
+        prepass,
+        observations,
+        adapter=adapter,
+        max_provider_attempts=1,
+    )
+
+    system = " ".join(adapter.requests[0].system.split()).casefold()
+    for field_name in (
+        "canonical_groups",
+        "member_ids",
+        "representative_id",
+        "canonical_claim",
+        "rationale",
+        "supporting_refs",
+        "proposed_confidence",
+        "rejections",
+        "candidate_id",
+        "reason",
+        "decision_refs",
+        "disagreements",
+        "disagreement_id",
+        "candidate_ids",
+        "status",
+        "issue",
+        "resolution",
+        "supplemental_requests",
+        "question",
+        "required_evidence",
+        "preferred_perspective",
+        "related_candidate_ids",
+        "reason_refs",
+        "uncertainties",
+        "summary",
+    ):
+        assert field_name in system
+    for rule in (
+        "disposed exactly once",
+        "representative_id must belong to member_ids",
+        "do not wrap the json in markdown",
+        "needs_investigation",
+        "exactly one matching supplemental request",
+    ):
+        assert rule in system
+
+
 def test_reconciler_retries_malformed_responses_then_falls_back_conservatively():
     candidate = _candidate("0", claim="Candidate", severity="high")
     prepass, observations, _ = _packet([candidate])

@@ -55,6 +55,29 @@ states, or repository facts. Every supported candidate must be disposed exactly 
 strict JSON matching semantic_reconciliation_proposal_v1. Runtime validates and compiles the
 proposal and remains authoritative for evidence, severity floors, permissions, budget,
 scheduling, Finding preservation, and completion.
+
+Return exactly one JSON object and no Markdown or commentary. Do not wrap the JSON in Markdown
+fences. The top-level object has exactly these fields:
+- canonical_groups: an array of objects. Each object has exactly member_ids,
+  representative_id, canonical_claim, rationale, supporting_refs, and proposed_confidence.
+  proposed_confidence is high, medium, or low.
+- rejections: an array of objects. Each object has exactly candidate_id, reason, rationale,
+  and decision_refs. reason is unsupported_claim, contradicted_by_test, or outside_review_scope.
+- disagreements: an array of objects. Each object has exactly disagreement_id,
+  candidate_ids, status, issue, resolution, and decision_refs. status is resolved,
+  needs_investigation, or unresolved.
+- supplemental_requests: an array of objects. Each object has exactly disagreement_id,
+  question, required_evidence, preferred_perspective, related_candidate_ids, and reason_refs.
+- uncertainties: an array of strings.
+- summary: a non-empty string.
+
+Dispose every candidate in this batch exactly once: each candidate_id must appear in exactly
+one canonical_groups member_ids array or exactly one rejection, never both. representative_id
+must belong to member_ids. supporting_refs must come from the grouped candidates. Candidate IDs,
+decision_refs, supporting_refs, and reason_refs must come from the packet allowlists. Every
+needs_investigation disagreement requires exactly one matching supplemental request; resolved
+and unresolved disagreements require none. Do not add fields or invent IDs, Observations,
+Findings, or facts.
 """
 
 ALLOWED_REJECTION_REASONS = (
