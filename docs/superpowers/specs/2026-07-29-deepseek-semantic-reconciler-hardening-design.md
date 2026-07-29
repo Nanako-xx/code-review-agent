@@ -75,7 +75,12 @@ The DeepSeek baseline Agent snapshot will include these current-Agent adapter an
 --semantic-reconciler-max-elapsed-seconds=240
 ```
 
-Evaluation `prepare` must explicitly freeze memory mode off in the current-Agent adapter snapshot. Memory off prevents prior local project Memory from changing diagnostic or baseline inputs, and prevents smoke or evaluation runs from proposing or writing Memory. Reviewer count is not frozen: accepted model Risk feeds the local Runtime `ReviewProfile`, so actual reviewer depth remains risk-dependent. Do not change global `ModelStageConfig` defaults.
+Evaluation `prepare` must explicitly freeze memory mode off in the current-Agent adapter
+snapshot. Memory off prevents prior local project Memory from changing diagnostic or
+baseline inputs, and prevents smoke or evaluation runs from proposing or writing Memory.
+Reviewer count is not frozen: accepted model Risk feeds the local Runtime `ReviewProfile`,
+so actual reviewer depth remains risk-dependent. Do not change global `ModelStageConfig`
+defaults.
 
 `max_provider_attempts` remains 2. The OpenAI-compatible adapter retains its 180-second per-request ceiling, while the 240-second stage budget leaves bounded time for a second attempt after an early parse or provider failure.
 
@@ -97,7 +102,12 @@ Implementation follows a minimal red-green cycle:
 2. Make the smallest production change that satisfies the test.
 3. Run focused Reconciler and adapter tests, then the complete local regression suite.
 4. Replay the existing `core-py-001` Reconciler packet with 8192 tokens and a 240-second stage budget.
-5. Run one complete `core-py-001` smoke with the same frozen Agent arguments and inspect every Runtime-scheduled Reviewer, Reconciler, Completion, and Final Risk artifact. Exactly one bounded, audited JSON finalization is acceptable when the terminal structured Reviewer result is `completed` or `partial` and provider-attempt, token, and elapsed budgets are respected. Unrecovered parser, provider, or budget errors remain failures.
+5. Run one complete `core-py-001` smoke with the same frozen Agent arguments and inspect
+   every Runtime-scheduled Reviewer, Reconciler, Completion, and Final Risk artifact.
+   Exactly one bounded, audited JSON finalization is acceptable when the terminal
+   structured Reviewer result is `completed` or `partial` and provider-attempt, token,
+   and elapsed budgets are respected. Unrecovered parser, provider, or budget errors
+   remain failures.
 
 Formal 10-case x 3-trial baseline execution is outside this hardening change and starts only after the single-case smoke is clean.
 

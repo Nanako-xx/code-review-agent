@@ -600,9 +600,15 @@ Expected:
 - medium risk may validly schedule two reviewers; high or critical risk may schedule more;
 - `semantic_status` and `semantic_model_status` are not `fallback`;
 - no artifact reports provider timeout, response truncation, invalid JSON, or an undocumented response shape;
-- a recovered initial final-response parse diagnostic is acceptable only when the trace audits exactly one bounded JSON finalization, that finalization stays within provider-attempt, token, and elapsed budgets, and the terminal structured Reviewer result is `completed` or `partial`;
-- repeated finalization or unrecovered parser, schema, provider, truncation, token, or elapsed failure is unacceptable;
-- Semantic Reconciler remains non-fallback; if Completion is `blocked` in this smoke, its sole blocker must be exactly `Intent Packet insufficient`; any additional blocker is a smoke failure requiring investigation.
+- a recovered initial final-response parse diagnostic is acceptable only when the trace
+  audits exactly one bounded JSON finalization, that finalization stays within
+  provider-attempt, token, and elapsed budgets, and the terminal structured Reviewer
+  result is `completed` or `partial`;
+- repeated finalization or unrecovered parser, schema, provider, truncation, token, or
+  elapsed failure is unacceptable;
+- Semantic Reconciler remains non-fallback; if Completion is `blocked` in this smoke,
+  its sole blocker must be exactly `Intent Packet insufficient`; any additional blocker
+  is a smoke failure requiring investigation.
 
 ### Task 7: Freeze the later evaluation snapshot arguments and complete verification
 
@@ -620,7 +626,10 @@ When the formal evaluation Run is prepared, include all three exact arguments in
 --agent-argument=--semantic-reconciler-max-elapsed-seconds=240
 ```
 
-`memory_mode` is frozen in the adapter parameters, while the two semantic flags are `review_arguments`. Expected: inspection of the prepared Agent snapshot verifies `adapter.memory_mode` is `off` and both exact review argument strings exist. The formal 10-case x 3-trial baseline remains outside this hardening plan.
+`memory_mode` is frozen in the adapter parameters, while the two semantic flags are
+`review_arguments`. Expected: inspection of the prepared Agent snapshot verifies
+`adapter.memory_mode` is `off` and both exact review argument strings exist. The formal
+10-case x 3-trial baseline remains outside this hardening plan.
 
 - [ ] **Step 2: Run final repository checks**
 
