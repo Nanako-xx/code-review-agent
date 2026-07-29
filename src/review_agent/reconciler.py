@@ -76,8 +76,19 @@ one canonical_groups member_ids array or exactly one rejection, never both. repr
 must belong to member_ids. supporting_refs must come from the grouped candidates. Candidate IDs,
 decision_refs, supporting_refs, and reason_refs must come from the packet allowlists. Every
 needs_investigation disagreement requires exactly one matching supplemental request; resolved
-and unresolved disagreements require none. Do not add fields or invent IDs, Observations,
-Findings, or facts.
+and unresolved disagreements require none. All top-level collection fields are arrays. Every
+scalar string field is a non-empty string except disagreement resolution, which may be empty.
+ID/ref/evidence arrays contain unique non-empty strings. member_ids, supporting_refs, disagreement
+candidate_ids, required_evidence, and related_candidate_ids must be non-empty arrays.
+decision_refs, reason_refs, and uncertainties may be empty arrays. disagreement_id values must be
+unique, and related_candidate_ids must be a subset of the candidate_ids on the matching
+disagreement. A contradicted_by_test rejection requires non-empty decision_refs, including at
+least one referenced packet Observation that is a test, quality, or gate Observation.
+disagreement_id is intentionally model-created. A model-created disagreement_id must begin with
+a letter, be at most 128 characters, and use only letters, digits, dot, underscore, colon, or
+hyphen. A supplemental request must reuse exactly the disagreement_id of its matching
+needs_investigation disagreement. Do not add fields or invent candidate IDs, Finding IDs,
+Observation references, or facts.
 """
 
 ALLOWED_REJECTION_REASONS = (
