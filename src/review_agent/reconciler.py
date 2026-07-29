@@ -7,6 +7,7 @@ import json
 import math
 import re
 import time
+from types import MappingProxyType
 from typing import Any, Callable
 
 from review_agent.evidence import (
@@ -300,6 +301,14 @@ class ReconciliationPacketBatch:
             if key in referenced
         }
         return full
+
+
+@dataclass(frozen=True)
+class _SemanticValidationContext:
+    allowed_candidate_ids: frozenset[str]
+    allowed_observation_ids: frozenset[str]
+    candidate_evidence_refs: Mapping[str, frozenset[str]]
+    observation_sources: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -691,20 +700,25 @@ def parse_semantic_proposal(
 ) -> SemanticProposal:
     if not isinstance(content, str):
         raise SemanticProposalParseError("semantic proposal response must be a string")
-    batch = packet if isinstance(packet, ReconciliationPacketBatch) else None
-    full_packet = packet.packet if batch is not None else packet
-    if not isinstance(full_packet, ReconciliationPacket):
+    if not isinstance(packet, (ReconciliationPacket, ReconciliationPacketBatch)):
         raise ValueError("packet must be a reconciliation packet or batch")
-    allowed_candidates = (
-        frozenset(batch.candidate_ids)
-        if batch is not None
-        else full_packet.allowed_candidate_ids
-    )
-    allowed_refs = (
-        frozenset(batch.to_dict()["observation_catalog"])
-        if batch is not None
-        else full_packet.allowed_observation_ids
-    )
+    try:
+        validation_context = _semantic_validation_context_from_packet_payload(
+            packet.to_dict()
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise SemanticProposalParseError(
+            f"invalid reconciliation packet snapshot: {error}"
+        ) from error
+    return _parse_semantic_proposal(content, validation_context)
+
+
+def _parse_semantic_proposal(
+    content: str,
+    validation_context: _SemanticValidationContext,
+) -> SemanticProposal:
+    if not isinstance(content, str):
+        raise SemanticProposalParseError("semantic proposal response must be a string")
     try:
         payload = json.loads(
             content,
@@ -768,22 +782,134 @@ def parse_semantic_proposal(
         )
         _validate_semantic_proposal(
             proposal,
-            full_packet,
-            allowed_candidates=allowed_candidates,
-            allowed_refs=allowed_refs,
+            validation_context,
         )
         return proposal
     except ValueError as error:
         raise SemanticProposalParseError(str(error)) from error
 
 
+def _semantic_validation_context_from_packet_payload(
+    payload: Mapping[str, Any],
+) -> _SemanticValidationContext:
+    context = "reconciliation packet snapshot"
+    root = _object(payload, context)
+    if any(not isinstance(key, str) for key in root):
+        raise ValueError(f"{context} field names must be strings")
+    fields = {
+        "schema_version",
+        "review_id",
+        "revision_binding",
+        "candidate_catalog",
+        "conflict_hints",
+        "observation_catalog",
+        "contract_coverage",
+        "intent_summary",
+        "code_snippets",
+        "allowed_rejection_reasons",
+        "policy_summary",
+    }
+    if "batch_id" in root:
+        fields.add("batch_id")
+    _exact(root, fields, context)
+    if root["schema_version"] != RECONCILIATION_PACKET_SCHEMA_VERSION:
+        raise ValueError(f"{context} has an unsupported schema version")
+
+    candidate_catalog = _object(
+        root["candidate_catalog"],
+        f"{context}.candidate_catalog",
+    )
+    observation_catalog = _object(
+        root["observation_catalog"],
+        f"{context}.observation_catalog",
+    )
+    if any(not isinstance(key, str) for key in candidate_catalog):
+        raise ValueError(f"{context}.candidate_catalog keys must be strings")
+    if any(not isinstance(key, str) for key in observation_catalog):
+        raise ValueError(f"{context}.observation_catalog keys must be strings")
+
+    candidate_evidence_refs: dict[str, frozenset[str]] = {}
+    candidate_fields = {
+        "finding_id",
+        "origin",
+        "reviewer_task_id",
+        "reviewer_index",
+        "role",
+        "role_kind",
+        "claim",
+        "severity",
+        "confidence",
+        "path",
+        "line",
+        "impact",
+        "suggested_action",
+        "verification_performed",
+        "evidence_refs",
+        "validation_status",
+        "deterministic_rejection_reason",
+    }
+    for candidate_id, value in candidate_catalog.items():
+        _non_empty(candidate_id, f"{context}.candidate_catalog key")
+        candidate_context = f"{context}.candidate_catalog[{candidate_id!r}]"
+        candidate = _object(value, candidate_context)
+        if any(not isinstance(key, str) for key in candidate):
+            raise ValueError(f"{candidate_context} field names must be strings")
+        _exact(candidate, candidate_fields, candidate_context)
+        if _string(candidate, "finding_id", candidate_context) != candidate_id:
+            raise ValueError(f"{candidate_context}.finding_id must match its key")
+        if candidate["validation_status"] != "supported":
+            raise ValueError(f"{candidate_context} must be supported")
+        candidate_evidence_refs[candidate_id] = frozenset(
+            _string_tuple(
+                candidate["evidence_refs"],
+                f"{candidate_context}.evidence_refs",
+            )
+        )
+
+    observation_sources: dict[str, str] = {}
+    observation_fields = {
+        "source",
+        "revision",
+        "path",
+        "line_start",
+        "line_end",
+        "context_view",
+    }
+    for observation_id, value in observation_catalog.items():
+        _non_empty(observation_id, f"{context}.observation_catalog key")
+        observation_context = (
+            f"{context}.observation_catalog[{observation_id!r}]"
+        )
+        observation = _object(value, observation_context)
+        if any(not isinstance(key, str) for key in observation):
+            raise ValueError(f"{observation_context} field names must be strings")
+        _exact(observation, observation_fields, observation_context)
+        observation_sources[observation_id] = _string(
+            observation,
+            "source",
+            observation_context,
+        )
+
+    allowed_observation_ids = frozenset(observation_sources)
+    for candidate_id, evidence_refs in candidate_evidence_refs.items():
+        if not evidence_refs <= allowed_observation_ids:
+            raise ValueError(
+                f"{context} candidate {candidate_id} references an unknown Observation"
+            )
+    return _SemanticValidationContext(
+        allowed_candidate_ids=frozenset(candidate_evidence_refs),
+        allowed_observation_ids=allowed_observation_ids,
+        candidate_evidence_refs=MappingProxyType(dict(candidate_evidence_refs)),
+        observation_sources=MappingProxyType(dict(observation_sources)),
+    )
+
+
 def _validate_semantic_proposal(
     proposal: SemanticProposal,
-    packet: ReconciliationPacket,
-    *,
-    allowed_candidates: frozenset[str],
-    allowed_refs: frozenset[str],
+    validation_context: _SemanticValidationContext,
 ) -> None:
+    allowed_candidates = validation_context.allowed_candidate_ids
+    allowed_refs = validation_context.allowed_observation_ids
     disposed: list[str] = []
     for group in proposal.canonical_groups:
         if not set(group.member_ids) <= allowed_candidates:
@@ -793,7 +919,7 @@ def _validate_semantic_proposal(
         member_refs = {
             ref
             for candidate_id in group.member_ids
-            for ref in packet.candidate_catalog[candidate_id].evidence_refs
+            for ref in validation_context.candidate_evidence_refs[candidate_id]
         }
         if not set(group.supporting_refs) <= member_refs:
             raise ValueError(
@@ -812,7 +938,7 @@ def _validate_semantic_proposal(
                     "contradicted_by_test requires decision_refs"
                 )
             if not any(
-                _is_test_observation(packet.observation_catalog[ref].source)
+                _is_test_observation(validation_context.observation_sources[ref])
                 for ref in rejection.decision_refs
             ):
                 raise ValueError(
@@ -896,6 +1022,9 @@ def run_semantic_reconciler_batch(
     provider_name = _adapter_name(adapter)
     resolved_model = model
     packet_payload = batch.to_dict()
+    validation_context = _semantic_validation_context_from_packet_payload(
+        packet_payload
+    )
     messages: list[dict[str, Any]] = [
         {
             "role": "user",
@@ -967,27 +1096,24 @@ def run_semantic_reconciler_batch(
             messages.append(_rejection_message(message))
             continue
         elapsed_after = _elapsed(clock, started)
+        validated_response, response_shape_error = (
+            _validated_model_turn_response(response)
+        )
         if elapsed_after >= max_elapsed_seconds:
             message = "elapsed budget exhausted during provider attempt"
             failures.append(message)
-            if isinstance(response, ModelTurnResponse):
-                provider_name = response.provider_name or provider_name
-                resolved_model = response.model or resolved_model
+            if validated_response is not None:
+                provider_name = validated_response.provider_name or provider_name
+                resolved_model = validated_response.model or resolved_model
                 attempts.append(
                     ReconcilerAttempt(
                         attempt_index=attempt_index,
                         status="timed_out",
-                        response_kind=(
-                            response.kind.value
-                            if isinstance(response.kind, ModelResponseKind)
-                            else ModelResponseKind.INVALID.value
-                        ),
+                        response_kind=validated_response.kind.value,
                         error=message,
-                        response_text=response.final_text,
-                        raw_response=(
-                            model_turn_response_to_dict(response)
-                            if isinstance(response.kind, ModelResponseKind)
-                            else {}
+                        response_text=validated_response.final_text,
+                        raw_response=model_turn_response_to_dict(
+                            validated_response
                         ),
                     )
                 )
@@ -1001,8 +1127,10 @@ def run_semantic_reconciler_batch(
                     )
                 )
             break
-        if not isinstance(response, ModelTurnResponse):
-            message = "provider returned an invalid ModelTurnResponse"
+        if validated_response is None:
+            message = response_shape_error or (
+                "provider returned an invalid ModelTurnResponse"
+            )
             failures.append(message)
             attempts.append(
                 ReconcilerAttempt(
@@ -1010,10 +1138,17 @@ def run_semantic_reconciler_batch(
                     status="invalid_response",
                     response_kind=ModelResponseKind.INVALID.value,
                     error=message,
+                    response_text=(
+                        response.final_text
+                        if isinstance(response, ModelTurnResponse)
+                        and isinstance(response.final_text, str)
+                        else None
+                    ),
                 )
             )
             messages.append(_rejection_message(message))
             continue
+        response = validated_response
         provider_name = response.provider_name or provider_name
         resolved_model = response.model or resolved_model
         if response.kind is not ModelResponseKind.FINAL or response.final_text is None:
@@ -1034,7 +1169,10 @@ def run_semantic_reconciler_batch(
             messages.append(_rejection_message(message))
             continue
         try:
-            proposal = parse_semantic_proposal(response.final_text, batch)
+            proposal = _parse_semantic_proposal(
+                response.final_text,
+                validation_context,
+            )
         except SemanticProposalParseError as error:
             message = str(error)
             failures.append(message)
@@ -2214,6 +2352,26 @@ def _stable_conflict_id(candidate_ids: Sequence[str], issue: str) -> str:
 def _is_test_observation(source: str) -> bool:
     normalized = source.casefold()
     return "test" in normalized or "quality" in normalized or "gate" in normalized
+
+
+def _validated_model_turn_response(
+    value: object,
+) -> tuple[ModelTurnResponse | None, str | None]:
+    if not isinstance(value, ModelTurnResponse):
+        return None, "provider returned an invalid ModelTurnResponse"
+    if not isinstance(value.kind, ModelResponseKind):
+        return None, "provider returned a ModelTurnResponse with an invalid kind"
+    if not isinstance(value.tool_calls, list):
+        return None, "provider returned a ModelTurnResponse with invalid tool_calls"
+    if value.final_text is not None and not isinstance(value.final_text, str):
+        return None, "provider returned a ModelTurnResponse with invalid final_text"
+    if value.error is not None and not isinstance(value.error, str):
+        return None, "provider returned a ModelTurnResponse with an invalid error"
+    if not isinstance(value.raw, dict):
+        return None, "provider returned a ModelTurnResponse with invalid raw data"
+    if not isinstance(value.provider_name, str) or not isinstance(value.model, str):
+        return None, "provider returned a ModelTurnResponse with invalid metadata"
+    return value, None
 
 
 def _adapter_name(adapter: object) -> str:

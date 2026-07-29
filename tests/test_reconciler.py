@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 
@@ -329,6 +330,113 @@ def test_full_packet_parser_keeps_complete_observation_allowlist():
     assert proposal.rejections[0].candidate_id == blocker.finding_id
 
 
+def test_reconciler_rejects_ref_exposed_only_after_sent_snapshot():
+    blocker, _, _, batch = _two_batch_packet()
+
+    def expose_hidden_ref(_request):
+        batch.packet.candidate_catalog[blocker.finding_id].evidence_refs.append(
+            "O-batch-hidden-quality"
+        )
+        return ModelTurnResponse(
+            kind=ModelResponseKind.FINAL,
+            final_text=json.dumps(
+                _proposal_payload(
+                    [blocker],
+                    groups=[],
+                    rejections=[
+                        {
+                            "candidate_id": blocker.finding_id,
+                            "reason": "contradicted_by_test",
+                            "rationale": "A hidden quality gate contradicts the blocker.",
+                            "decision_refs": ["O-batch-hidden-quality"],
+                        }
+                    ],
+                )
+            ),
+        )
+
+    adapter = FakeToolCallingAdapter([expose_hidden_ref])
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=1,
+    )
+
+    sent_packet = json.loads(adapter.requests[0].messages[0]["content"])
+    assert "O-batch-hidden-quality" not in sent_packet["observation_catalog"]
+    assert run.status == "fallback"
+    assert [attempt.status for attempt in run.attempts] == ["parse_error"]
+    assert "unknown Observation" in run.failure_reason
+
+
+def test_reconciler_uses_observation_source_from_sent_snapshot():
+    blocker, _, _, batch = _two_batch_packet()
+
+    def change_source(_request):
+        observation = batch.packet.observation_catalog["O-batch-blocker"]
+        batch.packet.observation_catalog["O-batch-blocker"] = replace(
+            observation,
+            source="quality_gate",
+        )
+        return ModelTurnResponse(
+            kind=ModelResponseKind.FINAL,
+            final_text=json.dumps(
+                _proposal_payload(
+                    [blocker],
+                    groups=[],
+                    rejections=[
+                        {
+                            "candidate_id": blocker.finding_id,
+                            "reason": "contradicted_by_test",
+                            "rationale": "The mutated source marks this as quality evidence.",
+                            "decision_refs": ["O-batch-blocker"],
+                        }
+                    ],
+                )
+            ),
+        )
+
+    adapter = FakeToolCallingAdapter([change_source])
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=1,
+    )
+
+    sent_packet = json.loads(adapter.requests[0].messages[0]["content"])
+    assert sent_packet["observation_catalog"]["O-batch-blocker"]["source"] == (
+        "read_range"
+    )
+    assert run.status == "fallback"
+    assert [attempt.status for attempt in run.attempts] == ["parse_error"]
+    assert "requires a test or quality Observation" in run.failure_reason
+
+
+def test_reconciler_does_not_reread_packet_mappings_deleted_after_send():
+    blocker, _, _, batch = _two_batch_packet()
+
+    def delete_sent_entries(_request):
+        del batch.packet.candidate_catalog[blocker.finding_id]
+        del batch.packet.observation_catalog["O-batch-blocker"]
+        return ModelTurnResponse(
+            kind=ModelResponseKind.FINAL,
+            final_text=json.dumps(_proposal_payload([blocker])),
+        )
+
+    adapter = FakeToolCallingAdapter([delete_sent_entries])
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=1,
+    )
+
+    assert run.status == "accepted"
+    assert [attempt.status for attempt in run.attempts] == ["accepted"]
+
+
 def test_runtime_preserves_supported_high_severity_rejection():
     candidate = _candidate(
         "0",
@@ -582,6 +690,65 @@ def test_reconciler_retries_malformed_responses_then_falls_back_conservatively()
         "Candidate"
     ]
     assert run.supplemental_requests == ()
+
+
+def test_reconciler_retries_malformed_typed_response_then_accepts():
+    candidate = _candidate("typed-retry", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    adapter = FakeToolCallingAdapter(
+        [
+            ModelTurnResponse(
+                kind="final",
+                final_text=json.dumps(_proposal_payload([candidate])),
+            ),
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(_proposal_payload([candidate])),
+            ),
+        ]
+    )
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=2,
+    )
+
+    assert run.status == "accepted"
+    assert len(adapter.requests) == 2
+    assert [attempt.status for attempt in run.attempts] == [
+        "invalid_response",
+        "accepted",
+    ]
+
+
+def test_reconciler_bounds_malformed_typed_response_attempts_before_fallback():
+    candidate = _candidate("typed-fallback", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    malformed = ModelTurnResponse(
+        kind="final",
+        final_text=json.dumps(_proposal_payload([candidate])),
+    )
+    adapter = FakeToolCallingAdapter([malformed, malformed])
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=2,
+    )
+
+    assert run.status == "fallback"
+    assert len(adapter.requests) == 2
+    assert [attempt.status for attempt in run.attempts] == [
+        "invalid_response",
+        "invalid_response",
+    ]
+    assert all(
+        attempt.response_kind == ModelResponseKind.INVALID.value
+        for attempt in run.attempts
+    )
 
 
 def test_reconciler_falls_back_when_provider_returns_after_elapsed_budget():
