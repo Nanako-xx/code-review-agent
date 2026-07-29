@@ -206,13 +206,23 @@ _REVIEWER_TOOL_DEFINITIONS = (
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "assignment_id": {"type": "string", "maxLength": 512},
-                "path": {"type": "string", "maxLength": 1024},
-                "symbol": {"type": "string", "maxLength": 512},
-                "contract": {"type": "string", "maxLength": 512},
-                "query": {"type": "string", "maxLength": 2048},
+                "assignment_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512,
+                },
+                "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
+                "contract": {"type": "string", "minLength": 1, "maxLength": 512},
+                "query": {"type": "string", "minLength": 1, "maxLength": 2048},
             },
             "required": ["assignment_id"],
+            "anyOf": [
+                {"required": ["path"]},
+                {"required": ["symbol"]},
+                {"required": ["contract"]},
+                {"required": ["query"]},
+            ],
         },
     ),
 )
@@ -477,6 +487,7 @@ def build_reviewer_envelope(
             if name == "query_project_memory":
                 schema["properties"]["assignment_id"] = {
                     "type": "string",
+                    "minLength": 1,
                     "const": memory_assignment_id,
                 }
             definition["parameters"] = schema

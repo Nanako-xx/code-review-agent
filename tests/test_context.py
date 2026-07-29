@@ -868,6 +868,7 @@ def test_memory_query_tool_exposes_and_schema_binds_assignment_id_only_with_snap
     assert schema["required"] == ["assignment_id"]
     assert schema["properties"]["assignment_id"] == {
         "type": "string",
+        "minLength": 1,
         "const": "assignment-memory",
     }
 
@@ -881,6 +882,36 @@ def test_memory_query_tool_exposes_and_schema_binds_assignment_id_only_with_snap
     )
     assert legacy.tools == []
     assert legacy.parameters["tool_choice"] == "none"
+
+
+def test_memory_query_tool_schema_requires_non_empty_query_selector():
+    assignment = _context_assignment()
+    snapshot = _memory_snapshot()
+    service = SnapshotMemoryQueryService(
+        snapshot,
+        assignment_id="assignment-memory",
+        assignment_scope=MemoryScope(paths=("app.py",), contracts=("intent_alignment",)),
+    )
+    envelope = build_reviewer_envelope(
+        assignment=assignment,
+        intent=_context_intent(),
+        code_snippets={},
+        observations={},
+        trace_id="trace-memory-query-schema",
+        allowed_tools=("query_project_memory",),
+        memory_context=ReviewerMemoryContext(snapshot=snapshot, query_service=service),
+    )
+
+    schema = envelope.tools[0]["parameters"]
+    assert schema["required"] == ["assignment_id"]
+    for field in ("assignment_id", "path", "symbol", "contract", "query"):
+        assert schema["properties"][field]["minLength"] == 1
+    assert schema["anyOf"] == [
+        {"required": ["path"]},
+        {"required": ["symbol"]},
+        {"required": ["contract"]},
+        {"required": ["query"]},
+    ]
 
 
 def test_local_only_memory_is_not_rendered_in_remote_messages():

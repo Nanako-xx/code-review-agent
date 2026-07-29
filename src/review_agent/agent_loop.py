@@ -142,6 +142,7 @@ def run_reviewer_agent_loop(
     tool_call_count = 0
     last_response: ModelTurnResponse | None = None
     runtime_failures: list[str] = []
+    json_finalization_attempted = False
 
     for turn_index in range(assignment.max_turns):
         budget_reason = budget_reason_before_call(assignment, runtime)
@@ -395,6 +396,33 @@ def run_reviewer_agent_loop(
                 error_message = f"final response parse failed: {error}"
                 runtime_failures.append(error_message)
                 repaired_parse_error = error_message
+                if json_finalization_attempted:
+                    finalization_error_message = (
+                        "final response JSON finalization already attempted"
+                    )
+                    runtime_failures.append(finalization_error_message)
+                    turns.append(
+                        AgentLoopTurn(
+                            turn_index=turn_index,
+                            response_kind=response.kind.value,
+                            error=finalization_error_message,
+                            provider_attempts=provider_attempts,
+                        )
+                    )
+                    result = _failed_result(
+                        finalization_error_message,
+                        _authorized_observation_ids(gateway, observations),
+                        runtime_failures,
+                    )
+                    return _run_from_parts(
+                        envelope,
+                        response,
+                        result,
+                        trace_id,
+                        turns,
+                        runtime,
+                        ReviewerTerminationReason.RUNTIME_FAILURE,
+                    )
                 if len(provider_attempts) >= assignment.max_provider_attempts:
                     finalization_error_message = (
                         "final response JSON finalization skipped: "
@@ -447,6 +475,7 @@ def run_reviewer_agent_loop(
                         runtime_failures,
                     )
 
+                json_finalization_attempted = True
                 finalization = _finalize_reviewer_json(
                     adapter=adapter,
                     envelope=envelope,

@@ -621,6 +621,60 @@ def test_agent_loop_performs_one_no_tool_json_finalization_after_parse_failure(
     assert run.runtime.model_turns == 1
 
 
+def test_agent_loop_does_not_finalize_json_again_after_rejected_repair(git_repo):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(
+        git_repo / ".review-agent" / "runs" / "review-json-finalization-once"
+    )
+    gateway = ToolGateway(git_repo, base, base, observation_store)
+    repaired_json = json.dumps(
+        {
+            "contract_assessments": [],
+            "confirmed_findings": [],
+            "rejected_hypotheses": [],
+            "uncertainties": [],
+            "observation_refs": [],
+            "investigation_summary": "Repaired but incomplete.",
+            "status": "completed",
+        }
+    )
+    extra_repair = ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=repaired_json,
+    )
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="first Markdown final",
+            ),
+            extra_repair,
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="second Markdown final",
+            ),
+            extra_repair,
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=make_assignment("Core Reviewer"),
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-json-finalization-once-reviewer-0",
+    )
+
+    assert len(adapter.requests) == 3
+    assert run.result.status.value == "failed"
+    assert "final response JSON finalization already attempted" in run.result.uncertainties
+    assert "final response JSON finalization already attempted" in (
+        run.trace.turns[-1].error or ""
+    )
+
+
 def test_agent_loop_checks_time_budget_when_json_finalization_raises(
     git_repo,
     monkeypatch,
