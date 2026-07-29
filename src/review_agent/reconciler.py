@@ -1138,12 +1138,6 @@ def run_semantic_reconciler_batch(
                     status="invalid_response",
                     response_kind=ModelResponseKind.INVALID.value,
                     error=message,
-                    response_text=(
-                        response.final_text
-                        if isinstance(response, ModelTurnResponse)
-                        and isinstance(response.final_text, str)
-                        else None
-                    ),
                 )
             )
             messages.append(_rejection_message(message))
@@ -1175,6 +1169,23 @@ def run_semantic_reconciler_batch(
             )
         except SemanticProposalParseError as error:
             message = str(error)
+            failures.append(message)
+            attempts.append(
+                ReconcilerAttempt(
+                    attempt_index=attempt_index,
+                    status="parse_error",
+                    response_kind=response.kind.value,
+                    error=message,
+                    response_text=response.final_text,
+                    raw_response=model_turn_response_to_dict(response),
+                )
+            )
+            messages.append(_rejection_message(message))
+            continue
+        try:
+            _persistence_json_bytes(proposal.to_dict())
+        except (RecursionError, TypeError, ValueError, UnicodeEncodeError):
+            message = "semantic proposal is not persistence-safe"
             failures.append(message)
             attempts.append(
                 ReconcilerAttempt(
@@ -2377,23 +2388,43 @@ def _validated_model_turn_response(
         )
     except (RecursionError, TypeError, ValueError):
         return None, "provider returned a ModelTurnResponse with invalid raw data"
-    return (
-        ModelTurnResponse(
-            kind=value.kind,
-            tool_calls=[],
-            final_text=value.final_text,
-            error=value.error,
-            raw=safe_raw,
-            provider_name=value.provider_name,
-            model=value.model,
-        ),
-        None,
+    safe_response = ModelTurnResponse(
+        kind=value.kind,
+        tool_calls=[],
+        final_text=value.final_text,
+        error=value.error,
+        raw=safe_raw,
+        provider_name=value.provider_name,
+        model=value.model,
     )
+    try:
+        _persistence_json_bytes(model_turn_response_to_dict(safe_response))
+    except (RecursionError, TypeError, ValueError, UnicodeEncodeError):
+        return None, (
+            "provider returned a ModelTurnResponse that is not persistence-safe"
+        )
+    return safe_response, None
+
+
+def _persistence_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 def _adapter_name(adapter: object) -> str:
     value = getattr(adapter, "provider_name", None)
-    return value if isinstance(value, str) and value else type(adapter).__name__
+    if isinstance(value, str) and value:
+        try:
+            _persistence_json_bytes(value)
+        except (RecursionError, TypeError, ValueError, UnicodeEncodeError):
+            pass
+        else:
+            return value
+    return type(adapter).__name__
 
 
 def _rejection_message(message: str) -> dict[str, str]:

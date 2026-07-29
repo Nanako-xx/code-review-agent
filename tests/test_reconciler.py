@@ -46,6 +46,21 @@ class _ControllableClock:
         return self.now
 
 
+def _assert_batch_run_is_utf8_persistable(run) -> None:
+    payloads = [
+        run.decision_to_dict(),
+        run.raw_response_to_dict(),
+        *(attempt.to_dict() for attempt in run.attempts),
+    ]
+    for payload in payloads:
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+        ).encode("utf-8")
+
+
 def _finding_id(suffix: str) -> str:
     return "F-" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()[:32]
 
@@ -849,6 +864,102 @@ def test_reconciler_retries_unsafe_raw_at_persistence_boundary(unsafe_raw):
     assert run.attempts[0].error == (
         "provider returned a ModelTurnResponse with invalid raw data"
     )
+
+
+def test_reconciler_rejects_parsed_proposal_with_lone_surrogate_at_utf8_boundary():
+    candidate = _candidate("proposal-surrogate", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    surrogate = chr(0xD800)
+    payload = _proposal_payload([candidate])
+    payload["summary"] = surrogate
+    final_text = json.dumps(payload)
+    assert final_text.isascii()
+    adapter = FakeToolCallingAdapter(
+        [
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=final_text,
+            )
+        ]
+    )
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=1,
+    )
+
+    assert run.status == "fallback"
+    assert run.proposal is None
+    assert [attempt.status for attempt in run.attempts] == ["parse_error"]
+    assert run.attempts[0].error == "semantic proposal is not persistence-safe"
+    assert surrogate not in (run.failure_reason or "")
+    assert surrogate not in (run.attempts[0].error or "")
+    _assert_batch_run_is_utf8_persistable(run)
+
+
+@pytest.mark.parametrize("unsafe_field", ["raw", "model", "final_text"])
+def test_reconciler_rejects_response_surrogate_at_utf8_boundary(unsafe_field):
+    candidate = _candidate(f"response-surrogate-{unsafe_field}", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    surrogate = chr(0xD800)
+    response_values = {
+        "kind": ModelResponseKind.FINAL,
+        "final_text": json.dumps(_proposal_payload([candidate])),
+    }
+    if unsafe_field == "raw":
+        response_values["raw"] = {"unsafe": surrogate}
+    else:
+        response_values[unsafe_field] = surrogate
+    adapter = FakeToolCallingAdapter([ModelTurnResponse(**response_values)])
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=1,
+    )
+
+    assert run.status == "fallback"
+    assert run.proposal is None
+    assert [attempt.status for attempt in run.attempts] == ["invalid_response"]
+    assert run.attempts[0].error == (
+        "provider returned a ModelTurnResponse that is not persistence-safe"
+    )
+    assert run.attempts[0].response_text is None
+    assert surrogate not in (run.failure_reason or "")
+    assert surrogate not in (run.attempts[0].error or "")
+    _assert_batch_run_is_utf8_persistable(run)
+
+
+def test_reconciler_keeps_fallback_safe_when_adapter_metadata_has_surrogate():
+    candidate = _candidate("adapter-surrogate", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    surrogate = chr(0xD800)
+
+    class SurrogateMetadataAdapter:
+        provider_name = surrogate
+
+        def complete_turn(self, _request):
+            return ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(_proposal_payload([candidate])),
+                provider_name=surrogate,
+            )
+
+    run = run_semantic_reconciler_batch(
+        SurrogateMetadataAdapter(),
+        batch,
+        max_provider_attempts=1,
+    )
+
+    assert run.status == "fallback"
+    assert [attempt.status for attempt in run.attempts] == ["invalid_response"]
+    assert surrogate not in run.provider_name
+    assert surrogate not in (run.failure_reason or "")
+    _assert_batch_run_is_utf8_persistable(run)
 
 
 def test_reconciler_falls_back_when_provider_returns_after_elapsed_budget():
