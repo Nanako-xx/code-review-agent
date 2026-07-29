@@ -230,7 +230,7 @@ _REVIEWER_TOOL_DEFINITIONS = (
                     "maxLength": 512,
                     "pattern": r"\S",
                 },
-                "query": {"type": "string", "minLength": 1, "maxLength": 2048},
+                "query": {"type": "string", "maxLength": 2048},
             },
             "required": ["assignment_id"],
             "anyOf": [

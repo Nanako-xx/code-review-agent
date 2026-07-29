@@ -905,10 +905,14 @@ def test_memory_query_tool_schema_requires_non_empty_query_selector():
 
     schema = envelope.tools[0]["parameters"]
     assert schema["required"] == ["assignment_id"]
-    for field in ("assignment_id", "path", "symbol", "contract", "query"):
+    for field in ("assignment_id", "path", "symbol", "contract"):
         assert schema["properties"][field]["minLength"] == 1
     for field in ("assignment_id", "path", "symbol", "contract"):
         assert schema["properties"][field]["pattern"] == r"\S"
+    assert schema["properties"]["query"] == {
+        "type": "string",
+        "maxLength": 2048,
+    }
     assert "pattern" not in schema["properties"]["query"]
     assert schema["anyOf"] == [
         {"required": ["path"]},
