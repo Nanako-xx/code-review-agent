@@ -369,14 +369,31 @@ def test_reconciler_system_prompt_declares_the_exact_proposal_contract():
         "summary",
     ):
         assert field_name in system
-    for rule in (
+    for requirement in (
+        "exactly one json object",
+        "no markdown or commentary",
+        "top-level object has exactly these fields",
+        "canonical_groups: an array of objects. each object has exactly member_ids, representative_id, canonical_claim, rationale, supporting_refs, and proposed_confidence.",
+        "proposed_confidence is high, medium, or low",
+        "rejections: an array of objects. each object has exactly candidate_id, reason, rationale, and decision_refs.",
+        "reason is unsupported_claim, contradicted_by_test, or outside_review_scope",
+        "disagreements: an array of objects. each object has exactly disagreement_id, candidate_ids, status, issue, resolution, and decision_refs.",
+        "status is resolved, needs_investigation, or unresolved",
+        "supplemental_requests: an array of objects. each object has exactly disagreement_id, question, required_evidence, preferred_perspective, related_candidate_ids, and reason_refs.",
+        "uncertainties: an array of strings",
+        "summary: a non-empty string",
+        "each candidate_id must appear in exactly one canonical_groups member_ids array or exactly one rejection, never both",
+        "supporting_refs must come from the grouped candidates",
+        "candidate ids, decision_refs, supporting_refs, and reason_refs must come from the packet allowlists",
+        "resolved and unresolved disagreements require none",
+        "do not add fields or invent ids, observations, findings, or facts",
         "disposed exactly once",
         "representative_id must belong to member_ids",
         "do not wrap the json in markdown",
         "needs_investigation",
         "exactly one matching supplemental request",
     ):
-        assert rule in system
+        assert requirement in system
 
 
 def test_reconciler_retries_malformed_responses_then_falls_back_conservatively():
