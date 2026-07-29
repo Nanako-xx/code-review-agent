@@ -21,7 +21,7 @@ The change must:
 - request JSON object mode only for this no-tool model turn;
 - retain strict Runtime parsing, candidate accounting, Observation-reference validation, conservative retry, and deterministic fallback;
 - record the JSON-mode request in the immutable invocation envelope;
-- configure the DeepSeek baseline with an 8192-token Semantic Reconciler output limit and a 240-second stage elapsed limit;
+- configure the DeepSeek baseline with an 8192-token Semantic Reconciler output limit, exactly two provider attempts, and a 240-second stage elapsed limit;
 - leave shared `ModelStageConfig` defaults unchanged, because baseline budgets are part of the evaluated Agent identity rather than universal provider defaults.
 
 The live smoke succeeds when every Reviewer result remains structurally valid and Semantic Reconciliation no longer falls back because of timeout, output truncation, invalid JSON, or an undocumented response shape. An overall `blocked` result remains legitimate when the only blocker is an insufficient Intent Packet.
@@ -67,24 +67,41 @@ If a provider does not support the configured JSON mode or returns an invalid pr
 
 ## 5. Baseline budgets
 
-The DeepSeek baseline Agent snapshot will include these current-Agent adapter and review arguments:
+The direct-review DeepSeek baseline will include all four frozen arguments explicitly:
 
 ```text
 --memory-mode=off
 --semantic-reconciler-max-output-tokens=8192
+--semantic-reconciler-max-provider-attempts=2
 --semantic-reconciler-max-elapsed-seconds=240
 ```
 
-Evaluation `prepare` must explicitly freeze memory mode off in the current-Agent adapter
-snapshot. Memory off prevents prior local project Memory from changing diagnostic or
-baseline inputs, and prevents smoke or evaluation runs from proposing or writing Memory.
+Evaluation `prepare` will encode the same evaluated Agent identity explicitly in the
+current-Agent snapshot:
+
+```text
+--memory-mode=off
+--agent-argument=--semantic-reconciler-max-output-tokens=8192
+--agent-argument=--semantic-reconciler-max-provider-attempts=2
+--agent-argument=--semantic-reconciler-max-elapsed-seconds=240
+```
+
+Memory off prevents prior local project Memory from changing diagnostic or baseline
+inputs, and prevents smoke or evaluation runs from proposing or writing Memory.
 Reviewer count is not frozen: accepted model Risk feeds the local Runtime `ReviewProfile`,
 so actual reviewer depth remains risk-dependent. Do not change global `ModelStageConfig`
 defaults.
 
-`max_provider_attempts` remains 2. The OpenAI-compatible adapter retains its 180-second per-request ceiling, while the 240-second stage budget leaves bounded time for a second attempt after an early parse or provider failure.
+`--semantic-reconciler-max-provider-attempts=2` is frozen evaluated-Agent identity
+configuration, not a value inherited from the current shared default. The
+OpenAI-compatible adapter retains its 180-second per-request ceiling, while the 240-second
+stage budget leaves bounded time for a second attempt after an early parse or provider
+failure.
 
-The global `ModelStageConfig` defaults remain 4096 tokens and 60 seconds. Changing them would silently alter Risk Assessor, Portfolio Planner, Memory Curator, existing Sessions, and non-DeepSeek evaluations without evidence that those stages need larger budgets.
+The global `ModelStageConfig` defaults remain unchanged at 4096 tokens, 2 provider
+attempts, and 60 seconds. Changing them would silently alter Risk Assessor, Portfolio
+Planner, Memory Curator, existing Sessions, and non-DeepSeek evaluations without evidence
+that those stages need different budgets.
 
 ## 6. Error handling and privacy
 
@@ -101,9 +118,15 @@ Implementation follows a minimal red-green cycle:
 1. Add a failing test proving the Reconciler request contains `response_format=json_object` and that its System Prompt exposes the exact field contract and accounting rules.
 2. Make the smallest production change that satisfies the test.
 3. Run focused Reconciler and adapter tests, then the complete local regression suite.
+   The local direct malformed-finalization regression must prove this exact terminal path:
+   the initial Reviewer `FINAL` is non-JSON; the sole JSON finalization is also non-JSON;
+   total provider requests equal 2; the terminal Reviewer status is `failed`; the
+   finalization parse diagnostic is preserved; and no third provider attempt occurs.
 4. Replay the existing `core-py-001` Reconciler packet with 8192 tokens and a 240-second stage budget.
 5. Run one complete `core-py-001` smoke with the same frozen Agent arguments and inspect
-   every Runtime-scheduled Reviewer, Reconciler, Completion, and Final Risk artifact.
+   every Runtime-scheduled Reviewer, Reconciler, Completion, and Final Risk artifact. The
+   smoke validates the normal Reviewer protocol and need not deliberately trigger the
+   malformed-finalization path proved by the local direct regression.
    Exactly one bounded, audited JSON finalization is acceptable when the terminal
    structured Reviewer result is `completed` or `partial` and provider-attempt, token,
    and elapsed budgets are respected. Unrecovered parser, provider, or budget errors

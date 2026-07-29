@@ -4,7 +4,7 @@
 
 **Goal:** Make the model-backed Semantic Reconciler reliably return Runtime-valid structured output for the `core-py-001` DeepSeek smoke without weakening strict reconciliation or changing shared model-stage defaults.
 
-**Architecture:** Keep the Semantic Reconciler and unified model adapter boundary unchanged. Strengthen the Reconciler System Prompt with the exact project response protocol, send the existing provider-neutral `response_format=json_object` hint on its no-tool turn, and freeze DeepSeek-specific 8192-token/240-second limits in the evaluated Agent arguments rather than global defaults. Runtime parsing, candidate accounting, bounded retry, deterministic fallback, and Completion remain authoritative.
+**Architecture:** Keep the Semantic Reconciler and unified model adapter boundary unchanged. Strengthen the Reconciler System Prompt with the exact project response protocol, send the existing provider-neutral `response_format=json_object` hint on its no-tool turn, and freeze DeepSeek-specific 8192-token/two-attempt/240-second limits in the evaluated Agent arguments rather than global defaults. Runtime parsing, candidate accounting, bounded retry, deterministic fallback, and Completion remain authoritative.
 
 **Tech Stack:** Python 3.12, dataclasses, pytest, the existing `ModelAdapter` protocol, OpenAI-compatible HTTP transport, PowerShell, Git.
 
@@ -352,7 +352,12 @@ $env:PYTHONPATH='src'
   --basetemp 'D:\Agent\code review agent\.worktrees\real-model-baseline\.test-tmp\focused-full'
 ```
 
-Expected: all focused tests pass.
+Expected: all focused tests pass. The local direct regression
+`test_agent_loop_fails_after_single_malformed_json_finalization_response` is an acceptance
+gate: the initial Reviewer `FINAL` is non-JSON, the sole JSON finalization is also
+non-JSON, total provider requests equal 2, terminal status is `failed`, the finalization
+parse diagnostic is preserved in the result and trace, and no third provider attempt
+occurs.
 
 - [ ] **Step 2: Run the complete local test suite**
 
@@ -544,6 +549,7 @@ $request = Get-Content -LiteralPath (Join-Path $oldRun 'request.json') -Raw | Co
   --portfolio-planner-mode model `
   --semantic-reconciler-mode model `
   --semantic-reconciler-max-output-tokens 8192 `
+  --semantic-reconciler-max-provider-attempts=2 `
   --semantic-reconciler-max-elapsed-seconds 240 `
   --memory-mode off `
   --non-interactive
@@ -596,6 +602,9 @@ $reviewers | Format-Table -AutoSize
 
 Expected:
 
+- this real-model smoke validates the normal Reviewer protocol and does not deliberately
+  trigger the malformed-finalization failure path; the local direct regression in Task 4
+  proves that path;
 - all Runtime-scheduled Reviewer results are parseable `completed` or `partial`, not `failed`;
 - medium risk may validly schedule two reviewers; high or critical risk may schedule more;
 - `semantic_status` and `semantic_model_status` are not `fallback`;
@@ -618,17 +627,21 @@ Expected:
 
 - [ ] **Step 1: Record the exact arguments for the later diagnostic/baseline `prepare` command**
 
-When the formal evaluation Run is prepared, include all three exact arguments in the immutable current-Agent snapshot:
+When the formal evaluation Run is prepared, include all four exact arguments in the immutable current-Agent snapshot:
 
 ```powershell
 --memory-mode=off
 --agent-argument=--semantic-reconciler-max-output-tokens=8192
+--agent-argument=--semantic-reconciler-max-provider-attempts=2
 --agent-argument=--semantic-reconciler-max-elapsed-seconds=240
 ```
 
-`memory_mode` is frozen in the adapter parameters, while the two semantic flags are
+`memory_mode` is frozen in the adapter parameters, while the three semantic flags are
 `review_arguments`. Expected: inspection of the prepared Agent snapshot verifies
-`adapter.memory_mode` is `off` and both exact review argument strings exist. The formal
+`adapter.memory_mode` is `off` and all three exact review argument strings exist.
+`--semantic-reconciler-max-provider-attempts=2` is frozen evaluated-Agent identity
+configuration and must not be inferred from the current default; shared `ModelStageConfig`
+defaults remain unchanged. The formal
 10-case x 3-trial baseline remains outside this hardening plan.
 
 - [ ] **Step 2: Run final repository checks**
