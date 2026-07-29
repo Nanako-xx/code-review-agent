@@ -962,6 +962,87 @@ def test_reconciler_keeps_fallback_safe_when_adapter_metadata_has_surrogate():
     _assert_batch_run_is_utf8_persistable(run)
 
 
+def test_reconciler_sanitizes_surrogate_parse_diagnostic_at_artifact_boundary():
+    candidate = _candidate("parse-diagnostic-surrogate", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    surrogate = chr(0xD800)
+    payload = _proposal_payload([candidate])
+    payload[surrogate] = "unexpected"
+    final_text = json.dumps(payload)
+    assert final_text.isascii()
+    adapter = FakeToolCallingAdapter(
+        [
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=final_text,
+            )
+        ]
+    )
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=1,
+    )
+
+    assert run.status == "fallback"
+    assert [attempt.status for attempt in run.attempts] == ["parse_error"]
+    assert run.attempts[0].error == (
+        "semantic proposal parsing failed; diagnostic was not persistence-safe"
+    )
+    assert surrogate not in (run.failure_reason or "")
+    assert surrogate not in (run.attempts[0].error or "")
+    _assert_batch_run_is_utf8_persistable(run)
+
+
+def test_reconciler_sanitizes_surrogate_provider_exception_diagnostic():
+    candidate = _candidate("provider-diagnostic-surrogate", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    surrogate = chr(0xD800)
+
+    def raise_with_surrogate(_request):
+        raise RuntimeError("provider failure " + surrogate)
+
+    adapter = FakeToolCallingAdapter([raise_with_surrogate])
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=1,
+    )
+
+    assert run.status == "fallback"
+    assert [attempt.status for attempt in run.attempts] == ["provider_error"]
+    assert run.attempts[0].error == (
+        "provider invocation failed; diagnostic was not persistence-safe"
+    )
+    assert surrogate not in (run.failure_reason or "")
+    assert surrogate not in (run.attempts[0].error or "")
+    _assert_batch_run_is_utf8_persistable(run)
+
+
+def test_reconciler_preserves_specific_ascii_parse_diagnostic():
+    candidate = _candidate("ascii-parse-diagnostic", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    adapter = FakeToolCallingAdapter(
+        [ModelTurnResponse(kind=ModelResponseKind.FINAL, final_text="not-json")]
+    )
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=1,
+    )
+
+    assert run.status == "fallback"
+    assert run.attempts[0].status == "parse_error"
+    assert run.attempts[0].error == "invalid JSON: Expecting value"
+    _assert_batch_run_is_utf8_persistable(run)
+
+
 def test_reconciler_falls_back_when_provider_returns_after_elapsed_budget():
     candidate = _candidate("elapsed-return", claim="Candidate")
     _, _, packet = _packet([candidate])

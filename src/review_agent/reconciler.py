@@ -726,9 +726,17 @@ def _parse_semantic_proposal(
             parse_constant=_reject_non_standard_constant,
         )
     except json.JSONDecodeError as error:
-        raise SemanticProposalParseError(f"invalid JSON: {error.msg}") from error
+        message = _safe_diagnostic(
+            f"invalid JSON: {error.msg}",
+            "semantic proposal parsing failed; diagnostic was not persistence-safe",
+        )
+        raise SemanticProposalParseError(message) from error
     except ValueError as error:
-        raise SemanticProposalParseError(f"invalid JSON: {error}") from error
+        message = _safe_diagnostic(
+            f"invalid JSON: {error}",
+            "semantic proposal parsing failed; diagnostic was not persistence-safe",
+        )
+        raise SemanticProposalParseError(message) from error
     try:
         root = _object(payload, "proposal")
         _exact(
@@ -786,7 +794,11 @@ def _parse_semantic_proposal(
         )
         return proposal
     except ValueError as error:
-        raise SemanticProposalParseError(str(error)) from error
+        message = _safe_diagnostic(
+            str(error),
+            "semantic proposal parsing failed; diagnostic was not persistence-safe",
+        )
+        raise SemanticProposalParseError(message) from error
 
 
 def _semantic_validation_context_from_packet_payload(
@@ -1080,7 +1092,10 @@ def run_semantic_reconciler_batch(
             response = adapter.complete_turn(request)
         except Exception as error:
             elapsed_after = _elapsed(clock, started)
-            message = f"provider invocation failed: {type(error).__name__}: {error}"
+            message = _safe_diagnostic(
+                f"provider invocation failed: {type(error).__name__}: {error}",
+                "provider invocation failed; diagnostic was not persistence-safe",
+            )
             failures.append(message)
             attempts.append(
                 ReconcilerAttempt(
@@ -1168,7 +1183,10 @@ def run_semantic_reconciler_batch(
                 validation_context,
             )
         except SemanticProposalParseError as error:
-            message = str(error)
+            message = _safe_diagnostic(
+                str(error),
+                "semantic proposal parsing failed; diagnostic was not persistence-safe",
+            )
             failures.append(message)
             attempts.append(
                 ReconcilerAttempt(
@@ -2413,6 +2431,16 @@ def _persistence_json_bytes(value: Any) -> bytes:
         allow_nan=False,
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _safe_diagnostic(message: object, fallback: str) -> str:
+    if not isinstance(message, str):
+        return fallback
+    try:
+        _persistence_json_bytes(message)
+    except (RecursionError, TypeError, ValueError, UnicodeEncodeError):
+        return fallback
+    return message
 
 
 def _adapter_name(adapter: object) -> str:
