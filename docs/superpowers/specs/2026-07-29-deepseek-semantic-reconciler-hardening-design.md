@@ -6,7 +6,7 @@
 
 ## 1. Problem statement
 
-The first complete `core-py-001` DeepSeek run proved that all four Reviewers can return parseable, contract-valid `partial` results. The run still used deterministic Semantic Reconciler fallback for two independent reasons found by bounded replay:
+The first complete `core-py-001` DeepSeek run proved that all Runtime-scheduled Reviewers can return parseable, contract-valid `partial` results. The run still used deterministic Semantic Reconciler fallback for two independent reasons found by bounded replay:
 
 1. The configured Semantic Reconciler stage allowed only 60 elapsed seconds. DeepSeek required approximately 65-84 seconds per response, so the original request was terminated at 60 seconds before a second attempt could start.
 2. A 4096-token response was truncated. At 8192 tokens the response completed, but it invented field names such as `groups` because the System Prompt named `semantic_reconciliation_proposal_v1` without defining its exact wire shape.
@@ -67,12 +67,15 @@ If a provider does not support the configured JSON mode or returns an invalid pr
 
 ## 5. Baseline budgets
 
-The DeepSeek baseline Agent snapshot will include these current-Agent review arguments:
+The DeepSeek baseline Agent snapshot will include these current-Agent adapter and review arguments:
 
 ```text
+--memory-mode=off
 --semantic-reconciler-max-output-tokens=8192
 --semantic-reconciler-max-elapsed-seconds=240
 ```
+
+Evaluation `prepare` must explicitly freeze memory mode off in the current-Agent adapter snapshot. Memory off prevents prior local project Memory from changing diagnostic or baseline inputs, and prevents smoke or evaluation runs from proposing or writing Memory. Reviewer count is not frozen: accepted model Risk feeds the local Runtime `ReviewProfile`, so actual reviewer depth remains risk-dependent. Do not change global `ModelStageConfig` defaults.
 
 `max_provider_attempts` remains 2. The OpenAI-compatible adapter retains its 180-second per-request ceiling, while the 240-second stage budget leaves bounded time for a second attempt after an early parse or provider failure.
 
@@ -94,7 +97,7 @@ Implementation follows a minimal red-green cycle:
 2. Make the smallest production change that satisfies the test.
 3. Run focused Reconciler and adapter tests, then the complete local regression suite.
 4. Replay the existing `core-py-001` Reconciler packet with 8192 tokens and a 240-second stage budget.
-5. Run one complete `core-py-001` smoke with the same frozen Agent arguments and inspect Reviewer, Reconciler, Completion, and Final Risk artifacts.
+5. Run one complete `core-py-001` smoke with the same frozen Agent arguments and inspect every Runtime-scheduled Reviewer, Reconciler, Completion, and Final Risk artifact. A bounded and audited one-shot Reviewer JSON finalization diagnostic is acceptable when the final structured result is valid and all budgets are respected. Unrecovered parser, provider, or budget errors remain failures.
 
 Formal 10-case x 3-trial baseline execution is outside this hardening change and starts only after the single-case smoke is clean.
 

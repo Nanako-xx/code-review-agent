@@ -545,6 +545,7 @@ $request = Get-Content -LiteralPath (Join-Path $oldRun 'request.json') -Raw | Co
   --semantic-reconciler-mode model `
   --semantic-reconciler-max-output-tokens 8192 `
   --semantic-reconciler-max-elapsed-seconds 240 `
+  --memory-mode off `
   --non-interactive
 ```
 
@@ -559,13 +560,13 @@ $runsRoot = 'D:\Agent\code review agent\.worktrees\real-model-baseline\.eval-dat
 $run = Get-ChildItem -LiteralPath $runsRoot -Directory |
   Sort-Object LastWriteTime -Descending |
   Select-Object -First 1
-$reviewers = foreach ($i in 0..3) {
-    $result = Get-Content -LiteralPath (Join-Path $run.FullName "reviewer_${i}_result.json") -Raw | ConvertFrom-Json
+$multi = Get-Content -LiteralPath (Join-Path $run.FullName 'multi_reviewer_result.json') -Raw | ConvertFrom-Json
+$reviewers = foreach ($execution in @($multi.executions)) {
+    $i = [int]$execution.reviewer_index
     $trace = Get-Content -LiteralPath (Join-Path $run.FullName "reviewer_${i}_agent_trace.json") -Raw | ConvertFrom-Json
     [pscustomobject]@{
         reviewer = $i
-        status = $result.status
-        findings = @($result.confirmed_findings).Count
+        status = $execution.result.status
         provider_attempts = $trace.provider_attempt_count
         tool_calls = $trace.tool_call_count
         turns = @($trace.turns).Count
@@ -586,15 +587,21 @@ $reviewers | Format-Table -AutoSize
     recommendation = $completion.recommendation
     blockers = @($completion.blockers) -join ' | '
     final_risk = $risk.level
+    reviewer_count = @($multi.executions).Count
+    reviewer_status_counts = ($reviewers | Group-Object status | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
+    memory_mode = $multi.memory_mode
 } | Format-List
 ```
 
 Expected:
 
-- all four Reviewer results are parseable `completed` or `partial`, not `failed`;
+- all Runtime-scheduled Reviewer results are parseable `completed` or `partial`, not `failed`;
+- medium risk may validly schedule two reviewers; high or critical risk may schedule more;
 - `semantic_status` and `semantic_model_status` are not `fallback`;
 - no artifact reports provider timeout, response truncation, invalid JSON, or an undocumented response shape;
-- if Completion remains `blocked`, `Intent Packet insufficient` is its blocker rather than a model protocol failure.
+- recovered initial final-response parse diagnostics are acceptable only when exactly one bounded JSON finalization succeeds and the terminal result is parseable `completed` or `partial`;
+- unrecovered provider timeout, truncation, parser or schema failure, repeated finalization, token failure, or elapsed-budget failure is not acceptable;
+- Semantic Reconciler remains non-fallback; if Completion remains `blocked`, `Intent Packet insufficient` may legitimately be its blocker rather than a model protocol failure.
 
 ### Task 7: Freeze the later evaluation snapshot arguments and complete verification
 
@@ -604,14 +611,15 @@ Expected:
 
 - [ ] **Step 1: Record the exact arguments for the later diagnostic/baseline `prepare` command**
 
-When the formal evaluation Run is prepared, include both arguments in the immutable current-Agent snapshot:
+When the formal evaluation Run is prepared, include all three exact arguments in the immutable current-Agent snapshot:
 
 ```powershell
+--memory-mode=off
 --agent-argument=--semantic-reconciler-max-output-tokens=8192
 --agent-argument=--semantic-reconciler-max-elapsed-seconds=240
 ```
 
-Expected: inspection of the prepared Agent snapshot shows both exact strings. Do not start the formal 10-case x 3-trial baseline as part of this hardening plan.
+`memory_mode` is frozen in the adapter parameters, while the two semantic flags are `review_arguments`. Expected: inspection of the prepared Agent snapshot verifies `adapter.memory_mode` is `off` and both exact review argument strings exist. The formal 10-case x 3-trial baseline remains outside this hardening plan.
 
 - [ ] **Step 2: Run final repository checks**
 
