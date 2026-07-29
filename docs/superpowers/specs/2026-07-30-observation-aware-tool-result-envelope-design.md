@@ -1,7 +1,7 @@
 # Observation-Aware Tool Result Envelope Design
 
 **Date:** 2026-07-30
-**Status:** Approved for written-spec review
+**Status:** Approved
 **Scope:** The project-level tool-result protocol used by Reviewer and Intent Inference model turns
 
 ## 1. Problem statement
