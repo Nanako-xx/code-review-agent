@@ -410,6 +410,34 @@ def test_reconciler_system_prompt_declares_the_exact_proposal_contract():
         assert requirement in system
 
 
+def test_reconciler_records_and_requests_json_object_mode():
+    candidate = _candidate("json-mode", claim="Candidate must be preserved")
+    prepass, observations, _ = _packet([candidate])
+    adapter = FakeToolCallingAdapter(
+        [
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(_proposal_payload([candidate])),
+            )
+        ]
+    )
+
+    run = reconcile_semantically(
+        prepass,
+        observations,
+        adapter=adapter,
+        max_provider_attempts=1,
+    )
+
+    request = adapter.requests[0]
+    assert request.tools == []
+    assert request.parameters["response_format"] == "json_object"
+    assert (
+        run.batches[0].envelope["parameters"]["response_format"]
+        == "json_object"
+    )
+
+
 def test_reconciler_retries_malformed_responses_then_falls_back_conservatively():
     candidate = _candidate("0", claim="Candidate", severity="high")
     prepass, observations, _ = _packet([candidate])

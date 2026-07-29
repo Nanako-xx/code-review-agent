@@ -918,6 +918,7 @@ def run_semantic_reconciler_batch(
             "tool_choice": "none",
             "max_elapsed_seconds": float(max_elapsed_seconds),
             "response_schema": SEMANTIC_PROPOSAL_SCHEMA_VERSION,
+            "response_format": "json_object",
             "invocation_id": invocation_id,
         },
     }
