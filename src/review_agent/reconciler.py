@@ -700,7 +700,11 @@ def parse_semantic_proposal(
         if batch is not None
         else full_packet.allowed_candidate_ids
     )
-    allowed_refs = full_packet.allowed_observation_ids
+    allowed_refs = (
+        frozenset(batch.to_dict()["observation_catalog"])
+        if batch is not None
+        else full_packet.allowed_observation_ids
+    )
     try:
         payload = json.loads(
             content,
@@ -946,6 +950,7 @@ def run_semantic_reconciler_batch(
         try:
             response = adapter.complete_turn(request)
         except Exception as error:
+            elapsed_after = _elapsed(clock, started)
             message = f"provider invocation failed: {type(error).__name__}: {error}"
             failures.append(message)
             attempts.append(
@@ -956,8 +961,46 @@ def run_semantic_reconciler_batch(
                     error=message,
                 )
             )
+            if elapsed_after >= max_elapsed_seconds:
+                failures.append("elapsed budget exhausted during provider attempt")
+                break
             messages.append(_rejection_message(message))
             continue
+        elapsed_after = _elapsed(clock, started)
+        if elapsed_after >= max_elapsed_seconds:
+            message = "elapsed budget exhausted during provider attempt"
+            failures.append(message)
+            if isinstance(response, ModelTurnResponse):
+                provider_name = response.provider_name or provider_name
+                resolved_model = response.model or resolved_model
+                attempts.append(
+                    ReconcilerAttempt(
+                        attempt_index=attempt_index,
+                        status="timed_out",
+                        response_kind=(
+                            response.kind.value
+                            if isinstance(response.kind, ModelResponseKind)
+                            else ModelResponseKind.INVALID.value
+                        ),
+                        error=message,
+                        response_text=response.final_text,
+                        raw_response=(
+                            model_turn_response_to_dict(response)
+                            if isinstance(response.kind, ModelResponseKind)
+                            else {}
+                        ),
+                    )
+                )
+            else:
+                attempts.append(
+                    ReconcilerAttempt(
+                        attempt_index=attempt_index,
+                        status="timed_out",
+                        response_kind=ModelResponseKind.INVALID.value,
+                        error=message,
+                    )
+                )
+            break
         if not isinstance(response, ModelTurnResponse):
             message = "provider returned an invalid ModelTurnResponse"
             failures.append(message)

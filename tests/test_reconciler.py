@@ -25,6 +25,7 @@ from review_agent.reconciler import (
     compile_semantic_proposals,
     parse_semantic_proposal,
     reconcile_semantically,
+    run_semantic_reconciler_batch,
     semantic_reconciliation_from_dict,
     semantic_reconciliation_to_dict,
     semantic_to_evidence_reconciliation,
@@ -33,6 +34,14 @@ from review_agent.reconciler import (
 
 BASE_SHA = "a" * 40
 HEAD_SHA = "b" * 40
+
+
+class _ControllableClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
 
 
 def _finding_id(suffix: str) -> str:
@@ -111,6 +120,40 @@ def _packet(
         for ref in candidate.evidence_refs
     }
     return prepass, observations, build_reconciliation_packet(prepass, observations)
+
+
+def _two_batch_packet():
+    blocker = _candidate(
+        "batch-blocker",
+        claim="A blocker candidate must not be rejected with hidden evidence",
+        severity="blocker",
+        evidence_ref="O-batch-blocker",
+    )
+    hidden = _candidate(
+        "batch-hidden-quality",
+        claim="A separate batch owns the quality Observation",
+        evidence_ref="O-batch-hidden-quality",
+    )
+    prepass = _prepass([blocker, hidden])
+    packet = build_reconciliation_packet(
+        prepass,
+        {
+            "O-batch-blocker": _observation("O-batch-blocker"),
+            "O-batch-hidden-quality": _observation(
+                "O-batch-hidden-quality",
+                source="quality_gate",
+            ),
+        },
+    )
+    batches = batch_reconciliation_packet(packet, max_candidates_per_batch=1)
+    blocker_batch = next(
+        batch for batch in batches if batch.candidate_ids == (blocker.finding_id,)
+    )
+    assert len(batches) == 2
+    assert "O-batch-hidden-quality" not in blocker_batch.to_dict()[
+        "observation_catalog"
+    ]
+    return blocker, hidden, packet, blocker_batch
 
 
 def _proposal_payload(
@@ -216,6 +259,74 @@ def test_parser_rejects_unknown_observation_references():
 
     with pytest.raises(SemanticProposalParseError, match="supporting_refs"):
         parse_semantic_proposal(json.dumps(payload), packet)
+
+
+def test_batch_parser_rejects_hidden_quality_observation_in_decision_refs():
+    blocker, _, _, batch = _two_batch_packet()
+    payload = _proposal_payload(
+        [blocker],
+        groups=[],
+        rejections=[
+            {
+                "candidate_id": blocker.finding_id,
+                "reason": "contradicted_by_test",
+                "rationale": "A quality gate in another batch contradicts this blocker.",
+                "decision_refs": ["O-batch-hidden-quality"],
+            }
+        ],
+    )
+
+    with pytest.raises(SemanticProposalParseError, match="unknown Observation"):
+        parse_semantic_proposal(json.dumps(payload), batch)
+
+
+def test_batch_parser_rejects_hidden_quality_observation_in_reason_refs():
+    blocker, _, _, batch = _two_batch_packet()
+    payload = _proposal_payload(
+        [blocker],
+        disagreements=[
+            {
+                "disagreement_id": "D-hidden-quality",
+                "candidate_ids": [blocker.finding_id],
+                "status": "needs_investigation",
+                "issue": "The blocker needs current-batch quality evidence.",
+                "resolution": "",
+                "decision_refs": [],
+            }
+        ],
+        supplemental_requests=[
+            {
+                "disagreement_id": "D-hidden-quality",
+                "question": "Does a quality gate contradict the blocker?",
+                "required_evidence": ["quality gate result"],
+                "preferred_perspective": "quality",
+                "related_candidate_ids": [blocker.finding_id],
+                "reason_refs": ["O-batch-hidden-quality"],
+            }
+        ],
+    )
+
+    with pytest.raises(SemanticProposalParseError, match="unknown Observation"):
+        parse_semantic_proposal(json.dumps(payload), batch)
+
+
+def test_full_packet_parser_keeps_complete_observation_allowlist():
+    blocker, hidden, packet, _ = _two_batch_packet()
+    payload = _proposal_payload(
+        [hidden],
+        rejections=[
+            {
+                "candidate_id": blocker.finding_id,
+                "reason": "contradicted_by_test",
+                "rationale": "The full packet exposes the quality Observation.",
+                "decision_refs": ["O-batch-hidden-quality"],
+            }
+        ],
+    )
+
+    proposal = parse_semantic_proposal(json.dumps(payload), packet)
+
+    assert proposal.rejections[0].candidate_id == blocker.finding_id
 
 
 def test_runtime_preserves_supported_high_severity_rejection():
@@ -471,6 +582,96 @@ def test_reconciler_retries_malformed_responses_then_falls_back_conservatively()
         "Candidate"
     ]
     assert run.supplemental_requests == ()
+
+
+def test_reconciler_falls_back_when_provider_returns_after_elapsed_budget():
+    candidate = _candidate("elapsed-return", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    clock = _ControllableClock()
+
+    def delayed_final(_request):
+        clock.now = 2.0
+        return ModelTurnResponse(
+            kind=ModelResponseKind.FINAL,
+            final_text=json.dumps(_proposal_payload([candidate])),
+        )
+
+    adapter = FakeToolCallingAdapter([delayed_final])
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=1,
+        max_elapsed_seconds=1,
+        clock=clock,
+    )
+
+    assert run.status == "fallback"
+    assert run.proposal is None
+    assert [attempt.status for attempt in run.attempts] == ["timed_out"]
+    assert "elapsed budget exhausted during provider attempt" in run.failure_reason
+
+
+def test_reconciler_stops_after_provider_exception_exhausts_elapsed_budget():
+    candidate = _candidate("elapsed-error", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    clock = _ControllableClock()
+
+    def delayed_error(_request):
+        clock.now = 2.0
+        raise RuntimeError("delayed provider failure")
+
+    adapter = FakeToolCallingAdapter([delayed_error])
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=2,
+        max_elapsed_seconds=1,
+        clock=clock,
+    )
+
+    assert run.status == "fallback"
+    assert len(adapter.requests) == 1
+    assert [attempt.status for attempt in run.attempts] == ["provider_error"]
+    assert "provider invocation failed" in run.failure_reason
+    assert "elapsed budget exhausted during provider attempt" in run.failure_reason
+
+
+def test_reconciler_retries_provider_exception_while_elapsed_budget_remains():
+    candidate = _candidate("elapsed-retry", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    clock = _ControllableClock()
+
+    def immediate_error(_request):
+        raise RuntimeError("transient provider failure")
+
+    adapter = FakeToolCallingAdapter(
+        [
+            immediate_error,
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(_proposal_payload([candidate])),
+            ),
+        ]
+    )
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=2,
+        max_elapsed_seconds=1,
+        clock=clock,
+    )
+
+    assert run.status == "accepted"
+    assert [attempt.status for attempt in run.attempts] == [
+        "provider_error",
+        "accepted",
+    ]
 
 
 def test_local_only_reconciliation_is_deterministic_and_does_not_invoke_a_model():
