@@ -97,7 +97,7 @@ Implementation follows a minimal red-green cycle:
 2. Make the smallest production change that satisfies the test.
 3. Run focused Reconciler and adapter tests, then the complete local regression suite.
 4. Replay the existing `core-py-001` Reconciler packet with 8192 tokens and a 240-second stage budget.
-5. Run one complete `core-py-001` smoke with the same frozen Agent arguments and inspect every Runtime-scheduled Reviewer, Reconciler, Completion, and Final Risk artifact. A bounded and audited one-shot Reviewer JSON finalization diagnostic is acceptable when the final structured result is valid and all budgets are respected. Unrecovered parser, provider, or budget errors remain failures.
+5. Run one complete `core-py-001` smoke with the same frozen Agent arguments and inspect every Runtime-scheduled Reviewer, Reconciler, Completion, and Final Risk artifact. Exactly one bounded, audited JSON finalization is acceptable when the terminal structured Reviewer result is `completed` or `partial` and provider-attempt, token, and elapsed budgets are respected. Unrecovered parser, provider, or budget errors remain failures.
 
 Formal 10-case x 3-trial baseline execution is outside this hardening change and starts only after the single-case smoke is clean.
 

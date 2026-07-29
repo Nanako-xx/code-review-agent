@@ -560,6 +560,7 @@ $runsRoot = 'D:\Agent\code review agent\.worktrees\real-model-baseline\.eval-dat
 $run = Get-ChildItem -LiteralPath $runsRoot -Directory |
   Sort-Object LastWriteTime -Descending |
   Select-Object -First 1
+$session = Get-Content -LiteralPath (Join-Path $run.FullName 'session.json') -Raw | ConvertFrom-Json
 $multi = Get-Content -LiteralPath (Join-Path $run.FullName 'multi_reviewer_result.json') -Raw | ConvertFrom-Json
 $reviewers = foreach ($execution in @($multi.executions)) {
     $i = [int]$execution.reviewer_index
@@ -589,7 +590,7 @@ $reviewers | Format-Table -AutoSize
     final_risk = $risk.level
     reviewer_count = @($multi.executions).Count
     reviewer_status_counts = ($reviewers | Group-Object status | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
-    memory_mode = $multi.memory_mode
+    memory_mode = $session.execution.memory.mode
 } | Format-List
 ```
 
@@ -599,9 +600,9 @@ Expected:
 - medium risk may validly schedule two reviewers; high or critical risk may schedule more;
 - `semantic_status` and `semantic_model_status` are not `fallback`;
 - no artifact reports provider timeout, response truncation, invalid JSON, or an undocumented response shape;
-- recovered initial final-response parse diagnostics are acceptable only when exactly one bounded JSON finalization succeeds and the terminal result is parseable `completed` or `partial`;
-- unrecovered provider timeout, truncation, parser or schema failure, repeated finalization, token failure, or elapsed-budget failure is not acceptable;
-- Semantic Reconciler remains non-fallback; if Completion remains `blocked`, `Intent Packet insufficient` may legitimately be its blocker rather than a model protocol failure.
+- a recovered initial final-response parse diagnostic is acceptable only when the trace audits exactly one bounded JSON finalization, that finalization stays within provider-attempt, token, and elapsed budgets, and the terminal structured Reviewer result is `completed` or `partial`;
+- repeated finalization or unrecovered parser, schema, provider, truncation, token, or elapsed failure is unacceptable;
+- Semantic Reconciler remains non-fallback; if Completion is `blocked` in this smoke, its sole blocker must be exactly `Intent Packet insufficient`; any additional blocker is a smoke failure requiring investigation.
 
 ### Task 7: Freeze the later evaluation snapshot arguments and complete verification
 
