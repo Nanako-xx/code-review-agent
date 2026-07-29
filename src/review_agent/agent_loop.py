@@ -10,7 +10,11 @@ from review_agent.context import (
     current_reviewer_memory_context,
 )
 from review_agent.memory_retrieval import HardPolicyBudgetExceeded
-from review_agent.model_adapter import ModelAdapter
+from review_agent.model_adapter import (
+    ModelAdapter,
+    model_response_to_assistant_message,
+    model_tool_result_to_message,
+)
 from review_agent.model_protocol import (
     ModelResponse,
     ModelResponseKind,
@@ -189,20 +193,16 @@ def run_reviewer_agent_loop(
                     runtime_failures,
                 )
 
-            parameters = request_parameters(
-                envelope.parameters,
-                assignment,
-                runtime,
-            )
-            parameters["tool_history_after_message_index"] = len(
-                envelope.messages
-            )
             request = ModelTurnRequest(
                 system=envelope.system,
                 tools=tools,
                 messages=list(runtime_messages),
                 tool_results=list(tool_results),
-                parameters=parameters,
+                parameters=request_parameters(
+                    envelope.parameters,
+                    assignment,
+                    runtime,
+                ),
             )
             try:
                 candidate = adapter.complete_turn(request)
@@ -377,6 +377,11 @@ def run_reviewer_agent_loop(
             tool_call_count += attempted_in_turn
             runtime.tool_calls = tool_call_count
             tool_results.extend(turn_tool_results)
+            runtime_messages.append(model_response_to_assistant_message(response))
+            runtime_messages.extend(
+                model_tool_result_to_message(result)
+                for result in turn_tool_results
+            )
             turns.append(
                 AgentLoopTurn(
                     turn_index=turn_index,
@@ -389,6 +394,7 @@ def run_reviewer_agent_loop(
             continue
 
         if response.kind is ModelResponseKind.FINAL:
+            runtime_messages.append(model_response_to_assistant_message(response))
             repaired_parse_error: str | None = None
             try:
                 result = parse_reviewer_result(response.final_text or "")
@@ -476,6 +482,9 @@ def run_reviewer_agent_loop(
                     )
 
                 json_finalization_attempted = True
+                runtime_messages.append(
+                    _runtime_json_finalization_message(error_message)
+                )
                 finalization = _finalize_reviewer_json(
                     adapter=adapter,
                     envelope=envelope,
@@ -484,12 +493,19 @@ def run_reviewer_agent_loop(
                     runtime_messages=runtime_messages,
                     tool_results=tool_results,
                     original_response=response,
-                    parse_error=error_message,
                     attempt_number=len(provider_attempts) + 1,
                 )
                 response = finalization.response
                 last_response = finalization.response
                 provider_attempts.append(finalization.attempt)
+                if (
+                    finalization.attempt.response_kind != "exception"
+                    and response.kind
+                    in {ModelResponseKind.TOOL_CALLS, ModelResponseKind.FINAL}
+                ):
+                    runtime_messages.append(
+                        model_response_to_assistant_message(response)
+                    )
                 if finalization.error is not None:
                     runtime_failures.append(finalization.error)
                 if finalization.budget_reason is not None:
@@ -519,7 +535,7 @@ def run_reviewer_agent_loop(
                         AgentLoopTurn(
                             turn_index=turn_index,
                             response_kind=response.kind.value,
-                            error=error_message,
+                            error=finalization.error,
                             provider_attempts=provider_attempts,
                         )
                     )
@@ -717,7 +733,6 @@ def _finalize_reviewer_json(
     runtime_messages: list[dict[str, Any]],
     tool_results: list[ModelToolResult],
     original_response: ModelTurnResponse,
-    parse_error: str,
     attempt_number: int,
 ) -> _JsonFinalizationOutcome:
     parameters = request_parameters(envelope.parameters, assignment, runtime)
@@ -725,20 +740,12 @@ def _finalize_reviewer_json(
         {
             "tool_choice": "none",
             "response_format": "json_object",
-            "tool_history_after_message_index": len(envelope.messages),
         }
     )
     request = ModelTurnRequest(
         system=envelope.system,
         tools=[],
-        messages=[
-            *runtime_messages,
-            {
-                "role": "assistant",
-                "content": original_response.final_text or "",
-            },
-            _runtime_json_finalization_message(parse_error),
-        ],
+        messages=list(runtime_messages),
         tool_results=list(tool_results),
         parameters=parameters,
     )

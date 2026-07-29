@@ -370,18 +370,13 @@ class OpenAICompatibleToolAdapter:
         self._config = config
         self._transport = transport
         self._capabilities = resolved_capabilities
-        self._assistant_tool_call_messages: list[dict[str, Any]] = []
 
     @property
     def capabilities(self) -> ModelAdapterCapabilities:
         return self._capabilities
 
     def complete_turn(self, request: ModelTurnRequest) -> ModelTurnResponse:
-        payload = _build_openai_tool_payload(
-            self._config.model,
-            request,
-            self._assistant_tool_call_messages,
-        )
+        payload = _build_openai_tool_payload(self._config.model, request)
         headers = {
             "Authorization": f"Bearer {self._config.api_key}",
             "Content-Type": "application/json",
@@ -420,12 +415,7 @@ class OpenAICompatibleToolAdapter:
                 provider_name=self.provider_name,
                 model=self._config.model,
             )
-        response = _parse_openai_tool_response(raw, self.provider_name, self._config.model)
-        if response.kind is ModelResponseKind.TOOL_CALLS:
-            self._assistant_tool_call_messages.append(
-                _assistant_tool_call_message(response)
-            )
-        return response
+        return _parse_openai_tool_response(raw, self.provider_name, self._config.model)
 
 
 def _transport_timeout_seconds(
@@ -446,29 +436,20 @@ def _transport_timeout_seconds(
 def _build_openai_tool_payload(
     model: str,
     request: ModelTurnRequest,
-    assistant_tool_call_messages: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    runtime_messages = list(request.messages)
+    runtime_messages = [dict(message) for message in request.messages]
     if request.tool_results:
-        tool_history = _assistant_and_tool_result_messages(
-            request.tool_results,
-            assistant_tool_call_messages or [],
+        represented_call_ids = {
+            message.get("tool_call_id")
+            for message in runtime_messages
+            if message.get("role") == "tool"
+            and isinstance(message.get("tool_call_id"), str)
+        }
+        runtime_messages.extend(
+            model_tool_result_to_message(result)
+            for result in request.tool_results
+            if result.call_id not in represented_call_ids
         )
-        insertion_index = request.parameters.get(
-            "tool_history_after_message_index"
-        )
-        if insertion_index is None:
-            runtime_messages.extend(tool_history)
-        else:
-            if (
-                type(insertion_index) is not int
-                or insertion_index < 0
-                or insertion_index > len(runtime_messages)
-            ):
-                raise ValueError(
-                    "tool_history_after_message_index must be a valid message index"
-                )
-            runtime_messages[insertion_index:insertion_index] = tool_history
     messages = [{"role": "system", "content": request.system}, *runtime_messages]
     payload = {
         "model": model,
@@ -501,7 +482,7 @@ def _tool_spec_to_openai(tool: ModelToolSpec) -> dict[str, Any]:
     }
 
 
-def _tool_result_message(result: ModelToolResult) -> dict[str, Any]:
+def model_tool_result_to_message(result: ModelToolResult) -> dict[str, Any]:
     return {
         "role": "tool",
         "tool_call_id": result.call_id,
@@ -509,7 +490,9 @@ def _tool_result_message(result: ModelToolResult) -> dict[str, Any]:
     }
 
 
-def _assistant_tool_call_message(response: ModelTurnResponse) -> dict[str, Any]:
+def model_response_to_assistant_message(
+    response: ModelTurnResponse,
+) -> dict[str, Any]:
     source_message: dict[str, Any] = {}
     try:
         candidate = response.raw["choices"][0]["message"]
@@ -518,11 +501,22 @@ def _assistant_tool_call_message(response: ModelTurnResponse) -> dict[str, Any]:
     if isinstance(candidate, dict):
         source_message = candidate
 
-    content = source_message.get("content")
+    fallback_content = (
+        response.final_text
+        if response.kind is ModelResponseKind.FINAL
+        else None
+    )
+    content = source_message.get("content", fallback_content)
     message = {
         "role": "assistant",
-        "content": content if isinstance(content, (str, list)) else None,
-        "tool_calls": [
+        "content": (
+            content
+            if isinstance(content, (str, list))
+            else fallback_content
+        ),
+    }
+    if response.tool_calls:
+        message["tool_calls"] = [
             {
                 "id": call.call_id,
                 "type": "function",
@@ -532,41 +526,11 @@ def _assistant_tool_call_message(response: ModelTurnResponse) -> dict[str, Any]:
                 },
             }
             for call in response.tool_calls
-        ],
-    }
+        ]
     reasoning_content = source_message.get("reasoning_content")
     if isinstance(reasoning_content, str):
         message["reasoning_content"] = reasoning_content
     return message
-
-
-def _assistant_and_tool_result_messages(
-    tool_results: list[ModelToolResult],
-    assistant_tool_call_messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    results_by_call_id = {result.call_id: result for result in tool_results}
-    matched_call_ids: set[str] = set()
-    messages: list[dict[str, Any]] = []
-
-    for assistant_message in assistant_tool_call_messages:
-        tool_calls = assistant_message.get("tool_calls", [])
-        matching_call_ids = [tool_call.get("id") for tool_call in tool_calls if tool_call.get("id") in results_by_call_id]
-        if not matching_call_ids:
-            continue
-
-        messages.append(assistant_message)
-        for call_id in matching_call_ids:
-            if call_id is None:
-                continue
-            messages.append(_tool_result_message(results_by_call_id[call_id]))
-            matched_call_ids.add(call_id)
-
-    messages.extend(
-        _tool_result_message(result)
-        for result in tool_results
-        if result.call_id not in matched_call_ids
-    )
-    return messages
 
 
 def _parse_openai_tool_response(raw: dict[str, Any], provider_name: str, model: str) -> ModelTurnResponse:

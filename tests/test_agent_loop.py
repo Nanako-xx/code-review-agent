@@ -2,7 +2,11 @@ import json
 from dataclasses import replace
 
 from review_agent.agent_loop import agent_loop_run_to_dict, run_reviewer_agent_loop
-from review_agent.model_adapter import FakeToolCallingAdapter
+from review_agent.model_adapter import (
+    FakeToolCallingAdapter,
+    OpenAICompatibleConfig,
+    OpenAICompatibleToolAdapter,
+)
 from review_agent.model_protocol import ModelResponseKind, ModelToolCall, ModelTurnResponse
 from review_agent.memory_models import MemoryScope
 from review_agent.memory_retrieval import SnapshotMemoryQueryService
@@ -449,6 +453,168 @@ def test_agent_loop_rejects_incomplete_completion_and_accepts_correction(
     assert "missing contract assessment" in run.trace.turns[0].error
 
 
+def test_agent_loop_sends_ordered_transcript_after_rejected_final_and_second_tool(
+    git_repo,
+):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "app.py").write_text(
+        "def add(a, b):\n    return a - b\n",
+        encoding="utf-8",
+    )
+    run_git(git_repo, "add", "app.py")
+    run_git(git_repo, "commit", "-m", "change app for ordered transcript")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(
+        git_repo / ".review-agent" / "runs" / "review-ordered-transcript"
+    )
+    gateway = ToolGateway(git_repo, base, head, observation_store)
+    rejected_final = json.dumps(
+        {
+            "contract_assessments": [],
+            "confirmed_findings": [],
+            "rejected_hypotheses": [],
+            "uncertainties": [],
+            "observation_refs": [],
+            "investigation_summary": "Structured, but missing the assigned contract.",
+            "status": "completed",
+        }
+    )
+    accepted_final = json.dumps(
+        {
+            "contract_assessments": [
+                {
+                    "contract": "regression_safety",
+                    "status": "covered",
+                    "summary": "Compared the changed implementation twice.",
+                    "evidence_refs": [],
+                }
+            ],
+            "confirmed_findings": [],
+            "rejected_hypotheses": [],
+            "uncertainties": [],
+            "observation_refs": [],
+            "investigation_summary": "Completed after the Runtime correction.",
+            "status": "completed",
+        }
+    )
+    provider_responses = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "Inspecting the first range.",
+                        "reasoning_content": "The first comparison is required.",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "compare_base_head",
+                                    "arguments": '{"path": "app.py"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": rejected_final,
+                        "reasoning_content": "I initially considered the review complete.",
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "Inspecting the second range.",
+                        "reasoning_content": "The Runtime rejection requires more evidence.",
+                        "tool_calls": [
+                            {
+                                "id": "call-2",
+                                "type": "function",
+                                "function": {
+                                    "name": "compare_base_head",
+                                    "arguments": '{"path": "app.py"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {"choices": [{"message": {"content": accepted_final}}]},
+    ]
+    captured_payloads = []
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured_payloads.append(payload)
+        return provider_responses.pop(0)
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=make_assignment("Core Reviewer"),
+        intent=make_intent(),
+        diff_excerpt=["diff excerpt"],
+        observations={},
+        trace_id="review-ordered-transcript-reviewer-0",
+    )
+
+    assert run.result.status.value == "completed"
+    assert len(captured_payloads) == 4
+    provider_messages = captured_payloads[-1]["messages"]
+    assert provider_messages[0]["role"] == "system"
+    transcript = provider_messages[1:]
+    assert [message["role"] for message in transcript] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert len(transcript) == 7
+    assert transcript[1]["content"] == "Inspecting the first range."
+    assert transcript[1]["reasoning_content"] == "The first comparison is required."
+    assert transcript[1]["tool_calls"][0]["id"] == "call-1"
+    assert json.loads(
+        transcript[1]["tool_calls"][0]["function"]["arguments"]
+    ) == {"path": "app.py"}
+    assert transcript[2]["tool_call_id"] == "call-1"
+    assert transcript[3] == {
+        "role": "assistant",
+        "content": rejected_final,
+        "reasoning_content": "I initially considered the review complete.",
+    }
+    assert "Runtime rejected completion" in transcript[4]["content"]
+    assert transcript[5]["content"] == "Inspecting the second range."
+    assert (
+        transcript[5]["reasoning_content"]
+        == "The Runtime rejection requires more evidence."
+    )
+    assert transcript[5]["tool_calls"][0]["id"] == "call-2"
+    assert json.loads(
+        transcript[5]["tool_calls"][0]["function"]["arguments"]
+    ) == {"path": "app.py"}
+    assert transcript[6]["tool_call_id"] == "call-2"
+
+
 def test_agent_loop_downgrades_invalid_completion_when_budget_ends(git_repo):
     base = run_git(git_repo, "rev-parse", "HEAD")
     observation_store = ObservationStore(
@@ -557,7 +723,10 @@ def test_agent_loop_returns_failed_result_when_final_response_cannot_be_parsed(g
     assert run.result.status.value == "failed"
     assert "final response parse failed" in run.result.uncertainties[0]
     assert run.trace.final_status == "failed"
-    assert run.trace.turns[0].error == run.result.uncertainties[0]
+    assert run.trace.turns[0].error == (
+        "final response JSON finalization returned invalid"
+    )
+    assert run.trace.turns[0].error in run.result.uncertainties
 
 
 def test_agent_loop_performs_one_no_tool_json_finalization_after_parse_failure(
@@ -573,7 +742,6 @@ def test_agent_loop_performs_one_no_tool_json_finalization_after_parse_failure(
         assert request.tools == []
         assert request.parameters["tool_choice"] == "none"
         assert request.parameters["response_format"] == "json_object"
-        assert request.parameters["tool_history_after_message_index"] == 1
         assert request.messages[-2] == {
             "role": "assistant",
             "content": "## Structured Findings\n- prose, not JSON",
@@ -619,6 +787,49 @@ def test_agent_loop_performs_one_no_tool_json_finalization_after_parse_failure(
     assert len(adapter.requests) == 2
     assert run.runtime.provider_attempts == 2
     assert run.runtime.model_turns == 1
+
+
+def test_agent_loop_fails_after_single_malformed_json_finalization_response(
+    git_repo,
+):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(
+        git_repo / ".review-agent" / "runs" / "review-json-finalization-malformed"
+    )
+    gateway = ToolGateway(git_repo, base, base, observation_store)
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="first final is not JSON",
+            ),
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="finalization response is still not JSON",
+            ),
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=make_assignment("Core Reviewer"),
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-json-finalization-malformed-reviewer-0",
+    )
+
+    diagnostic = "final response JSON finalization parse failed"
+    assert len(adapter.requests) == 2
+    assert run.runtime.provider_attempts == 2
+    assert run.runtime.model_turns == 1
+    assert run.runtime.termination_reason is ReviewerTerminationReason.RUNTIME_FAILURE
+    assert run.result.status.value == "failed"
+    assert any(diagnostic in item for item in run.result.uncertainties)
+    assert diagnostic in (run.trace.turns[0].error or "")
+    assert run.trace.final_status == "failed"
+    assert run.response.content == "finalization response is still not JSON"
 
 
 def test_agent_loop_does_not_finalize_json_again_after_rejected_repair(git_repo):
@@ -669,6 +880,13 @@ def test_agent_loop_does_not_finalize_json_again_after_rejected_repair(git_repo)
 
     assert len(adapter.requests) == 3
     assert run.result.status.value == "failed"
+    assert adapter.requests[2].messages[-2] == {
+        "role": "assistant",
+        "content": repaired_json,
+    }
+    assert "Runtime rejected completion" in (
+        adapter.requests[2].messages[-1]["content"]
+    )
     assert "final response JSON finalization already attempted" in run.result.uncertainties
     assert "final response JSON finalization already attempted" in (
         run.trace.turns[-1].error or ""

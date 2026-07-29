@@ -15,6 +15,8 @@ from review_agent.model_adapter import (
     OpenAICompatibleConfig,
     OpenAICompatibleToolAdapter,
     _urllib_transport,
+    model_response_to_assistant_message,
+    model_tool_result_to_message,
 )
 from review_agent.model_protocol import (
     ModelResponse,
@@ -892,28 +894,28 @@ def test_openai_adapter_places_tool_history_before_json_finalization_messages():
     assert first_response.kind is ModelResponseKind.TOOL_CALLS
     assert first_response.tool_calls[0].call_id == "call-1"
 
+    tool_result = ModelToolResult(
+        call_id="call-1",
+        tool_name="read_range",
+        content="app.py contents",
+        observation_ids=["O-read"],
+    )
     second_response = adapter.complete_turn(
         ModelTurnRequest(
             system="system",
             tools=[],
             messages=[
                 *first_request.messages,
+                model_response_to_assistant_message(first_response),
+                model_tool_result_to_message(tool_result),
                 {"role": "assistant", "content": "prose final"},
                 {"role": "user", "content": "Return corrected JSON."},
             ],
-            tool_results=[
-                ModelToolResult(
-                    call_id="call-1",
-                    tool_name="read_range",
-                    content="app.py contents",
-                    observation_ids=["O-read"],
-                )
-            ],
+            tool_results=[tool_result],
             parameters={
                 **first_request.parameters,
                 "tool_choice": "none",
                 "response_format": "json_object",
-                "tool_history_after_message_index": 1,
             },
         )
     )
@@ -949,6 +951,126 @@ def test_openai_adapter_places_tool_history_before_json_finalization_messages():
     }
     assert second_response.kind is ModelResponseKind.FINAL
     assert second_response.final_text == '{"status": "completed"}'
+
+
+def test_openai_adapter_does_not_reuse_tool_history_across_conversations():
+    captured_payloads = []
+    responses = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "session A tool call",
+                        "reasoning_content": "session A reasoning",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_range",
+                                    "arguments": '{"path": "a.py"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "session B tool call",
+                        "reasoning_content": "session B reasoning",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_range",
+                                    "arguments": '{"path": "b.py"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {"choices": [{"message": {"content": "done"}}]},
+    ]
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured_payloads.append(payload)
+        return responses.pop(0)
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    tool = ModelToolSpec(
+        name="read_range",
+        description="Read range",
+        parameters_schema={"type": "object"},
+    )
+    adapter.complete_turn(
+        ModelTurnRequest(
+            system="system",
+            tools=[tool],
+            messages=[{"role": "user", "content": "Review session A"}],
+            tool_results=[],
+            parameters={"trace_id": "session-a"},
+        )
+    )
+    session_b_response = adapter.complete_turn(
+        ModelTurnRequest(
+            system="system",
+            tools=[tool],
+            messages=[{"role": "user", "content": "Review session B"}],
+            tool_results=[],
+            parameters={"trace_id": "session-b"},
+        )
+    )
+
+    tool_result = ModelToolResult(
+        call_id="call-1",
+        tool_name="read_range",
+        content="b.py contents",
+    )
+    adapter.complete_turn(
+        ModelTurnRequest(
+            system="system",
+            tools=[tool],
+            messages=[
+                {"role": "user", "content": "Review session B"},
+                model_response_to_assistant_message(session_b_response),
+                model_tool_result_to_message(tool_result),
+            ],
+            tool_results=[tool_result],
+            parameters={"trace_id": "session-b"},
+        )
+    )
+
+    messages = captured_payloads[-1]["messages"]
+    assert [message["role"] for message in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert messages[2]["content"] == "session B tool call"
+    assert messages[2]["reasoning_content"] == "session B reasoning"
+    assert json.loads(
+        messages[2]["tool_calls"][0]["function"]["arguments"]
+    ) == {"path": "b.py"}
+    assert messages[3] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "b.py contents",
+    }
 
 
 def test_openai_compatible_adapter_returns_invalid_when_transport_raises_json_decode_error():
