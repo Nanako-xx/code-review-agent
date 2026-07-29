@@ -869,6 +869,7 @@ def test_memory_query_tool_exposes_and_schema_binds_assignment_id_only_with_snap
     assert schema["properties"]["assignment_id"] == {
         "type": "string",
         "minLength": 1,
+        "pattern": r"\S",
         "const": "assignment-memory",
     }
 
@@ -906,11 +907,14 @@ def test_memory_query_tool_schema_requires_non_empty_query_selector():
     assert schema["required"] == ["assignment_id"]
     for field in ("assignment_id", "path", "symbol", "contract", "query"):
         assert schema["properties"][field]["minLength"] == 1
+    for field in ("assignment_id", "path", "symbol", "contract"):
+        assert schema["properties"][field]["pattern"] == r"\S"
+    assert "pattern" not in schema["properties"]["query"]
     assert schema["anyOf"] == [
         {"required": ["path"]},
         {"required": ["symbol"]},
         {"required": ["contract"]},
-        {"required": ["query"]},
+        {"required": ["query"], "properties": {"query": {"pattern": r"\S"}}},
     ]
 
 

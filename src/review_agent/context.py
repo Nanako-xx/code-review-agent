@@ -210,10 +210,26 @@ _REVIEWER_TOOL_DEFINITIONS = (
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 512,
+                    "pattern": r"\S",
                 },
-                "path": {"type": "string", "minLength": 1, "maxLength": 1024},
-                "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
-                "contract": {"type": "string", "minLength": 1, "maxLength": 512},
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024,
+                    "pattern": r"\S",
+                },
+                "symbol": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512,
+                    "pattern": r"\S",
+                },
+                "contract": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512,
+                    "pattern": r"\S",
+                },
                 "query": {"type": "string", "minLength": 1, "maxLength": 2048},
             },
             "required": ["assignment_id"],
@@ -221,7 +237,7 @@ _REVIEWER_TOOL_DEFINITIONS = (
                 {"required": ["path"]},
                 {"required": ["symbol"]},
                 {"required": ["contract"]},
-                {"required": ["query"]},
+                {"required": ["query"], "properties": {"query": {"pattern": r"\S"}}},
             ],
         },
     ),
@@ -488,6 +504,7 @@ def build_reviewer_envelope(
                 schema["properties"]["assignment_id"] = {
                     "type": "string",
                     "minLength": 1,
+                    "pattern": r"\S",
                     "const": memory_assignment_id,
                 }
             definition["parameters"] = schema
