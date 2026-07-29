@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import threading
 
 import pytest
 
@@ -748,6 +749,105 @@ def test_reconciler_bounds_malformed_typed_response_attempts_before_fallback():
     assert all(
         attempt.response_kind == ModelResponseKind.INVALID.value
         for attempt in run.attempts
+    )
+
+
+def test_reconciler_rejects_final_with_tool_calls_at_persistence_boundary():
+    candidate = _candidate("final-tool-call", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    adapter = FakeToolCallingAdapter(
+        [
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                tool_calls=[None],
+                final_text=json.dumps(_proposal_payload([candidate])),
+            )
+        ]
+    )
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=1,
+    )
+
+    assert run.status == "fallback"
+    assert len(adapter.requests) == 1
+    assert [attempt.status for attempt in run.attempts] == ["invalid_response"]
+    assert run.attempts[0].error == (
+        "provider returned a ModelTurnResponse with invalid tool_calls"
+    )
+
+
+def test_reconciler_bounds_unserializable_tool_calls_at_persistence_boundary():
+    candidate = _candidate("unsafe-tool-call", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    malformed = ModelTurnResponse(
+        kind=ModelResponseKind.TOOL_CALLS,
+        tool_calls=[threading.Lock()],
+    )
+    adapter = FakeToolCallingAdapter([malformed, malformed])
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=2,
+    )
+
+    assert run.status == "fallback"
+    assert len(adapter.requests) == 2
+    assert [attempt.status for attempt in run.attempts] == [
+        "invalid_response",
+        "invalid_response",
+    ]
+    assert all(
+        attempt.error
+        == "provider returned a ModelTurnResponse with invalid tool_calls"
+        for attempt in run.attempts
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_raw",
+    [
+        pytest.param(threading.Lock(), id="object"),
+        pytest.param(float("nan"), id="non-standard-number"),
+    ],
+)
+def test_reconciler_retries_unsafe_raw_at_persistence_boundary(unsafe_raw):
+    candidate = _candidate("unsafe-raw", claim="Candidate")
+    _, _, packet = _packet([candidate])
+    batch = batch_reconciliation_packet(packet)[0]
+    adapter = FakeToolCallingAdapter(
+        [
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(_proposal_payload([candidate])),
+                raw={"unsafe": unsafe_raw},
+            ),
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(_proposal_payload([candidate])),
+            ),
+        ]
+    )
+
+    run = run_semantic_reconciler_batch(
+        adapter,
+        batch,
+        max_provider_attempts=2,
+    )
+
+    assert run.status == "accepted"
+    assert len(adapter.requests) == 2
+    assert [attempt.status for attempt in run.attempts] == [
+        "invalid_response",
+        "accepted",
+    ]
+    assert run.attempts[0].error == (
+        "provider returned a ModelTurnResponse with invalid raw data"
     )
 
 

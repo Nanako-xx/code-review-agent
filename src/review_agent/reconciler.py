@@ -2361,7 +2361,7 @@ def _validated_model_turn_response(
         return None, "provider returned an invalid ModelTurnResponse"
     if not isinstance(value.kind, ModelResponseKind):
         return None, "provider returned a ModelTurnResponse with an invalid kind"
-    if not isinstance(value.tool_calls, list):
+    if not isinstance(value.tool_calls, list) or value.tool_calls:
         return None, "provider returned a ModelTurnResponse with invalid tool_calls"
     if value.final_text is not None and not isinstance(value.final_text, str):
         return None, "provider returned a ModelTurnResponse with invalid final_text"
@@ -2371,7 +2371,24 @@ def _validated_model_turn_response(
         return None, "provider returned a ModelTurnResponse with invalid raw data"
     if not isinstance(value.provider_name, str) or not isinstance(value.model, str):
         return None, "provider returned a ModelTurnResponse with invalid metadata"
-    return value, None
+    try:
+        safe_raw = json.loads(
+            json.dumps(value.raw, ensure_ascii=False, allow_nan=False)
+        )
+    except (RecursionError, TypeError, ValueError):
+        return None, "provider returned a ModelTurnResponse with invalid raw data"
+    return (
+        ModelTurnResponse(
+            kind=value.kind,
+            tool_calls=[],
+            final_text=value.final_text,
+            error=value.error,
+            raw=safe_raw,
+            provider_name=value.provider_name,
+            model=value.model,
+        ),
+        None,
+    )
 
 
 def _adapter_name(adapter: object) -> str:
