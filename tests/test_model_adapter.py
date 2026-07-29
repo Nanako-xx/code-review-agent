@@ -1073,6 +1073,227 @@ def test_openai_adapter_does_not_reuse_tool_history_across_conversations():
     }
 
 
+def test_openai_adapter_rejects_orphan_tool_result_before_transport():
+    transport_called = False
+
+    def transport(url, headers, payload, timeout_seconds):
+        nonlocal transport_called
+        transport_called = True
+        return {"choices": [{"message": {"content": "must not be called"}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+
+    with pytest.raises(ValueError, match="no matching assistant tool call"):
+        adapter.complete_turn(
+            ModelTurnRequest(
+                system="system",
+                tools=[],
+                messages=[{"role": "user", "content": "Review"}],
+                tool_results=[
+                    ModelToolResult(
+                        call_id="orphan-call",
+                        tool_name="read_range",
+                        content="orphan result",
+                    )
+                ],
+                parameters={},
+            )
+        )
+
+    assert transport_called is False
+
+
+def test_openai_adapter_rejects_orphan_tool_message_before_transport():
+    transport_called = False
+
+    def transport(url, headers, payload, timeout_seconds):
+        nonlocal transport_called
+        transport_called = True
+        return {"choices": [{"message": {"content": "must not be called"}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    orphan = ModelToolResult(
+        call_id="orphan-message",
+        tool_name="read_range",
+        content="orphan result",
+    )
+
+    with pytest.raises(ValueError, match="no matching assistant tool call"):
+        adapter.complete_turn(
+            ModelTurnRequest(
+                system="system",
+                tools=[],
+                messages=[
+                    {"role": "user", "content": "Review"},
+                    model_tool_result_to_message(orphan),
+                ],
+                tool_results=[],
+                parameters={},
+            )
+        )
+
+    assert transport_called is False
+
+
+def test_openai_adapter_pairs_separate_results_across_two_ordered_tool_turns():
+    captured_payloads = []
+    responses = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "first tool turn",
+                        "reasoning_content": "first reasoning",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_range",
+                                    "arguments": '{"path": "a.py"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "second tool turn",
+                        "reasoning_content": "second reasoning",
+                        "tool_calls": [
+                            {
+                                "id": "call-2",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_range",
+                                    "arguments": '{"path": "b.py"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {"choices": [{"message": {"content": "done"}}]},
+    ]
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured_payloads.append(payload)
+        return responses.pop(0)
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    tool = ModelToolSpec(
+        name="read_range",
+        description="Read range",
+        parameters_schema={"type": "object"},
+    )
+    initial_user = {"role": "user", "content": "Review"}
+    first_response = adapter.complete_turn(
+        ModelTurnRequest(
+            system="system",
+            tools=[tool],
+            messages=[initial_user],
+            tool_results=[],
+            parameters={},
+        )
+    )
+    first_result = ModelToolResult(
+        call_id="call-1",
+        tool_name="read_range",
+        content="a.py contents",
+    )
+    first_checkpoint = {"role": "user", "content": "Runtime checkpoint one"}
+    second_response = adapter.complete_turn(
+        ModelTurnRequest(
+            system="system",
+            tools=[tool],
+            messages=[
+                initial_user,
+                model_response_to_assistant_message(first_response),
+                first_checkpoint,
+            ],
+            tool_results=[first_result],
+            parameters={},
+        )
+    )
+    assert [message["role"] for message in captured_payloads[1]["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+
+    second_result = ModelToolResult(
+        call_id="call-2",
+        tool_name="read_range",
+        content="b.py contents",
+    )
+    second_checkpoint = {"role": "user", "content": "Runtime checkpoint two"}
+    adapter.complete_turn(
+        ModelTurnRequest(
+            system="system",
+            tools=[tool],
+            messages=[
+                initial_user,
+                model_response_to_assistant_message(first_response),
+                model_tool_result_to_message(first_result),
+                first_checkpoint,
+                model_response_to_assistant_message(second_response),
+                second_checkpoint,
+            ],
+            tool_results=[first_result, second_result],
+            parameters={},
+        )
+    )
+
+    messages = captured_payloads[2]["messages"]
+    assert [message["role"] for message in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert [
+        message["tool_call_id"]
+        for message in messages
+        if message["role"] == "tool"
+    ] == ["call-1", "call-2"]
+    assert messages[5]["reasoning_content"] == "second reasoning"
+    assert json.loads(
+        messages[5]["tool_calls"][0]["function"]["arguments"]
+    ) == {"path": "b.py"}
+
+
 def test_openai_compatible_adapter_returns_invalid_when_transport_raises_json_decode_error():
     def transport(url, headers, payload, timeout_seconds):
         raise json.JSONDecodeError("bad json", "{", 0)

@@ -13,7 +13,11 @@ from review_agent.memory_models import (
     Sensitivity,
     canonical_sha256,
 )
-from review_agent.model_adapter import ModelAdapter
+from review_agent.model_adapter import (
+    ModelAdapter,
+    model_response_to_assistant_message,
+    model_tool_result_to_message,
+)
 from review_agent.model_protocol import (
     ModelResponseKind,
     ModelToolCall,
@@ -532,6 +536,11 @@ def run_intent_inference(
             current_results = [_execute_tool_call(gateway, call) for call in calls]
             tool_call_count += len(calls)
             tool_results.extend(current_results)
+            messages.append(model_response_to_assistant_message(response))
+            messages.extend(
+                model_tool_result_to_message(result)
+                for result in current_results
+            )
             tool_errors = [
                 f"tool {result.tool_name} failed: {result.content}"
                 for result in current_results
@@ -563,7 +572,12 @@ def run_intent_inference(
                 )
                 deficiencies.append(error_message)
                 if turn_index + 1 < max_turns:
-                    messages.append(_runtime_rejection_message(error_message))
+                    messages.extend(
+                        [
+                            model_response_to_assistant_message(response),
+                            _runtime_rejection_message(error_message),
+                        ]
+                    )
                     continue
                 all_deficiencies = _dedupe(deficiencies)
                 return _finish_run(

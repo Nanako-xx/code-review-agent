@@ -438,18 +438,10 @@ def _build_openai_tool_payload(
     request: ModelTurnRequest,
 ) -> dict[str, Any]:
     runtime_messages = [dict(message) for message in request.messages]
-    if request.tool_results:
-        represented_call_ids = {
-            message.get("tool_call_id")
-            for message in runtime_messages
-            if message.get("role") == "tool"
-            and isinstance(message.get("tool_call_id"), str)
-        }
-        runtime_messages.extend(
-            model_tool_result_to_message(result)
-            for result in request.tool_results
-            if result.call_id not in represented_call_ids
-        )
+    _pair_tool_results_with_assistant_calls(
+        runtime_messages,
+        request.tool_results,
+    )
     messages = [{"role": "system", "content": request.system}, *runtime_messages]
     payload = {
         "model": model,
@@ -488,6 +480,69 @@ def model_tool_result_to_message(result: ModelToolResult) -> dict[str, Any]:
         "tool_call_id": result.call_id,
         "content": result.content,
     }
+
+
+def _pair_tool_results_with_assistant_calls(
+    messages: list[dict[str, Any]],
+    tool_results: list[ModelToolResult],
+) -> None:
+    assistant_indices_by_call_id: dict[str, list[int]] = {}
+    for message_index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls", [])
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            call_id = tool_call.get("id")
+            if isinstance(call_id, str):
+                assistant_indices_by_call_id.setdefault(call_id, []).append(
+                    message_index
+                )
+
+    represented_call_ids: set[str] = set()
+    for message_index, message in enumerate(messages):
+        if message.get("role") != "tool":
+            continue
+        call_id = message.get("tool_call_id")
+        matching_indices = (
+            assistant_indices_by_call_id.get(call_id, [])
+            if isinstance(call_id, str)
+            else []
+        )
+        if not any(index < message_index for index in matching_indices):
+            raise ValueError(
+                f"tool result {call_id!r} has no matching assistant tool call"
+            )
+        represented_call_ids.add(call_id)
+
+    pending_by_assistant_index: dict[int, list[dict[str, Any]]] = {}
+    for result in tool_results:
+        if result.call_id in represented_call_ids:
+            continue
+        matching_indices = assistant_indices_by_call_id.get(result.call_id, [])
+        if not matching_indices:
+            raise ValueError(
+                f"tool result {result.call_id!r} has no matching assistant tool call"
+            )
+        assistant_index = matching_indices[-1]
+        pending_by_assistant_index.setdefault(assistant_index, []).append(
+            model_tool_result_to_message(result)
+        )
+        represented_call_ids.add(result.call_id)
+
+    for assistant_index in sorted(pending_by_assistant_index, reverse=True):
+        insertion_index = assistant_index + 1
+        while (
+            insertion_index < len(messages)
+            and messages[insertion_index].get("role") == "tool"
+        ):
+            insertion_index += 1
+        messages[insertion_index:insertion_index] = pending_by_assistant_index[
+            assistant_index
+        ]
 
 
 def model_response_to_assistant_message(
