@@ -84,6 +84,7 @@ decision_refs, reason_refs, and uncertainties may be empty arrays. disagreement_
 unique, and related_candidate_ids must be a subset of the candidate_ids on the matching
 disagreement. A contradicted_by_test rejection requires non-empty decision_refs, including at
 least one referenced packet Observation that is a test, quality, or gate Observation.
+Uncertainties may be empty, but any elements must be unique non-empty strings.
 disagreement_id is intentionally model-created. A model-created disagreement_id must begin with
 a letter, be at most 128 characters, and use only letters, digits, dot, underscore, colon, or
 hyphen. A supplemental request must reuse exactly the disagreement_id of its matching

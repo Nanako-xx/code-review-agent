@@ -393,6 +393,7 @@ def test_reconciler_system_prompt_declares_the_exact_proposal_contract():
         "id/ref/evidence arrays contain unique non-empty strings",
         "member_ids, supporting_refs, disagreement candidate_ids, required_evidence, and related_candidate_ids must be non-empty arrays",
         "decision_refs, reason_refs, and uncertainties may be empty arrays",
+        "uncertainties may be empty, but any elements must be unique non-empty strings",
         "disagreement_id values must be unique",
         "related_candidate_ids must be a subset of the candidate_ids on the matching disagreement",
         "a contradicted_by_test rejection requires non-empty decision_refs",
