@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from review_agent.context import (
+    REVIEWER_RESULT_OUTPUT_INSTRUCTIONS,
     ReviewerMemoryContext,
     build_reviewer_envelope,
     current_reviewer_memory_context,
@@ -86,6 +87,15 @@ class AgentLoopRun:
     result: ReviewerResult
     trace: AgentLoopTrace
     runtime: ReviewerRuntimeMetadata
+
+
+@dataclass(frozen=True)
+class _JsonFinalizationOutcome:
+    response: ModelTurnResponse
+    result: ReviewerResult | None
+    attempt: AgentLoopProviderAttempt
+    error: str | None = None
+    budget_reason: ReviewerTerminationReason | None = None
 
 
 def run_reviewer_agent_loop(
@@ -178,16 +188,20 @@ def run_reviewer_agent_loop(
                     runtime_failures,
                 )
 
+            parameters = request_parameters(
+                envelope.parameters,
+                assignment,
+                runtime,
+            )
+            parameters["tool_history_after_message_index"] = len(
+                envelope.messages
+            )
             request = ModelTurnRequest(
                 system=envelope.system,
                 tools=tools,
                 messages=list(runtime_messages),
                 tool_results=list(tool_results),
-                parameters=request_parameters(
-                    envelope.parameters,
-                    assignment,
-                    runtime,
-                ),
+                parameters=parameters,
             )
             try:
                 candidate = adapter.complete_turn(request)
@@ -374,23 +388,129 @@ def run_reviewer_agent_loop(
             continue
 
         if response.kind is ModelResponseKind.FINAL:
+            repaired_parse_error: str | None = None
             try:
                 result = parse_reviewer_result(response.final_text or "")
             except ReviewerResultParseError as error:
                 error_message = f"final response parse failed: {error}"
                 runtime_failures.append(error_message)
-                turns.append(
-                    AgentLoopTurn(
-                        turn_index=turn_index,
-                        response_kind=response.kind.value,
-                        error=error_message,
-                        provider_attempts=provider_attempts,
+                repaired_parse_error = error_message
+                if len(provider_attempts) >= assignment.max_provider_attempts:
+                    finalization_error_message = (
+                        "final response JSON finalization skipped: "
+                        "provider attempt budget exhausted"
                     )
+                    runtime_failures.append(finalization_error_message)
+                    turns.append(
+                        AgentLoopTurn(
+                            turn_index=turn_index,
+                            response_kind=response.kind.value,
+                            error=error_message,
+                            provider_attempts=provider_attempts,
+                        )
+                    )
+                    result = _failed_result(
+                        finalization_error_message,
+                        _authorized_observation_ids(gateway, observations),
+                        runtime_failures,
+                    )
+                    return _run_from_parts(
+                        envelope,
+                        response,
+                        result,
+                        trace_id,
+                        turns,
+                        runtime,
+                        ReviewerTerminationReason.PROVIDER_RETRY_EXHAUSTED,
+                    )
+                budget_reason = budget_reason_before_call(assignment, runtime)
+                if budget_reason is not None:
+                    turns.append(
+                        AgentLoopTurn(
+                            turn_index=turn_index,
+                            response_kind=response.kind.value,
+                            error=error_message,
+                            provider_attempts=provider_attempts,
+                        )
+                    )
+                    return _budget_run(
+                        envelope,
+                        response,
+                        adapter,
+                        model,
+                        gateway,
+                        observations,
+                        trace_id,
+                        turns,
+                        runtime,
+                        budget_reason,
+                        runtime_failures,
+                    )
+
+                finalization = _finalize_reviewer_json(
+                    adapter=adapter,
+                    envelope=envelope,
+                    assignment=assignment,
+                    runtime=runtime,
+                    runtime_messages=runtime_messages,
+                    tool_results=tool_results,
+                    original_response=response,
+                    parse_error=error_message,
+                    attempt_number=len(provider_attempts) + 1,
                 )
-                if turn_index + 1 < assignment.max_turns:
-                    runtime_messages.append(_runtime_rejection_message(error_message))
-                    continue
-                continue
+                response = finalization.response
+                last_response = finalization.response
+                provider_attempts.append(finalization.attempt)
+                if finalization.error is not None:
+                    runtime_failures.append(finalization.error)
+                if finalization.budget_reason is not None:
+                    turns.append(
+                        AgentLoopTurn(
+                            turn_index=turn_index,
+                            response_kind=response.kind.value,
+                            error=termination_summary(finalization.budget_reason),
+                            provider_attempts=provider_attempts,
+                        )
+                    )
+                    return _budget_run(
+                        envelope,
+                        response,
+                        adapter,
+                        model,
+                        gateway,
+                        observations,
+                        trace_id,
+                        turns,
+                        runtime,
+                        finalization.budget_reason,
+                        runtime_failures,
+                    )
+                if finalization.error is not None:
+                    turns.append(
+                        AgentLoopTurn(
+                            turn_index=turn_index,
+                            response_kind=response.kind.value,
+                            error=error_message,
+                            provider_attempts=provider_attempts,
+                        )
+                    )
+                    result = _failed_result(
+                        finalization.error,
+                        _authorized_observation_ids(gateway, observations),
+                        runtime_failures,
+                    )
+                    return _run_from_parts(
+                        envelope,
+                        response,
+                        result,
+                        trace_id,
+                        turns,
+                        runtime,
+                        ReviewerTerminationReason.RUNTIME_FAILURE,
+                    )
+                if finalization.result is None:
+                    raise AssertionError("successful JSON finalization has no result")
+                result = finalization.result
 
             validation = validate_reviewer_completion(
                 assignment,
@@ -439,6 +559,7 @@ def run_reviewer_agent_loop(
                 AgentLoopTurn(
                     turn_index=turn_index,
                     response_kind=response.kind.value,
+                    error=repaired_parse_error,
                     provider_attempts=provider_attempts,
                 )
             )
@@ -558,6 +679,105 @@ def _execute_tool_call(gateway: ToolGateway, call: ModelToolCall) -> ModelToolRe
     )
 
 
+def _finalize_reviewer_json(
+    *,
+    adapter: ModelAdapter,
+    envelope: ModelInvocationEnvelope,
+    assignment: Assignment,
+    runtime: RuntimeTracker,
+    runtime_messages: list[dict[str, Any]],
+    tool_results: list[ModelToolResult],
+    original_response: ModelTurnResponse,
+    parse_error: str,
+    attempt_number: int,
+) -> _JsonFinalizationOutcome:
+    parameters = request_parameters(envelope.parameters, assignment, runtime)
+    parameters.update(
+        {
+            "tool_choice": "none",
+            "response_format": "json_object",
+            "tool_history_after_message_index": len(envelope.messages),
+        }
+    )
+    request = ModelTurnRequest(
+        system=envelope.system,
+        tools=[],
+        messages=[
+            *runtime_messages,
+            {
+                "role": "assistant",
+                "content": original_response.final_text or "",
+            },
+            _runtime_json_finalization_message(parse_error),
+        ],
+        tool_results=list(tool_results),
+        parameters=parameters,
+    )
+
+    try:
+        response = adapter.complete_turn(request)
+    except Exception as error:
+        runtime.record_attempt(None)
+        error_message = (
+            "final response JSON finalization raised "
+            f"{type(error).__name__}: {error}"
+        )
+        return _JsonFinalizationOutcome(
+            response=original_response,
+            result=None,
+            attempt=AgentLoopProviderAttempt(
+                provider_attempt=attempt_number,
+                response_kind="exception",
+                error=error_message,
+            ),
+            error=error_message,
+            budget_reason=budget_reason_after_call(assignment, runtime),
+        )
+
+    usage = runtime.record_attempt(response.raw)
+    attempt = AgentLoopProviderAttempt(
+        provider_attempt=attempt_number,
+        response_kind=response.kind.value,
+        error=response.error,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        total_tokens=usage.total_tokens,
+        usage_available=usage.available,
+    )
+    budget_reason = budget_reason_after_call(assignment, runtime)
+    if budget_reason is not None:
+        return _JsonFinalizationOutcome(
+            response=response,
+            result=None,
+            attempt=attempt,
+            budget_reason=budget_reason,
+        )
+    if response.kind is not ModelResponseKind.FINAL:
+        return _JsonFinalizationOutcome(
+            response=response,
+            result=None,
+            attempt=attempt,
+            error=(
+                "final response JSON finalization returned "
+                f"{response.kind.value}"
+            ),
+        )
+    try:
+        result = parse_reviewer_result(response.final_text or "")
+    except ReviewerResultParseError as error:
+        return _JsonFinalizationOutcome(
+            response=response,
+            result=None,
+            attempt=attempt,
+            error=f"final response JSON finalization parse failed: {error}",
+        )
+    return _JsonFinalizationOutcome(
+        response=response,
+        result=result,
+        attempt=attempt,
+    )
+
+
 def _blocked_result(
     reason: str,
     observation_refs: set[str],
@@ -644,6 +864,18 @@ def _runtime_rejection_message(reason: str) -> dict[str, str]:
         "content": (
             f"{reason}. Continue the assigned investigation and submit a corrected "
             "structured result that satisfies every Runtime requirement."
+        ),
+    }
+
+
+def _runtime_json_finalization_message(reason: str) -> dict[str, str]:
+    return {
+        "role": "user",
+        "content": (
+            f"{reason}. The investigation is complete. Do not call tools or add "
+            "new analysis. Convert the completed analysis into exactly one JSON "
+            "object that follows this Runtime-owned protocol.\n\n"
+            f"{REVIEWER_RESULT_OUTPUT_INSTRUCTIONS}"
         ),
     }
 

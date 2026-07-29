@@ -22,6 +22,7 @@ from review_agent.model_protocol import (
 
 DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_ALLOWED_RESPONSE_BYTES = 256 * 1024 * 1024
+DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS = 180
 PROVIDER_RESPONSE_TOO_LARGE_ERROR = (
     "provider response exceeded configured max_response_bytes"
 )
@@ -142,7 +143,7 @@ class OpenAICompatibleConfig:
     base_url: str
     api_key: str
     model: str
-    timeout_seconds: int = 60
+    timeout_seconds: int = DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
 
     def __post_init__(self) -> None:
@@ -421,7 +422,9 @@ class OpenAICompatibleToolAdapter:
             )
         response = _parse_openai_tool_response(raw, self.provider_name, self._config.model)
         if response.kind is ModelResponseKind.TOOL_CALLS:
-            self._assistant_tool_call_messages.append(_assistant_tool_call_message(response.tool_calls))
+            self._assistant_tool_call_messages.append(
+                _assistant_tool_call_message(response)
+            )
         return response
 
 
@@ -445,23 +448,46 @@ def _build_openai_tool_payload(
     request: ModelTurnRequest,
     assistant_tool_call_messages: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    messages = [{"role": "system", "content": request.system}]
-    messages.extend(request.messages)
+    runtime_messages = list(request.messages)
     if request.tool_results:
-        messages.extend(
-            _assistant_and_tool_result_messages(
-                request.tool_results,
-                assistant_tool_call_messages or [],
-            )
+        tool_history = _assistant_and_tool_result_messages(
+            request.tool_results,
+            assistant_tool_call_messages or [],
         )
-    return {
+        insertion_index = request.parameters.get(
+            "tool_history_after_message_index"
+        )
+        if insertion_index is None:
+            runtime_messages.extend(tool_history)
+        else:
+            if (
+                type(insertion_index) is not int
+                or insertion_index < 0
+                or insertion_index > len(runtime_messages)
+            ):
+                raise ValueError(
+                    "tool_history_after_message_index must be a valid message index"
+                )
+            runtime_messages[insertion_index:insertion_index] = tool_history
+    messages = [{"role": "system", "content": request.system}, *runtime_messages]
+    payload = {
         "model": model,
         "messages": messages,
-        "tools": [_tool_spec_to_openai(tool) for tool in request.tools],
-        "tool_choice": request.parameters.get("tool_choice", "auto"),
         "max_tokens": request.parameters.get("max_output_tokens", 4096),
         "temperature": request.parameters.get("temperature", 0),
     }
+    response_format = request.parameters.get("response_format")
+    if response_format is not None:
+        if response_format != "json_object":
+            raise ValueError("unsupported response_format")
+        if request.tools:
+            raise ValueError("json_object response_format requires a no-tool request")
+        payload["response_format"] = {"type": "json_object"}
+        return payload
+
+    payload["tools"] = [_tool_spec_to_openai(tool) for tool in request.tools]
+    payload["tool_choice"] = request.parameters.get("tool_choice", "auto")
+    return payload
 
 
 def _tool_spec_to_openai(tool: ModelToolSpec) -> dict[str, Any]:
@@ -483,10 +509,19 @@ def _tool_result_message(result: ModelToolResult) -> dict[str, Any]:
     }
 
 
-def _assistant_tool_call_message(tool_calls: list[ModelToolCall]) -> dict[str, Any]:
-    return {
+def _assistant_tool_call_message(response: ModelTurnResponse) -> dict[str, Any]:
+    source_message: dict[str, Any] = {}
+    try:
+        candidate = response.raw["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        candidate = None
+    if isinstance(candidate, dict):
+        source_message = candidate
+
+    content = source_message.get("content")
+    message = {
         "role": "assistant",
-        "content": None,
+        "content": content if isinstance(content, (str, list)) else None,
         "tool_calls": [
             {
                 "id": call.call_id,
@@ -496,9 +531,13 @@ def _assistant_tool_call_message(tool_calls: list[ModelToolCall]) -> dict[str, A
                     "arguments": json.dumps(call.arguments),
                 },
             }
-            for call in tool_calls
+            for call in response.tool_calls
         ],
     }
+    reasoning_content = source_message.get("reasoning_content")
+    if isinstance(reasoning_content, str):
+        message["reasoning_content"] = reasoning_content
+    return message
 
 
 def _assistant_and_tool_result_messages(

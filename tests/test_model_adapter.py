@@ -321,6 +321,80 @@ def test_openai_compatible_adapter_converts_final_text_response():
     assert response.provider_name == "openai-compatible"
 
 
+def test_openai_compatible_adapter_maps_explicit_json_finalization_without_tools():
+    captured = {}
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured["payload"] = payload
+        return {"choices": [{"message": {"content": '{"status": "partial"}'}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    request = ModelTurnRequest(
+        system="Return JSON.",
+        tools=[],
+        messages=[{"role": "user", "content": "Finalize the review as JSON."}],
+        tool_results=[],
+        parameters={
+            "max_output_tokens": 1000,
+            "temperature": 0,
+            "tool_choice": "none",
+            "response_format": "json_object",
+        },
+    )
+
+    adapter.complete_turn(request)
+
+    assert "tools" not in captured["payload"]
+    assert "tool_choice" not in captured["payload"]
+    assert captured["payload"]["response_format"] == {"type": "json_object"}
+
+
+def test_openai_compatible_adapter_does_not_enable_json_mode_for_tool_turns():
+    captured = {}
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured["payload"] = payload
+        return {"choices": [{"message": {"content": "done"}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    request = ModelTurnRequest(
+        system="system",
+        tools=[
+            ModelToolSpec(
+                name="read_range",
+                description="Read range",
+                parameters_schema={"type": "object", "properties": {}},
+            )
+        ],
+        messages=[{"role": "user", "content": "Review"}],
+        tool_results=[],
+        parameters={
+            "tool_choice": "auto",
+            "response_schema": "reviewer_assignment_result_v2",
+        },
+    )
+
+    adapter.complete_turn(request)
+
+    assert captured["payload"]["tools"]
+    assert captured["payload"]["tool_choice"] == "auto"
+    assert "response_format" not in captured["payload"]
+
+
 def test_default_transport_capabilities_bind_configured_response_limit():
     adapter = OpenAICompatibleToolAdapter(
         OpenAICompatibleConfig(
@@ -761,13 +835,15 @@ def test_default_transport_rejects_limit_plus_one_without_leaking_body_or_creden
     assert http_response.read_sizes == [configured_limit + 1]
 
 
-def test_openai_compatible_adapter_includes_prior_assistant_tool_call_before_tool_result():
+def test_openai_adapter_places_tool_history_before_json_finalization_messages():
     captured_payloads = []
     responses = [
         {
             "choices": [
                 {
                     "message": {
+                        "content": "I will inspect the requested range.",
+                        "reasoning_content": "The file range is needed before concluding.",
                         "tool_calls": [
                             {
                                 "id": "call-1",
@@ -819,8 +895,12 @@ def test_openai_compatible_adapter_includes_prior_assistant_tool_call_before_too
     second_response = adapter.complete_turn(
         ModelTurnRequest(
             system="system",
-            tools=first_request.tools,
-            messages=first_request.messages,
+            tools=[],
+            messages=[
+                *first_request.messages,
+                {"role": "assistant", "content": "prose final"},
+                {"role": "user", "content": "Return corrected JSON."},
+            ],
             tool_results=[
                 ModelToolResult(
                     call_id="call-1",
@@ -829,14 +909,30 @@ def test_openai_compatible_adapter_includes_prior_assistant_tool_call_before_too
                     observation_ids=["O-read"],
                 )
             ],
-            parameters=first_request.parameters,
+            parameters={
+                **first_request.parameters,
+                "tool_choice": "none",
+                "response_format": "json_object",
+                "tool_history_after_message_index": 1,
+            },
         )
     )
 
     second_messages = captured_payloads[1]["messages"]
-    assert [message["role"] for message in second_messages] == ["system", "user", "assistant", "tool"]
+    assert [message["role"] for message in second_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "user",
+    ]
     assistant_message = second_messages[2]
-    assert assistant_message["content"] is None
+    assert assistant_message["content"] == "I will inspect the requested range."
+    assert (
+        assistant_message["reasoning_content"]
+        == "The file range is needed before concluding."
+    )
     assert assistant_message["tool_calls"][0]["id"] == "call-1"
     assert assistant_message["tool_calls"][0]["type"] == "function"
     assert assistant_message["tool_calls"][0]["function"]["name"] == "read_range"
@@ -845,6 +941,11 @@ def test_openai_compatible_adapter_includes_prior_assistant_tool_call_before_too
         "role": "tool",
         "tool_call_id": "call-1",
         "content": "app.py contents",
+    }
+    assert second_messages[4] == {"role": "assistant", "content": "prose final"}
+    assert second_messages[5] == {
+        "role": "user",
+        "content": "Return corrected JSON.",
     }
     assert second_response.kind is ModelResponseKind.FINAL
     assert second_response.final_text == '{"status": "completed"}'

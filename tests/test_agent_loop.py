@@ -560,6 +560,164 @@ def test_agent_loop_returns_failed_result_when_final_response_cannot_be_parsed(g
     assert run.trace.turns[0].error == run.result.uncertainties[0]
 
 
+def test_agent_loop_performs_one_no_tool_json_finalization_after_parse_failure(
+    git_repo,
+):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(
+        git_repo / ".review-agent" / "runs" / "review-json-finalization"
+    )
+    gateway = ToolGateway(git_repo, base, base, observation_store)
+
+    def corrected_json(request):
+        assert request.tools == []
+        assert request.parameters["tool_choice"] == "none"
+        assert request.parameters["response_format"] == "json_object"
+        assert request.parameters["tool_history_after_message_index"] == 1
+        assert request.messages[-2] == {
+            "role": "assistant",
+            "content": "## Structured Findings\n- prose, not JSON",
+        }
+        assert "exactly one JSON object" in request.messages[-1]["content"]
+        return ModelTurnResponse(
+            kind=ModelResponseKind.FINAL,
+            final_text=json.dumps(
+                {
+                    "contract_assessments": [],
+                    "confirmed_findings": [],
+                    "rejected_hypotheses": [],
+                    "uncertainties": ["No repository observation was available."],
+                    "observation_refs": [],
+                    "investigation_summary": "Finalized the previously completed analysis.",
+                    "status": "partial",
+                }
+            ),
+        )
+
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="## Structured Findings\n- prose, not JSON",
+            ),
+            corrected_json,
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=make_assignment("Core Reviewer"),
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-json-finalization-reviewer-0",
+    )
+
+    assert run.result.status.value == "partial"
+    assert run.result.investigation_summary.startswith("Finalized")
+    assert len(adapter.requests) == 2
+    assert run.runtime.provider_attempts == 2
+    assert run.runtime.model_turns == 1
+
+
+def test_agent_loop_checks_time_budget_when_json_finalization_raises(
+    git_repo,
+    monkeypatch,
+):
+    clock = [0.0]
+    monkeypatch.setattr(
+        "review_agent.reviewer_runtime.time.monotonic",
+        lambda: clock[0],
+    )
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(
+        git_repo / ".review-agent" / "runs" / "review-json-finalization-time"
+    )
+    gateway = ToolGateway(git_repo, base, base, observation_store)
+    assignment = replace(
+        make_assignment("Core Reviewer"),
+        max_elapsed_seconds=1.0,
+        max_provider_attempts=2,
+    )
+
+    def finalization_times_out(_request):
+        clock[0] = 2.0
+        raise TimeoutError("finalization timed out")
+
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="not JSON",
+            ),
+            finalization_times_out,
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=assignment,
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-json-finalization-time-reviewer-0",
+    )
+
+    assert run.result.status.value == "partial"
+    assert run.runtime.provider_attempts == 2
+    assert (
+        run.runtime.termination_reason
+        is ReviewerTerminationReason.TIME_BUDGET_EXHAUSTED
+    )
+    assert any(
+        "final response JSON finalization raised TimeoutError" in item
+        for item in run.result.uncertainties
+    )
+    assert "time budget exhausted" in run.result.uncertainties
+
+
+def test_agent_loop_does_not_exceed_provider_attempt_budget_for_json_finalization(
+    git_repo,
+):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    observation_store = ObservationStore(
+        git_repo / ".review-agent" / "runs" / "review-json-finalization-budget"
+    )
+    gateway = ToolGateway(git_repo, base, base, observation_store)
+    assignment = replace(
+        make_assignment("Core Reviewer"),
+        max_provider_attempts=1,
+    )
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="not JSON",
+            )
+        ]
+    )
+
+    run = run_reviewer_agent_loop(
+        adapter=adapter,
+        gateway=gateway,
+        assignment=assignment,
+        intent=make_intent(),
+        diff_excerpt=[],
+        observations={},
+        trace_id="review-json-finalization-budget-reviewer-0",
+    )
+
+    assert run.result.status.value == "failed"
+    assert len(adapter.requests) == 1
+    assert run.runtime.provider_attempts == 1
+    assert any(
+        "JSON finalization skipped: provider attempt budget exhausted" in item
+        for item in run.result.uncertainties
+    )
+
+
 def test_agent_loop_run_to_dict_serializes_trace_response_and_result(git_repo):
     base = run_git(git_repo, "rev-parse", "HEAD")
     (git_repo / "app.py").write_text("def add(a, b):\n    return a * b\n", encoding="utf-8")

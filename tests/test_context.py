@@ -407,6 +407,23 @@ def test_reviewer_envelope_exposes_only_runtime_allowed_tools():
     assert envelope.parameters["tool_choice"] == "auto"
 
 
+def test_reviewer_tools_publish_non_empty_object_schemas():
+    envelope = build_reviewer_envelope(
+        assignment=_context_assignment(),
+        intent=_context_intent(),
+        code_snippets={},
+        observations={},
+        trace_id="trace-tool-schemas",
+    )
+
+    assert envelope.tools
+    for tool in envelope.tools:
+        schema = tool.get("parameters")
+        assert isinstance(schema, dict)
+        assert schema.get("type") == "object"
+        assert isinstance(schema.get("properties"), dict)
+
+
 def test_reviewer_envelope_can_disable_tools_and_rejects_unknown_allowlist_items():
     envelope = build_reviewer_envelope(
         assignment=_context_assignment(),
@@ -561,6 +578,31 @@ def test_reviewer_envelope_records_context_metadata():
     assert "parameters" in metadata["excluded_from_budget"]
     assert envelope.messages[0]["role"] == "user"
     assert len(envelope.messages[0]["content"]) == metadata["message_chars"]
+
+
+def test_reviewer_context_includes_exact_json_result_protocol():
+    envelope = build_reviewer_envelope(
+        assignment=_context_assignment(),
+        intent=_context_intent(),
+        code_snippets={},
+        observations={},
+        trace_id="trace-json-result-protocol",
+    )
+
+    assert "Return exactly one JSON object" in envelope.system
+    assert '"contract_assessments"' in envelope.system
+    assert '"confirmed_findings"' in envelope.system
+    assert '"verification_performed"' in envelope.system
+    assert "Do not wrap the JSON in Markdown" in envelope.system
+    assert "Nested objects must use exactly the keys shown" in envelope.system
+    assert "safe, non-empty repository-relative path" in envelope.system
+    assert "line must be a positive integer" in envelope.system
+    assert "finding evidence_refs must be non-empty" in envelope.system
+    assert "verification_performed must be non-empty" in envelope.system
+    assert (
+        "If any assigned contract is partial or unknown, result status must be partial"
+        in envelope.system
+    )
 
 
 def test_reviewer_envelope_uses_explicit_model_parameters():
