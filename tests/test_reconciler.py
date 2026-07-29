@@ -387,6 +387,7 @@ def test_reconciler_system_prompt_declares_the_exact_proposal_contract():
         "candidate ids, decision_refs, supporting_refs, and reason_refs must come from the packet allowlists",
         "resolved and unresolved disagreements require none",
         "do not add fields or invent ids, observations, findings, or facts",
+        "every needs_investigation disagreement requires exactly one matching supplemental request",
         "disposed exactly once",
         "representative_id must belong to member_ids",
         "do not wrap the json in markdown",
