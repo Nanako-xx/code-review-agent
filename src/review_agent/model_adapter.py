@@ -486,62 +486,133 @@ def _pair_tool_results_with_assistant_calls(
     messages: list[dict[str, Any]],
     tool_results: list[ModelToolResult],
 ) -> None:
-    assistant_indices_by_call_id: dict[str, list[int]] = {}
+    has_message_tool_results = any(
+        message.get("role") == "tool" for message in messages
+    )
+    if has_message_tool_results and tool_results:
+        raise ValueError("mixed tool result sources are not allowed")
+
+    assistant_batches: list[tuple[int, list[str]]] = []
+    assistant_call_ids: set[str] = set()
     for message_index, message in enumerate(messages):
         if message.get("role") != "assistant":
             continue
-        tool_calls = message.get("tool_calls", [])
-        if not isinstance(tool_calls, list):
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None:
             continue
+        if not isinstance(tool_calls, list):
+            raise ValueError("assistant tool_calls must be a list")
+        batch_call_ids: list[str] = []
         for tool_call in tool_calls:
             if not isinstance(tool_call, dict):
-                continue
+                raise ValueError("assistant tool call must be an object")
             call_id = tool_call.get("id")
-            if isinstance(call_id, str):
-                assistant_indices_by_call_id.setdefault(call_id, []).append(
-                    message_index
+            if not isinstance(call_id, str) or not call_id.strip():
+                raise ValueError("assistant tool call id must be non-empty")
+            if call_id in assistant_call_ids:
+                raise ValueError(
+                    f"duplicate assistant tool call id {call_id!r}"
                 )
+            assistant_call_ids.add(call_id)
+            batch_call_ids.append(call_id)
+        if batch_call_ids:
+            assistant_batches.append((message_index, batch_call_ids))
 
-    represented_call_ids: set[str] = set()
+    if has_message_tool_results:
+        _validate_complete_tool_transcript(
+            messages,
+            assistant_batches,
+            assistant_call_ids,
+        )
+        return
+
+    _insert_legacy_tool_results(
+        messages,
+        assistant_batches,
+        assistant_call_ids,
+        tool_results,
+    )
+
+
+def _validate_complete_tool_transcript(
+    messages: list[dict[str, Any]],
+    assistant_batches: list[tuple[int, list[str]]],
+    assistant_call_ids: set[str],
+) -> None:
+    tool_message_ids: set[str] = set()
+    tool_message_indices: dict[int, str] = {}
     for message_index, message in enumerate(messages):
         if message.get("role") != "tool":
             continue
         call_id = message.get("tool_call_id")
-        matching_indices = (
-            assistant_indices_by_call_id.get(call_id, [])
-            if isinstance(call_id, str)
-            else []
-        )
-        if not any(index < message_index for index in matching_indices):
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise ValueError("tool result call id must be non-empty")
+        if call_id in tool_message_ids:
+            raise ValueError(f"duplicate tool result call id {call_id!r}")
+        if call_id not in assistant_call_ids:
             raise ValueError(
                 f"tool result {call_id!r} has no matching assistant tool call"
             )
-        represented_call_ids.add(call_id)
+        tool_message_ids.add(call_id)
+        tool_message_indices[message_index] = call_id
 
-    pending_by_assistant_index: dict[int, list[dict[str, Any]]] = {}
-    for result in tool_results:
-        if result.call_id in represented_call_ids:
-            continue
-        matching_indices = assistant_indices_by_call_id.get(result.call_id, [])
-        if not matching_indices:
+    for call_id in assistant_call_ids:
+        if call_id not in tool_message_ids:
             raise ValueError(
-                f"tool result {result.call_id!r} has no matching assistant tool call"
+                f"missing tool result for assistant call {call_id!r}"
             )
-        assistant_index = matching_indices[-1]
-        pending_by_assistant_index.setdefault(assistant_index, []).append(
-            model_tool_result_to_message(result)
-        )
-        represented_call_ids.add(result.call_id)
 
-    for assistant_index in sorted(pending_by_assistant_index, reverse=True):
-        insertion_index = assistant_index + 1
-        while (
-            insertion_index < len(messages)
-            and messages[insertion_index].get("role") == "tool"
-        ):
-            insertion_index += 1
-        messages[insertion_index:insertion_index] = pending_by_assistant_index[
-            assistant_index
+    expected_tool_indices: set[int] = set()
+    for assistant_index, batch_call_ids in assistant_batches:
+        for offset, call_id in enumerate(batch_call_ids, start=1):
+            tool_index = assistant_index + offset
+            if (
+                tool_index >= len(messages)
+                or messages[tool_index].get("role") != "tool"
+                or messages[tool_index].get("tool_call_id") != call_id
+            ):
+                raise ValueError(
+                    f"tool result for assistant call {call_id!r} must be adjacent"
+                )
+            expected_tool_indices.add(tool_index)
+
+    unexpected_indices = set(tool_message_indices) - expected_tool_indices
+    if unexpected_indices:
+        call_id = tool_message_indices[min(unexpected_indices)]
+        raise ValueError(
+            f"tool result for assistant call {call_id!r} must be adjacent"
+        )
+
+
+def _insert_legacy_tool_results(
+    messages: list[dict[str, Any]],
+    assistant_batches: list[tuple[int, list[str]]],
+    assistant_call_ids: set[str],
+    tool_results: list[ModelToolResult],
+) -> None:
+    results_by_call_id: dict[str, ModelToolResult] = {}
+    for result in tool_results:
+        call_id = result.call_id
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise ValueError("tool result call id must be non-empty")
+        if call_id in results_by_call_id:
+            raise ValueError(f"duplicate tool result call id {call_id!r}")
+        if call_id not in assistant_call_ids:
+            raise ValueError(
+                f"tool result {call_id!r} has no matching assistant tool call"
+            )
+        results_by_call_id[call_id] = result
+
+    for call_id in assistant_call_ids:
+        if call_id not in results_by_call_id:
+            raise ValueError(
+                f"missing tool result for assistant call {call_id!r}"
+            )
+
+    for assistant_index, batch_call_ids in reversed(assistant_batches):
+        messages[assistant_index + 1:assistant_index + 1] = [
+            model_tool_result_to_message(results_by_call_id[call_id])
+            for call_id in batch_call_ids
         ]
 
 

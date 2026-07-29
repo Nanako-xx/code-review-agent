@@ -31,33 +31,38 @@ def make_intent():
     )
 
 
-def final_response(request):
-    observation_id = request.tool_results[-1].observation_ids[0]
-    return ModelTurnResponse(
-        kind=ModelResponseKind.FINAL,
-        final_text=json.dumps(
-            {
-                "contract_assessments": [
-                    {
-                        "contract": "regression_safety",
-                        "status": "covered",
-                        "summary": "Compared base and head.",
-                        "evidence_refs": [observation_id],
-                    }
-                ],
-                "confirmed_findings": [],
-                "rejected_hypotheses": [],
-                "uncertainties": [],
-                "observation_refs": [observation_id],
-                "investigation_summary": "Reviewed with a tool observation.",
-                "status": "completed",
-            }
-        ),
-    )
+def final_response(observation_store):
+    def respond(request):
+        assert request.tool_results == []
+        observation_id = list(observation_store.summaries_by_id())[-1]
+        return ModelTurnResponse(
+            kind=ModelResponseKind.FINAL,
+            final_text=json.dumps(
+                {
+                    "contract_assessments": [
+                        {
+                            "contract": "regression_safety",
+                            "status": "covered",
+                            "summary": "Compared base and head.",
+                            "evidence_refs": [observation_id],
+                        }
+                    ],
+                    "confirmed_findings": [],
+                    "rejected_hypotheses": [],
+                    "uncertainties": [],
+                    "observation_refs": [observation_id],
+                    "investigation_summary": "Reviewed with a tool observation.",
+                    "status": "completed",
+                }
+            ),
+        )
+
+    return respond
 
 
 def final_response_after_tool_error(request):
-    assert request.tool_results[-1].is_error
+    assert request.tool_results == []
+    assert request.messages[-1]["role"] == "tool"
     return ModelTurnResponse(
         kind=ModelResponseKind.FINAL,
         final_text=json.dumps(
@@ -91,7 +96,7 @@ def test_agent_loop_executes_tool_call_and_returns_final_result(git_repo):
                 kind=ModelResponseKind.TOOL_CALLS,
                 tool_calls=[ModelToolCall("call-1", "compare_base_head", {"path": "app.py"})],
             ),
-            final_response,
+            final_response(observation_store),
         ]
     )
 
@@ -110,7 +115,8 @@ def test_agent_loop_executes_tool_call_and_returns_final_result(git_repo):
     assert run.trace.tool_call_count == 1
     assert run.trace.turns[0].tool_calls[0].tool_name == "compare_base_head"
     assert run.trace.turns[0].tool_results[0].observation_ids
-    assert adapter.requests[1].tool_results[0].content
+    assert adapter.requests[1].tool_results == []
+    assert adapter.requests[1].messages[-1]["content"]
     assert list(observation_store.summaries_by_id())
 
 
@@ -160,7 +166,7 @@ def test_agent_loop_executes_snapshot_memory_tool_turn(git_repo):
                     )
                 ],
             ),
-            final_response,
+            final_response(observation_store),
         ]
     )
 
@@ -176,11 +182,11 @@ def test_agent_loop_executes_snapshot_memory_tool_turn(git_repo):
 
     assert run.trace.turns[0].tool_calls[0].tool_name == "query_project_memory"
     assert run.trace.turns[0].tool_results[0].observation_ids
-    assert gateway.memory_snapshot.snapshot_id in adapter.requests[1].tool_results[0].content
+    assert gateway.memory_snapshot.snapshot_id in adapter.requests[1].messages[-1]["content"]
     assert run.result.observation_refs == list(observation_store.summaries_by_id())
     metadata = run.envelope.parameters["context"]
     query_bytes = len(
-        adapter.requests[1].tool_results[0].content.encode("utf-8")
+        adapter.requests[1].messages[-1]["content"].encode("utf-8")
     )
     assert gateway.memory_context_used_bytes == (
         metadata["memory_ledger_initial_bytes"] + query_bytes
@@ -299,9 +305,13 @@ def test_agent_loop_memory_queries_share_one_cumulative_ten_percent_ledger(
     )
 
     def continue_until_ledger_error(request):
-        if request.tool_results[-1].is_error:
+        assert request.tool_results == []
+        tool_messages = [
+            message for message in request.messages if message["role"] == "tool"
+        ]
+        if "remaining Context budget" in tool_messages[-1]["content"]:
             return final_response_after_tool_error(request)
-        next_index = len(request.tool_results) + 1
+        next_index = len(tool_messages) + 1
         return ModelTurnResponse(
             kind=ModelResponseKind.TOOL_CALLS,
             tool_calls=[
@@ -692,7 +702,8 @@ def test_agent_loop_converts_gateway_argument_error_to_error_tool_result(git_rep
     assert error_result.tool_name == "compare_base_head"
     assert "KeyError" in error_result.content
     assert "'path'" in error_result.content
-    assert adapter.requests[1].tool_results[0].is_error is True
+    assert adapter.requests[1].tool_results == []
+    assert adapter.requests[1].messages[-1]["content"] == error_result.content
 
 
 def test_agent_loop_returns_failed_result_when_final_response_cannot_be_parsed(git_repo):
