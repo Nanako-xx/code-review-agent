@@ -424,6 +424,55 @@ def test_reviewer_tools_publish_non_empty_object_schemas():
         assert isinstance(schema.get("properties"), dict)
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "field_name"),
+    [
+        ("search_code", "query"),
+        ("read_range", "path"),
+        ("compare_base_head", "path"),
+        ("list_symbols", "path"),
+        ("inspect_symbol", "name"),
+        ("find_references", "name"),
+    ],
+)
+def test_reviewer_required_text_arguments_publish_non_empty_schemas(
+    tool_name,
+    field_name,
+):
+    envelope = build_reviewer_envelope(
+        assignment=_context_assignment(),
+        intent=_context_intent(),
+        code_snippets={},
+        observations={},
+        trace_id="trace-required-text-schemas",
+    )
+
+    tools_by_name = {tool["name"]: tool for tool in envelope.tools}
+    field_schema = tools_by_name[tool_name]["parameters"]["properties"][field_name]
+
+    assert field_schema["type"] == "string"
+    assert field_schema["minLength"] == 1
+    assert field_schema["pattern"] == r"\S"
+
+
+def test_read_range_schema_documents_ordered_positive_line_bounds():
+    envelope = build_reviewer_envelope(
+        assignment=_context_assignment(),
+        intent=_context_intent(),
+        code_snippets={},
+        observations={},
+        trace_id="trace-read-range-schema",
+        allowed_tools=("read_range",),
+    )
+
+    tool = envelope.tools[0]
+    assert "line_start <= line_end" in tool["description"]
+    for field_name in ("line_start", "line_end"):
+        field_schema = tool["parameters"]["properties"][field_name]
+        assert field_schema["minimum"] == 1
+        assert "line_start <= line_end" in field_schema["description"]
+
+
 def test_reviewer_envelope_can_disable_tools_and_rejects_unknown_allowlist_items():
     envelope = build_reviewer_envelope(
         assignment=_context_assignment(),

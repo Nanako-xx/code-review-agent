@@ -123,7 +123,7 @@ _REVIEWER_TOOL_DEFINITIONS = (
         {
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
+                "query": {"type": "string", "minLength": 1, "pattern": r"\S"},
                 "revision": {"type": "string", "enum": ["base", "head"]},
                 "max_results": {"type": "integer", "minimum": 1},
             },
@@ -133,14 +133,25 @@ _REVIEWER_TOOL_DEFINITIONS = (
     ),
     (
         "read_range",
-        "Read a bounded repository file range at an authorized base or head revision.",
+        (
+            "Read a bounded repository file range at an authorized base or head "
+            "revision; line_start <= line_end."
+        ),
         {
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
+                "path": {"type": "string", "minLength": 1, "pattern": r"\S"},
                 "revision": {"type": "string", "enum": ["base", "head"]},
-                "line_start": {"type": "integer", "minimum": 1},
-                "line_end": {"type": "integer", "minimum": 1},
+                "line_start": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "First line to read; line_start <= line_end.",
+                },
+                "line_end": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Last line to read; line_start <= line_end.",
+                },
             },
             "required": ["path", "line_start", "line_end"],
             "additionalProperties": False,
@@ -151,7 +162,9 @@ _REVIEWER_TOOL_DEFINITIONS = (
         "Read Runtime-authorized base and head file ranges or diff hunks for comparison.",
         {
             "type": "object",
-            "properties": {"path": {"type": "string"}},
+            "properties": {
+                "path": {"type": "string", "minLength": 1, "pattern": r"\S"}
+            },
             "required": ["path"],
             "additionalProperties": False,
         },
@@ -162,7 +175,7 @@ _REVIEWER_TOOL_DEFINITIONS = (
         {
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
+                "path": {"type": "string", "minLength": 1, "pattern": r"\S"},
                 "revision": {"type": "string", "enum": ["base", "head"]},
             },
             "required": ["path"],
@@ -175,7 +188,7 @@ _REVIEWER_TOOL_DEFINITIONS = (
         {
             "type": "object",
             "properties": {
-                "name": {"type": "string"},
+                "name": {"type": "string", "minLength": 1, "pattern": r"\S"},
                 "revision": {"type": "string", "enum": ["base", "head"]},
             },
             "required": ["name"],
@@ -188,7 +201,7 @@ _REVIEWER_TOOL_DEFINITIONS = (
         {
             "type": "object",
             "properties": {
-                "name": {"type": "string"},
+                "name": {"type": "string", "minLength": 1, "pattern": r"\S"},
                 "revision": {"type": "string", "enum": ["base", "head"]},
                 "max_results": {"type": "integer", "minimum": 1},
             },
