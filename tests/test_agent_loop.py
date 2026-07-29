@@ -33,8 +33,8 @@ def make_intent():
 
 def final_response(observation_store):
     def respond(request):
-        assert request.tool_results == []
-        observation_id = list(observation_store.summaries_by_id())[-1]
+        observation_id = request.tool_results[-1].observation_ids[0]
+        assert observation_id in observation_store.summaries_by_id()
         return ModelTurnResponse(
             kind=ModelResponseKind.FINAL,
             final_text=json.dumps(
@@ -61,7 +61,7 @@ def final_response(observation_store):
 
 
 def final_response_after_tool_error(request):
-    assert request.tool_results == []
+    assert request.tool_results[-1].is_error
     assert request.messages[-1]["role"] == "tool"
     return ModelTurnResponse(
         kind=ModelResponseKind.FINAL,
@@ -115,8 +115,11 @@ def test_agent_loop_executes_tool_call_and_returns_final_result(git_repo):
     assert run.trace.tool_call_count == 1
     assert run.trace.turns[0].tool_calls[0].tool_name == "compare_base_head"
     assert run.trace.turns[0].tool_results[0].observation_ids
-    assert adapter.requests[1].tool_results == []
-    assert adapter.requests[1].messages[-1]["content"]
+    assert adapter.requests[1].tool_results[0].content
+    assert (
+        adapter.requests[1].messages[-1]["content"]
+        == adapter.requests[1].tool_results[0].content
+    )
     assert list(observation_store.summaries_by_id())
 
 
@@ -305,7 +308,7 @@ def test_agent_loop_memory_queries_share_one_cumulative_ten_percent_ledger(
     )
 
     def continue_until_ledger_error(request):
-        assert request.tool_results == []
+        assert request.tool_results
         tool_messages = [
             message for message in request.messages if message["role"] == "tool"
         ]
@@ -700,9 +703,10 @@ def test_agent_loop_converts_gateway_argument_error_to_error_tool_result(git_rep
     assert error_result.is_error is True
     assert error_result.call_id == "call-1"
     assert error_result.tool_name == "compare_base_head"
-    assert "KeyError" in error_result.content
-    assert "'path'" in error_result.content
-    assert adapter.requests[1].tool_results == []
+    assert error_result.content == (
+        "ToolGatewayError: path must be a non-empty string"
+    )
+    assert adapter.requests[1].tool_results[-1] == error_result
     assert adapter.requests[1].messages[-1]["content"] == error_result.content
 
 

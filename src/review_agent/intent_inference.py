@@ -467,7 +467,7 @@ def run_intent_inference(
             system=INTENT_INFERENCE_SYSTEM_PROMPT,
             tools=tools,
             messages=list(messages),
-            tool_results=[],
+            tool_results=list(tool_results),
             parameters=dict(parameters),
         )
         try:

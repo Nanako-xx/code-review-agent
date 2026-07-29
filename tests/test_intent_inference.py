@@ -60,8 +60,8 @@ def test_intent_inference_runs_legal_tool_loop_with_bound_context(git_repo, tmp_
     gateway = ToolGateway(git_repo, base, head, store)
 
     def final_response(request):
-        assert request.tool_results == []
-        observation_id = list(store.summaries_by_id())[-1]
+        observation_id = request.tool_results[-1].observation_ids[0]
+        assert observation_id in store.summaries_by_id()
         return ModelTurnResponse(
             kind=ModelResponseKind.FINAL,
             final_text=_result_json(

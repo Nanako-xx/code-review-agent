@@ -911,7 +911,7 @@ def test_openai_adapter_places_tool_history_before_json_finalization_messages():
                 {"role": "assistant", "content": "prose final"},
                 {"role": "user", "content": "Return corrected JSON."},
             ],
-            tool_results=[],
+            tool_results=[tool_result],
             parameters={
                 **first_request.parameters,
                 "tool_choice": "none",
@@ -1049,7 +1049,7 @@ def test_openai_adapter_does_not_reuse_tool_history_across_conversations():
                 model_response_to_assistant_message(session_b_response),
                 model_tool_result_to_message(tool_result),
             ],
-            tool_results=[],
+            tool_results=[tool_result],
             parameters={"trace_id": "session-b"},
         )
     )
@@ -1149,7 +1149,72 @@ def test_openai_adapter_rejects_orphan_tool_message_before_transport():
     assert transport_called is False
 
 
-def test_openai_adapter_rejects_mixed_tool_result_sources_before_transport():
+def test_openai_adapter_accepts_exact_tool_result_metadata_without_duplicate():
+    captured_payloads = []
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured_payloads.append(payload)
+        return {"choices": [{"message": {"content": "done"}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    result = ModelToolResult(
+        call_id="call-1",
+        tool_name="read_range",
+        content="app.py contents",
+        observation_ids=["O-read"],
+    )
+    assistant = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_range",
+                    "arguments": '{"path": "app.py"}',
+                },
+            }
+        ],
+    }
+
+    adapter.complete_turn(
+        ModelTurnRequest(
+            system="system",
+            tools=[],
+            messages=[
+                {"role": "user", "content": "Review"},
+                assistant,
+                model_tool_result_to_message(result),
+            ],
+            tool_results=[result],
+            parameters={},
+        )
+    )
+
+    messages = captured_payloads[0]["messages"]
+    assert [message["role"] for message in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert sum(message["role"] == "tool" for message in messages) == 1
+    assert messages[-1] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "app.py contents",
+    }
+
+
+def test_openai_adapter_rejects_mismatched_tool_result_metadata_before_transport():
     transport_called = False
 
     def transport(url, headers, payload, timeout_seconds):
@@ -1190,7 +1255,7 @@ def test_openai_adapter_rejects_mixed_tool_result_sources_before_transport():
         content="new-sensitive-content",
     )
 
-    with pytest.raises(ValueError, match="mixed tool result sources") as error:
+    with pytest.raises(ValueError, match="metadata content mismatch") as error:
         adapter.complete_turn(
             ModelTurnRequest(
                 system="system",
@@ -1446,7 +1511,7 @@ def test_openai_adapter_pairs_separate_results_across_two_ordered_tool_turns():
                 model_tool_result_to_message(second_result),
                 second_checkpoint,
             ],
-            tool_results=[],
+            tool_results=[first_result, second_result],
             parameters={},
         )
     )

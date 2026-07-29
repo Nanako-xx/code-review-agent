@@ -197,7 +197,7 @@ def run_reviewer_agent_loop(
                 system=envelope.system,
                 tools=tools,
                 messages=list(runtime_messages),
-                tool_results=[],
+                tool_results=list(tool_results),
                 parameters=request_parameters(
                     envelope.parameters,
                     assignment,
@@ -491,6 +491,7 @@ def run_reviewer_agent_loop(
                     assignment=assignment,
                     runtime=runtime,
                     runtime_messages=runtime_messages,
+                    tool_results=tool_results,
                     original_response=response,
                     attempt_number=len(provider_attempts) + 1,
                 )
@@ -730,6 +731,7 @@ def _finalize_reviewer_json(
     assignment: Assignment,
     runtime: RuntimeTracker,
     runtime_messages: list[dict[str, Any]],
+    tool_results: list[ModelToolResult],
     original_response: ModelTurnResponse,
     attempt_number: int,
 ) -> _JsonFinalizationOutcome:
@@ -744,7 +746,7 @@ def _finalize_reviewer_json(
         system=envelope.system,
         tools=[],
         messages=list(runtime_messages),
-        tool_results=[],
+        tool_results=list(tool_results),
         parameters=parameters,
     )
 

@@ -489,8 +489,6 @@ def _pair_tool_results_with_assistant_calls(
     has_message_tool_results = any(
         message.get("role") == "tool" for message in messages
     )
-    if has_message_tool_results and tool_results:
-        raise ValueError("mixed tool result sources are not allowed")
 
     assistant_batches: list[tuple[int, list[str]]] = []
     assistant_call_ids: set[str] = set()
@@ -519,11 +517,16 @@ def _pair_tool_results_with_assistant_calls(
             assistant_batches.append((message_index, batch_call_ids))
 
     if has_message_tool_results:
-        _validate_complete_tool_transcript(
+        message_tool_results = _validate_complete_tool_transcript(
             messages,
             assistant_batches,
             assistant_call_ids,
         )
+        if tool_results:
+            _validate_tool_result_metadata(
+                message_tool_results,
+                tool_results,
+            )
         return
 
     _insert_legacy_tool_results(
@@ -538,7 +541,7 @@ def _validate_complete_tool_transcript(
     messages: list[dict[str, Any]],
     assistant_batches: list[tuple[int, list[str]]],
     assistant_call_ids: set[str],
-) -> None:
+) -> dict[str, Any]:
     tool_message_ids: set[str] = set()
     tool_message_indices: dict[int, str] = {}
     for message_index, message in enumerate(messages):
@@ -582,6 +585,36 @@ def _validate_complete_tool_transcript(
         raise ValueError(
             f"tool result for assistant call {call_id!r} must be adjacent"
         )
+
+    return {
+        call_id: messages[message_index].get("content")
+        for message_index, call_id in tool_message_indices.items()
+    }
+
+
+def _validate_tool_result_metadata(
+    message_tool_results: dict[str, Any],
+    tool_results: list[ModelToolResult],
+) -> None:
+    metadata_by_call_id: dict[str, ModelToolResult] = {}
+    for result in tool_results:
+        call_id = result.call_id
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise ValueError("tool result metadata call id must be non-empty")
+        if call_id in metadata_by_call_id:
+            raise ValueError(
+                f"duplicate tool result metadata call id {call_id!r}"
+            )
+        metadata_by_call_id[call_id] = result
+
+    if set(metadata_by_call_id) != set(message_tool_results):
+        raise ValueError("tool result metadata ids do not match transcript")
+
+    for call_id, result in metadata_by_call_id.items():
+        if result.content != message_tool_results[call_id]:
+            raise ValueError(
+                f"tool result metadata content mismatch for call id {call_id!r}"
+            )
 
 
 def _insert_legacy_tool_results(
