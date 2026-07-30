@@ -27,6 +27,7 @@ from review_agent.model_protocol import (
     ModelTurnRequest,
     ModelTurnResponse,
 )
+from review_agent.tool_result_protocol import serialize_tool_result_envelope
 
 
 class _BoundedHttpResponse:
@@ -939,9 +940,17 @@ def test_openai_adapter_places_tool_history_before_json_finalization_messages():
     assert assistant_message["tool_calls"][0]["type"] == "function"
     assert assistant_message["tool_calls"][0]["function"]["name"] == "read_range"
     assert json.loads(assistant_message["tool_calls"][0]["function"]["arguments"]) == {"path": "app.py"}
-    assert second_messages[3] == {
+    tool_message = second_messages[3]
+    assert tool_message == {
         "role": "tool",
         "tool_call_id": "call-1",
+        "content": serialize_tool_result_envelope(tool_result),
+    }
+    assert json.loads(tool_message["content"]) == {
+        "schema_version": "review_agent_tool_result_v1",
+        "tool_name": "read_range",
+        "observation_ids": ["O-read"],
+        "is_error": False,
         "content": "app.py contents",
     }
     assert second_messages[4] == {"role": "assistant", "content": "prose final"}
@@ -1069,7 +1078,7 @@ def test_openai_adapter_does_not_reuse_tool_history_across_conversations():
     assert messages[3] == {
         "role": "tool",
         "tool_call_id": "call-1",
-        "content": "b.py contents",
+        "content": serialize_tool_result_envelope(tool_result),
     }
 
 
@@ -1210,7 +1219,7 @@ def test_openai_adapter_accepts_exact_tool_result_metadata_without_duplicate():
     assert messages[-1] == {
         "role": "tool",
         "tool_call_id": "call-1",
-        "content": "app.py contents",
+        "content": serialize_tool_result_envelope(result),
     }
 
 
@@ -1255,7 +1264,7 @@ def test_openai_adapter_rejects_mismatched_tool_result_metadata_before_transport
         content="new-sensitive-content",
     )
 
-    with pytest.raises(ValueError, match="metadata content mismatch") as error:
+    with pytest.raises(ValueError) as error:
         adapter.complete_turn(
             ModelTurnRequest(
                 system="system",
@@ -1271,8 +1280,175 @@ def test_openai_adapter_rejects_mismatched_tool_result_metadata_before_transport
         )
 
     assert transport_called is False
-    assert "old-sensitive-content" not in str(error.value)
-    assert "new-sensitive-content" not in str(error.value)
+    assert str(error.value) == "tool result metadata does not match transcript"
+
+
+@pytest.mark.parametrize(
+    "metadata_override",
+    [
+        pytest.param(
+            {"observation_ids": ["O-metadata-secret"]},
+            id="observation-ids",
+        ),
+        pytest.param(
+            {"tool_name": "metadata-secret-tool"},
+            id="tool-name",
+        ),
+        pytest.param({"is_error": True}, id="is-error"),
+    ],
+)
+def test_openai_adapter_rejects_full_metadata_mismatch_when_raw_content_matches(
+    metadata_override,
+):
+    transport_called = False
+
+    def transport(url, headers, payload, timeout_seconds):
+        nonlocal transport_called
+        transport_called = True
+        return {"choices": [{"message": {"content": "must not be called"}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    call_id = "call-sensitive-metadata"
+    transcript_result = ModelToolResult(
+        call_id=call_id,
+        tool_name="read_range",
+        content="same-sensitive-content",
+        observation_ids=["O-transcript-secret"],
+        is_error=False,
+    )
+    metadata_values = {
+        "call_id": call_id,
+        "tool_name": transcript_result.tool_name,
+        "content": transcript_result.content,
+        "observation_ids": list(transcript_result.observation_ids),
+        "is_error": transcript_result.is_error,
+        **metadata_override,
+    }
+    metadata_result = ModelToolResult(**metadata_values)
+    assistant = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "read_range", "arguments": "{}"},
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError) as error:
+        adapter.complete_turn(
+            ModelTurnRequest(
+                system="system",
+                tools=[],
+                messages=[
+                    {"role": "user", "content": "Review"},
+                    assistant,
+                    model_tool_result_to_message(transcript_result),
+                ],
+                tool_results=[metadata_result],
+                parameters={},
+            )
+        )
+
+    assert transport_called is False
+    assert str(error.value) == "tool result metadata does not match transcript"
+
+
+@pytest.mark.parametrize(
+    "encoding",
+    [
+        pytest.param("plain", id="plain-content"),
+        pytest.param("noncanonical", id="noncanonical-json"),
+        pytest.param("extra-field", id="extra-field"),
+    ],
+)
+def test_openai_adapter_rejects_invalid_adjacent_tool_result_envelope_before_transport(
+    encoding,
+):
+    transport_called = False
+
+    def transport(url, headers, payload, timeout_seconds):
+        nonlocal transport_called
+        transport_called = True
+        return {"choices": [{"message": {"content": "must not be called"}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    call_id = "call-sensitive-envelope"
+    result = ModelToolResult(
+        call_id=call_id,
+        tool_name="read_range",
+        content="sensitive-envelope-content",
+        observation_ids=["O-sensitive-envelope"],
+    )
+    canonical_content = serialize_tool_result_envelope(result)
+    if encoding == "plain":
+        message_content = result.content
+    else:
+        envelope = json.loads(canonical_content)
+        if encoding == "extra-field":
+            envelope["extra_field"] = "sensitive-extra-field"
+            message_content = json.dumps(
+                envelope,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        else:
+            message_content = json.dumps(
+                envelope,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+            )
+    assistant = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "read_range", "arguments": "{}"},
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError) as error:
+        adapter.complete_turn(
+            ModelTurnRequest(
+                system="system",
+                tools=[],
+                messages=[
+                    {"role": "user", "content": "Review"},
+                    assistant,
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": message_content,
+                    },
+                ],
+                tool_results=[],
+                parameters={},
+            )
+        )
+
+    assert transport_called is False
+    assert str(error.value) == "invalid tool result envelope"
 
 
 def test_openai_adapter_rejects_duplicate_call_id_across_assistant_turns():
@@ -1491,6 +1667,11 @@ def test_openai_adapter_pairs_separate_results_across_two_ordered_tool_turns():
         "tool",
         "user",
     ]
+    assert captured_payloads[1]["messages"][3] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": serialize_tool_result_envelope(first_result),
+    }
 
     second_result = ModelToolResult(
         call_id="call-2",
@@ -1532,6 +1713,14 @@ def test_openai_adapter_pairs_separate_results_across_two_ordered_tool_turns():
         for message in messages
         if message["role"] == "tool"
     ] == ["call-1", "call-2"]
+    assert [
+        message["content"]
+        for message in messages
+        if message["role"] == "tool"
+    ] == [
+        serialize_tool_result_envelope(first_result),
+        serialize_tool_result_envelope(second_result),
+    ]
     assert messages[5]["reasoning_content"] == "second reasoning"
     assert json.loads(
         messages[5]["tool_calls"][0]["function"]["arguments"]

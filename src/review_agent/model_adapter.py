@@ -18,6 +18,10 @@ from review_agent.model_protocol import (
     ModelTurnRequest,
     ModelTurnResponse,
 )
+from review_agent.tool_result_protocol import (
+    parse_tool_result_envelope,
+    serialize_tool_result_envelope,
+)
 
 
 DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -28,6 +32,9 @@ PROVIDER_RESPONSE_TOO_LARGE_ERROR = (
 )
 MAX_HTTP_DEADLINE_WORKERS = 32
 MAX_HTTP_CLOSE_WORKERS = 32
+_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC = (
+    "tool result metadata does not match transcript"
+)
 _HTTP_DEADLINE_SLOTS = threading.BoundedSemaphore(MAX_HTTP_DEADLINE_WORKERS)
 _HTTP_CLOSE_SLOTS = threading.BoundedSemaphore(MAX_HTTP_CLOSE_WORKERS)
 
@@ -478,7 +485,7 @@ def model_tool_result_to_message(result: ModelToolResult) -> dict[str, Any]:
     return {
         "role": "tool",
         "tool_call_id": result.call_id,
-        "content": result.content,
+        "content": serialize_tool_result_envelope(result),
     }
 
 
@@ -541,9 +548,10 @@ def _validate_complete_tool_transcript(
     messages: list[dict[str, Any]],
     assistant_batches: list[tuple[int, list[str]]],
     assistant_call_ids: set[str],
-) -> dict[str, Any]:
+) -> dict[str, ModelToolResult]:
     tool_message_ids: set[str] = set()
     tool_message_indices: dict[int, str] = {}
+    tool_message_results: dict[str, ModelToolResult] = {}
     for message_index, message in enumerate(messages):
         if message.get("role") != "tool":
             continue
@@ -558,6 +566,10 @@ def _validate_complete_tool_transcript(
             )
         tool_message_ids.add(call_id)
         tool_message_indices[message_index] = call_id
+        tool_message_results[call_id] = parse_tool_result_envelope(
+            call_id,
+            message.get("content"),
+        )
 
     for call_id in assistant_call_ids:
         if call_id not in tool_message_ids:
@@ -586,35 +598,30 @@ def _validate_complete_tool_transcript(
             f"tool result for assistant call {call_id!r} must be adjacent"
         )
 
-    return {
-        call_id: messages[message_index].get("content")
-        for message_index, call_id in tool_message_indices.items()
-    }
+    return tool_message_results
 
 
 def _validate_tool_result_metadata(
-    message_tool_results: dict[str, Any],
+    message_tool_results: dict[str, ModelToolResult],
     tool_results: list[ModelToolResult],
 ) -> None:
     metadata_by_call_id: dict[str, ModelToolResult] = {}
     for result in tool_results:
+        if not isinstance(result, ModelToolResult):
+            raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC)
         call_id = result.call_id
         if not isinstance(call_id, str) or not call_id.strip():
-            raise ValueError("tool result metadata call id must be non-empty")
+            raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC)
         if call_id in metadata_by_call_id:
-            raise ValueError(
-                f"duplicate tool result metadata call id {call_id!r}"
-            )
+            raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC)
         metadata_by_call_id[call_id] = result
 
     if set(metadata_by_call_id) != set(message_tool_results):
-        raise ValueError("tool result metadata ids do not match transcript")
+        raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC)
 
     for call_id, result in metadata_by_call_id.items():
-        if result.content != message_tool_results[call_id]:
-            raise ValueError(
-                f"tool result metadata content mismatch for call id {call_id!r}"
-            )
+        if result != message_tool_results[call_id]:
+            raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC)
 
 
 def _insert_legacy_tool_results(
