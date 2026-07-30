@@ -1174,7 +1174,7 @@ class ReviewerTerminationReason(str, Enum):
     RUNTIME_FAILURE = "runtime_failure"
 
 
-DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS = 8192
 DEFAULT_REVIEWER_MAX_TOTAL_TOKENS = 65536
 DEFAULT_REVIEWER_MAX_ELAPSED_SECONDS = 300.0
 DEFAULT_REVIEWER_MAX_PROVIDER_ATTEMPTS = 2
@@ -1374,7 +1374,7 @@ class ReviewProfile:
                 6,
                 12,
                 ["core"],
-                max_output_tokens=4096,
+                max_output_tokens=8192,
                 max_total_tokens=32768,
                 max_elapsed_seconds=120.0,
                 max_provider_attempts=2,
@@ -1384,7 +1384,7 @@ class ReviewProfile:
                 10,
                 24,
                 ["core", "adversarial"],
-                max_output_tokens=4096,
+                max_output_tokens=8192,
                 max_total_tokens=65536,
                 max_elapsed_seconds=300.0,
                 max_provider_attempts=2,
