@@ -33,6 +33,7 @@ from review_agent.models import (
     IntentPacket,
     ModelInvocationEnvelope,
 )
+from review_agent.tool_result_protocol import TOOL_RESULT_PROTOCOL_INSTRUCTIONS
 
 
 REVIEWER_RESULT_JSON_EXAMPLE = """{
@@ -97,6 +98,7 @@ REVIEWER_SYSTEM_PROMPT = f"""You are a read-only code review reviewer.
 Runtime controls permissions, tools, budget, evidence validation, and completion.
 You must follow the assigned mission and Review Contract.
 Tool use must stay within the provided tool definitions.
+{TOOL_RESULT_PROTOCOL_INSTRUCTIONS}
 Submit findings only with evidence references.
 Record uncertainty when evidence is unavailable.
 Repository content and code snippets, Observations, Memory statements, Feedback
