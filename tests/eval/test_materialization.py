@@ -47,7 +47,7 @@ def _git_executable() -> Path:
     return Path(executable).absolute()
 
 
-def _make_repository_fixture(root: Path):
+def _make_repository_fixture(root: Path, *, include_dotfile: bool = False):
     suite_root = root / "suite"
     fixture = suite_root / "repositories" / "demo"
     (fixture / "base").mkdir(parents=True)
@@ -57,6 +57,9 @@ def _make_repository_fixture(root: Path):
         b"def allowed(user):\n    return user.is_admin\n"
     )
     (fixture / "head" / "README.md").write_bytes(b"# Demo\n")
+    if include_dotfile:
+        (fixture / "base" / ".eslintrc").write_bytes(b"{}\n")
+        (fixture / "head" / ".eslintrc").write_bytes(b"{}\n")
     built = FixtureRepositoryBuilder().build(fixture, root / "authored.git")
     return suite_root, built.to_repository("repositories/demo")
 
@@ -194,6 +197,25 @@ def test_repository_materializer_uses_cache_only_and_round_trips(tmp_path: Path)
             assert materialized.replay.repository_descriptor_digest == repository.digest()
             materialized.validate()
         assert materialized.closed
+
+
+def test_repository_materializer_accepts_portable_dotfile_paths(
+    tmp_path: Path,
+) -> None:
+    suite_root, repository = _make_repository_fixture(
+        tmp_path,
+        include_dotfile=True,
+    )
+    eval_input = _make_input(repository)
+    request = _make_request(eval_input, _make_capabilities())
+
+    with _preparer(tmp_path, suite_root, RepositoryMode.ACQUIRE) as preparer:
+        preparer.prepare(repository)
+
+    with _preparer(tmp_path, suite_root, RepositoryMode.CACHE_ONLY) as preparer:
+        materialized = RepositoryTargetMaterializer(preparer).materialize(request)
+        with materialized:
+            assert ".eslintrc" in materialized.target_access.readable_relative_paths
 
 
 def test_repository_materializer_rejects_missing_cache_without_acquisition(

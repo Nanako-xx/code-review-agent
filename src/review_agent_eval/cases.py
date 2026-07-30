@@ -129,7 +129,12 @@ def validate_run_case_snapshot_id(
     return result
 
 
-def _portable_case_path(value: Any, context: str) -> str:
+def portable_repository_path(
+    value: Any,
+    context: str = "repository path",
+) -> str:
+    """Validate a traversal-safe repository path portable to Windows."""
+
     path = _safe_repo_path(value, context)
     for component in path.split("/"):
         if component.endswith((" ", ".")):
@@ -146,6 +151,10 @@ def _portable_case_path(value: Any, context: str) -> str:
                 "%s contains a reserved portable path component" % context
             )
     return path
+
+
+def _portable_case_path(value: Any, context: str) -> str:
+    return portable_repository_path(value, context)
 
 
 def _source_uri(value: Any, context: str) -> Optional[str]:
@@ -1631,6 +1640,7 @@ __all__ = [
     "RunCaseSnapshotEntry",
     "RunCaseSnapshot",
     "validate_run_case_snapshot_id",
+    "portable_repository_path",
     "CaseHandle",
     "validate_case_for_manifest",
     "load_suite_manifest",

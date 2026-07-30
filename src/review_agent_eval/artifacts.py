@@ -40,6 +40,7 @@ from .cases import (
     PublicSuitePreparationBindingV2,
     RunCaseSnapshot,
     WireContractV2,
+    portable_repository_path,
 )
 from .config import (
     MAX_EVAL_RUN_CONFIG_BYTES,
@@ -324,6 +325,12 @@ def _relative_artifact_path(value: Any, context: str = "artifact path") -> str:
     return value
 
 
+def _relative_target_path(value: Any, context: str = "Target path") -> str:
+    if type(value) is not str or not value or len(value) > MAX_ARTIFACT_PATH_CHARS:
+        raise SchemaError("%s must be a bounded non-empty relative path" % context)
+    return portable_repository_path(value, context)
+
+
 def _runner_artifact_name(value: Any) -> str:
     """Validate one Runner-owned JSON metadata filename."""
 
@@ -567,7 +574,7 @@ class TargetAccess(_JsonModel):
                 % MAX_AGENT_VISIBLE_FILES
             )
         paths = tuple(
-            _relative_artifact_path(
+            _relative_target_path(
                 item,
                 "target_access.readable_relative_paths[%d]" % index,
             )
@@ -619,7 +626,7 @@ class AgentVisibleFileBinding(_JsonModel):
 
     def __post_init__(self) -> None:
         _identifier(self.role, "agent-visible file.role")
-        _relative_artifact_path(
+        _relative_target_path(
             self.relative_path, "agent-visible file.relative_path"
         )
         _integer(
@@ -640,7 +647,7 @@ class AgentVisibleFileBinding(_JsonModel):
         )
         return cls(
             role=_identifier(payload["role"], "agent-visible file.role"),
-            relative_path=_relative_artifact_path(
+            relative_path=_relative_target_path(
                 payload["relative_path"],
                 "agent-visible file.relative_path",
             ),
@@ -884,7 +891,7 @@ class TrialMaterializationManifest(_JsonModel):
             MAX_AGENT_VISIBLE_FILES,
         )
         paths = tuple(
-            _relative_artifact_path(
+            _relative_target_path(
                 item,
                 "materialization.readable_relative_paths[%d]" % index,
             )
@@ -969,7 +976,7 @@ class TrialMaterializationManifest(_JsonModel):
             MAX_AGENT_VISIBLE_FILES,
         )
         paths = tuple(
-            _relative_artifact_path(
+            _relative_target_path(
                 item, "materialization.readable_relative_paths"
             )
             for item in raw_paths
