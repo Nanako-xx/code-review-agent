@@ -33,7 +33,7 @@ _INVALID_ENVELOPE_DIAGNOSTIC = "invalid tool result envelope"
 
 
 def _invalid_envelope() -> NoReturn:
-    raise ValueError(_INVALID_ENVELOPE_DIAGNOSTIC)
+    raise ValueError(_INVALID_ENVELOPE_DIAGNOSTIC) from None
 
 
 def _require_utf8(value: str) -> None:
@@ -104,21 +104,26 @@ def tool_result_envelope_to_dict(result: ModelToolResult) -> dict[str, object]:
     if not isinstance(result, ModelToolResult):
         _invalid_envelope()
 
+    tool_name = result.tool_name
+    content = result.content
+    is_error = result.is_error
+    observation_ids = result.observation_ids
+    if not isinstance(observation_ids, list):
+        _invalid_envelope()
+    try:
+        observation_ids_snapshot = list(observation_ids)
+    except Exception:
+        _invalid_envelope()
+
     payload: dict[str, object] = {
         "schema_version": TOOL_RESULT_ENVELOPE_SCHEMA_VERSION,
-        "tool_name": result.tool_name,
-        "observation_ids": result.observation_ids,
-        "is_error": result.is_error,
-        "content": result.content,
+        "tool_name": tool_name,
+        "observation_ids": observation_ids_snapshot,
+        "is_error": is_error,
+        "content": content,
     }
     _validate_payload(payload)
-    return {
-        "schema_version": TOOL_RESULT_ENVELOPE_SCHEMA_VERSION,
-        "tool_name": result.tool_name,
-        "observation_ids": list(result.observation_ids),
-        "is_error": result.is_error,
-        "content": result.content,
-    }
+    return payload
 
 
 def serialize_tool_result_envelope(result: ModelToolResult) -> str:
@@ -130,6 +135,8 @@ def serialize_tool_result_envelope(result: ModelToolResult) -> str:
 def parse_tool_result_envelope(call_id: str, content: str) -> ModelToolResult:
     """Parse a canonical envelope and restore its externally supplied call ID."""
 
+    if not isinstance(call_id, str) or not call_id.strip():
+        _invalid_envelope()
     if not isinstance(content, str):
         _invalid_envelope()
     _require_utf8(content)

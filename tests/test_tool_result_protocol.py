@@ -44,6 +44,27 @@ def _assert_invalid(callable_: object, *args: object) -> None:
     assert str(error.value) == INVALID_ENVELOPE_DIAGNOSTIC
 
 
+class FlipList(list[str]):
+    def __init__(self) -> None:
+        super().__init__(["OBS-1"])
+        self.iteration_count = 0
+
+    def __iter__(self):
+        self.iteration_count += 1
+        if self.iteration_count == 1:
+            return iter(["OBS-1"])
+        return iter(["OBS-1", "OBS-1"])
+
+
+class RaisingList(list[str]):
+    def __init__(self, error: Exception) -> None:
+        super().__init__(["OBS-1"])
+        self.error = error
+
+    def __iter__(self):
+        raise self.error
+
+
 def test_envelope_has_exact_dict_json_and_round_trips_call_id_externally():
     result = ModelToolResult(
         call_id="call-17",
@@ -103,6 +124,60 @@ def test_envelope_round_trips_empty_and_multiple_observation_ids(observation_ids
     )
 
     assert parsed.observation_ids == observation_ids
+
+
+def test_serializer_snapshots_flip_list_once_and_round_trips():
+    observation_ids = FlipList()
+    result = ModelToolResult(
+        call_id="call-flip-list",
+        tool_name="read_range",
+        content="result",
+        observation_ids=observation_ids,
+    )
+
+    serialized = serialize_tool_result_envelope(result)
+
+    assert observation_ids.iteration_count == 1
+    assert parse_tool_result_envelope(result.call_id, serialized) == ModelToolResult(
+        call_id="call-flip-list",
+        tool_name="read_range",
+        content="result",
+        observation_ids=["OBS-1"],
+    )
+
+
+def test_to_dict_snapshot_is_detached_from_original_observation_ids():
+    observation_ids = ["OBS-1"]
+    result = ModelToolResult(
+        call_id="call-detached-list",
+        tool_name="read_range",
+        content="result",
+        observation_ids=observation_ids,
+    )
+
+    payload = tool_result_envelope_to_dict(result)
+    observation_ids.append("OBS-2")
+
+    assert type(payload["observation_ids"]) is list
+    assert payload["observation_ids"] == ["OBS-1"]
+
+
+@pytest.mark.parametrize("error_type", [TypeError, RuntimeError])
+def test_observation_snapshot_errors_use_fixed_diagnostic_without_echo(error_type):
+    secret = "SECRET-ITERATION-ERROR-MUST-NOT-ECHO"
+    result = ModelToolResult(
+        call_id="call-raising-list",
+        tool_name="read_range",
+        content="result",
+        observation_ids=RaisingList(error_type(secret)),
+    )
+
+    with pytest.raises(ValueError) as error:
+        tool_result_envelope_to_dict(result)
+
+    diagnostic = str(error.value)
+    assert diagnostic == INVALID_ENVELOPE_DIAGNOSTIC
+    assert secret not in diagnostic
 
 
 def test_serialized_envelope_persists_as_utf8_and_round_trips_from_disk(tmp_path):
@@ -280,6 +355,24 @@ def test_outbound_envelope_rejects_invalid_field_values(result, converter):
 )
 def test_parser_rejects_invalid_envelope_fields(payload):
     _assert_invalid(parse_tool_result_envelope, "call", _canonical_json(payload))
+
+
+@pytest.mark.parametrize(
+    "call_id",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(1, id="integer"),
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="blank"),
+    ],
+)
+def test_parser_rejects_invalid_outer_call_id_without_echo(call_id):
+    with pytest.raises(ValueError) as error:
+        parse_tool_result_envelope(call_id, _canonical_json(_valid_payload()))
+
+    diagnostic = str(error.value)
+    assert diagnostic == INVALID_ENVELOPE_DIAGNOSTIC
+    assert repr(call_id) not in diagnostic
 
 
 @pytest.mark.parametrize(
