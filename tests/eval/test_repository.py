@@ -562,6 +562,41 @@ def test_prepare_git_processes_inherit_operation_lease(
             assert len(pass_fds) == 1
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows streamed Git stdout regression")
+def test_git_run_to_file_preserves_large_cat_file_batch_bytes_on_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    source = tmp_path / "source.git"
+    source.mkdir()
+    _git(source, "init", "--bare")
+    payload = (b"line\n" * 5_033_164) + b"xxxx"
+    blob = _git(source, "hash-object", "-w", "--stdin", input_bytes=payload)
+    batch_input = blob.encode("ascii") + b"\n"
+    command = ["--git-dir", str(source), "cat-file", "--batch"]
+    expected = subprocess.run(
+        ["git", *command],
+        input=batch_input,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout
+
+    with _preparer(tmp_path, suite) as preparer:
+        monkeypatch.setattr(repository_module.time, "sleep", lambda _seconds: None)
+        output = tmp_path / "cat-file-batch.bin"
+        preparer._runner.run_to_file(
+            command,
+            output,
+            input_bytes=batch_input,
+            stdout_limit=len(payload) * 2,
+        )
+
+    assert output.read_bytes() == expected
+
+
 def test_prepare_rejects_missing_and_non_commit_objects(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()

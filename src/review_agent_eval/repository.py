@@ -2600,6 +2600,10 @@ class _GitRunner:
         job = _WindowsProcessJob()
         writer: Optional[threading.Thread] = None
         writer_errors: List[BaseException] = []
+        reader: Optional[threading.Thread] = None
+        reader_errors: List[BaseException] = []
+        stdout_limit_exceeded = threading.Event()
+        streamed_stdout_bytes = 0
 
         def terminate_tree() -> None:
             if process is None:
@@ -2646,7 +2650,7 @@ class _GitRunner:
             process = subprocess.Popen(
                 list(argv),
                 stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
-                stdout=stdout_file,
+                stdout=(subprocess.PIPE if not own_stdout else stdout_file),
                 stderr=own_stderr,
                 shell=False,
                 close_fds=True,
@@ -2659,6 +2663,32 @@ class _GitRunner:
             except BaseException:
                 terminate_tree()
                 raise
+            if not own_stdout:
+                assert process.stdout is not None
+
+                def copy_output() -> None:
+                    nonlocal streamed_stdout_bytes
+                    try:
+                        while True:
+                            chunk = process.stdout.read(64 * 1024)
+                            if not chunk:
+                                break
+                            next_size = streamed_stdout_bytes + len(chunk)
+                            if next_size > stdout_limit:
+                                stdout_limit_exceeded.set()
+                                return
+                            stdout_file.write(chunk)
+                            streamed_stdout_bytes = next_size
+                        stdout_file.flush()
+                    except BaseException as exc:
+                        reader_errors.append(exc)
+
+                reader = threading.Thread(
+                    target=copy_output,
+                    name="repository-git-stdout",
+                    daemon=True,
+                )
+                reader.start()
             if input_bytes is not None:
                 assert process.stdin is not None
 
@@ -2680,13 +2710,25 @@ class _GitRunner:
             deadline = time.monotonic() + self.timeout_seconds
             next_watch = 0.0
             while process.poll() is None:
-                stdout_file.flush()
                 own_stderr.flush()
-                if os.fstat(stdout_file.fileno()).st_size > stdout_limit:
-                    terminate_tree()
-                    raise RepositoryLimitError(
-                        "Git process stdout exceeds its fixed budget"
-                    )
+                if own_stdout:
+                    stdout_file.flush()
+                    if os.fstat(stdout_file.fileno()).st_size > stdout_limit:
+                        terminate_tree()
+                        raise RepositoryLimitError(
+                            "Git process stdout exceeds its fixed budget"
+                        )
+                else:
+                    if stdout_limit_exceeded.is_set():
+                        terminate_tree()
+                        raise RepositoryLimitError(
+                            "Git process stdout exceeds its fixed budget"
+                        )
+                    if reader_errors:
+                        terminate_tree()
+                        raise RepositoryPreparationError(
+                            "Git output reader failed"
+                        ) from reader_errors[0]
                 if os.fstat(own_stderr.fileno()).st_size > stderr_limit:
                     terminate_tree()
                     raise RepositoryLimitError(
@@ -2719,6 +2761,21 @@ class _GitRunner:
                     )
             if writer_errors:
                 raise RepositoryPreparationError("Git input writer failed") from writer_errors[0]
+            if reader is not None:
+                reader.join(timeout=5)
+                if reader.is_alive():
+                    terminate_tree()
+                    raise RepositoryPreparationError(
+                        "Git output reader did not terminate"
+                    )
+                if stdout_limit_exceeded.is_set():
+                    raise RepositoryLimitError(
+                        "Git process stdout exceeds its fixed budget"
+                    )
+                if reader_errors:
+                    raise RepositoryPreparationError(
+                        "Git output reader failed"
+                    ) from reader_errors[0]
             returncode = process.returncode
             if own_stdout:
                 stdout_data = self._read_spooled(stdout_file, stdout_limit)
@@ -2739,6 +2796,13 @@ class _GitRunner:
             raise RepositoryPreparationError("Git executable could not be launched") from exc
         finally:
             terminate_tree()
+            if process is not None and process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except OSError:
+                    pass
+            if reader is not None and reader.is_alive():
+                reader.join(timeout=5)
             job.close()
             if own_stdout:
                 stdout_file.close()
