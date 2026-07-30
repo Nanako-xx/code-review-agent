@@ -231,6 +231,20 @@ def test_request_deduplication_is_stable_and_reports_all_dropped_ids() -> None:
     assert dropped == (duplicate.request_id,)
 
 
+def test_default_supplemental_reviewer_uses_shared_8192_output_budget() -> None:
+    plan = compile_supplemental_plan(
+        review_id="review-default-budget",
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+        risk_level=RiskLevel.MEDIUM,
+        wave_index=1,
+        trigger_digest="trigger-default-budget",
+        requests=[_request()],
+    )
+
+    assert plan.tasks[0].assignment.max_output_tokens == 8192
+
+
 def test_compiler_enforces_role_contract_permissions_tools_and_task_budget() -> None:
     request = _request()
     target_context = InitialContext(

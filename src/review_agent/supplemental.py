@@ -12,7 +12,12 @@ from review_agent.context import (
     REVIEWER_TOOL_NAMES,
     normalize_reviewer_allowed_tools,
 )
-from review_agent.models import Assignment, InitialContext, RiskLevel
+from review_agent.models import (
+    Assignment,
+    DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS,
+    InitialContext,
+    RiskLevel,
+)
 from review_agent.session import SupplementalPolicy
 
 
@@ -142,7 +147,7 @@ class SupplementalRuntimeLimits:
 
 @dataclass(frozen=True)
 class ReviewerBudgetCaps:
-    max_output_tokens: int = 4096
+    max_output_tokens: int = DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS
     max_total_tokens: int = 2**63 - 1
     max_elapsed_seconds: float = 1_000_000_000.0
     max_provider_attempts: int = 2
