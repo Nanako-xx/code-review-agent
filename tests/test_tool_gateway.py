@@ -64,6 +64,71 @@ def test_tool_gateway_search_code_records_matches(git_repo: Path, tmp_path: Path
     assert store.list_observations()[0].source == "git.search_code"
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "field_name", "arguments"),
+    [
+        ("search_code", "query", {"query": "def add", "revision": "head"}),
+        (
+            "read_range",
+            "path",
+            {"path": "app.py", "revision": "head", "line_start": 1, "line_end": 1},
+        ),
+        ("compare_base_head", "path", {"path": "app.py"}),
+        ("list_symbols", "path", {"path": "app.py", "revision": "head"}),
+        ("inspect_symbol", "name", {"name": "add", "revision": "head"}),
+        ("find_references", "name", {"name": "add", "revision": "head"}),
+    ],
+)
+@pytest.mark.parametrize("invalid_value", ["", " \t", 123])
+def test_tool_gateway_rejects_invalid_required_text_before_execution(
+    git_repo: Path,
+    tmp_path: Path,
+    tool_name,
+    field_name,
+    arguments,
+    invalid_value,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    store = ObservationStore(tmp_path)
+    gateway = ToolGateway(
+        git_repo,
+        base_revision=head,
+        head_revision=head,
+        observation_store=store,
+    )
+    invalid_arguments = {**arguments, field_name: invalid_value}
+
+    with pytest.raises(
+        ToolGatewayError,
+        match=rf"{field_name} must be a non-empty string",
+    ):
+        gateway.execute(tool_name, invalid_arguments)
+
+    assert store.list_observations() == []
+
+
+def test_tool_gateway_rejects_read_range_with_inverted_bounds(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    store = ObservationStore(tmp_path)
+    gateway = ToolGateway(
+        git_repo,
+        base_revision=head,
+        head_revision=head,
+        observation_store=store,
+    )
+
+    with pytest.raises(ToolGatewayError, match="invalid line range"):
+        gateway.execute(
+            "read_range",
+            {"path": "app.py", "revision": "head", "line_start": 2, "line_end": 1},
+        )
+
+    assert store.list_observations() == []
+
+
 def test_tool_gateway_rejects_unsafe_paths(git_repo: Path, tmp_path: Path):
     head = run_git(git_repo, "rev-parse", "HEAD")
     gateway = ToolGateway(git_repo, base_revision=head, head_revision=head, observation_store=ObservationStore(tmp_path))

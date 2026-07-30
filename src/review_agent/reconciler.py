@@ -7,6 +7,7 @@ import json
 import math
 import re
 import time
+from types import MappingProxyType
 from typing import Any, Callable
 
 from review_agent.evidence import (
@@ -55,6 +56,41 @@ states, or repository facts. Every supported candidate must be disposed exactly 
 strict JSON matching semantic_reconciliation_proposal_v1. Runtime validates and compiles the
 proposal and remains authoritative for evidence, severity floors, permissions, budget,
 scheduling, Finding preservation, and completion.
+
+Return exactly one JSON object and no Markdown or commentary. Do not wrap the JSON in Markdown
+fences. The top-level object has exactly these fields:
+- canonical_groups: an array of objects. Each object has exactly member_ids,
+  representative_id, canonical_claim, rationale, supporting_refs, and proposed_confidence.
+  proposed_confidence is high, medium, or low.
+- rejections: an array of objects. Each object has exactly candidate_id, reason, rationale,
+  and decision_refs. reason is unsupported_claim, contradicted_by_test, or outside_review_scope.
+- disagreements: an array of objects. Each object has exactly disagreement_id,
+  candidate_ids, status, issue, resolution, and decision_refs. status is resolved,
+  needs_investigation, or unresolved.
+- supplemental_requests: an array of objects. Each object has exactly disagreement_id,
+  question, required_evidence, preferred_perspective, related_candidate_ids, and reason_refs.
+- uncertainties: an array of strings.
+- summary: a non-empty string.
+
+Dispose every candidate in this batch exactly once: each candidate_id must appear in exactly
+one canonical_groups member_ids array or exactly one rejection, never both. representative_id
+must belong to member_ids. supporting_refs must come from the grouped candidates. Candidate IDs,
+decision_refs, supporting_refs, and reason_refs must come from the packet allowlists. Every
+needs_investigation disagreement requires exactly one matching supplemental request; resolved
+and unresolved disagreements require none. All top-level collection fields are arrays. Every
+scalar string field is a non-empty string except disagreement resolution, which may be empty.
+ID/ref/evidence arrays contain unique non-empty strings. member_ids, supporting_refs, disagreement
+candidate_ids, required_evidence, and related_candidate_ids must be non-empty arrays.
+decision_refs, reason_refs, and uncertainties may be empty arrays. disagreement_id values must be
+unique, and related_candidate_ids must be a subset of the candidate_ids on the matching
+disagreement. A contradicted_by_test rejection requires non-empty decision_refs, including at
+least one referenced packet Observation that is a test, quality, or gate Observation.
+Uncertainties may be empty, but any elements must be unique non-empty strings.
+disagreement_id is intentionally model-created. A model-created disagreement_id must begin with
+a letter, be at most 128 characters, and use only letters, digits, dot, underscore, colon, or
+hyphen. A supplemental request must reuse exactly the disagreement_id of its matching
+needs_investigation disagreement. Do not add fields or invent candidate IDs, Finding IDs,
+Observation references, or facts.
 """
 
 ALLOWED_REJECTION_REASONS = (
@@ -265,6 +301,14 @@ class ReconciliationPacketBatch:
             if key in referenced
         }
         return full
+
+
+@dataclass(frozen=True)
+class _SemanticValidationContext:
+    allowed_candidate_ids: frozenset[str]
+    allowed_observation_ids: frozenset[str]
+    candidate_evidence_refs: Mapping[str, frozenset[str]]
+    observation_sources: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -656,16 +700,25 @@ def parse_semantic_proposal(
 ) -> SemanticProposal:
     if not isinstance(content, str):
         raise SemanticProposalParseError("semantic proposal response must be a string")
-    batch = packet if isinstance(packet, ReconciliationPacketBatch) else None
-    full_packet = packet.packet if batch is not None else packet
-    if not isinstance(full_packet, ReconciliationPacket):
+    if not isinstance(packet, (ReconciliationPacket, ReconciliationPacketBatch)):
         raise ValueError("packet must be a reconciliation packet or batch")
-    allowed_candidates = (
-        frozenset(batch.candidate_ids)
-        if batch is not None
-        else full_packet.allowed_candidate_ids
-    )
-    allowed_refs = full_packet.allowed_observation_ids
+    try:
+        validation_context = _semantic_validation_context_from_packet_payload(
+            packet.to_dict()
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise SemanticProposalParseError(
+            f"invalid reconciliation packet snapshot: {error}"
+        ) from error
+    return _parse_semantic_proposal(content, validation_context)
+
+
+def _parse_semantic_proposal(
+    content: str,
+    validation_context: _SemanticValidationContext,
+) -> SemanticProposal:
+    if not isinstance(content, str):
+        raise SemanticProposalParseError("semantic proposal response must be a string")
     try:
         payload = json.loads(
             content,
@@ -673,9 +726,17 @@ def parse_semantic_proposal(
             parse_constant=_reject_non_standard_constant,
         )
     except json.JSONDecodeError as error:
-        raise SemanticProposalParseError(f"invalid JSON: {error.msg}") from error
+        message = _safe_diagnostic(
+            f"invalid JSON: {error.msg}",
+            "semantic proposal parsing failed; diagnostic was not persistence-safe",
+        )
+        raise SemanticProposalParseError(message) from error
     except ValueError as error:
-        raise SemanticProposalParseError(f"invalid JSON: {error}") from error
+        message = _safe_diagnostic(
+            f"invalid JSON: {error}",
+            "semantic proposal parsing failed; diagnostic was not persistence-safe",
+        )
+        raise SemanticProposalParseError(message) from error
     try:
         root = _object(payload, "proposal")
         _exact(
@@ -729,22 +790,138 @@ def parse_semantic_proposal(
         )
         _validate_semantic_proposal(
             proposal,
-            full_packet,
-            allowed_candidates=allowed_candidates,
-            allowed_refs=allowed_refs,
+            validation_context,
         )
         return proposal
     except ValueError as error:
-        raise SemanticProposalParseError(str(error)) from error
+        message = _safe_diagnostic(
+            str(error),
+            "semantic proposal parsing failed; diagnostic was not persistence-safe",
+        )
+        raise SemanticProposalParseError(message) from error
+
+
+def _semantic_validation_context_from_packet_payload(
+    payload: Mapping[str, Any],
+) -> _SemanticValidationContext:
+    context = "reconciliation packet snapshot"
+    root = _object(payload, context)
+    if any(not isinstance(key, str) for key in root):
+        raise ValueError(f"{context} field names must be strings")
+    fields = {
+        "schema_version",
+        "review_id",
+        "revision_binding",
+        "candidate_catalog",
+        "conflict_hints",
+        "observation_catalog",
+        "contract_coverage",
+        "intent_summary",
+        "code_snippets",
+        "allowed_rejection_reasons",
+        "policy_summary",
+    }
+    if "batch_id" in root:
+        fields.add("batch_id")
+    _exact(root, fields, context)
+    if root["schema_version"] != RECONCILIATION_PACKET_SCHEMA_VERSION:
+        raise ValueError(f"{context} has an unsupported schema version")
+
+    candidate_catalog = _object(
+        root["candidate_catalog"],
+        f"{context}.candidate_catalog",
+    )
+    observation_catalog = _object(
+        root["observation_catalog"],
+        f"{context}.observation_catalog",
+    )
+    if any(not isinstance(key, str) for key in candidate_catalog):
+        raise ValueError(f"{context}.candidate_catalog keys must be strings")
+    if any(not isinstance(key, str) for key in observation_catalog):
+        raise ValueError(f"{context}.observation_catalog keys must be strings")
+
+    candidate_evidence_refs: dict[str, frozenset[str]] = {}
+    candidate_fields = {
+        "finding_id",
+        "origin",
+        "reviewer_task_id",
+        "reviewer_index",
+        "role",
+        "role_kind",
+        "claim",
+        "severity",
+        "confidence",
+        "path",
+        "line",
+        "impact",
+        "suggested_action",
+        "verification_performed",
+        "evidence_refs",
+        "validation_status",
+        "deterministic_rejection_reason",
+    }
+    for candidate_id, value in candidate_catalog.items():
+        _non_empty(candidate_id, f"{context}.candidate_catalog key")
+        candidate_context = f"{context}.candidate_catalog[{candidate_id!r}]"
+        candidate = _object(value, candidate_context)
+        if any(not isinstance(key, str) for key in candidate):
+            raise ValueError(f"{candidate_context} field names must be strings")
+        _exact(candidate, candidate_fields, candidate_context)
+        if _string(candidate, "finding_id", candidate_context) != candidate_id:
+            raise ValueError(f"{candidate_context}.finding_id must match its key")
+        if candidate["validation_status"] != "supported":
+            raise ValueError(f"{candidate_context} must be supported")
+        candidate_evidence_refs[candidate_id] = frozenset(
+            _string_tuple(
+                candidate["evidence_refs"],
+                f"{candidate_context}.evidence_refs",
+            )
+        )
+
+    observation_sources: dict[str, str] = {}
+    observation_fields = {
+        "source",
+        "revision",
+        "path",
+        "line_start",
+        "line_end",
+        "context_view",
+    }
+    for observation_id, value in observation_catalog.items():
+        _non_empty(observation_id, f"{context}.observation_catalog key")
+        observation_context = (
+            f"{context}.observation_catalog[{observation_id!r}]"
+        )
+        observation = _object(value, observation_context)
+        if any(not isinstance(key, str) for key in observation):
+            raise ValueError(f"{observation_context} field names must be strings")
+        _exact(observation, observation_fields, observation_context)
+        observation_sources[observation_id] = _string(
+            observation,
+            "source",
+            observation_context,
+        )
+
+    allowed_observation_ids = frozenset(observation_sources)
+    for candidate_id, evidence_refs in candidate_evidence_refs.items():
+        if not evidence_refs <= allowed_observation_ids:
+            raise ValueError(
+                f"{context} candidate {candidate_id} references an unknown Observation"
+            )
+    return _SemanticValidationContext(
+        allowed_candidate_ids=frozenset(candidate_evidence_refs),
+        allowed_observation_ids=allowed_observation_ids,
+        candidate_evidence_refs=MappingProxyType(dict(candidate_evidence_refs)),
+        observation_sources=MappingProxyType(dict(observation_sources)),
+    )
 
 
 def _validate_semantic_proposal(
     proposal: SemanticProposal,
-    packet: ReconciliationPacket,
-    *,
-    allowed_candidates: frozenset[str],
-    allowed_refs: frozenset[str],
+    validation_context: _SemanticValidationContext,
 ) -> None:
+    allowed_candidates = validation_context.allowed_candidate_ids
+    allowed_refs = validation_context.allowed_observation_ids
     disposed: list[str] = []
     for group in proposal.canonical_groups:
         if not set(group.member_ids) <= allowed_candidates:
@@ -754,7 +931,7 @@ def _validate_semantic_proposal(
         member_refs = {
             ref
             for candidate_id in group.member_ids
-            for ref in packet.candidate_catalog[candidate_id].evidence_refs
+            for ref in validation_context.candidate_evidence_refs[candidate_id]
         }
         if not set(group.supporting_refs) <= member_refs:
             raise ValueError(
@@ -773,7 +950,7 @@ def _validate_semantic_proposal(
                     "contradicted_by_test requires decision_refs"
                 )
             if not any(
-                _is_test_observation(packet.observation_catalog[ref].source)
+                _is_test_observation(validation_context.observation_sources[ref])
                 for ref in rejection.decision_refs
             ):
                 raise ValueError(
@@ -857,6 +1034,9 @@ def run_semantic_reconciler_batch(
     provider_name = _adapter_name(adapter)
     resolved_model = model
     packet_payload = batch.to_dict()
+    validation_context = _semantic_validation_context_from_packet_payload(
+        packet_payload
+    )
     messages: list[dict[str, Any]] = [
         {
             "role": "user",
@@ -883,6 +1063,7 @@ def run_semantic_reconciler_batch(
             "tool_choice": "none",
             "max_elapsed_seconds": float(max_elapsed_seconds),
             "response_schema": SEMANTIC_PROPOSAL_SCHEMA_VERSION,
+            "response_format": "json_object",
             "invocation_id": invocation_id,
         },
     }
@@ -910,7 +1091,11 @@ def run_semantic_reconciler_batch(
         try:
             response = adapter.complete_turn(request)
         except Exception as error:
-            message = f"provider invocation failed: {type(error).__name__}: {error}"
+            elapsed_after = _elapsed(clock, started)
+            message = _safe_diagnostic(
+                f"provider invocation failed: {type(error).__name__}: {error}",
+                "provider invocation failed; diagnostic was not persistence-safe",
+            )
             failures.append(message)
             attempts.append(
                 ReconcilerAttempt(
@@ -920,10 +1105,47 @@ def run_semantic_reconciler_batch(
                     error=message,
                 )
             )
+            if elapsed_after >= max_elapsed_seconds:
+                failures.append("elapsed budget exhausted during provider attempt")
+                break
             messages.append(_rejection_message(message))
             continue
-        if not isinstance(response, ModelTurnResponse):
-            message = "provider returned an invalid ModelTurnResponse"
+        elapsed_after = _elapsed(clock, started)
+        validated_response, response_shape_error = (
+            _validated_model_turn_response(response)
+        )
+        if elapsed_after >= max_elapsed_seconds:
+            message = "elapsed budget exhausted during provider attempt"
+            failures.append(message)
+            if validated_response is not None:
+                provider_name = validated_response.provider_name or provider_name
+                resolved_model = validated_response.model or resolved_model
+                attempts.append(
+                    ReconcilerAttempt(
+                        attempt_index=attempt_index,
+                        status="timed_out",
+                        response_kind=validated_response.kind.value,
+                        error=message,
+                        response_text=validated_response.final_text,
+                        raw_response=model_turn_response_to_dict(
+                            validated_response
+                        ),
+                    )
+                )
+            else:
+                attempts.append(
+                    ReconcilerAttempt(
+                        attempt_index=attempt_index,
+                        status="timed_out",
+                        response_kind=ModelResponseKind.INVALID.value,
+                        error=message,
+                    )
+                )
+            break
+        if validated_response is None:
+            message = response_shape_error or (
+                "provider returned an invalid ModelTurnResponse"
+            )
             failures.append(message)
             attempts.append(
                 ReconcilerAttempt(
@@ -935,6 +1157,7 @@ def run_semantic_reconciler_batch(
             )
             messages.append(_rejection_message(message))
             continue
+        response = validated_response
         provider_name = response.provider_name or provider_name
         resolved_model = response.model or resolved_model
         if response.kind is not ModelResponseKind.FINAL or response.final_text is None:
@@ -955,9 +1178,32 @@ def run_semantic_reconciler_batch(
             messages.append(_rejection_message(message))
             continue
         try:
-            proposal = parse_semantic_proposal(response.final_text, batch)
+            proposal = _parse_semantic_proposal(
+                response.final_text,
+                validation_context,
+            )
         except SemanticProposalParseError as error:
-            message = str(error)
+            message = _safe_diagnostic(
+                str(error),
+                "semantic proposal parsing failed; diagnostic was not persistence-safe",
+            )
+            failures.append(message)
+            attempts.append(
+                ReconcilerAttempt(
+                    attempt_index=attempt_index,
+                    status="parse_error",
+                    response_kind=response.kind.value,
+                    error=message,
+                    response_text=response.final_text,
+                    raw_response=model_turn_response_to_dict(response),
+                )
+            )
+            messages.append(_rejection_message(message))
+            continue
+        try:
+            _persistence_json_bytes(proposal.to_dict())
+        except (RecursionError, TypeError, ValueError, UnicodeEncodeError):
+            message = "semantic proposal is not persistence-safe"
             failures.append(message)
             attempts.append(
                 ReconcilerAttempt(
@@ -2137,9 +2383,76 @@ def _is_test_observation(source: str) -> bool:
     return "test" in normalized or "quality" in normalized or "gate" in normalized
 
 
+def _validated_model_turn_response(
+    value: object,
+) -> tuple[ModelTurnResponse | None, str | None]:
+    if not isinstance(value, ModelTurnResponse):
+        return None, "provider returned an invalid ModelTurnResponse"
+    if not isinstance(value.kind, ModelResponseKind):
+        return None, "provider returned a ModelTurnResponse with an invalid kind"
+    if not isinstance(value.tool_calls, list) or value.tool_calls:
+        return None, "provider returned a ModelTurnResponse with invalid tool_calls"
+    if value.final_text is not None and not isinstance(value.final_text, str):
+        return None, "provider returned a ModelTurnResponse with invalid final_text"
+    if value.error is not None and not isinstance(value.error, str):
+        return None, "provider returned a ModelTurnResponse with an invalid error"
+    if not isinstance(value.raw, dict):
+        return None, "provider returned a ModelTurnResponse with invalid raw data"
+    if not isinstance(value.provider_name, str) or not isinstance(value.model, str):
+        return None, "provider returned a ModelTurnResponse with invalid metadata"
+    try:
+        safe_raw = json.loads(
+            json.dumps(value.raw, ensure_ascii=False, allow_nan=False)
+        )
+    except (RecursionError, TypeError, ValueError):
+        return None, "provider returned a ModelTurnResponse with invalid raw data"
+    safe_response = ModelTurnResponse(
+        kind=value.kind,
+        tool_calls=[],
+        final_text=value.final_text,
+        error=value.error,
+        raw=safe_raw,
+        provider_name=value.provider_name,
+        model=value.model,
+    )
+    try:
+        _persistence_json_bytes(model_turn_response_to_dict(safe_response))
+    except (RecursionError, TypeError, ValueError, UnicodeEncodeError):
+        return None, (
+            "provider returned a ModelTurnResponse that is not persistence-safe"
+        )
+    return safe_response, None
+
+
+def _persistence_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _safe_diagnostic(message: object, fallback: str) -> str:
+    if not isinstance(message, str):
+        return fallback
+    try:
+        _persistence_json_bytes(message)
+    except (RecursionError, TypeError, ValueError, UnicodeEncodeError):
+        return fallback
+    return message
+
+
 def _adapter_name(adapter: object) -> str:
     value = getattr(adapter, "provider_name", None)
-    return value if isinstance(value, str) and value else type(adapter).__name__
+    if isinstance(value, str) and value:
+        try:
+            _persistence_json_bytes(value)
+        except (RecursionError, TypeError, ValueError, UnicodeEncodeError):
+            pass
+        else:
+            return value
+    return type(adapter).__name__
 
 
 def _rejection_message(message: str) -> dict[str, str]:

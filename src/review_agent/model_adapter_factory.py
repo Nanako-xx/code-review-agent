@@ -7,6 +7,7 @@ import os
 from typing import Protocol
 
 from review_agent.model_adapter import (
+    DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
     DEFAULT_MAX_RESPONSE_BYTES,
     MAX_ALLOWED_RESPONSE_BYTES,
     FakeToolCallingAdapter,
@@ -125,7 +126,7 @@ def build_model_adapter_factory_from_config(
         # supplied.  This is deliberately resolved only after the provider
         # and credential checks, so old callers retain their error ordering.
         if configured_timeout is None:
-            configured_timeout = 60
+            configured_timeout = DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS
         if configured_response_limit is None:
             configured_response_limit = DEFAULT_MAX_RESPONSE_BYTES
         return OpenAICompatibleModelAdapterFactory(

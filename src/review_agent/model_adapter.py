@@ -8,7 +8,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Protocol, Union, cast
+from typing import Any, Callable, NoReturn, Protocol, Union, cast
 
 from review_agent.model_protocol import (
     ModelResponseKind,
@@ -18,17 +18,29 @@ from review_agent.model_protocol import (
     ModelTurnRequest,
     ModelTurnResponse,
 )
+from review_agent.tool_result_protocol import (
+    parse_tool_result_envelope,
+    serialize_tool_result_envelope,
+)
 
 
 DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_ALLOWED_RESPONSE_BYTES = 256 * 1024 * 1024
+DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS = 180
 PROVIDER_RESPONSE_TOO_LARGE_ERROR = (
     "provider response exceeded configured max_response_bytes"
 )
 MAX_HTTP_DEADLINE_WORKERS = 32
 MAX_HTTP_CLOSE_WORKERS = 32
+_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC = (
+    "tool result metadata does not match transcript"
+)
 _HTTP_DEADLINE_SLOTS = threading.BoundedSemaphore(MAX_HTTP_DEADLINE_WORKERS)
 _HTTP_CLOSE_SLOTS = threading.BoundedSemaphore(MAX_HTTP_CLOSE_WORKERS)
+
+
+def _tool_result_metadata_mismatch() -> NoReturn:
+    raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC) from None
 
 
 def _validate_max_response_bytes(value: object, context: str) -> int:
@@ -142,7 +154,7 @@ class OpenAICompatibleConfig:
     base_url: str
     api_key: str
     model: str
-    timeout_seconds: int = 60
+    timeout_seconds: int = DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
 
     def __post_init__(self) -> None:
@@ -369,18 +381,13 @@ class OpenAICompatibleToolAdapter:
         self._config = config
         self._transport = transport
         self._capabilities = resolved_capabilities
-        self._assistant_tool_call_messages: list[dict[str, Any]] = []
 
     @property
     def capabilities(self) -> ModelAdapterCapabilities:
         return self._capabilities
 
     def complete_turn(self, request: ModelTurnRequest) -> ModelTurnResponse:
-        payload = _build_openai_tool_payload(
-            self._config.model,
-            request,
-            self._assistant_tool_call_messages,
-        )
+        payload = _build_openai_tool_payload(self._config.model, request)
         headers = {
             "Authorization": f"Bearer {self._config.api_key}",
             "Content-Type": "application/json",
@@ -419,10 +426,7 @@ class OpenAICompatibleToolAdapter:
                 provider_name=self.provider_name,
                 model=self._config.model,
             )
-        response = _parse_openai_tool_response(raw, self.provider_name, self._config.model)
-        if response.kind is ModelResponseKind.TOOL_CALLS:
-            self._assistant_tool_call_messages.append(_assistant_tool_call_message(response.tool_calls))
-        return response
+        return _parse_openai_tool_response(raw, self.provider_name, self._config.model)
 
 
 def _transport_timeout_seconds(
@@ -443,25 +447,31 @@ def _transport_timeout_seconds(
 def _build_openai_tool_payload(
     model: str,
     request: ModelTurnRequest,
-    assistant_tool_call_messages: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    messages = [{"role": "system", "content": request.system}]
-    messages.extend(request.messages)
-    if request.tool_results:
-        messages.extend(
-            _assistant_and_tool_result_messages(
-                request.tool_results,
-                assistant_tool_call_messages or [],
-            )
-        )
-    return {
+    runtime_messages = [dict(message) for message in request.messages]
+    _pair_tool_results_with_assistant_calls(
+        runtime_messages,
+        request.tool_results,
+    )
+    messages = [{"role": "system", "content": request.system}, *runtime_messages]
+    payload = {
         "model": model,
         "messages": messages,
-        "tools": [_tool_spec_to_openai(tool) for tool in request.tools],
-        "tool_choice": request.parameters.get("tool_choice", "auto"),
         "max_tokens": request.parameters.get("max_output_tokens", 4096),
         "temperature": request.parameters.get("temperature", 0),
     }
+    response_format = request.parameters.get("response_format")
+    if response_format is not None:
+        if response_format != "json_object":
+            raise ValueError("unsupported response_format")
+        if request.tools:
+            raise ValueError("json_object response_format requires a no-tool request")
+        payload["response_format"] = {"type": "json_object"}
+        return payload
+
+    payload["tools"] = [_tool_spec_to_openai(tool) for tool in request.tools]
+    payload["tool_choice"] = request.parameters.get("tool_choice", "auto")
+    return payload
 
 
 def _tool_spec_to_openai(tool: ModelToolSpec) -> dict[str, Any]:
@@ -475,19 +485,215 @@ def _tool_spec_to_openai(tool: ModelToolSpec) -> dict[str, Any]:
     }
 
 
-def _tool_result_message(result: ModelToolResult) -> dict[str, Any]:
+def model_tool_result_to_message(result: ModelToolResult) -> dict[str, Any]:
     return {
         "role": "tool",
         "tool_call_id": result.call_id,
-        "content": result.content,
+        "content": serialize_tool_result_envelope(result),
     }
 
 
-def _assistant_tool_call_message(tool_calls: list[ModelToolCall]) -> dict[str, Any]:
-    return {
+def _pair_tool_results_with_assistant_calls(
+    messages: list[dict[str, Any]],
+    tool_results: list[ModelToolResult],
+) -> None:
+    has_message_tool_results = any(
+        message.get("role") == "tool" for message in messages
+    )
+
+    assistant_batches: list[tuple[int, list[str]]] = []
+    assistant_call_ids: set[str] = set()
+    for message_index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None:
+            continue
+        if not isinstance(tool_calls, list):
+            raise ValueError("assistant tool_calls must be a list")
+        batch_call_ids: list[str] = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                raise ValueError("assistant tool call must be an object")
+            call_id = tool_call.get("id")
+            if not isinstance(call_id, str) or not call_id.strip():
+                raise ValueError("assistant tool call id must be non-empty")
+            if call_id in assistant_call_ids:
+                raise ValueError(
+                    f"duplicate assistant tool call id {call_id!r}"
+                )
+            assistant_call_ids.add(call_id)
+            batch_call_ids.append(call_id)
+        if batch_call_ids:
+            assistant_batches.append((message_index, batch_call_ids))
+
+    if has_message_tool_results:
+        message_tool_results = _validate_complete_tool_transcript(
+            messages,
+            assistant_batches,
+            assistant_call_ids,
+        )
+        if tool_results:
+            _validate_tool_result_metadata(
+                message_tool_results,
+                tool_results,
+            )
+        return
+
+    _insert_legacy_tool_results(
+        messages,
+        assistant_batches,
+        assistant_call_ids,
+        tool_results,
+    )
+
+
+def _validate_complete_tool_transcript(
+    messages: list[dict[str, Any]],
+    assistant_batches: list[tuple[int, list[str]]],
+    assistant_call_ids: set[str],
+) -> dict[str, ModelToolResult]:
+    tool_message_ids: set[str] = set()
+    tool_message_indices: dict[int, str] = {}
+    tool_message_results: dict[str, ModelToolResult] = {}
+    for message_index, message in enumerate(messages):
+        if message.get("role") != "tool":
+            continue
+        call_id = message.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise ValueError("tool result call id must be non-empty")
+        if call_id in tool_message_ids:
+            raise ValueError(f"duplicate tool result call id {call_id!r}")
+        if call_id not in assistant_call_ids:
+            raise ValueError(
+                f"tool result {call_id!r} has no matching assistant tool call"
+            )
+        tool_message_ids.add(call_id)
+        tool_message_indices[message_index] = call_id
+        tool_message_results[call_id] = parse_tool_result_envelope(
+            call_id,
+            message.get("content"),
+        )
+
+    for call_id in assistant_call_ids:
+        if call_id not in tool_message_ids:
+            raise ValueError(
+                f"missing tool result for assistant call {call_id!r}"
+            )
+
+    expected_tool_indices: set[int] = set()
+    for assistant_index, batch_call_ids in assistant_batches:
+        for offset, call_id in enumerate(batch_call_ids, start=1):
+            tool_index = assistant_index + offset
+            if (
+                tool_index >= len(messages)
+                or messages[tool_index].get("role") != "tool"
+                or messages[tool_index].get("tool_call_id") != call_id
+            ):
+                raise ValueError(
+                    f"tool result for assistant call {call_id!r} must be adjacent"
+                )
+            expected_tool_indices.add(tool_index)
+
+    unexpected_indices = set(tool_message_indices) - expected_tool_indices
+    if unexpected_indices:
+        call_id = tool_message_indices[min(unexpected_indices)]
+        raise ValueError(
+            f"tool result for assistant call {call_id!r} must be adjacent"
+        )
+
+    return tool_message_results
+
+
+def _validate_tool_result_metadata(
+    message_tool_results: dict[str, ModelToolResult],
+    tool_results: list[ModelToolResult],
+) -> None:
+    metadata_by_call_id: dict[str, ModelToolResult] = {}
+    for result in tool_results:
+        if not isinstance(result, ModelToolResult):
+            _tool_result_metadata_mismatch()
+        call_id = result.call_id
+        if not isinstance(call_id, str) or not call_id.strip():
+            _tool_result_metadata_mismatch()
+        if call_id in metadata_by_call_id:
+            _tool_result_metadata_mismatch()
+        metadata_by_call_id[call_id] = result
+
+    if set(metadata_by_call_id) != set(message_tool_results):
+        _tool_result_metadata_mismatch()
+
+    for call_id, result in metadata_by_call_id.items():
+        try:
+            metadata_canonical = serialize_tool_result_envelope(result)
+            transcript_canonical = serialize_tool_result_envelope(
+                message_tool_results[call_id]
+            )
+        except Exception:
+            _tool_result_metadata_mismatch()
+        if metadata_canonical != transcript_canonical:
+            _tool_result_metadata_mismatch()
+
+
+def _insert_legacy_tool_results(
+    messages: list[dict[str, Any]],
+    assistant_batches: list[tuple[int, list[str]]],
+    assistant_call_ids: set[str],
+    tool_results: list[ModelToolResult],
+) -> None:
+    results_by_call_id: dict[str, ModelToolResult] = {}
+    for result in tool_results:
+        call_id = result.call_id
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise ValueError("tool result call id must be non-empty")
+        if call_id in results_by_call_id:
+            raise ValueError(f"duplicate tool result call id {call_id!r}")
+        if call_id not in assistant_call_ids:
+            raise ValueError(
+                f"tool result {call_id!r} has no matching assistant tool call"
+            )
+        results_by_call_id[call_id] = result
+
+    for call_id in assistant_call_ids:
+        if call_id not in results_by_call_id:
+            raise ValueError(
+                f"missing tool result for assistant call {call_id!r}"
+            )
+
+    for assistant_index, batch_call_ids in reversed(assistant_batches):
+        messages[assistant_index + 1:assistant_index + 1] = [
+            model_tool_result_to_message(results_by_call_id[call_id])
+            for call_id in batch_call_ids
+        ]
+
+
+def model_response_to_assistant_message(
+    response: ModelTurnResponse,
+) -> dict[str, Any]:
+    source_message: dict[str, Any] = {}
+    try:
+        candidate = response.raw["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        candidate = None
+    if isinstance(candidate, dict):
+        source_message = candidate
+
+    fallback_content = (
+        response.final_text
+        if response.kind is ModelResponseKind.FINAL
+        else None
+    )
+    content = source_message.get("content", fallback_content)
+    message = {
         "role": "assistant",
-        "content": None,
-        "tool_calls": [
+        "content": (
+            content
+            if isinstance(content, (str, list))
+            else fallback_content
+        ),
+    }
+    if response.tool_calls:
+        message["tool_calls"] = [
             {
                 "id": call.call_id,
                 "type": "function",
@@ -496,38 +702,12 @@ def _assistant_tool_call_message(tool_calls: list[ModelToolCall]) -> dict[str, A
                     "arguments": json.dumps(call.arguments),
                 },
             }
-            for call in tool_calls
-        ],
-    }
-
-
-def _assistant_and_tool_result_messages(
-    tool_results: list[ModelToolResult],
-    assistant_tool_call_messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    results_by_call_id = {result.call_id: result for result in tool_results}
-    matched_call_ids: set[str] = set()
-    messages: list[dict[str, Any]] = []
-
-    for assistant_message in assistant_tool_call_messages:
-        tool_calls = assistant_message.get("tool_calls", [])
-        matching_call_ids = [tool_call.get("id") for tool_call in tool_calls if tool_call.get("id") in results_by_call_id]
-        if not matching_call_ids:
-            continue
-
-        messages.append(assistant_message)
-        for call_id in matching_call_ids:
-            if call_id is None:
-                continue
-            messages.append(_tool_result_message(results_by_call_id[call_id]))
-            matched_call_ids.add(call_id)
-
-    messages.extend(
-        _tool_result_message(result)
-        for result in tool_results
-        if result.call_id not in matched_call_ids
-    )
-    return messages
+            for call in response.tool_calls
+        ]
+    reasoning_content = source_message.get("reasoning_content")
+    if isinstance(reasoning_content, str):
+        message["reasoning_content"] = reasoning_content
+    return message
 
 
 def _parse_openai_tool_response(raw: dict[str, Any], provider_name: str, model: str) -> ModelTurnResponse:

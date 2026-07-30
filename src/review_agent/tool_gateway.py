@@ -294,7 +294,7 @@ class ToolGateway:
         )
 
     def _read_range(self, arguments: dict[str, Any]) -> ToolExecutionResult:
-        path = _safe_repo_path(str(arguments["path"]))
+        path = _safe_repo_path(_require_non_empty_string(arguments, "path"))
         revision_label, revision = self._resolve_revision(str(arguments.get("revision", "head")))
         line_start = int(arguments["line_start"])
         line_end = int(arguments["line_end"])
@@ -318,7 +318,7 @@ class ToolGateway:
         return ToolExecutionResult("read_range", [observation.observation_id], context_view, truncated)
 
     def _compare_base_head(self, arguments: dict[str, Any]) -> ToolExecutionResult:
-        path = _safe_repo_path(str(arguments["path"]))
+        path = _safe_repo_path(_require_non_empty_string(arguments, "path"))
         raw = _run_git(
             self.repository_path,
             ["diff", "--unified=3", f"{self.base_revision}..{self.head_revision}", "--", path],
@@ -338,9 +338,7 @@ class ToolGateway:
         return ToolExecutionResult("compare_base_head", [observation.observation_id], context_view, truncated)
 
     def _search_code(self, arguments: dict[str, Any]) -> ToolExecutionResult:
-        query = str(arguments["query"])
-        if not query:
-            raise ToolGatewayError("search query must not be empty")
+        query = _require_non_empty_string(arguments, "query")
         revision_label, revision = self._resolve_revision(str(arguments.get("revision", "head")))
         max_results = int(arguments.get("max_results", 20))
         if max_results < 1:
@@ -368,7 +366,7 @@ class ToolGateway:
         return ToolExecutionResult("search_code", [observation.observation_id], context_view, truncated)
 
     def _list_symbols(self, arguments: dict[str, Any]) -> ToolExecutionResult:
-        path = _safe_repo_path(str(arguments["path"]))
+        path = _safe_repo_path(_require_non_empty_string(arguments, "path"))
         revision_label, revision = self._resolve_revision(str(arguments.get("revision", "head")))
         symbols = collect_python_symbols(self.repository_path, revision, paths=[path])
         raw_content = json.dumps([asdict(symbol) for symbol in symbols], ensure_ascii=False, indent=2)
@@ -389,7 +387,7 @@ class ToolGateway:
         return ToolExecutionResult("list_symbols", [observation.observation_id], context_view, truncated)
 
     def _inspect_symbol(self, arguments: dict[str, Any]) -> ToolExecutionResult:
-        name = str(arguments["name"])
+        name = _require_non_empty_string(arguments, "name")
         revision_label, revision = self._resolve_revision(str(arguments.get("revision", "head")))
         symbols = collect_python_symbols(self.repository_path, revision)
         matches = [symbol for symbol in symbols if symbol.name == name or symbol.qualified_name == name]
@@ -414,7 +412,7 @@ class ToolGateway:
         return ToolExecutionResult("inspect_symbol", [observation.observation_id], context_view, truncated)
 
     def _find_references(self, arguments: dict[str, Any]) -> ToolExecutionResult:
-        name = str(arguments["name"])
+        name = _require_non_empty_string(arguments, "name")
         revision_label, revision = self._resolve_revision(str(arguments.get("revision", "head")))
         max_results = int(arguments.get("max_results", 20))
         if max_results < 1:
@@ -556,6 +554,13 @@ class ToolGateway:
             raw_content,
             False,
         )
+
+
+def _require_non_empty_string(arguments: dict[str, Any], name: str) -> str:
+    value = arguments.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise ToolGatewayError(f"{name} must be a non-empty string")
+    return value
 
 
 def _safe_repo_path(path: str) -> str:

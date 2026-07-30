@@ -6,6 +6,7 @@ from review_agent.models import (
     CompiledRiskFloor,
     CompletionMemoryProjection,
     ContractItemStatus,
+    DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS,
     FinalRiskMemoryProjection,
     InitialContext,
     IntentField,
@@ -133,6 +134,21 @@ def test_assignment_has_structured_initial_context():
     assert assignment.initial_context.observation_refs == ["O-diff-api"]
 
 
+def test_reviewer_output_default_is_exactly_8192():
+    assert DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS == 8192
+    assignment = Assignment(
+        role="core",
+        mission="review",
+        assignment_reason=[],
+        assigned_contract=[],
+        required_checks=[],
+        initial_context=InitialContext(),
+        max_turns=1,
+        max_tool_calls=0,
+    )
+    assert assignment.max_output_tokens == 8192
+
+
 def test_review_profile_maps_risk_to_depth():
     profile = ReviewProfile.for_risk(RiskLevel.HIGH)
 
@@ -216,6 +232,7 @@ def test_assignment_rejects_runtime_authority_escalation(
 def test_review_profiles_expand_every_runtime_budget_by_risk():
     profiles = [ReviewProfile.for_risk(level) for level in RiskLevel]
 
+    assert [profile.max_output_tokens for profile in profiles] == [8192] * len(RiskLevel)
     assert [profile.max_total_tokens for profile in profiles] == sorted(
         profile.max_total_tokens for profile in profiles
     )
@@ -223,7 +240,6 @@ def test_review_profiles_expand_every_runtime_budget_by_risk():
         profile.max_elapsed_seconds for profile in profiles
     )
     for profile in profiles:
-        assert profile.max_output_tokens > 0
         assert profile.max_total_tokens > 0
         assert profile.max_elapsed_seconds > 0
         assert profile.max_provider_attempts > 0

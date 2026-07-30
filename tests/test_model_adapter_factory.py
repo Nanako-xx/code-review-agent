@@ -4,7 +4,11 @@ import json
 
 import pytest
 
-from review_agent.model_adapter import FakeToolCallingAdapter, OpenAICompatibleToolAdapter
+from review_agent.model_adapter import (
+    DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
+    FakeToolCallingAdapter,
+    OpenAICompatibleToolAdapter,
+)
 from review_agent.model_adapter_factory import (
     AdapterConfigError,
     ModelAdapterConfig,
@@ -284,6 +288,8 @@ def test_factory_creates_openai_compatible_adapter(monkeypatch):
 
     assert isinstance(adapter, OpenAICompatibleToolAdapter)
     assert adapter.provider_name == "openai-compatible"
+    assert factory.config.timeout_seconds == DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS
+    assert DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS == 180
 
 
 def test_factory_rejects_missing_openai_api_key(monkeypatch):
