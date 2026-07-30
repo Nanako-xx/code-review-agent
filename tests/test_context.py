@@ -229,7 +229,7 @@ def test_reviewer_envelope_uses_standard_four_inputs():
     assert "Assignment" in envelope.messages[0]["content"]
     assert "Observation Summary" in envelope.messages[0]["content"]
     assert "Initial Context" in envelope.messages[0]["content"]
-    assert "4096 output tokens per model call" in envelope.messages[0]["content"]
+    assert "8192 output tokens per model call" in envelope.messages[0]["content"]
     assert "65536 total tokens" in envelope.messages[0]["content"]
     assert "300 elapsed seconds" in envelope.messages[0]["content"]
     assert "2 provider attempts per model turn" in envelope.messages[0]["content"]

@@ -469,7 +469,7 @@ def test_typed_memory_planner_projection_only_adds_registered_requirements_and_h
         "per_reviewer": {
             "max_turns": 6,
             "max_tool_calls": 12,
-            "max_output_tokens": 4096,
+            "max_output_tokens": 8192,
             "max_total_tokens": 32768,
             "max_elapsed_seconds": 120.0,
             "max_provider_attempts": 2,
