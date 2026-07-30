@@ -8,7 +8,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Protocol, Union, cast
+from typing import Any, Callable, NoReturn, Protocol, Union, cast
 
 from review_agent.model_protocol import (
     ModelResponseKind,
@@ -37,6 +37,10 @@ _TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC = (
 )
 _HTTP_DEADLINE_SLOTS = threading.BoundedSemaphore(MAX_HTTP_DEADLINE_WORKERS)
 _HTTP_CLOSE_SLOTS = threading.BoundedSemaphore(MAX_HTTP_CLOSE_WORKERS)
+
+
+def _tool_result_metadata_mismatch() -> NoReturn:
+    raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC) from None
 
 
 def _validate_max_response_bytes(value: object, context: str) -> int:
@@ -608,20 +612,27 @@ def _validate_tool_result_metadata(
     metadata_by_call_id: dict[str, ModelToolResult] = {}
     for result in tool_results:
         if not isinstance(result, ModelToolResult):
-            raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC)
+            _tool_result_metadata_mismatch()
         call_id = result.call_id
         if not isinstance(call_id, str) or not call_id.strip():
-            raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC)
+            _tool_result_metadata_mismatch()
         if call_id in metadata_by_call_id:
-            raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC)
+            _tool_result_metadata_mismatch()
         metadata_by_call_id[call_id] = result
 
     if set(metadata_by_call_id) != set(message_tool_results):
-        raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC)
+        _tool_result_metadata_mismatch()
 
     for call_id, result in metadata_by_call_id.items():
-        if result != message_tool_results[call_id]:
-            raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC)
+        try:
+            metadata_canonical = serialize_tool_result_envelope(result)
+            transcript_canonical = serialize_tool_result_envelope(
+                message_tool_results[call_id]
+            )
+        except Exception:
+            _tool_result_metadata_mismatch()
+        if metadata_canonical != transcript_canonical:
+            _tool_result_metadata_mismatch()
 
 
 def _insert_legacy_tool_results(

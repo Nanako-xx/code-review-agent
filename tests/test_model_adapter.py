@@ -71,6 +71,11 @@ class _BlockingReadHttpResponse(_BoundedHttpResponse):
         self.closed.set()
 
 
+class _ExplodingUtf8Str(str):
+    def encode(self, encoding="utf-8", errors="strict"):
+        raise RuntimeError("sensitive malicious metadata error")
+
+
 def make_request(tool_results=None):
     return ModelTurnRequest(
         system="system",
@@ -1178,6 +1183,7 @@ def test_openai_adapter_accepts_exact_tool_result_metadata_without_duplicate():
         tool_name="read_range",
         content="app.py contents",
         observation_ids=["O-read"],
+        is_error=True,
     )
     assistant = {
         "role": "assistant",
@@ -1361,6 +1367,94 @@ def test_openai_adapter_rejects_full_metadata_mismatch_when_raw_content_matches(
 
     assert transport_called is False
     assert str(error.value) == "tool result metadata does not match transcript"
+
+
+@pytest.mark.parametrize(
+    "metadata_override",
+    [
+        pytest.param({"is_error": 1}, id="integer-is-error"),
+        pytest.param(
+            {"observation_ids": ("O-read",)},
+            id="non-list-observation-ids",
+        ),
+        pytest.param(
+            {"observation_ids": ["O-read", "O-read"]},
+            id="duplicate-observation-ids",
+        ),
+        pytest.param({"content": 7}, id="non-string-content"),
+        pytest.param({"tool_name": " \n"}, id="blank-tool-name"),
+        pytest.param(
+            {"content": _ExplodingUtf8Str("same-sensitive-content")},
+            id="malicious-content-exception",
+        ),
+    ],
+)
+def test_openai_adapter_rejects_noncanonical_typed_metadata_before_transport(
+    metadata_override,
+):
+    transport_called = False
+
+    def transport(url, headers, payload, timeout_seconds):
+        nonlocal transport_called
+        transport_called = True
+        return {"choices": [{"message": {"content": "must not be called"}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    call_id = "call-sensitive-strict-metadata"
+    transcript_result = ModelToolResult(
+        call_id=call_id,
+        tool_name="read_range",
+        content="same-sensitive-content",
+        observation_ids=["O-read"],
+        is_error=True,
+    )
+    metadata_values = {
+        "call_id": call_id,
+        "tool_name": transcript_result.tool_name,
+        "content": transcript_result.content,
+        "observation_ids": list(transcript_result.observation_ids),
+        "is_error": transcript_result.is_error,
+        **metadata_override,
+    }
+    metadata_result = ModelToolResult(**metadata_values)
+    assistant = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "read_range", "arguments": "{}"},
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError) as error:
+        adapter.complete_turn(
+            ModelTurnRequest(
+                system="system",
+                tools=[],
+                messages=[
+                    {"role": "user", "content": "Review"},
+                    assistant,
+                    model_tool_result_to_message(transcript_result),
+                ],
+                tool_results=[metadata_result],
+                parameters={},
+            )
+        )
+
+    assert transport_called is False
+    assert str(error.value) == "tool result metadata does not match transcript"
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__ is True
 
 
 @pytest.mark.parametrize(
