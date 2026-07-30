@@ -2512,7 +2512,7 @@ def _prepare_swe_prbench_projection(
                 content_hash=case_hash,
             ),
             input=EvalCaseInput(review_target=review_target),
-            clarification_script=ClarificationScript(max_rounds=1, answers=()),
+            clarification_script=ClarificationScript(max_rounds=4, answers=()),
             intent_truth=IntentTruth(
                 scorable=False,
                 authority=None,

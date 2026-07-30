@@ -38,7 +38,10 @@ from review_agent_eval.adapters.current_agent import (
 from review_agent_eval.adapters.subprocess_agent import BoundedProcessResult
 from review_agent_eval.artifacts import TargetAccess
 from review_agent_eval.cases import REPOSITORY_MATERIALIZER_PROTOCOL, WireContractV2
-from review_agent_eval.clarification import canonical_material_claim_matcher_snapshot
+from review_agent_eval.clarification import (
+    UNANSWERED_CLARIFICATION_CONTINUE,
+    canonical_material_claim_matcher_snapshot,
+)
 from review_agent_eval.config import AgentConfigSnapshot, ResourceBudgets, derive_trial_id
 from review_agent_eval.models import (
     ClarificationAction,
@@ -159,6 +162,7 @@ def _config(
     memory_mode: str = "off",
     max_trace_bytes: int = 64 * 1024 * 1024,
     adapter_override: object = ...,
+    unanswered_action: str | None = None,
 ) -> AgentRunConfig:
     adapter: object
     if adapter_override is ...:
@@ -179,6 +183,10 @@ def _config(
     else:
         adapter = adapter_override
     parameters = {"adapter": adapter}
+    if unanswered_action is not None:
+        parameters["clarification"] = {
+            "unanswered_action": unanswered_action,
+        }
     agent = AgentConfigSnapshot(
         agent_id="agent-current",
         agent_name="Current review Agent",
@@ -261,6 +269,26 @@ class _SkipChannel:
             question=question["question"],
             material_claim=question["material_claim"],
             matched_answer_id="answer-skip-%d" % (len(self.exchanges) + 1),
+            action=ClarificationAction.SKIP,
+            response=None,
+            resolved_values=(),
+        )
+        self.exchanges.append(exchange)
+        return exchange
+
+
+class _PolicySkipChannel:
+    def __init__(self) -> None:
+        self.exchanges: list[SubmissionClarificationExchange] = []
+
+    def ask(self, **question: Any) -> SubmissionClarificationExchange:
+        exchange = SubmissionClarificationExchange(
+            turn_index=len(self.exchanges) + 1,
+            question_id=question["question_id"],
+            dimension=question["dimension"],
+            question=question["question"],
+            material_claim=question["material_claim"],
+            matched_answer_id=None,
             action=ClarificationAction.SKIP,
             response=None,
             resolved_values=(),
@@ -751,6 +779,78 @@ def test_empty_ci_evidence_adds_no_cli_argument(tmp_path: Path) -> None:
     )
     assert len(calls) == 1
     assert not (tmp_path / ".review-agent" / "eval-input").exists()
+
+
+def test_current_adapter_policy_skip_keeps_inferred_intent_and_completes_review(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base, head = _commit_change(git_repo)
+    original = _eval_input(base, head)
+    target = _repository_target(original)
+    eval_input = replace(
+        original,
+        review_target=replace(
+            target,
+            review_request=replace(
+                target.review_request,
+                title=None,
+                user_intent=None,
+            ),
+        ),
+    )
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    monkeypatch.setenv("PYTHONPATH", str(source_root))
+    channel = _PolicySkipChannel()
+    config = _config(
+        eval_input,
+        review_arguments=(),
+        environment_allowlist=("PATH", "PYTHONPATH"),
+        unanswered_action=UNANSWERED_CLARIFICATION_CONTINUE,
+    )
+
+    submission = _run_current(
+        CurrentAgentAdapter(),
+        eval_input,
+        git_repo,
+        config,
+        channel,
+    )
+
+    assert submission.status is SubmissionStatus.COMPLETED
+    assert submission.intent is not None
+    assert submission.intent.status.value == "partial"
+    assert submission.review is not None
+    assert submission.intent.clarification_questions == tuple(channel.exchanges)
+    assert channel.exchanges
+    assert all(item.matched_answer_id is None for item in channel.exchanges)
+    assert any(item.source.value == "inferred" for item in submission.intent.claims)
+    assert submission.trace_ref is not None
+    run_dir = git_repo / submission.trace_ref.value
+    events = json.loads((run_dir / "intent_events.json").read_text(encoding="utf-8"))
+    assert events["decisions"]
+    assert {
+        (item["action"], item["continuation_basis"])
+        for item in events["decisions"]
+    } == {("skipped_non_interactive", "benchmark_no_user")}
+
+
+def test_policy_skip_uses_benchmark_no_user_continuation_token() -> None:
+    exchange = SubmissionClarificationExchange(
+        turn_index=1,
+        question_id="question-policy-skip",
+        dimension=IntentDimension.GOAL,
+        question="Confirm the inferred goal?",
+        material_claim="Preserve deterministic behavior",
+        matched_answer_id=None,
+        action=ClarificationAction.SKIP,
+        response=None,
+        resolved_values=(),
+    )
+
+    assert current_module._answer_input(exchange, SimpleNamespace()) == (
+        b"continue-with-uncertainty:benchmark-no-user\n"
+    )
 
 
 def test_large_ci_payload_with_nul_and_unicode_stays_out_of_argv(

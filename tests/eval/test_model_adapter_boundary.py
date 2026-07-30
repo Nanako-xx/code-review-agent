@@ -275,6 +275,34 @@ def test_agent_factory_rejects_invalid_or_judge_mixed_snapshot(adapter: dict[str
         )
 
 
+@pytest.mark.parametrize(
+    "policy",
+    [
+        None,
+        {"unanswered_action": "promote_to_explicit"},
+    ],
+)
+def test_agent_factory_rejects_invalid_unanswered_clarification_policy(
+    policy: object,
+) -> None:
+    snapshot = _agent_snapshot(CURRENT_AGENT_ADAPTER_KIND)
+    parameters = snapshot.to_dict()["parameters"]
+    parameters["clarification"] = policy
+    invalid = AgentConfigSnapshot(
+        agent_id=snapshot.agent_id,
+        agent_name=snapshot.agent_name,
+        agent_version=snapshot.agent_version,
+        commit=snapshot.commit,
+        model=snapshot.model,
+        provider=snapshot.provider,
+        parameters=parameters,
+        prompt_config_digest=snapshot.prompt_config_digest,
+    )
+
+    with pytest.raises(AgentAdapterConfigError, match="clarification policy"):
+        build_agent_adapter_factory(invalid)
+
+
 def test_agent_factory_rejects_judge_namespace_and_has_no_judge_parameter() -> None:
     snapshot = _agent_snapshot(CURRENT_AGENT_ADAPTER_KIND)
     parameters = snapshot.to_dict()["parameters"]

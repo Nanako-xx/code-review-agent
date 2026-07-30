@@ -992,7 +992,7 @@ def _build_case(
                 ),
             ),
         ),
-        clarification_script=ClarificationScript(max_rounds=1, answers=()),
+        clarification_script=ClarificationScript(max_rounds=4, answers=()),
         intent_truth=IntentTruth(
             scorable=False,
             authority=None,

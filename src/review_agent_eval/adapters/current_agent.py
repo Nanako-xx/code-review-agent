@@ -584,6 +584,8 @@ def _answer_input(
             raise _CurrentAdapterError("reject cannot be represented by product CLI")
         return b"reject\n"
     if action is ClarificationAction.SKIP:
+        if exchange.matched_answer_id is None:
+            return b"continue-with-uncertainty:benchmark-no-user\n"
         return b"skip\n"
     if action is ClarificationAction.CORRECT:
         if exchange.response is None:

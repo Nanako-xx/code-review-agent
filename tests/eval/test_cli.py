@@ -14,6 +14,7 @@ from review_agent_eval.cli import (
     EXIT_PRECONDITION,
     _canonical_digest,
     _build_parser,
+    _default_agent_snapshot,
     _domain_error_category,
     main,
 )
@@ -123,6 +124,22 @@ def test_parser_exposes_trial_public_and_analysis_commands() -> None:
         "compare",
         "calibrate",
         "gate",
+    }
+
+
+def test_prepare_binds_unanswered_clarification_policy_into_agent_identity() -> None:
+    args = _build_parser().parse_args(
+        [
+            "prepare",
+            "--suite-root=suite",
+            "--unanswered-clarification=continue-with-uncertainty",
+        ]
+    )
+
+    snapshot = _default_agent_snapshot(args)
+
+    assert snapshot.parameters["clarification"] == {
+        "unanswered_action": "continue_with_uncertainty"
     }
 
 

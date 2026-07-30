@@ -15,6 +15,10 @@ import re
 from typing import Any, Callable, Protocol
 
 from ..config import AdapterCapabilitiesV2, AgentConfigSnapshot
+from ..clarification import (
+    ClarificationProtocolError,
+    unanswered_clarification_action,
+)
 from ..models import EVAL_INPUT_SCHEMA_VERSION, EVAL_SUBMISSION_SCHEMA_VERSION
 from .base import AgentUnderTestAdapter
 
@@ -162,6 +166,12 @@ def _validate_snapshot(snapshot: AgentConfigSnapshot) -> str:
         raise AgentAdapterConfigError(
             "Judge configuration must not be present in Agent parameters"
         )
+    try:
+        unanswered_clarification_action(parameters)
+    except ClarificationProtocolError as exc:
+        raise AgentAdapterConfigError(
+            "Agent clarification policy is invalid"
+        ) from exc
     raw = parameters.get("adapter")
     if not isinstance(raw, Mapping):
         raise AgentAdapterConfigError("agent.parameters.adapter is required")

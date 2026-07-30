@@ -771,6 +771,16 @@ def test_submission_clarification_action_matrix_round_trips(action: str | None) 
     assert isinstance(exchange.resolved_values, tuple)
 
 
+def test_policy_skip_needs_no_case_answer() -> None:
+    payload = exchange_payload("skip")
+    payload["matched_answer_id"] = None
+
+    exchange = SubmissionClarificationExchange.from_dict(payload)
+
+    assert exchange.action is ClarificationAction.SKIP
+    assert exchange.matched_answer_id is None
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

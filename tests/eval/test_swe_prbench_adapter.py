@@ -305,6 +305,8 @@ def test_native_repository_publishes_v2_repository_target_with_unscorable_author
     assert case.input.review_target.review_request.user_intent is None
     assert case.input.review_target.review_request.existing_ci_evidence == ()
     assert case.intent_truth.scorable is False
+    assert case.clarification_script.max_rounds == 4
+    assert case.clarification_script.answers == ()
     assert case.review_truth.completeness is TruthCompleteness.HUMAN_OBSERVED
     assert case.review_truth.novel_finding_policy is NovelFindingPolicy.VERIFY
     assert len(case.review_truth.expected_findings) == 3

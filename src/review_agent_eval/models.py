@@ -1256,8 +1256,14 @@ class SubmissionClarificationExchange(_JsonModel):
                     "unanswered clarification must have null match/action/response and empty resolved_values"
                 )
         else:
-            if self.matched_answer_id is None:
+            policy_skip = (
+                self.action is ClarificationAction.SKIP
+                and self.matched_answer_id is None
+            )
+            if self.matched_answer_id is None and not policy_skip:
                 raise _error("answered clarification must have matched_answer_id")
+            if policy_skip and self.response is not None:
+                raise _error("policy skip clarification must have no response")
             if self.action is ClarificationAction.CONFIRM:
                 if not resolved:
                     raise _error("confirm clarification must have resolved_values")

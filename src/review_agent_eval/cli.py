@@ -297,6 +297,15 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--agent-commit", default="unknown")
     prepare.add_argument("--memory-mode", choices=("off", "read", "read-write"), default="off")
     prepare.add_argument(
+        "--unanswered-clarification",
+        choices=("defer", "continue-with-uncertainty"),
+        default="defer",
+        help=(
+            "defer for a user answer, or preserve inferred intent and continue "
+            "when the benchmark has no user"
+        ),
+    )
+    prepare.add_argument(
         "--agent-timeout-seconds",
         type=lambda value: _positive_float(value, name="agent_timeout_seconds"),
         default=900.0,
@@ -587,7 +596,12 @@ def _default_agent_snapshot(args: argparse.Namespace):
                 target_kinds=(ReviewTargetKind.REPOSITORY,),
             ).to_dict(),
         }
-    parameters = {"adapter": adapter}
+    parameters = {
+        "adapter": adapter,
+        "clarification": {
+            "unanswered_action": args.unanswered_clarification.replace("-", "_"),
+        },
+    }
     return AgentConfigSnapshot(
         agent_id=args.agent_id,
         agent_name=args.agent_name,

@@ -236,6 +236,8 @@ def test_prepare_maps_official_records_and_publishes_case_bank(tmp_path: Path) -
     assert case.input.review_target.review_request.title is None
     assert case.input.review_target.review_request.description is None
     assert case.intent_truth.scorable is False
+    assert case.clarification_script.max_rounds == 4
+    assert case.clarification_script.answers == ()
     assert case.review_truth.completeness is TruthCompleteness.EXPERT_AUGMENTED
     assert case.review_truth.novel_finding_policy is NovelFindingPolicy.VERIFY
 

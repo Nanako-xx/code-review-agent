@@ -11,6 +11,7 @@ from review_agent_eval.clarification import (
     MaterialClaimMatcher,
     MaterialClaimMatcherFactory,
     MaterialClaimMatchOutcome,
+    UNANSWERED_CLARIFICATION_CONTINUE,
     canonical_material_claim_matcher_snapshot,
 )
 from review_agent_eval.adapters.base import AgentRunConfig
@@ -79,6 +80,7 @@ def session_with(
     *answers: ClarificationAnswer,
     max_rounds: int = 16,
     matcher: MaterialClaimMatcher | None = None,
+    unanswered_action: str | None = None,
 ) -> ClarificationSession:
     snapshot = (
         canonical_material_claim_matcher_snapshot()
@@ -91,7 +93,10 @@ def session_with(
         factory = StaticMatcherFactory(matcher)
     return ClarificationSession(
         ClarificationScript(max_rounds=max_rounds, answers=answers),
-        run_binding=run_binding(snapshot),
+        run_binding=run_binding(
+            snapshot,
+            unanswered_action=unanswered_action,
+        ),
         matcher_factory=factory,
     )
 
@@ -114,8 +119,14 @@ def run_binding(
     snapshot: ClarificationMatcherSnapshot,
     *,
     matcher_digest: str | None = None,
+    unanswered_action: str | None = None,
 ) -> AgentRunConfig:
     task_id = "task-clarification-session"
+    parameters = {}
+    if unanswered_action is not None:
+        parameters["clarification"] = {
+            "unanswered_action": unanswered_action,
+        }
     agent = AgentConfigSnapshot(
         agent_id="agent-clarification-test",
         agent_name="Clarification test agent",
@@ -123,7 +134,7 @@ def run_binding(
         commit="a" * 40,
         model="none",
         provider="test",
-        parameters={},
+        parameters=parameters,
         prompt_config_digest="b" * 64,
     )
     run_id = stable_id("run", "clarification-session-tests", snapshot.digest())
@@ -540,6 +551,23 @@ def test_wrong_dimension_and_material_claim_do_not_match_or_consume() -> None:
     assert exact.matched_answer_id == "answer-exact"
     assert exact.turn_index == 3
     assert session.consumed_answer_ids == frozenset({"answer-exact"})
+
+
+def test_unanswered_policy_continues_without_fabricating_a_case_answer() -> None:
+    session = session_with(
+        max_rounds=4,
+        unanswered_action=UNANSWERED_CLARIFICATION_CONTINUE,
+    )
+
+    exchange = session.channel.ask(**question("question-policy-skip"))
+
+    assert exchange.action is ClarificationAction.SKIP
+    assert exchange.matched_answer_id is None
+    assert exchange.response is None
+    assert exchange.resolved_values == ()
+    assert session.consumed_answer_ids == frozenset()
+    assert session.match_receipts[0].outcome is MaterialClaimMatchOutcome.UNMATCHED
+    assert session.match_receipts[0].matched_answer_id is None
 
 
 def test_each_answer_is_consumed_at_most_once_and_exhaustion_is_recorded() -> None:

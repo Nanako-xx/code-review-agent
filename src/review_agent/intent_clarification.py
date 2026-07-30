@@ -61,6 +61,12 @@ class ConsoleIntentClarifier:
                     action=IntentDecisionAction.SKIPPED,
                     continuation_basis="user_skip",
                 )
+            if raw == "continue-with-uncertainty:benchmark-no-user":
+                return IntentDecision(
+                    question_id=question.question_id,
+                    action=IntentDecisionAction.SKIPPED_NON_INTERACTIVE,
+                    continuation_basis="benchmark_no_user",
+                )
             if raw in {"confirm", "c", "yes", "y"}:
                 if not question.proposed_values:
                     self._output("There is no proposed value to confirm; choose correct or skip.")

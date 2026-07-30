@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
@@ -36,6 +37,36 @@ class ClarificationProtocolError(RuntimeError):
 
 class ClarificationMatcherError(ClarificationProtocolError):
     """The Harness-owned material-claim matcher failed its contract."""
+
+
+UNANSWERED_CLARIFICATION_DEFER = "defer"
+UNANSWERED_CLARIFICATION_CONTINUE = "continue_with_uncertainty"
+_UNANSWERED_CLARIFICATION_ACTIONS = frozenset(
+    {
+        UNANSWERED_CLARIFICATION_DEFER,
+        UNANSWERED_CLARIFICATION_CONTINUE,
+    }
+)
+
+
+def unanswered_clarification_action(parameters: Mapping[str, object]) -> str:
+    """Return the immutable no-answer policy bound into Agent identity."""
+
+    if not isinstance(parameters, Mapping):
+        raise ClarificationProtocolError("Agent parameters must be a mapping")
+    if "clarification" not in parameters:
+        return UNANSWERED_CLARIFICATION_DEFER
+    policy = parameters["clarification"]
+    if not isinstance(policy, Mapping) or set(policy) != {"unanswered_action"}:
+        raise ClarificationProtocolError(
+            "Agent clarification policy must contain exactly unanswered_action"
+        )
+    action = policy["unanswered_action"]
+    if type(action) is not str or action not in _UNANSWERED_CLARIFICATION_ACTIONS:
+        raise ClarificationProtocolError(
+            "Agent unanswered clarification action is invalid"
+        )
+    return action
 
 
 @runtime_checkable
@@ -215,6 +246,7 @@ class ClarificationSession:
         "__question_ids",
         "__script",
         "__transcript",
+        "__unanswered_action",
     )
 
     def __init__(
@@ -253,6 +285,9 @@ class ClarificationSession:
             raise ClarificationMatcherError(
                 "clarification matcher does not match the run binding"
             )
+        self.__unanswered_action = unanswered_clarification_action(
+            run_binding.agent.parameters
+        )
         self.__script = script
         self.__matcher = matcher
         self.__match_receipts: list[MaterialClaimMatchReceipt] = []
@@ -352,6 +387,11 @@ class ClarificationSession:
                 material_claim=asked_claim,
                 proposed_values=proposed,
                 matched_answer=matched_answer,
+                unanswered_action=(
+                    self.__unanswered_action
+                    if turn_index <= self.__script.max_rounds
+                    else UNANSWERED_CLARIFICATION_DEFER
+                ),
             )
             self.__question_ids.add(question_id)
             if matched_answer is not None:
@@ -469,6 +509,7 @@ class ClarificationSession:
         material_claim: str,
         proposed_values: Tuple[str, ...],
         matched_answer: ClarificationAnswer | None,
+        unanswered_action: str,
     ) -> SubmissionClarificationExchange:
         if matched_answer is None:
             return SubmissionClarificationExchange(
@@ -478,7 +519,11 @@ class ClarificationSession:
                 question=question,
                 material_claim=material_claim,
                 matched_answer_id=None,
-                action=None,
+                action=(
+                    ClarificationAction.SKIP
+                    if unanswered_action == UNANSWERED_CLARIFICATION_CONTINUE
+                    else None
+                ),
                 response=None,
                 resolved_values=(),
             )
@@ -507,6 +552,8 @@ __all__ = [
     "ClarificationMatcherError",
     "ClarificationProtocolError",
     "ClarificationSession",
+    "UNANSWERED_CLARIFICATION_CONTINUE",
+    "UNANSWERED_CLARIFICATION_DEFER",
     "MaterialClaimMatcher",
     "MaterialClaimMatcherFactory",
     "MaterialClaimCandidateDecision",
@@ -514,4 +561,5 @@ __all__ = [
     "MaterialClaimMatchReceipt",
     "NormalizedMaterialClaimMatcher",
     "canonical_material_claim_matcher_snapshot",
+    "unanswered_clarification_action",
 ]
