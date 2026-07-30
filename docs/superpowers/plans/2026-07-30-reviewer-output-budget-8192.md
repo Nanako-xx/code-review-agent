@@ -18,6 +18,8 @@
 - Modify: `src/review_agent/supplemental.py:143-148`
 - Modify: `tests/test_models.py:216-229`
 - Modify: `tests/test_supplemental.py`
+- Modify: `tests/test_context.py:232`
+- Modify: `tests/test_portfolio.py:472`
 - Verify: `tests/test_hydration.py:497-514`
 
 - [ ] **Step 1: Tighten the profile regression before changing production code**
@@ -118,6 +120,19 @@ max_output_tokens: int = DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS
 Do not change high/critical values, total-token budgets, elapsed-time budgets,
 provider-attempt budgets, parsing, Review Contract validation, or Evidence authorization.
 
+Update the two Reviewer-policy expectations that intentionally expose this budget:
+
+```python
+assert "8192 output tokens per model call" in envelope.messages[0]["content"]
+```
+
+```python
+"max_output_tokens": 8192,
+```
+
+The remaining `4096` values in CLI model-stage fixtures and non-Reviewer model stages are
+outside this change and must remain unchanged.
+
 - [ ] **Step 4: Run focused model and hydration verification**
 
 Run:
@@ -127,6 +142,8 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 & 'D:\Anaconda\envs\MINIST\python.exe' -m pytest `
   tests/test_models.py `
   tests/test_supplemental.py `
+  tests/test_context.py::test_reviewer_envelope_uses_standard_four_inputs `
+  tests/test_portfolio.py::test_typed_memory_planner_projection_only_adds_registered_requirements_and_hints `
   tests/test_hydration.py::test_assignment_hydration_adds_runtime_defaults_to_legacy_artifact `
   -q -p no:cacheprovider --basetemp 'D:\tmp\reviewer-output-8192-focused'
 ```
@@ -156,7 +173,7 @@ Expected: both commands exit 0.
 - [ ] **Step 6: Commit only the budget implementation and regression**
 
 ```powershell
-git add -- src/review_agent/models.py src/review_agent/supplemental.py tests/test_models.py tests/test_supplemental.py
+git add -- src/review_agent/models.py src/review_agent/supplemental.py tests/test_models.py tests/test_supplemental.py tests/test_context.py tests/test_portfolio.py
 git commit -m "fix: raise reviewer output budget to 8192"
 ```
 
