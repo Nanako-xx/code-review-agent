@@ -21,6 +21,8 @@ Raise the Reviewer per-call output ceiling from 4096 to 8192 tokens everywhere:
 - `DEFAULT_REVIEWER_MAX_OUTPUT_TOKENS` becomes `8192`;
 - low-risk and medium-risk `ReviewProfile` values become `8192`;
 - high-risk and critical-risk profiles remain `8192`;
+- supplemental `ReviewerBudgetCaps` inherits the same shared `8192` default instead of
+  carrying an independent `4096` literal;
 - legacy Assignment hydration continues to use the default constant and therefore also
   resolves missing `max_output_tokens` to `8192`.
 
@@ -41,6 +43,7 @@ The change is acceptable when:
 
 - the default Reviewer output budget is exactly `8192`;
 - every risk profile exposes an `8192` per-call Reviewer output budget;
+- a default supplemental Reviewer Assignment exposes the same `8192` budget;
 - legacy Assignment hydration resolves an omitted value to `8192`;
 - Product and Eval test suites pass;
 - a fresh current-HEAD DeepSeek smoke has no `failed` Reviewer and preserves strict
