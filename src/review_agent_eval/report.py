@@ -3285,12 +3285,20 @@ def render_trial_markdown(inspection: TrialInspection) -> str:
     trace = payload.get("trace", {})
     trace_ref = trace.get("trace_ref")
     capture = trace.get("capture", {})
+    if trace_ref is None:
+        trace_ref_summary = "`null`"
+    else:
+        trace_ref_summary = (
+            f"artifact `{trace_ref.get('artifact_kind')}`, "
+            f"digest `{trace_ref.get('source_digest')}`, "
+            f"schema `{trace_ref.get('schema_version')}`"
+        )
     lines.extend(
         [
             "",
             "## Trace metadata",
             "",
-            f"- Trace ref: `{canonical_json(trace_ref) if trace_ref is not None else 'null'}`",
+            f"- Trace ref: {trace_ref_summary}",
             f"- Captured bytes: `{capture.get('total_bytes')}`",
             f"- Captured files: `{len(capture.get('files', []))}`",
             "",

@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from review_agent_eval.artifacts import ArtifactStore
+from review_agent_eval.config import validate_safe_text
 from review_agent_eval.intent_evaluator import IntentEvaluator
 from review_agent_eval.judge import JudgeContextKind, repository_context
 from review_agent_eval.metrics import MetricsAggregator, TrialScore
@@ -317,6 +318,7 @@ def test_trace_ref_projection_is_a_versioned_redacted_artifact_wrapper() -> None
     assert "value" not in projected
     assert "password" not in inspection.to_json()
     assert "example.test" not in inspection.to_json()
+    assert validate_safe_text(render_trial_markdown(inspection), "report")
 
 
 def test_summary_from_dict_rejects_a_forged_builder() -> None:
