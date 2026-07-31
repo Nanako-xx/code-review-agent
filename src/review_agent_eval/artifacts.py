@@ -861,7 +861,24 @@ class TrialMaterializationManifest(_JsonModel):
             raise SchemaError(
                 "materialization_id does not match its canonical identity"
             )
-        validate_safe_json(self.to_dict(), "materialization")
+        # Repository paths are already validated by _relative_target_path and
+        # the portable collision checks above.  Do not run credential-looking
+        # content heuristics over those path names: a legitimate source file
+        # such as ``sk_service_configurator.py`` can resemble a token prefix.
+        # Keep the actual paths in the sealed manifest, while validating every
+        # other field with the ordinary sensitive-text policy.
+        safe_payload = self.to_dict()
+        safe_target_access = dict(safe_payload["target_access"])
+        safe_target_access["readable_relative_paths"] = [
+            "repository-path"
+            for _path in safe_target_access["readable_relative_paths"]
+        ]
+        safe_payload["target_access"] = safe_target_access
+        safe_payload["files"] = [
+            dict(item, relative_path="repository-path")
+            for item in safe_payload["files"]
+        ]
+        validate_safe_json(safe_payload, "materialization")
 
     @classmethod
     def derive_materialization_id(

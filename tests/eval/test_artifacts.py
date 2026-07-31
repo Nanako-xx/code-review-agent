@@ -242,6 +242,36 @@ def make_materialization(
     )
 
 
+def test_materialization_accepts_benign_token_like_repository_paths(tmp_path) -> None:
+    _store, config, _manifest, plan, _trial = make_store(tmp_path)
+    path = "samples/sk_service_configurator.py"
+    body = b"def configure():\n    return None\n"
+    visible = AgentVisibleFileBinding(
+        role="repository_file",
+        relative_path=path,
+        size_bytes=len(body),
+        sha256=hashlib.sha256(body).hexdigest(),
+    )
+
+    materialization = TrialMaterializationManifest.create(
+        run_id=config.run_id,
+        task_id=TASK_ID,
+        trial_id=plan.trial_id,
+        attempt=1,
+        eval_input_digest=make_input().digest(),
+        review_target_digest=make_input().review_target.digest(),
+        wire_contract=config.wire_contract,
+        suite_preparation_binding_digest=config.suite_preparation_binding_digest,
+        prepared_source_id="prepared-repository-001",
+        adapter_capabilities_digest=config.adapter_capabilities_digest,
+        readable_relative_paths=(path,),
+        files=(visible,),
+        replay_binding_digest="7" * 64,
+    )
+
+    assert materialization.target_access.readable_relative_paths == (path,)
+
+
 def write_orphan_materialization(
     store: ArtifactStore,
     config: EvalRunConfig,

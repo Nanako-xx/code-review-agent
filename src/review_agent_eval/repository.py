@@ -101,6 +101,8 @@ PREPARED_REPOSITORY_MANIFEST_SCHEMA_VERSION = (
     "prepared_repository_manifest_v1"
 )
 WORKSPACE_MANIFEST_SCHEMA_VERSION = "workspace_manifest_v1"
+WORKSPACE_DIRECTORY_ID_VERSION = "workspace_directory_id_v1"
+WORKSPACE_DIRECTORY_DIGEST_CHARS = 32
 REPOSITORY_ACQUISITION_BINDING_SCHEMA_VERSION = (
     "repository_acquisition_binding_v1"
 )
@@ -5011,6 +5013,19 @@ def _workspace_binding_id(
     )
 
 
+def _workspace_directory_id(workspace_binding_id: str) -> str:
+    """Map the full manifest identity to a bounded internal directory name."""
+
+    binding = _identifier(workspace_binding_id, "workspace binding ID")
+    digest = canonical_sha256(
+        {
+            "schema_version": WORKSPACE_DIRECTORY_ID_VERSION,
+            "workspace_binding_id": binding,
+        }
+    )
+    return "workspace-" + digest[:WORKSPACE_DIRECTORY_DIGEST_CHARS]
+
+
 @dataclass(frozen=True)
 class WorkspaceManifest(_JsonModel):
     """Canonical Trial/workspace binding with no denormalized repository copy."""
@@ -6727,7 +6742,7 @@ class RepositoryPreparer:
             eval_input=eval_input,
             attempt=attempt,
         )
-        workspace_id = stable_id("workspace", manifest.workspace_binding_id)
+        workspace_id = _workspace_directory_id(manifest.workspace_binding_id)
         target = self.active_root / workspace_id
         _validate_direct_child(self.active_root, target, "Trial workspace")
         if workspace_id in self._active_leases or os.path.lexists(target):
@@ -6794,7 +6809,7 @@ class RepositoryPreparer:
 
     def _assert_workspace_lease(self, lease: TrialWorkspace) -> None:
         self._require_open()
-        workspace_id = stable_id("workspace", lease.manifest.workspace_binding_id)
+        workspace_id = _workspace_directory_id(lease.manifest.workspace_binding_id)
         if self._active_leases.get(workspace_id) is not lease:
             raise RepositorySecurityError("workspace lease is not active")
         expected = self.active_root / workspace_id
@@ -6817,7 +6832,7 @@ class RepositoryPreparer:
         return target
 
     def _release_workspace(self, lease: TrialWorkspace) -> None:
-        workspace_id = stable_id("workspace", lease.manifest.workspace_binding_id)
+        workspace_id = _workspace_directory_id(lease.manifest.workspace_binding_id)
         if self._active_leases.get(workspace_id) is not lease:
             lease._closed = True
             return

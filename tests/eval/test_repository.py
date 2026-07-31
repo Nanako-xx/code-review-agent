@@ -429,6 +429,26 @@ def test_fixture_prepare_rebuilds_exact_descriptor_and_keeps_truth_out(
         assert lease.cleanup_diagnostic is None
 
 
+def test_trial_workspace_uses_a_bounded_directory_name_for_windows_path_budget(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "suite"
+    descriptor, _built = _author_fixture(suite, tmp_path)
+
+    with _preparer(tmp_path, suite) as preparer:
+        prepared = preparer.prepare(descriptor)
+        with _trial_workspace(preparer, prepared, descriptor) as workspace:
+            assert workspace.manifest.workspace_binding_id.startswith(
+                "workspace-binding-"
+            )
+            assert len(workspace.manifest.workspace_binding_id) > 42
+            assert workspace.path.name.startswith("workspace-")
+            assert len(workspace.path.name) == 42
+            assert workspace.read_file("app.py").endswith(
+                b"return user.is_admin\n"
+            )
+
+
 def test_fixture_prepare_rejects_revision_drift(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     descriptor, _built = _author_fixture(suite, tmp_path)
