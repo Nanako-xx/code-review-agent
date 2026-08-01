@@ -1968,7 +1968,9 @@ class StageReceipt(_JsonModel):
             "agent_visible_files",
             tuple(sorted(visible_files, key=lambda item: item.relative_path)),
         )
-        validate_safe_json(self.to_dict(), "stage_receipt")
+        validate_safe_json(
+            _artifact_validation_projection(self), "stage_receipt"
+        )
         _check_model_size(self, MAX_STAGE_RECEIPT_BYTES, "StageReceipt")
 
     @classmethod
@@ -2244,6 +2246,67 @@ class StageReceipt(_JsonModel):
             ),
             "failure_code": None if self.failure_code is None else self.failure_code.value,
         }
+
+
+def _artifact_validation_projection(value: Any) -> Any:
+    """Validate typed repository paths without treating names as secrets.
+
+    Repository paths are attacker-controlled path data, so the typed models
+    still enforce traversal, Unicode, Windows portability, and collision
+    rules.  Credential-looking content heuristics are intentionally applied
+    only to non-path fields: legitimate source names such as
+    ``sk_service_configurator.py`` can otherwise resemble API-token prefixes.
+    Raw persisted payloads are reconstructed as their typed model before any
+    path is exempted from the generic content scan.
+    """
+
+    if isinstance(value, TrialMaterializationManifest):
+        payload = value.to_dict()
+    elif isinstance(value, StageReceipt):
+        payload = value.to_dict()
+    elif type(value) is dict:
+        schema_version = value.get("schema_version")
+        if schema_version == EVAL_TRIAL_MATERIALIZATION_SCHEMA_VERSION:
+            payload = TrialMaterializationManifest.from_dict(value).to_dict()
+        elif schema_version == EVAL_STAGE_RECEIPT_SCHEMA_VERSION:
+            payload = StageReceipt.from_dict(value).to_dict()
+        else:
+            return value
+    else:
+        return value
+
+    schema_version = payload["schema_version"]
+    if schema_version == EVAL_TRIAL_MATERIALIZATION_SCHEMA_VERSION:
+        safe_payload = dict(payload)
+        safe_target_access = dict(safe_payload["target_access"])
+        safe_target_access["readable_relative_paths"] = [
+            "repository-path"
+            for _path in safe_target_access["readable_relative_paths"]
+        ]
+        safe_payload["target_access"] = safe_target_access
+        safe_payload["files"] = [
+            dict(item, relative_path="repository-path")
+            for item in safe_payload["files"]
+        ]
+        return safe_payload
+
+    if (
+        schema_version == EVAL_STAGE_RECEIPT_SCHEMA_VERSION
+        and payload["stage"] == StageName.PREPARE.value
+    ):
+        safe_payload = dict(payload)
+        safe_target_access = dict(safe_payload["target_access"])
+        safe_target_access["readable_relative_paths"] = [
+            "repository-path"
+            for _path in safe_target_access["readable_relative_paths"]
+        ]
+        safe_payload["target_access"] = safe_target_access
+        safe_payload["agent_visible_files"] = [
+            dict(item, relative_path="repository-path")
+            for item in safe_payload["agent_visible_files"]
+        ]
+        return safe_payload
+    return payload
 
 
 @dataclass(frozen=True)
@@ -3874,7 +3937,7 @@ class ArtifactStore:
         if canonical_json_bytes(value) != data:
             raise ArtifactIntegrityError("JSON artifact is not canonical UTF-8 JSON")
         validate_safe_json(
-            value,
+            _artifact_validation_projection(value),
             "artifact",
             evaluator_context_policy=_evaluator_context_policy_for_payload(
                 value,
@@ -3942,7 +4005,7 @@ class ArtifactStore:
         evaluator_context_policy: Optional[str] = None,
     ) -> ArtifactRef:
         validate_safe_json(
-            value,
+            _artifact_validation_projection(value),
             "artifact",
             evaluator_context_policy=_evaluator_context_policy_for_payload(
                 value,
@@ -4002,7 +4065,9 @@ class ArtifactStore:
         )
         if canonical_json_bytes(value) != data:
             raise ArtifactIntegrityError("orphan JSON artifact is not canonical")
-        validate_safe_json(value, "artifact")
+        validate_safe_json(
+            _artifact_validation_projection(value), "artifact"
+        )
         return value, self._artifact_ref(run_id, path, data)
 
     def read_json_artifact(self, run_id: str, artifact: ArtifactRef) -> Any:

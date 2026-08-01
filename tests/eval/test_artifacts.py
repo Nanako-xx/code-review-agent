@@ -243,7 +243,7 @@ def make_materialization(
 
 
 def test_materialization_accepts_benign_token_like_repository_paths(tmp_path) -> None:
-    _store, config, _manifest, plan, _trial = make_store(tmp_path)
+    store, config, _manifest, plan, _trial = make_store(tmp_path)
     path = "samples/sk_service_configurator.py"
     body = b"def configure():\n    return None\n"
     visible = AgentVisibleFileBinding(
@@ -270,6 +270,18 @@ def test_materialization_accepts_benign_token_like_repository_paths(tmp_path) ->
     )
 
     assert materialization.target_access.readable_relative_paths == (path,)
+    running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
+    assert running.active_attempt == materialization.attempt
+    receipt = store.write_prepare_stage(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        make_input(),
+        materialization,
+        attempt=materialization.attempt,
+    )
+    assert receipt.target_access is not None
+    assert receipt.target_access.readable_relative_paths == (path,)
 
 
 def write_orphan_materialization(
