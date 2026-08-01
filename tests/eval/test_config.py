@@ -1054,6 +1054,23 @@ def test_config_rejects_secrets_full_env_url_userinfo_and_raw_reasoning(
     assert "user:password" not in str(caught.value)
 
 
+def test_safe_text_skips_url_regex_without_an_authority_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ForbiddenURLRegex:
+        @staticmethod
+        def finditer(_value: str):
+            raise AssertionError("URL regex must not scan marker-free base64")
+
+    monkeypatch.setattr(config_module, "_URL_AUTHORITY_RE", ForbiddenURLRegex())
+    encoded_trace_chunk = "A" * 65_536
+
+    assert config_module.validate_safe_text(
+        encoded_trace_chunk,
+        "trace_capture.files[0].content_base64",
+    ) == encoded_trace_chunk
+
+
 _ENV_LIKE_CODE_CONTEXT = (
     "count = len(items)\n"
     "affinity = score(item)"

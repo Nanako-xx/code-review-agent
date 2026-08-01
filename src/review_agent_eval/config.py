@@ -211,10 +211,10 @@ def _key_is_forbidden(key: str) -> bool:
 
 def _has_url_userinfo(value: str) -> bool:
     candidate = value.strip()
-    if any("@" in match.group(1) for match in _URL_AUTHORITY_RE.finditer(candidate)):
-        return True
     if "://" not in candidate and not candidate.startswith("//"):
         return False
+    if any("@" in match.group(1) for match in _URL_AUTHORITY_RE.finditer(candidate)):
+        return True
     try:
         parsed = urlsplit(candidate)
         username = parsed.username
