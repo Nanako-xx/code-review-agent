@@ -542,6 +542,16 @@ class _LazyClarificationSession:
         except Exception as exc:
             raise RunnerError("clarification matcher execution failed") from exc
 
+    def skip_unresolved(self, **kwargs: Any) -> Any:
+        try:
+            return self._ensure().channel.skip_unresolved(**kwargs)
+        except ClarificationMatcherError as exc:
+            raise RunnerError("clarification matcher execution failed") from exc
+        except (RunnerError, ClarificationProtocolError):
+            raise
+        except Exception as exc:
+            raise RunnerError("clarification matcher execution failed") from exc
+
 
 class _LazyClarificationChannel:
     def __init__(self, owner: _LazyClarificationSession) -> None:
@@ -549,6 +559,9 @@ class _LazyClarificationChannel:
 
     def ask(self, **kwargs: Any) -> Any:
         return self._owner.ask(**kwargs)
+
+    def skip_unresolved(self, **kwargs: Any) -> Any:
+        return self._owner.skip_unresolved(**kwargs)
 
 
 class _CombinedCancelEvent:

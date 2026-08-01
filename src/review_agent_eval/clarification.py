@@ -205,12 +205,28 @@ class ClarificationChannel(Protocol):
     ) -> SubmissionClarificationExchange:
         ...
 
+    def skip_unresolved(
+        self,
+        *,
+        question_id: str,
+        dimension: IntentDimension,
+        question: str,
+        proposed_values: Sequence[str] = (),
+    ) -> SubmissionClarificationExchange:
+        """Continue without matching when no canonical material claim exists."""
+        ...
+
 
 class _BoundClarificationChannel:
-    __slots__ = ("__ask_question",)
+    __slots__ = ("__ask_question", "__skip_unresolved_question")
 
-    def __init__(self, ask_question: Callable[..., SubmissionClarificationExchange]):
+    def __init__(
+        self,
+        ask_question: Callable[..., SubmissionClarificationExchange],
+        skip_unresolved_question: Callable[..., SubmissionClarificationExchange],
+    ):
         self.__ask_question = ask_question
+        self.__skip_unresolved_question = skip_unresolved_question
 
     def ask(
         self,
@@ -226,6 +242,21 @@ class _BoundClarificationChannel:
             dimension=dimension,
             question=question,
             material_claim=material_claim,
+            proposed_values=proposed_values,
+        )
+
+    def skip_unresolved(
+        self,
+        *,
+        question_id: str,
+        dimension: IntentDimension,
+        question: str,
+        proposed_values: Sequence[str] = (),
+    ) -> SubmissionClarificationExchange:
+        return self.__skip_unresolved_question(
+            question_id=question_id,
+            dimension=dimension,
+            question=question,
             proposed_values=proposed_values,
         )
 
@@ -295,7 +326,10 @@ class ClarificationSession:
         self.__consumed_answer_ids: set[str] = set()
         self.__question_ids: set[str] = set()
         self.__lock = Lock()
-        self.__channel: ClarificationChannel = _BoundClarificationChannel(self.__ask)
+        self.__channel: ClarificationChannel = _BoundClarificationChannel(
+            self.__ask,
+            self.__skip_unresolved,
+        )
 
     @property
     def channel(self) -> ClarificationChannel:
@@ -396,6 +430,83 @@ class ClarificationSession:
             self.__question_ids.add(question_id)
             if matched_answer is not None:
                 self.__consumed_answer_ids.add(matched_answer.answer_id)
+            self.__match_receipts.append(match_receipt)
+            self.__transcript.append(exchange)
+            return exchange
+
+    def __skip_unresolved(
+        self,
+        *,
+        question_id: str,
+        dimension: IntentDimension,
+        question: str,
+        proposed_values: Sequence[str] = (),
+    ) -> SubmissionClarificationExchange:
+        """Record an auditable no-user skip without invoking the matcher."""
+
+        _canonical._identifier(question_id, "clarification question.question_id")
+        _canonical._require_enum(
+            IntentDimension,
+            dimension,
+            "clarification question.dimension",
+        )
+        asked_text = _canonical._string(
+            question,
+            "clarification question.question",
+            _canonical.MAX_QUESTION_CHARS,
+        )
+        proposed = _canonical._text_tuple(
+            proposed_values,
+            "clarification question.proposed_values",
+            _canonical.MAX_TEXT_LIST_ITEMS,
+            _canonical.MAX_ANSWER_CHARS,
+        )
+        if self.__unanswered_action != UNANSWERED_CLARIFICATION_CONTINUE:
+            raise ClarificationProtocolError(
+                "unresolved material claims require continue_with_uncertainty"
+            )
+
+        with self.__lock:
+            if question_id in self.__question_ids:
+                raise ClarificationProtocolError(
+                    "duplicate clarification question_id: %r" % question_id
+                )
+            if len(self.__transcript) >= MAX_CLARIFICATION_QUESTIONS:
+                raise ClarificationProtocolError(
+                    "canonical clarification question limit of %d exceeded"
+                    % MAX_CLARIFICATION_QUESTIONS
+                )
+
+            turn_index = len(self.__transcript) + 1
+            within_round_limit = turn_index <= self.__script.max_rounds
+            match_receipt = self.__match_receipt(
+                turn_index=turn_index,
+                question_id=question_id,
+                dimension=dimension,
+                material_claim=asked_text,
+                candidates=(),
+                outcome=(
+                    MaterialClaimMatchOutcome.UNMATCHED
+                    if within_round_limit
+                    else MaterialClaimMatchOutcome.ROUND_LIMIT
+                ),
+                matched_answer_id=None,
+            )
+            exchange = self.__make_exchange(
+                turn_index=turn_index,
+                question_id=question_id,
+                dimension=dimension,
+                question=asked_text,
+                material_claim=asked_text,
+                proposed_values=proposed,
+                matched_answer=None,
+                unanswered_action=(
+                    self.__unanswered_action
+                    if within_round_limit
+                    else UNANSWERED_CLARIFICATION_DEFER
+                ),
+            )
+            self.__question_ids.add(question_id)
             self.__match_receipts.append(match_receipt)
             self.__transcript.append(exchange)
             return exchange

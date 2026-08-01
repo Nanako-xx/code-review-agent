@@ -34,7 +34,12 @@ from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import SESSION_SCHEMA_VERSION, SessionManifest
 from review_agent.session_store import SessionStore
 
-from ..clarification import ClarificationChannel, ClarificationProtocolError
+from ..clarification import (
+    UNANSWERED_CLARIFICATION_CONTINUE,
+    ClarificationChannel,
+    ClarificationProtocolError,
+    unanswered_clarification_action,
+)
 from ..config import ClarificationMatcherSnapshot
 from ..config import AdapterCapabilitiesV2
 from ..artifacts import TargetAccess
@@ -570,6 +575,42 @@ def _material_claim(
     return question.question
 
 
+def _ask_clarification(
+    question: ProductClarificationQuestion,
+    claims: Sequence[ProductIntentClaim],
+    config: AgentRunConfig,
+    clarification_channel: ClarificationChannel,
+) -> SubmissionClarificationExchange:
+    dimension = _FIELD_TO_DIMENSION[question.field]
+    try:
+        material_claim = _material_claim(
+            question,
+            claims,
+            config.clarification_matcher,
+        )
+    except AgentAdapterIncompatibleError as exc:
+        if (
+            exc.reason
+            is not AdapterIncompatibilityReason.CANONICAL_MATERIAL_CLAIM_UNAVAILABLE
+            or unanswered_clarification_action(config.agent.parameters)
+            != UNANSWERED_CLARIFICATION_CONTINUE
+        ):
+            raise
+        return clarification_channel.skip_unresolved(
+            question_id=question.question_id,
+            dimension=dimension,
+            question=question.question,
+            proposed_values=tuple(question.proposed_values),
+        )
+    return clarification_channel.ask(
+        question_id=question.question_id,
+        dimension=dimension,
+        question=question.question,
+        material_claim=material_claim,
+        proposed_values=tuple(question.proposed_values),
+    )
+
+
 def _answer_input(
     exchange: SubmissionClarificationExchange,
     question: ProductClarificationQuestion,
@@ -1007,16 +1048,11 @@ class CurrentAgentAdapter:
                         "awaiting Session has no new clarification question"
                     )
                 question = open_questions[0]
-                exchange = clarification_channel.ask(
-                    question_id=question.question_id,
-                    dimension=_FIELD_TO_DIMENSION[question.field],
-                    question=question.question,
-                    material_claim=_material_claim(
-                        question,
-                        claims,
-                        config.clarification_matcher,
-                    ),
-                    proposed_values=tuple(question.proposed_values),
+                exchange = _ask_clarification(
+                    question,
+                    claims,
+                    config,
+                    clarification_channel,
                 )
                 transcript.append(exchange)
                 answer = _answer_input(exchange, question)

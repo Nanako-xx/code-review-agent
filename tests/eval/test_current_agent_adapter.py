@@ -514,6 +514,61 @@ def test_canonical_matcher_never_receives_unresolved_free_text_material_claim(
     )
 
 
+def test_current_adapter_routes_unresolved_claim_to_bound_policy_skip() -> None:
+    goal_field = next(
+        field
+        for field, dimension in current_module._FIELD_TO_DIMENSION.items()
+        if dimension is IntentDimension.GOAL
+    )
+    question = SimpleNamespace(
+        question_id="question-unresolved",
+        field=goal_field,
+        claim_ids=(),
+        proposed_values=(),
+        question="What outcome should this change achieve?",
+    )
+    config = _config(
+        _eval_input("a" * 40, "b" * 40),
+        unanswered_action=UNANSWERED_CLARIFICATION_CONTINUE,
+    )
+    calls: list[dict[str, Any]] = []
+
+    class UnresolvedChannel:
+        def ask(self, **_kwargs: Any) -> SubmissionClarificationExchange:
+            raise AssertionError("canonical matcher path must not receive free text")
+
+        def skip_unresolved(self, **kwargs: Any) -> SubmissionClarificationExchange:
+            calls.append(kwargs)
+            return SubmissionClarificationExchange(
+                turn_index=1,
+                question_id=kwargs["question_id"],
+                dimension=kwargs["dimension"],
+                question=kwargs["question"],
+                material_claim=kwargs["question"],
+                matched_answer_id=None,
+                action=ClarificationAction.SKIP,
+                response=None,
+                resolved_values=(),
+            )
+
+    exchange = current_module._ask_clarification(
+        question,
+        (),
+        config,
+        UnresolvedChannel(),
+    )
+
+    assert exchange.action is ClarificationAction.SKIP
+    assert calls == [
+        {
+            "question_id": "question-unresolved",
+            "dimension": IntentDimension.GOAL,
+            "question": "What outcome should this change achieve?",
+            "proposed_values": (),
+        }
+    ]
+
+
 @pytest.mark.parametrize("replace_task_id", [False, True])
 def test_current_adapter_rejects_input_substitution_before_launch(
     tmp_path: Path,

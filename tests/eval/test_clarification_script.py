@@ -238,7 +238,7 @@ def test_ask_uses_canonical_types_and_limits() -> None:
     assert session.transcript == (exchange,)
 
 
-def test_channel_capability_exposes_only_ask_and_not_script_truth_or_transcript() -> None:
+def test_channel_capability_exposes_only_question_operations_not_truth_or_transcript() -> None:
     session = session_with(answer("answer-1"))
     channel = session.channel
 
@@ -247,10 +247,13 @@ def test_channel_capability_exposes_only_ask_and_not_script_truth_or_transcript(
         for name, member in ClarificationChannel.__dict__.items()
         if not name.startswith("_") and callable(member)
     }
-    assert protocol_methods == {"ask"}
+    assert protocol_methods == {"ask", "skip_unresolved"}
     assert isinstance(channel, ClarificationChannel)
     assert "__dir__" not in type(channel).__dict__
-    assert [name for name in dir(channel) if not name.startswith("_")] == ["ask"]
+    assert [name for name in dir(channel) if not name.startswith("_")] == [
+        "ask",
+        "skip_unresolved",
+    ]
     for forbidden in (
         "script",
         "answers",
@@ -568,6 +571,28 @@ def test_unanswered_policy_continues_without_fabricating_a_case_answer() -> None
     assert session.consumed_answer_ids == frozenset()
     assert session.match_receipts[0].outcome is MaterialClaimMatchOutcome.UNMATCHED
     assert session.match_receipts[0].matched_answer_id is None
+
+
+def test_unanswered_policy_skips_when_canonical_material_claim_is_unavailable() -> None:
+    session = session_with(
+        answer("answer-must-not-match"),
+        max_rounds=4,
+        unanswered_action=UNANSWERED_CLARIFICATION_CONTINUE,
+    )
+
+    exchange = session.channel.skip_unresolved(
+        question_id="question-unresolved",
+        dimension=IntentDimension.GOAL,
+        question="What outcome should this change achieve?",
+        proposed_values=(),
+    )
+
+    assert exchange.action is ClarificationAction.SKIP
+    assert exchange.matched_answer_id is None
+    assert exchange.material_claim == exchange.question
+    assert session.consumed_answer_ids == frozenset()
+    assert session.match_receipts[0].candidates == ()
+    assert session.match_receipts[0].outcome is MaterialClaimMatchOutcome.UNMATCHED
 
 
 def test_each_answer_is_consumed_at_most_once_and_exhaustion_is_recorded() -> None:
