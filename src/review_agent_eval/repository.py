@@ -98,19 +98,19 @@ def repository_from_eval_input(eval_input: EvalInput) -> Repository:
 
 
 PREPARED_REPOSITORY_MANIFEST_SCHEMA_VERSION = (
-    "prepared_repository_manifest_v1"
+    "prepared_repository_manifest_v2"
 )
 WORKSPACE_MANIFEST_SCHEMA_VERSION = "workspace_manifest_v1"
 WORKSPACE_DIRECTORY_ID_VERSION = "workspace_directory_id_v1"
 WORKSPACE_DIRECTORY_DIGEST_CHARS = 32
 REPOSITORY_ACQUISITION_BINDING_SCHEMA_VERSION = (
-    "repository_acquisition_binding_v1"
+    "repository_acquisition_binding_v2"
 )
 REPOSITORY_ISOLATION_POLICY_VERSION = "repository_isolation_v1"
 REPOSITORY_PATH_POLICY_VERSION = "repository_path_policy_v1"
-REPOSITORY_BUDGET_POLICY_VERSION = "repository_budget_policy_v1"
-LOGICAL_GIT_SOURCE_VERSION = "logical_git_source_v1"
-CACHE_INDEX_SCHEMA_VERSION = "repository_cache_index_v1"
+REPOSITORY_BUDGET_POLICY_VERSION = "repository_budget_policy_v2"
+LOGICAL_GIT_SOURCE_VERSION = "logical_git_review_closure_v2"
+CACHE_INDEX_SCHEMA_VERSION = "repository_cache_index_v2"
 REPOSITORY_RESERVATION_SCHEMA_VERSION = "repository_reservation_v1"
 
 MAX_REPOSITORY_MANIFEST_BYTES = 128 * 1024
@@ -333,7 +333,7 @@ def _budget_policy(
 ) -> Dict[str, Any]:
     return {
         "schema_version": REPOSITORY_BUDGET_POLICY_VERSION,
-        "max_objects": MAX_GIT_OBJECTS,
+        "object_count_policy": "observed_only",
         "max_blob_bytes": MAX_GIT_BLOB_BYTES,
         "max_materialized_files": MAX_MATERIALIZED_FILES,
         "max_materialized_bytes": MAX_MATERIALIZED_BYTES,
@@ -361,7 +361,7 @@ def _validate_budget_policy(value: Any) -> Dict[str, Any]:
     payload = _object(value, "repository budget policy")
     expected_fields = (
         "schema_version",
-        "max_objects",
+        "object_count_policy",
         "max_blob_bytes",
         "max_materialized_files",
         "max_materialized_bytes",
@@ -376,7 +376,7 @@ def _validate_budget_policy(value: Any) -> Dict[str, Any]:
     _exact_fields(payload, expected_fields, "repository budget policy")
     fixed = {
         "schema_version": REPOSITORY_BUDGET_POLICY_VERSION,
-        "max_objects": MAX_GIT_OBJECTS,
+        "object_count_policy": "observed_only",
         "max_blob_bytes": MAX_GIT_BLOB_BYTES,
         "max_materialized_files": MAX_MATERIALIZED_FILES,
         "max_materialized_bytes": MAX_MATERIALIZED_BYTES,
@@ -385,10 +385,10 @@ def _validate_budget_policy(value: Any) -> Dict[str, Any]:
     }
     for key, expected in fixed.items():
         if payload[key] != expected:
-            raise SchemaError("repository budget policy is not official v1")
+            raise SchemaError("repository budget policy is not official v2")
     maxima = {
-        "actual_objects": MAX_GIT_OBJECTS,
-        "actual_blobs": MAX_GIT_OBJECTS,
+        "actual_objects": MAX_COUNTER,
+        "actual_blobs": MAX_COUNTER,
         "actual_raw_object_bytes": MAX_CACHE_BYTES,
         "actual_materialized_files": MAX_MATERIALIZED_FILES,
         "actual_materialized_bytes": MAX_MATERIALIZED_BYTES,

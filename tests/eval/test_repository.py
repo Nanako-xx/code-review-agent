@@ -1273,6 +1273,33 @@ def test_cache_manifest_tamper_and_forged_runtime_handle_fail_closed(
             preparer.prepare(descriptor)
 
 
+def test_v1_manifest_and_cache_index_cannot_replay_as_v2(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    descriptor, _built = _author_fixture(suite, tmp_path)
+    with _preparer(tmp_path, suite) as preparer:
+        prepared = preparer.prepare(descriptor)
+        old_manifest = prepared.manifest.to_dict()
+        old_manifest["schema_version"] = "prepared_repository_manifest_v1"
+        with pytest.raises(ValueError, match="schema_version"):
+            PreparedRepositoryManifest.from_dict(old_manifest)
+
+        request_id = repository_module._request_id(
+            descriptor.digest(),
+            prepared.acquisition_binding_digest,
+            prepared.git_version,
+            prepared.git_executable_sha256,
+        )
+        index_path = preparer.index_root / f"{request_id}.json"
+        old_index = json.loads(index_path.read_text(encoding="utf-8"))
+        old_index["schema_version"] = "repository_cache_index_v1"
+        index_path.write_text(
+            json.dumps(old_index, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        with pytest.raises(RepositoryIntegrityError, match="unknown schema"):
+            repository_module._load_cache_index(index_path)
+
+
 def test_prepared_repository_rejects_forged_repository_revisions(
     tmp_path: Path,
 ) -> None:
@@ -1345,6 +1372,10 @@ def test_prepared_repository_budget_policy_is_immutable(tmp_path: Path) -> None:
             == repository_module.MAX_LOGICAL_TREE_ENTRIES
         )
         assert "actual_cache_bytes" not in manifest.budget_policy
+        assert manifest.logical_source_version == "logical_git_review_closure_v2"
+        assert manifest.budget_policy["object_count_policy"] == "observed_only"
+        assert "max_objects" not in manifest.budget_policy
+        assert manifest.budget_policy["actual_objects"] > 0
         detached = manifest.to_dict()["budget_policy"]
         detached["actual_objects"] = 0
         assert dict(manifest.budget_policy) == original_budget
@@ -1357,6 +1388,11 @@ def test_prepared_repository_id_binds_every_serialized_content_field(
     descriptor, _built = _author_fixture(suite, tmp_path)
     with _preparer(tmp_path, suite) as preparer:
         manifest = preparer.prepare(descriptor).manifest
+
+    assert manifest.logical_source_version == "logical_git_review_closure_v2"
+    assert manifest.budget_policy["object_count_policy"] == "observed_only"
+    assert "max_objects" not in manifest.budget_policy
+    assert manifest.budget_policy["actual_objects"] > 0
 
     payload = manifest.to_dict()
     mutations: list[tuple[tuple[str, ...], object]] = [
