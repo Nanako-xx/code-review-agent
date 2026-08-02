@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from review_agent.models import (
+    BENCHMARK_AUTO_ACCEPT_BASIS,
     ClarificationQuestion,
     IntentDecision,
     IntentDecisionAction,
@@ -66,6 +67,23 @@ class ConsoleIntentClarifier:
                     question_id=question.question_id,
                     action=IntentDecisionAction.SKIPPED_NON_INTERACTIVE,
                     continuation_basis="benchmark_no_user",
+                )
+            if raw == "confirm:benchmark-auto-accept":
+                if not question.proposed_values:
+                    self._output("There is no proposed value to auto-accept.")
+                    continue
+                if (
+                    question.field is IntentField.GOAL
+                    and len(question.proposed_values) > 1
+                ):
+                    self._output(
+                        "Conflicting goal candidates cannot be auto-accepted."
+                    )
+                    continue
+                return IntentDecision(
+                    question_id=question.question_id,
+                    action=IntentDecisionAction.CONFIRMED,
+                    continuation_basis=BENCHMARK_AUTO_ACCEPT_BASIS,
                 )
             if raw in {"confirm", "c", "yes", "y"}:
                 if not question.proposed_values:
