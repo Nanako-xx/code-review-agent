@@ -76,6 +76,22 @@ def _git(repo: Path, *args: str, input_bytes: bytes | None = None) -> str:
     return result.stdout.decode("utf-8").strip()
 
 
+def _git_exit_code(repo: Path, *args: str) -> int:
+    command = ["git"]
+    if (repo / "HEAD").is_file() and (repo / "objects").is_dir():
+        command.extend(["--git-dir", str(repo)])
+        cwd = repo.parent
+    else:
+        command.extend(["-C", str(repo)])
+        cwd = repo.parent
+    return subprocess.run(
+        [*command, *args],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).returncode
+
+
 def _write_fixture(root: Path) -> Path:
     fixture = root / "repositories" / "demo"
     base = fixture / "base"
@@ -114,6 +130,41 @@ def _init_local_repository(path: Path) -> tuple[str, str]:
     run_git(path, "commit", "-am", "head")
     head = run_git(path, "rev-parse", "HEAD")
     return base, head
+
+
+def _init_repository_with_review_history(
+    path: Path,
+) -> tuple[str, str, str, str, str, str]:
+    path.mkdir(parents=True)
+    run_git(path, "init")
+    run_git(path, "config", "user.email", "eval@example.test")
+    run_git(path, "config", "user.name", "Eval Test")
+
+    (path / "legacy.txt").write_text("legacy\n", encoding="utf-8")
+    run_git(path, "add", "legacy.txt")
+    run_git(path, "commit", "-m", "root")
+    root = run_git(path, "rev-parse", "HEAD")
+    root_tree = run_git(path, "rev-parse", "HEAD^{tree}")
+
+    (path / "legacy.txt").unlink()
+    (path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    run_git(path, "add", "-A")
+    run_git(path, "commit", "-m", "base")
+    base = run_git(path, "rev-parse", "HEAD")
+
+    (path / "app.py").write_text("value = 2\n", encoding="utf-8")
+    (path / "scratch.txt").write_text("scratch\n", encoding="utf-8")
+    run_git(path, "add", "-A")
+    run_git(path, "commit", "-m", "middle")
+    middle = run_git(path, "rev-parse", "HEAD")
+    middle_tree = run_git(path, "rev-parse", "HEAD^{tree}")
+
+    (path / "app.py").write_text("value = 3\n", encoding="utf-8")
+    (path / "scratch.txt").unlink()
+    run_git(path, "add", "-A")
+    run_git(path, "commit", "-m", "head")
+    head = run_git(path, "rev-parse", "HEAD")
+    return root, base, middle, head, root_tree, middle_tree
 
 
 def _init_bare_repository_with_tree_names(
@@ -504,6 +555,37 @@ def test_local_git_materialization_ignores_dirty_and_untracked_source_state(
             assert not (workspace.path / "truth.json").exists()
             assert not (workspace.path / ".review-agent").exists()
             assert _git(workspace.path, "status", "--porcelain=v1") == ""
+
+
+def test_review_history_keeps_commits_but_only_endpoint_snapshots(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    source = tmp_path / ".eval-data" / "imports" / "history"
+    root, base, middle, head, root_tree, middle_tree = (
+        _init_repository_with_review_history(source)
+    )
+    descriptor = _local_descriptor("imports/history", base, head)
+
+    with _preparer(tmp_path, suite) as preparer:
+        prepared = preparer.prepare(descriptor)
+        with _trial_workspace(preparer, prepared, descriptor) as workspace:
+            assert _git(workspace.path, "cat-file", "-t", root) == "commit"
+            assert _git(workspace.path, "cat-file", "-t", middle) == "commit"
+            assert _git(
+                workspace.path, "log", "--format=%s", f"{base}..{head}"
+            ) == "head\nmiddle"
+            assert _git(workspace.path, "show", f"{base}:app.py") == "value = 1"
+            assert _git(workspace.path, "show", f"{head}:app.py") == "value = 3"
+            assert (
+                _git_exit_code(workspace.path, "cat-file", "-e", root_tree)
+                != 0
+            )
+            assert (
+                _git_exit_code(workspace.path, "cat-file", "-e", middle_tree)
+                != 0
+            )
 
 
 def test_inherited_git_environment_cannot_redirect_preparation(

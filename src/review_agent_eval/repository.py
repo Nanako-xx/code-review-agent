@@ -122,6 +122,7 @@ MAX_GIT_CONFIG_BYTES = 1024 * 1024
 MAX_GIT_EXECUTABLE_BYTES = 512 * 1024 * 1024
 MAX_GIT_METADATA_NODES = 500_000
 MAX_GIT_OBJECTS = 100_000
+GIT_BATCH_OBJECT_CHUNK = 2_048
 MAX_GIT_BLOB_BYTES = 64 * 1024 * 1024
 MAX_MATERIALIZED_FILES = 50_000
 MAX_MATERIALIZED_BYTES = 512 * 1024 * 1024
@@ -3128,33 +3129,60 @@ def _closure_from_objects(
             parsed_trees[oid] = _parse_tree(canonical[oid], object_format)
         return parsed_trees[oid]
 
-    def reachable_from_commit(start: str) -> Set[str]:
+    commit_ids = {
+        oid for oid, obj in canonical.items() if obj.object_type == "commit"
+    }
+
+    def reachable_commits(starts: Iterable[str]) -> Set[str]:
         reachable: Set[str] = set()
-        pending: List[Tuple[str, str]] = [(start, "commit")]
+        pending = list(starts)
+        while pending:
+            oid = pending.pop()
+            if oid in reachable:
+                continue
+            if oid not in commit_ids:
+                raise RepositoryIntegrityError(
+                    "commit closure references a missing commit object"
+                )
+            reachable.add(oid)
+            _tree, parents = commit_data(oid)
+            pending.extend(parents)
+        return reachable
+
+    def reachable_tree_objects(tree_oid: str) -> Set[str]:
+        reachable: Set[str] = set()
+        pending = [(tree_oid, "tree")]
         while pending:
             oid, expected_type = pending.pop()
             if oid in reachable:
                 continue
             obj = canonical.get(oid)
-            if obj is None:
-                raise RepositoryIntegrityError("Git closure references a missing object")
-            if obj.object_type != expected_type:
-                raise RepositoryIntegrityError("Git closure reference has the wrong type")
+            if obj is None or obj.object_type != expected_type:
+                raise RepositoryIntegrityError(
+                    "endpoint snapshot references a missing or wrong-type object"
+                )
             reachable.add(oid)
-            if expected_type == "commit":
-                tree, parents = commit_data(oid)
-                pending.append((tree, "tree"))
-                pending.extend((parent, "commit") for parent in parents)
-            elif expected_type == "tree":
-                for entry in tree_data(oid):
-                    pending.append((entry.oid, entry.object_type))
+            if expected_type == "tree":
+                pending.extend(
+                    (entry.oid, entry.object_type) for entry in tree_data(oid)
+                )
         return reachable
 
-    base_reachable = reachable_from_commit(base_revision)
-    head_reachable = reachable_from_commit(head_revision)
+    all_commits = reachable_commits((base_revision, head_revision))
+    if commit_ids != all_commits:
+        raise RepositoryIntegrityError("cache contains commits outside review ancestry")
+
+    base_tree, _base_parents = commit_data(base_revision)
+    head_tree, _head_parents = commit_data(head_revision)
+    base_snapshot = reachable_tree_objects(base_tree)
+    head_snapshot = reachable_tree_objects(head_tree)
+    allowed_objects = all_commits | base_snapshot | head_snapshot
+    if set(canonical) != allowed_objects:
+        raise RepositoryIntegrityError("cache contains objects outside review closure")
+
+    base_reachable = reachable_commits((base_revision,)) | base_snapshot
+    head_reachable = reachable_commits((head_revision,)) | head_snapshot
     union_reachable = base_reachable | head_reachable
-    if set(canonical) != union_reachable:
-        raise RepositoryIntegrityError("cache contains objects outside base/head closure")
 
     # Validate every reachable tree's component/collision policy and calculate
     # the maximum path depth/bytes by memoized DAG traversal.
@@ -3185,11 +3213,8 @@ def _closure_from_objects(
         depth_memo[oid] = (max_depth, max_bytes)
         return depth_memo[oid]
 
-    for tree_oid, _parents in parsed_commits.values():
-        tree_extent(tree_oid)
-
-    base_tree, _ = commit_data(base_revision)
-    head_tree, _ = commit_data(head_revision)
+    tree_extent(base_tree)
+    tree_extent(head_tree)
     materialized: List[Tuple[str, int, bytes, str]] = []
     materialized_bytes = 0
     materialized_entries = 0
@@ -3682,6 +3707,93 @@ def _read_exact(handle: BinaryIO, size: int) -> bytes:
     return b"".join(chunks)
 
 
+def _read_object_id_file(path: Path, object_format: str) -> Set[str]:
+    expected_length = 40 if object_format == "sha1" else 64
+    result: Set[str] = set()
+    with open(path, "rb", buffering=0) as handle:
+        for raw_line in handle:
+            line = raw_line.rstrip(b"\r\n")
+            try:
+                oid = line.decode("ascii", "strict")
+            except UnicodeDecodeError as exc:
+                raise RepositoryIntegrityError(
+                    "Git closure enumeration was not ASCII"
+                ) from exc
+            if len(oid) != expected_length or _GIT_OID_RE.fullmatch(oid) is None:
+                raise RepositoryIntegrityError(
+                    "Git closure enumeration returned a non-canonical ID"
+                )
+            result.add(oid)
+    return result
+
+
+def _enumerate_review_object_ids(
+    runner: _GitRunner,
+    quarantine: Path,
+    *,
+    object_format: str,
+    base_revision: str,
+    head_revision: str,
+) -> Set[str]:
+    commits_path = runner.tmp_root / ("review-commits-" + uuid.uuid4().hex)
+    snapshots_path = runner.tmp_root / ("review-snapshots-" + uuid.uuid4().hex)
+    try:
+        runner.run_to_file(
+            [
+                "--git-dir",
+                str(quarantine),
+                "rev-list",
+                "--no-object-names",
+                base_revision,
+                head_revision,
+            ],
+            commits_path,
+            stdout_limit=MAX_CACHE_BYTES,
+        )
+        runner.run_to_file(
+            [
+                "--git-dir",
+                str(quarantine),
+                "rev-list",
+                "--objects",
+                "--no-object-names",
+                "--no-walk",
+                base_revision,
+                head_revision,
+            ],
+            snapshots_path,
+            stdout_limit=MAX_CACHE_BYTES,
+        )
+        object_ids = _read_object_id_file(commits_path, object_format)
+        object_ids.update(_read_object_id_file(snapshots_path, object_format))
+    except _GitCommandFailure as exc:
+        raise RepositoryIntegrityError("Git closure enumeration failed") from exc
+    finally:
+        for path in (commits_path, snapshots_path):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise RepositorySecurityError(
+                    "could not remove temporary Git closure enumeration"
+                ) from exc
+    if base_revision not in object_ids or head_revision not in object_ids:
+        raise RepositoryIntegrityError("review closure omitted a declared revision")
+    return object_ids
+
+
+def _object_id_chunks(object_ids: Iterable[str]) -> Iterator[Tuple[str, ...]]:
+    chunk: List[str] = []
+    for oid in sorted(object_ids):
+        chunk.append(oid)
+        if len(chunk) == GIT_BATCH_OBJECT_CHUNK:
+            yield tuple(chunk)
+            chunk.clear()
+    if chunk:
+        yield tuple(chunk)
+
+
 def _extract_quarantine_closure(
     runner: _GitRunner,
     quarantine: Path,
@@ -3690,95 +3802,103 @@ def _extract_quarantine_closure(
     head_revision: str,
 ) -> _RepositoryClosure:
     object_format = "sha1" if len(base_revision) == 40 else "sha256"
-    try:
-        result = runner.run(
-            [
-                "--git-dir",
-                str(quarantine),
-                "rev-list",
-                "--objects",
-                "--no-object-names",
-                base_revision,
-                head_revision,
-            ],
-            stdout_limit=MAX_GIT_OBJECTS * 70,
-        )
-    except _GitCommandFailure as exc:
-        raise RepositoryIntegrityError("Git closure enumeration failed") from exc
-    object_ids: Set[str] = set()
-    expected_length = 40 if object_format == "sha1" else 64
-    for line in result.stdout.splitlines():
-        try:
-            oid = line.decode("ascii", "strict").strip()
-        except UnicodeDecodeError as exc:
-            raise RepositoryIntegrityError("Git closure enumeration was not ASCII") from exc
-        if len(oid) != expected_length or _GIT_OID_RE.fullmatch(oid) is None:
-            raise RepositoryIntegrityError("Git closure enumeration returned a short ID")
-        object_ids.add(oid)
-        if len(object_ids) > MAX_GIT_OBJECTS:
-            raise RepositoryLimitError("Git closure exceeds object-count budget")
-    if base_revision not in object_ids or head_revision not in object_ids:
-        raise RepositoryIntegrityError("Git closure omitted a declared revision")
+    object_ids = _enumerate_review_object_ids(
+        runner,
+        quarantine,
+        object_format=object_format,
+        base_revision=base_revision,
+        head_revision=head_revision,
+    )
     if not object_ids:
         raise RepositoryIntegrityError("Git closure is empty")
 
-    batch_input = b"".join((oid.encode("ascii") + b"\n") for oid in sorted(object_ids))
-    batch_output = runner.tmp_root / ("batch-" + uuid.uuid4().hex)
-    try:
-        runner.run_to_file(
-            ["--git-dir", str(quarantine), "cat-file", "--batch"],
-            batch_output,
-            input_bytes=batch_input,
-            stdout_limit=MAX_CACHE_BYTES + MAX_GIT_OBJECTS * 128,
+    objects: Dict[str, _GitObject] = {}
+    raw_total = 0
+    for chunk in _object_id_chunks(object_ids):
+        chunk_ids = set(chunk)
+        batch_input = b"".join(
+            oid.encode("ascii") + b"\n" for oid in chunk
         )
-        objects: Dict[str, _GitObject] = {}
-        raw_total = 0
-        with open(batch_output, "rb", buffering=0) as handle:
-            for _index in range(len(object_ids)):
-                header = handle.readline(256)
-                if not header or not header.endswith(b"\n"):
-                    raise RepositoryIntegrityError("Git batch output has a malformed header")
-                parts = header[:-1].split(b" ")
-                if len(parts) != 3:
-                    raise RepositoryIntegrityError("Git batch output has an invalid header")
-                try:
-                    actual_oid = parts[0].decode("ascii", "strict")
-                    object_type = parts[1].decode("ascii", "strict")
-                    size = int(parts[2].decode("ascii", "strict"))
-                except (UnicodeDecodeError, ValueError) as exc:
-                    raise RepositoryIntegrityError("Git batch output header is invalid") from exc
-                if (
-                    actual_oid not in object_ids
-                    or actual_oid in objects
-                    or object_type == "missing"
-                    or size < 0
-                ):
-                    raise RepositoryIntegrityError("Git batch output omitted an object")
-                maximum = (
-                    MAX_GIT_BLOB_BYTES
-                    if object_type == "blob"
-                    else MAX_GIT_METADATA_OBJECT_BYTES
-                )
-                if object_type not in {"blob", "tree", "commit"} or size > maximum:
-                    raise RepositoryPolicyError("Git closure contains an unsupported object")
-                raw = _read_exact(handle, size)
-                if handle.read(1) != b"\n":
-                    raise RepositoryIntegrityError("Git batch object framing is invalid")
-                raw_total += len(raw)
-                if raw_total > MAX_CACHE_BYTES:
-                    raise RepositoryLimitError("Git closure exceeds raw cache budget")
-                objects[actual_oid] = _GitObject(actual_oid, object_type, raw)
-            if set(objects) != object_ids:
-                raise RepositoryIntegrityError("Git batch output omitted an object")
-            if handle.read(1):
-                raise RepositoryIntegrityError("Git batch output contains extra objects")
-    finally:
+        batch_output = runner.tmp_root / ("batch-" + uuid.uuid4().hex)
         try:
-            os.unlink(batch_output)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            raise RepositorySecurityError("could not remove temporary Git batch output") from exc
+            runner.run_to_file(
+                ["--git-dir", str(quarantine), "cat-file", "--batch"],
+                batch_output,
+                input_bytes=batch_input,
+                stdout_limit=MAX_CACHE_BYTES + MAX_GIT_STDOUT_BYTES,
+            )
+        except _GitCommandFailure as exc:
+            raise RepositoryIntegrityError("Git object extraction failed") from exc
+        try:
+            with open(batch_output, "rb", buffering=0) as handle:
+                for _index in range(len(chunk)):
+                    header = handle.readline(256)
+                    if not header or not header.endswith(b"\n"):
+                        raise RepositoryIntegrityError(
+                            "Git batch output has a malformed header"
+                        )
+                    parts = header[:-1].split(b" ")
+                    if len(parts) != 3:
+                        raise RepositoryIntegrityError(
+                            "Git batch output has an invalid header"
+                        )
+                    try:
+                        actual_oid = parts[0].decode("ascii", "strict")
+                        object_type = parts[1].decode("ascii", "strict")
+                        size = int(parts[2].decode("ascii", "strict"))
+                    except (UnicodeDecodeError, ValueError) as exc:
+                        raise RepositoryIntegrityError(
+                            "Git batch output header is invalid"
+                        ) from exc
+                    if (
+                        actual_oid not in chunk_ids
+                        or actual_oid in objects
+                        or object_type == "missing"
+                        or size < 0
+                    ):
+                        raise RepositoryIntegrityError(
+                            "Git batch output omitted an object"
+                        )
+                    maximum = (
+                        MAX_GIT_BLOB_BYTES
+                        if object_type == "blob"
+                        else MAX_GIT_METADATA_OBJECT_BYTES
+                    )
+                    if (
+                        object_type not in {"blob", "tree", "commit"}
+                        or size > maximum
+                    ):
+                        raise RepositoryPolicyError(
+                            "Git closure contains an unsupported object"
+                        )
+                    raw = _read_exact(handle, size)
+                    if handle.read(1) != b"\n":
+                        raise RepositoryIntegrityError(
+                            "Git batch object framing is invalid"
+                        )
+                    raw_total += len(raw)
+                    if raw_total > MAX_CACHE_BYTES:
+                        raise RepositoryLimitError(
+                            "Git closure exceeds raw cache budget"
+                        )
+                    objects[actual_oid] = _GitObject(
+                        actual_oid, object_type, raw
+                    )
+                if handle.read(1):
+                    raise RepositoryIntegrityError(
+                        "Git batch output contains extra objects"
+                    )
+        finally:
+            try:
+                os.unlink(batch_output)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise RepositorySecurityError(
+                    "could not remove temporary Git batch output"
+                ) from exc
+    if set(objects) != object_ids:
+        raise RepositoryIntegrityError("Git batch output omitted an object")
     return _closure_from_objects(
         objects,
         object_format=object_format,
