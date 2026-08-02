@@ -121,7 +121,6 @@ MAX_GIT_STDERR_BYTES = 256 * 1024
 MAX_GIT_CONFIG_BYTES = 1024 * 1024
 MAX_GIT_EXECUTABLE_BYTES = 512 * 1024 * 1024
 MAX_GIT_METADATA_NODES = 500_000
-MAX_GIT_OBJECTS = 100_000
 GIT_BATCH_OBJECT_CHUNK = 2_048
 MAX_GIT_BLOB_BYTES = 64 * 1024 * 1024
 MAX_MATERIALIZED_FILES = 50_000
@@ -3088,8 +3087,6 @@ def _closure_from_objects(
         raise RepositoryIntegrityError("revision length does not match object format")
     if base_revision == head_revision:
         raise RepositoryIntegrityError("base and head revisions must differ")
-    if len(objects) > MAX_GIT_OBJECTS:
-        raise RepositoryLimitError("Git closure exceeds the fixed object-count budget")
     canonical: Dict[str, _GitObject] = {}
     raw_object_bytes = 0
     for oid, obj in objects.items():
@@ -3463,8 +3460,6 @@ def _read_loose_repository(
             if oid in objects:
                 raise RepositoryIntegrityError("duplicate loose Git object")
             objects[oid] = _GitObject(oid, object_type, raw)
-            if len(objects) > MAX_GIT_OBJECTS:
-                raise RepositoryLimitError("cache exceeds object-count budget")
     closure = _closure_from_objects(
         objects,
         object_format=object_format,
@@ -3991,8 +3986,6 @@ def _add_object(
     if existing is not None and existing != candidate:
         raise RepositoryIntegrityError("Git object hash collision was detected")
     objects[oid] = candidate
-    if len(objects) > MAX_GIT_OBJECTS:
-        raise RepositoryLimitError("fixture exceeds Git object-count budget")
     return oid
 
 

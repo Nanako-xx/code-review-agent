@@ -13,6 +13,8 @@ import pytest
 
 from conftest import run_git
 import review_agent_eval.repository as repository_module
+from review_agent.observations import ObservationStore
+from review_agent.tool_gateway import ToolGateway
 from review_agent_eval.artifacts import TrialManifest
 from review_agent_eval.cases import (
     CaseSplit,
@@ -51,6 +53,7 @@ from review_agent_eval.repository import (
     RepositoryPolicyError,
     RepositoryPreparer,
     RepositoryPreparationError,
+    RepositoryMode,
     RepositorySecurityError,
     WorkspaceManifest,
     WorkspaceRetentionPolicy,
@@ -488,6 +491,8 @@ def test_trial_workspace_uses_a_bounded_directory_name_for_windows_path_budget(
 
     with _preparer(tmp_path, suite) as preparer:
         prepared = preparer.prepare(descriptor)
+        repeated = preparer.prepare(descriptor)
+        assert repeated.cache_id == prepared.cache_id
         with _trial_workspace(preparer, prepared, descriptor) as workspace:
             assert workspace.manifest.workspace_binding_id.startswith(
                 "workspace-binding-"
@@ -586,6 +591,55 @@ def test_review_history_keeps_commits_but_only_endpoint_snapshots(
                 _git_exit_code(workspace.path, "cat-file", "-e", middle_tree)
                 != 0
             )
+            store = ObservationStore(
+                workspace.path / ".review-agent" / "test-observations"
+            )
+            gateway = ToolGateway(
+                workspace.path,
+                base,
+                head,
+                store,
+                allowed_tools=("read_commit_messages",),
+            )
+            result = gateway.execute(
+                "read_commit_messages", {"max_commits": 10}
+            )
+            assert '"subject": "head"' in result.context_view
+            assert '"subject": "middle"' in result.context_view
+            assert '"subject": "root"' not in result.context_view
+
+    with _preparer(
+        tmp_path,
+        suite,
+        repository_mode=RepositoryMode.CACHE_ONLY,
+    ) as cache_only:
+        replayed = cache_only.prepare(descriptor)
+        assert replayed.cache_id == prepared.cache_id
+        assert replayed.manifest.source_digest == prepared.manifest.source_digest
+        assert replayed.manifest.budget_policy["actual_objects"] == (
+            prepared.manifest.budget_policy["actual_objects"]
+        )
+
+    request_id = repository_module._request_id(
+        descriptor.digest(),
+        prepared.acquisition_binding_digest,
+        prepared.git_version,
+        prepared.git_executable_sha256,
+    )
+    index_path = tmp_path / ".eval-data" / "indexes" / f"{request_id}.json"
+    old_index = json.loads(index_path.read_text(encoding="utf-8"))
+    old_index["schema_version"] = "repository_cache_index_v1"
+    index_path.write_text(
+        json.dumps(old_index, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    with _preparer(
+        tmp_path,
+        suite,
+        repository_mode=RepositoryMode.CACHE_ONLY,
+    ) as cache_only:
+        with pytest.raises(RepositoryIntegrityError, match="unknown schema"):
+            cache_only.prepare(descriptor)
 
 
 def test_inherited_git_environment_cannot_redirect_preparation(
