@@ -10,6 +10,10 @@ from pathlib import Path
 import pytest
 
 import review_agent_eval.models as eval_models
+from review_agent_eval.clarification import (
+    IntentContinuationMode,
+    intent_continuation_mode_for_case,
+)
 from review_agent_eval.models import (
     CaseOrigin,
     ClarificationAction,
@@ -917,6 +921,77 @@ def test_unscorable_intent_has_one_canonical_null_and_empty_representation() -> 
         invalid["intent_truth"][field] = value
         with pytest.raises(SchemaError):
             EvalCase.from_dict(invalid)
+
+
+def test_case_authority_derives_benchmark_auto_accept_only_without_truth_or_answers() -> None:
+    public_payload = case_payload()
+    public_payload["intent_truth"] = {
+        "scorable": False,
+        "authority": None,
+        "expected_claims": [],
+        "forbidden_claims": [],
+        "clarification_policy": None,
+    }
+    public_payload["clarification_script"]["answers"] = []
+    public_case = EvalCase.from_dict(public_payload)
+    assert intent_continuation_mode_for_case(public_case) is (
+        IntentContinuationMode.BENCHMARK_AUTO_ACCEPT
+    )
+
+    scorable_case = EvalCase.from_dict(case_payload())
+    assert intent_continuation_mode_for_case(scorable_case) is (
+        IntentContinuationMode.SCRIPTED
+    )
+
+    scripted_public_payload = case_payload()
+    scripted_public_payload["intent_truth"] = dict(
+        public_payload["intent_truth"]
+    )
+    scripted_public_case = EvalCase.from_dict(scripted_public_payload)
+    assert intent_continuation_mode_for_case(scripted_public_case) is (
+        IntentContinuationMode.SCRIPTED
+    )
+
+
+def test_case_validation_authorizes_only_private_benchmark_auto_accept_shape() -> None:
+    exchange = exchange_payload("confirm")
+    exchange["matched_answer_id"] = None
+    exchange["response"] = None
+    submission_raw = submission_payload()
+    submission_raw["intent"] = intent_payload(
+        clarification_questions=[exchange]
+    )
+    submission = EvalSubmission.from_dict(submission_raw)
+
+    public_payload = case_payload()
+    public_payload["intent_truth"] = {
+        "scorable": False,
+        "authority": None,
+        "expected_claims": [],
+        "forbidden_claims": [],
+        "clarification_policy": None,
+    }
+    public_payload["clarification_script"]["answers"] = []
+    validate_submission_for_case(
+        submission,
+        EvalCase.from_dict(public_payload),
+    )
+
+    with pytest.raises(SchemaError, match="not authorized"):
+        validate_submission_for_case(
+            submission,
+            EvalCase.from_dict(case_payload()),
+        )
+
+    scripted_public_payload = case_payload()
+    scripted_public_payload["intent_truth"] = dict(
+        public_payload["intent_truth"]
+    )
+    with pytest.raises(SchemaError, match="not authorized"):
+        validate_submission_for_case(
+            submission,
+            EvalCase.from_dict(scripted_public_payload),
+        )
 
 
 @pytest.mark.parametrize("completeness", ["expert_augmented", "human_observed"])

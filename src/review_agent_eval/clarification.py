@@ -25,6 +25,7 @@ from .models import (
     ClarificationAction,
     ClarificationAnswer,
     ClarificationScript,
+    EvalCase,
     IntentDimension,
     SchemaError,
     SubmissionClarificationExchange,
@@ -41,12 +42,26 @@ class ClarificationMatcherError(ClarificationProtocolError):
 
 UNANSWERED_CLARIFICATION_DEFER = "defer"
 UNANSWERED_CLARIFICATION_CONTINUE = "continue_with_uncertainty"
+BENCHMARK_AUTO_ACCEPT_POLICY_VERSION = "case-authority-auto-accept-v1"
 _UNANSWERED_CLARIFICATION_ACTIONS = frozenset(
     {
         UNANSWERED_CLARIFICATION_DEFER,
         UNANSWERED_CLARIFICATION_CONTINUE,
     }
 )
+
+
+class IntentContinuationMode(str, Enum):
+    SCRIPTED = "scripted"
+    BENCHMARK_AUTO_ACCEPT = "benchmark_auto_accept"
+
+
+def intent_continuation_mode_for_case(case: EvalCase) -> IntentContinuationMode:
+    if not isinstance(case, EvalCase):
+        raise TypeError("intent continuation mode requires EvalCase")
+    if not case.intent_truth.scorable and not case.clarification_script.answers:
+        return IntentContinuationMode.BENCHMARK_AUTO_ACCEPT
+    return IntentContinuationMode.SCRIPTED
 
 
 def unanswered_clarification_action(parameters: Mapping[str, object]) -> str:
@@ -57,9 +72,19 @@ def unanswered_clarification_action(parameters: Mapping[str, object]) -> str:
     if "clarification" not in parameters:
         return UNANSWERED_CLARIFICATION_DEFER
     policy = parameters["clarification"]
-    if not isinstance(policy, Mapping) or set(policy) != {"unanswered_action"}:
+    expected_fields = {
+        "unanswered_action",
+        "intent_continuation_policy_version",
+    }
+    if not isinstance(policy, Mapping) or set(policy) != expected_fields:
         raise ClarificationProtocolError(
-            "Agent clarification policy must contain exactly unanswered_action"
+            "Agent clarification policy must contain exactly unanswered_action "
+            "and intent_continuation_policy_version"
+        )
+    policy_version = policy["intent_continuation_policy_version"]
+    if policy_version != BENCHMARK_AUTO_ACCEPT_POLICY_VERSION:
+        raise ClarificationProtocolError(
+            "Agent intent continuation policy version is unsupported"
         )
     action = policy["unanswered_action"]
     if type(action) is not str or action not in _UNANSWERED_CLARIFICATION_ACTIONS:
@@ -168,6 +193,7 @@ class MaterialClaimMatchOutcome(str, Enum):
     UNMATCHED = "unmatched"
     AMBIGUOUS = "ambiguous"
     ROUND_LIMIT = "round_limit"
+    BENCHMARK_AUTO_ACCEPTED = "benchmark_auto_accepted"
 
 
 @dataclass(frozen=True)
@@ -274,6 +300,7 @@ class ClarificationSession:
         "__lock",
         "__matcher",
         "__match_receipts",
+        "__continuation_mode",
         "__question_ids",
         "__script",
         "__transcript",
@@ -286,6 +313,7 @@ class ClarificationSession:
         *,
         run_binding: AgentRunConfig,
         matcher_factory: MaterialClaimMatcherFactory | None = None,
+        continuation_mode: IntentContinuationMode = IntentContinuationMode.SCRIPTED,
     ) -> None:
         if not isinstance(script, ClarificationScript):
             raise SchemaError(
@@ -294,6 +322,17 @@ class ClarificationSession:
         if not isinstance(run_binding, AgentRunConfig):
             raise TypeError(
                 "clarification session requires a verified AgentRunConfig"
+            )
+        if not isinstance(continuation_mode, IntentContinuationMode):
+            raise TypeError(
+                "clarification session requires an IntentContinuationMode"
+            )
+        if (
+            continuation_mode is IntentContinuationMode.BENCHMARK_AUTO_ACCEPT
+            and script.answers
+        ):
+            raise ClarificationProtocolError(
+                "benchmark auto-accept cannot carry scripted answers"
             )
         snapshot = run_binding.clarification_matcher
         expected_matcher_digest = _canonical._digest(
@@ -319,6 +358,7 @@ class ClarificationSession:
         self.__unanswered_action = unanswered_clarification_action(
             run_binding.agent.parameters
         )
+        self.__continuation_mode = continuation_mode
         self.__script = script
         self.__matcher = matcher
         self.__match_receipts: list[MaterialClaimMatchReceipt] = []
@@ -396,13 +436,33 @@ class ClarificationSession:
             turn_index = len(self.__transcript) + 1
             matched_answer = None
             if turn_index <= self.__script.max_rounds:
-                matched_answer, match_receipt = self.__find_matching_answer(
-                    turn_index=turn_index,
-                    question_id=question_id,
-                    dimension=dimension,
-                    material_claim=asked_claim,
-                    proposed_values=proposed,
-                )
+                if (
+                    self.__continuation_mode
+                    is IntentContinuationMode.BENCHMARK_AUTO_ACCEPT
+                ):
+                    if not proposed:
+                        raise ClarificationProtocolError(
+                            "benchmark auto-accept requires proposed values"
+                        )
+                    match_receipt = self.__match_receipt(
+                        turn_index=turn_index,
+                        question_id=question_id,
+                        dimension=dimension,
+                        material_claim=asked_claim,
+                        candidates=(),
+                        outcome=(
+                            MaterialClaimMatchOutcome.BENCHMARK_AUTO_ACCEPTED
+                        ),
+                        matched_answer_id=None,
+                    )
+                else:
+                    matched_answer, match_receipt = self.__find_matching_answer(
+                        turn_index=turn_index,
+                        question_id=question_id,
+                        dimension=dimension,
+                        material_claim=asked_claim,
+                        proposed_values=proposed,
+                    )
             else:
                 match_receipt = self.__match_receipt(
                     turn_index=turn_index,
@@ -413,20 +473,36 @@ class ClarificationSession:
                     outcome=MaterialClaimMatchOutcome.ROUND_LIMIT,
                     matched_answer_id=None,
                 )
-            exchange = self.__make_exchange(
-                turn_index=turn_index,
-                question_id=question_id,
-                dimension=dimension,
-                question=asked_text,
-                material_claim=asked_claim,
-                proposed_values=proposed,
-                matched_answer=matched_answer,
-                unanswered_action=(
-                    self.__unanswered_action
-                    if turn_index <= self.__script.max_rounds
-                    else UNANSWERED_CLARIFICATION_DEFER
-                ),
-            )
+            if (
+                match_receipt.outcome
+                is MaterialClaimMatchOutcome.BENCHMARK_AUTO_ACCEPTED
+            ):
+                exchange = SubmissionClarificationExchange(
+                    turn_index=turn_index,
+                    question_id=question_id,
+                    dimension=dimension,
+                    question=asked_text,
+                    material_claim=asked_claim,
+                    matched_answer_id=None,
+                    action=ClarificationAction.CONFIRM,
+                    response=None,
+                    resolved_values=proposed,
+                )
+            else:
+                exchange = self.__make_exchange(
+                    turn_index=turn_index,
+                    question_id=question_id,
+                    dimension=dimension,
+                    question=asked_text,
+                    material_claim=asked_claim,
+                    proposed_values=proposed,
+                    matched_answer=matched_answer,
+                    unanswered_action=(
+                        self.__unanswered_action
+                        if turn_index <= self.__script.max_rounds
+                        else UNANSWERED_CLARIFICATION_DEFER
+                    ),
+                )
             self.__question_ids.add(question_id)
             if matched_answer is not None:
                 self.__consumed_answer_ids.add(matched_answer.answer_id)
@@ -658,11 +734,13 @@ class ClarificationSession:
 
 
 __all__ = [
+    "BENCHMARK_AUTO_ACCEPT_POLICY_VERSION",
     "BuiltinMaterialClaimMatcherFactory",
     "ClarificationChannel",
     "ClarificationMatcherError",
     "ClarificationProtocolError",
     "ClarificationSession",
+    "IntentContinuationMode",
     "UNANSWERED_CLARIFICATION_CONTINUE",
     "UNANSWERED_CLARIFICATION_DEFER",
     "MaterialClaimMatcher",
@@ -672,5 +750,6 @@ __all__ = [
     "MaterialClaimMatchReceipt",
     "NormalizedMaterialClaimMatcher",
     "canonical_material_claim_matcher_snapshot",
+    "intent_continuation_mode_for_case",
     "unanswered_clarification_action",
 ]

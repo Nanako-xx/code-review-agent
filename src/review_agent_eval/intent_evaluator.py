@@ -985,13 +985,28 @@ class ClarificationExchangeEvaluation:
                     "clarification without a receipt cannot contain inferred grading"
                 )
         else:
-            if self.material is None or self.answer_consumed is None:
+            benchmark_auto_accept = (
+                self.matched_answer_id is None
+                and self.material is True
+                and self.answer_consumed is None
+            )
+            if self.material is None or (
+                self.answer_consumed is None and not benchmark_auto_accept
+            ):
                 raise _error(
                     "receipt-bound clarification requires materiality and consumption"
                 )
-            if self.answer_consumed and not self.material:
+            if benchmark_auto_accept and self.update_applied is None:
+                raise _error(
+                    "benchmark auto-accept requires an Intent update result"
+                )
+            if self.answer_consumed is True and not self.material:
                 raise _error("a non-material clarification cannot consume an answer")
-            if self.update_applied is not None and not self.answer_consumed:
+            if (
+                not benchmark_auto_accept
+                and self.update_applied is not None
+                and not self.answer_consumed
+            ):
                 raise _error("an unconsumed answer cannot update Intent")
         object.__setattr__(
             self,
@@ -3325,9 +3340,14 @@ class IntentEvaluator:
         matcher_digest: Optional[str] = None
         evaluations: list[ClarificationExchangeEvaluation] = []
         all_reasons: list[IntentReasonCode] = []
+        allow_benchmark_auto_accept = policy is None and not script.answers
 
         for exchange in transcript:
             reasons: list[IntentReasonCode] = []
+            benchmark_exchange = (
+                exchange.action is ClarificationAction.CONFIRM
+                and exchange.matched_answer_id is None
+            )
             answer = (
                 None
                 if exchange.matched_answer_id is None
@@ -3340,6 +3360,10 @@ class IntentEvaluator:
 
             receipt = receipt_map.get((exchange.turn_index, exchange.question_id))
             if receipt is None:
+                if benchmark_exchange:
+                    raise _error(
+                        "benchmark auto-accept requires its Harness receipt"
+                    )
                 material = None
                 consumed = None
                 update = None
@@ -3356,30 +3380,64 @@ class IntentEvaluator:
                     answers=answers,
                     consumed_answer_ids=claimed_consumed,
                     expected_matcher_digest=matcher_digest,
+                    allow_benchmark_auto_accept=allow_benchmark_auto_accept,
                 )
                 receipt_digest = _material_receipt_digest(receipt)
                 receipt_matcher_digest = receipt.matcher_digest
-                material = receipt.outcome is MaterialClaimMatchOutcome.MATCHED
-                consumed = material
-                if receipt.outcome is MaterialClaimMatchOutcome.UNMATCHED:
-                    reasons.append(IntentReasonCode.CLARIFICATION_UNMATCHED)
-                    if self._looks_like_wrong_dimension(exchange, script):
-                        reasons.append(IntentReasonCode.CLARIFICATION_WRONG_DIMENSION)
-                    else:
-                        reasons.append(
-                            IntentReasonCode.CLARIFICATION_WRONG_MATERIAL_CLAIM
-                        )
-                elif receipt.outcome is MaterialClaimMatchOutcome.AMBIGUOUS:
-                    reasons.append(IntentReasonCode.CLARIFICATION_AMBIGUOUS)
-                elif receipt.outcome is MaterialClaimMatchOutcome.ROUND_LIMIT:
-                    reasons.append(IntentReasonCode.CLARIFICATION_ROUND_LIMIT)
-                if not consumed:
-                    reasons.append(
-                        IntentReasonCode.CLARIFICATION_ANSWER_NOT_CONSUMED
-                    )
-                update = self._clarification_update(
-                    projected, exchange, answer if material else None
+                auto_accepted = (
+                    receipt.outcome
+                    is MaterialClaimMatchOutcome.BENCHMARK_AUTO_ACCEPTED
                 )
+                material = (
+                    receipt.outcome is MaterialClaimMatchOutcome.MATCHED
+                    or auto_accepted
+                )
+                consumed = (
+                    True
+                    if receipt.outcome is MaterialClaimMatchOutcome.MATCHED
+                    else (None if auto_accepted else False)
+                )
+                if auto_accepted:
+                    final_claims = {
+                        item.normalized_text
+                        for item in projected
+                        if item.dimension is exchange.dimension
+                    }
+                    resolved = {
+                        normalize_intent_text(item)
+                        for item in exchange.resolved_values
+                    }
+                    update = bool(resolved) and resolved.issubset(
+                        final_claims
+                    )
+                else:
+                    if receipt.outcome is MaterialClaimMatchOutcome.UNMATCHED:
+                        reasons.append(IntentReasonCode.CLARIFICATION_UNMATCHED)
+                        if self._looks_like_wrong_dimension(exchange, script):
+                            reasons.append(
+                                IntentReasonCode.CLARIFICATION_WRONG_DIMENSION
+                            )
+                        else:
+                            reasons.append(
+                                IntentReasonCode.CLARIFICATION_WRONG_MATERIAL_CLAIM
+                            )
+                    elif receipt.outcome is MaterialClaimMatchOutcome.AMBIGUOUS:
+                        reasons.append(
+                            IntentReasonCode.CLARIFICATION_AMBIGUOUS
+                        )
+                    elif receipt.outcome is MaterialClaimMatchOutcome.ROUND_LIMIT:
+                        reasons.append(
+                            IntentReasonCode.CLARIFICATION_ROUND_LIMIT
+                        )
+                    if not consumed:
+                        reasons.append(
+                            IntentReasonCode.CLARIFICATION_ANSWER_NOT_CONSUMED
+                        )
+                    update = self._clarification_update(
+                        projected,
+                        exchange,
+                        answer if material else None,
+                    )
                 if update is False:
                     reasons.append(
                         IntentReasonCode.CLARIFICATION_ANSWER_NOT_APPLIED
@@ -3499,6 +3557,7 @@ class IntentEvaluator:
         answers: Mapping[str, Any],
         consumed_answer_ids: set[str],
         expected_matcher_digest: Optional[str],
+        allow_benchmark_auto_accept: bool,
     ) -> str:
         if type(receipt.turn_index) is not int or receipt.turn_index != exchange.turn_index:
             raise _error("clarification receipt turn does not match transcript")
@@ -3589,7 +3648,31 @@ class IntentEvaluator:
             if answer.dimension is exchange.dimension
             and answer.answer_id not in consumed_answer_ids
         )
-        if round_limited:
+        if (
+            receipt.outcome
+            is MaterialClaimMatchOutcome.BENCHMARK_AUTO_ACCEPTED
+        ):
+            if (
+                not allow_benchmark_auto_accept
+                or round_limited
+                or decisions
+                or receipt.matched_answer_id is not None
+                or exchange.matched_answer_id is not None
+                or exchange.action is not ClarificationAction.CONFIRM
+                or exchange.response is not None
+                or not exchange.resolved_values
+            ):
+                raise _error(
+                    "benchmark auto-accept receipt is unauthorized"
+                )
+        elif (
+            exchange.action is ClarificationAction.CONFIRM
+            and exchange.matched_answer_id is None
+        ):
+            raise _error(
+                "unmatched Confirm requires benchmark auto-accept receipt"
+            )
+        elif round_limited:
             if (
                 receipt.outcome is not MaterialClaimMatchOutcome.ROUND_LIMIT
                 or decisions

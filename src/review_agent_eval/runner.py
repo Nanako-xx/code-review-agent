@@ -69,6 +69,7 @@ from .clarification import (
     ClarificationMatcherError,
     ClarificationProtocolError,
     ClarificationSession,
+    IntentContinuationMode,
     MaterialClaimMatchReceipt,
 )
 from .config import EvalRunConfig, SuiteRunConfig
@@ -477,6 +478,11 @@ class ClarificationScriptProvider(Protocol):
     def clarification_script(self, task_id: str) -> ClarificationScript:
         ...
 
+    def intent_continuation_mode(
+        self, task_id: str
+    ) -> IntentContinuationMode:
+        ...
+
 
 @dataclass(frozen=True)
 class AdapterDiagnostic:
@@ -498,11 +504,17 @@ class _LazyClarificationSession:
         provider: Any,
         binding: AgentRunConfig,
         matcher_factory: Any,
+        continuation_mode: IntentContinuationMode,
     ) -> None:
         self._task_id = task_id
         self._provider = provider
         self._binding = binding
         self._matcher_factory = matcher_factory
+        if not isinstance(continuation_mode, IntentContinuationMode):
+            raise RunnerError(
+                "clarification continuation mode is not canonical"
+            )
+        self._continuation_mode = continuation_mode
         self._session: Optional[ClarificationSession] = None
 
     def _ensure(self) -> ClarificationSession:
@@ -513,6 +525,7 @@ class _LazyClarificationSession:
                     script,
                     run_binding=self._binding,
                     matcher_factory=self._matcher_factory,
+                    continuation_mode=self._continuation_mode,
                 )
             except (RunnerError, ClarificationProtocolError):
                 raise
@@ -614,6 +627,23 @@ def _load_clarification_script(provider: Any, task_id: str) -> ClarificationScri
     if isinstance(script, ClarificationScript):
         return script
     raise RunnerError("clarification provider did not return a ClarificationScript")
+
+
+def _load_intent_continuation_mode(
+    provider: Any,
+    task_id: str,
+) -> IntentContinuationMode:
+    """Load only the Case-authority-derived mode, never private Intent Truth."""
+
+    if provider is None or not hasattr(provider, "intent_continuation_mode"):
+        return IntentContinuationMode.SCRIPTED
+    try:
+        mode = provider.intent_continuation_mode(task_id)
+    except Exception as exc:
+        raise RunnerError("intent continuation mode could not be loaded") from exc
+    if not isinstance(mode, IntentContinuationMode):
+        raise RunnerError("intent continuation mode is not canonical")
+    return mode
 
 
 def _adapter_identity(adapter: Any) -> Tuple[str, str]:
@@ -2359,6 +2389,10 @@ class EvalRunner:
             provider=self.case_provider,
             binding=binding,
             matcher_factory=self.matcher_factory,
+            continuation_mode=_load_intent_continuation_mode(
+                self.case_provider,
+                plan.task_id,
+            ),
         )
         submission: Optional[EvalSubmission] = None
         incompatibility: Optional[str] = None

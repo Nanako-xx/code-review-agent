@@ -19,6 +19,10 @@ from .cases import (
     _portable_case_path,
     validate_case_for_manifest,
 )
+from .clarification import (
+    IntentContinuationMode,
+    intent_continuation_mode_for_case,
+)
 from .models import (
     MAX_EVAL_CASE_BYTES,
     EvalCase,
@@ -488,6 +492,12 @@ class CaseBank(_JsonModel):
 
     def runner_case(self, task_id: str) -> EvalCase:
         return _load_case_from_handle(self.handle(task_id))
+
+    def intent_continuation_mode(
+        self, task_id: str
+    ) -> IntentContinuationMode:
+        case = _load_case_from_handle(self.handle(task_id))
+        return intent_continuation_mode_for_case(case)
 
     def agent_input(self, task_id: str) -> EvalInput:
         # This is the only payload an Agent adapter should receive.

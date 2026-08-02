@@ -563,6 +563,7 @@ def _default_agent_snapshot(args: argparse.Namespace):
         subprocess_adapter_capabilities,
     )
     from .config import AgentConfigSnapshot
+    from .clarification import BENCHMARK_AUTO_ACCEPT_POLICY_VERSION
     from .models import ReviewTargetKind
 
     command = list(args.agent_command)
@@ -600,6 +601,9 @@ def _default_agent_snapshot(args: argparse.Namespace):
         "adapter": adapter,
         "clarification": {
             "unanswered_action": args.unanswered_clarification.replace("-", "_"),
+            "intent_continuation_policy_version": (
+                BENCHMARK_AUTO_ACCEPT_POLICY_VERSION
+            ),
         },
     }
     return AgentConfigSnapshot(

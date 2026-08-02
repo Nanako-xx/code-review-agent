@@ -1260,7 +1260,17 @@ class SubmissionClarificationExchange(_JsonModel):
                 self.action is ClarificationAction.SKIP
                 and self.matched_answer_id is None
             )
-            if self.matched_answer_id is None and not policy_skip:
+            benchmark_auto_accept = (
+                self.action is ClarificationAction.CONFIRM
+                and self.matched_answer_id is None
+                and self.response is None
+                and bool(resolved)
+            )
+            if (
+                self.matched_answer_id is None
+                and not policy_skip
+                and not benchmark_auto_accept
+            ):
                 raise _error("answered clarification must have matched_answer_id")
             if policy_skip and self.response is not None:
                 raise _error("policy skip clarification must have no response")
@@ -3801,6 +3811,17 @@ def validate_submission_for_case(submission: EvalSubmission, case: EvalCase) -> 
                     "clarification exchange beyond Case max_rounds must remain unresolved"
                 )
             continue
+        if (
+            exchange.action is ClarificationAction.CONFIRM
+            and exchange.matched_answer_id is None
+            and (
+                case.intent_truth.scorable
+                or bool(case.clarification_script.answers)
+            )
+        ):
+            raise _error(
+                "benchmark auto-accept is not authorized by this Case"
+            )
         if exchange.matched_answer_id is None:
             continue
         answer = answers.get(exchange.matched_answer_id)

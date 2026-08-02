@@ -39,6 +39,7 @@ from review_agent_eval.adapters.subprocess_agent import BoundedProcessResult
 from review_agent_eval.artifacts import TargetAccess
 from review_agent_eval.cases import REPOSITORY_MATERIALIZER_PROTOCOL, WireContractV2
 from review_agent_eval.clarification import (
+    BENCHMARK_AUTO_ACCEPT_POLICY_VERSION,
     UNANSWERED_CLARIFICATION_CONTINUE,
     canonical_material_claim_matcher_snapshot,
 )
@@ -186,6 +187,9 @@ def _config(
     if unanswered_action is not None:
         parameters["clarification"] = {
             "unanswered_action": unanswered_action,
+            "intent_continuation_policy_version": (
+                BENCHMARK_AUTO_ACCEPT_POLICY_VERSION
+            ),
         }
     agent = AgentConfigSnapshot(
         agent_id="agent-current",
@@ -277,11 +281,13 @@ class _SkipChannel:
         return exchange
 
 
-class _PolicySkipChannel:
+class _BenchmarkAutoAcceptChannel:
     def __init__(self) -> None:
         self.exchanges: list[SubmissionClarificationExchange] = []
 
     def ask(self, **question: Any) -> SubmissionClarificationExchange:
+        proposed_values = tuple(question["proposed_values"])
+        assert proposed_values
         exchange = SubmissionClarificationExchange(
             turn_index=len(self.exchanges) + 1,
             question_id=question["question_id"],
@@ -289,9 +295,9 @@ class _PolicySkipChannel:
             question=question["question"],
             material_claim=question["material_claim"],
             matched_answer_id=None,
-            action=ClarificationAction.SKIP,
+            action=ClarificationAction.CONFIRM,
             response=None,
-            resolved_values=(),
+            resolved_values=proposed_values,
         )
         self.exchanges.append(exchange)
         return exchange
@@ -836,7 +842,7 @@ def test_empty_ci_evidence_adds_no_cli_argument(tmp_path: Path) -> None:
     assert not (tmp_path / ".review-agent" / "eval-input").exists()
 
 
-def test_current_adapter_policy_skip_keeps_inferred_intent_and_completes_review(
+def test_current_adapter_benchmark_auto_accept_promotes_intent_and_completes_review(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -856,7 +862,7 @@ def test_current_adapter_policy_skip_keeps_inferred_intent_and_completes_review(
     )
     source_root = Path(__file__).resolve().parents[2] / "src"
     monkeypatch.setenv("PYTHONPATH", str(source_root))
-    channel = _PolicySkipChannel()
+    channel = _BenchmarkAutoAcceptChannel()
     config = _config(
         eval_input,
         review_arguments=(),
@@ -874,20 +880,55 @@ def test_current_adapter_policy_skip_keeps_inferred_intent_and_completes_review(
 
     assert submission.status is SubmissionStatus.COMPLETED
     assert submission.intent is not None
-    assert submission.intent.status.value == "partial"
+    assert submission.intent.status.value == "sufficient"
     assert submission.review is not None
     assert submission.intent.clarification_questions == tuple(channel.exchanges)
     assert channel.exchanges
     assert all(item.matched_answer_id is None for item in channel.exchanges)
-    assert any(item.source.value == "inferred" for item in submission.intent.claims)
+    assert all(item.source.value == "explicit" for item in submission.intent.claims)
     assert submission.trace_ref is not None
     run_dir = git_repo / submission.trace_ref.value
-    events = json.loads((run_dir / "intent_events.json").read_text(encoding="utf-8"))
+    events = json.loads(
+        (run_dir / "intent_events.json").read_text(encoding="utf-8")
+    )
     assert events["decisions"]
     assert {
         (item["action"], item["continuation_basis"])
         for item in events["decisions"]
-    } == {("skipped_non_interactive", "benchmark_no_user")}
+    } == {("confirmed", "benchmark_auto_accept")}
+    brief = json.loads(
+        (run_dir / "review_brief.json").read_text(encoding="utf-8")
+    )
+    active_provenance = [
+        item
+        for item in brief["change_intent"]["provenance"]
+        if item["claim_state"] == "active"
+    ]
+    assert active_provenance
+    assert all(item["source"] == "explicit" for item in active_provenance)
+    assert any(
+        item["origin"] == "benchmark_auto_accept"
+        for item in active_provenance
+    )
+    assert brief["intent_assessment"]["unconfirmed_inferred_claims"] == []
+
+
+def test_unmatched_confirm_uses_benchmark_auto_accept_token() -> None:
+    exchange = SubmissionClarificationExchange(
+        turn_index=1,
+        question_id="question-auto-accept",
+        dimension=IntentDimension.GOAL,
+        question="Confirm the inferred goal?",
+        material_claim="Preserve deterministic behavior",
+        matched_answer_id=None,
+        action=ClarificationAction.CONFIRM,
+        response=None,
+        resolved_values=("Preserve deterministic behavior",),
+    )
+
+    assert current_module._answer_input(exchange, SimpleNamespace()) == (
+        b"confirm:benchmark-auto-accept\n"
+    )
 
 
 def test_policy_skip_uses_benchmark_no_user_continuation_token() -> None:

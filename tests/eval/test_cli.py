@@ -7,6 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from review_agent_eval.clarification import (
+    BENCHMARK_AUTO_ACCEPT_POLICY_VERSION,
+)
 from review_agent_eval.cli import (
     EXIT_CONFLICT,
     EXIT_INTEGRITY,
@@ -139,7 +142,10 @@ def test_prepare_binds_unanswered_clarification_policy_into_agent_identity() -> 
     snapshot = _default_agent_snapshot(args)
 
     assert snapshot.parameters["clarification"] == {
-        "unanswered_action": "continue_with_uncertainty"
+        "unanswered_action": "continue_with_uncertainty",
+        "intent_continuation_policy_version": (
+            BENCHMARK_AUTO_ACCEPT_POLICY_VERSION
+        ),
     }
 
 

@@ -619,6 +619,8 @@ def _answer_input(
     if action is None or action is ClarificationAction.DEFER:
         return None
     if action is ClarificationAction.CONFIRM:
+        if exchange.matched_answer_id is None:
+            return b"confirm:benchmark-auto-accept\n"
         return b"confirm\n"
     if action is ClarificationAction.REJECT:
         if not question.claim_ids:

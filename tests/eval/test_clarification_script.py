@@ -5,14 +5,17 @@ from dataclasses import replace
 import pytest
 
 from review_agent_eval.clarification import (
+    BENCHMARK_AUTO_ACCEPT_POLICY_VERSION,
     ClarificationChannel,
     ClarificationProtocolError,
     ClarificationSession,
     MaterialClaimMatcher,
     MaterialClaimMatcherFactory,
     MaterialClaimMatchOutcome,
+    IntentContinuationMode,
     UNANSWERED_CLARIFICATION_CONTINUE,
     canonical_material_claim_matcher_snapshot,
+    unanswered_clarification_action,
 )
 from review_agent_eval.adapters.base import AgentRunConfig
 from review_agent_eval.adapters.current_agent import current_agent_capabilities
@@ -81,6 +84,7 @@ def session_with(
     max_rounds: int = 16,
     matcher: MaterialClaimMatcher | None = None,
     unanswered_action: str | None = None,
+    continuation_mode: IntentContinuationMode = IntentContinuationMode.SCRIPTED,
 ) -> ClarificationSession:
     snapshot = (
         canonical_material_claim_matcher_snapshot()
@@ -98,6 +102,7 @@ def session_with(
             unanswered_action=unanswered_action,
         ),
         matcher_factory=factory,
+        continuation_mode=continuation_mode,
     )
 
 
@@ -126,6 +131,9 @@ def run_binding(
     if unanswered_action is not None:
         parameters["clarification"] = {
             "unanswered_action": unanswered_action,
+            "intent_continuation_policy_version": (
+                BENCHMARK_AUTO_ACCEPT_POLICY_VERSION
+            ),
         }
     agent = AgentConfigSnapshot(
         agent_id="agent-clarification-test",
@@ -181,6 +189,22 @@ class StaticMatcherFactory:
     ) -> MaterialClaimMatcher:
         del snapshot
         return self.matcher
+
+
+def test_intent_continuation_policy_version_is_required_when_policy_is_present() -> None:
+    with pytest.raises(ClarificationProtocolError, match="exactly"):
+        unanswered_clarification_action(
+            {"clarification": {"unanswered_action": "defer"}}
+        )
+    with pytest.raises(ClarificationProtocolError, match="version"):
+        unanswered_clarification_action(
+            {
+                "clarification": {
+                    "unanswered_action": "defer",
+                    "intent_continuation_policy_version": "forged-v1",
+                }
+            }
+        )
 
 
 class FakeSemanticMatcher:
@@ -571,6 +595,27 @@ def test_unanswered_policy_continues_without_fabricating_a_case_answer() -> None
     assert session.consumed_answer_ids == frozenset()
     assert session.match_receipts[0].outcome is MaterialClaimMatchOutcome.UNMATCHED
     assert session.match_receipts[0].matched_answer_id is None
+
+
+def test_benchmark_auto_accept_confirms_without_fabricating_a_case_answer() -> None:
+    session = session_with(
+        max_rounds=4,
+        unanswered_action=UNANSWERED_CLARIFICATION_CONTINUE,
+        continuation_mode=IntentContinuationMode.BENCHMARK_AUTO_ACCEPT,
+    )
+
+    exchange = session.channel.ask(**question("question-auto-accept"))
+
+    assert exchange.action is ClarificationAction.CONFIRM
+    assert exchange.matched_answer_id is None
+    assert exchange.response is None
+    assert exchange.resolved_values == ("dry-run",)
+    assert session.consumed_answer_ids == frozenset()
+    assert (
+        session.match_receipts[0].outcome
+        is MaterialClaimMatchOutcome.BENCHMARK_AUTO_ACCEPTED
+    )
+    assert session.match_receipts[0].candidates == ()
 
 
 def test_unanswered_policy_skips_when_canonical_material_claim_is_unavailable() -> None:

@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 import pytest
 
+import review_agent_eval.runner as runner_module
 from review_agent_eval.adapters.base import (
     AdapterCompatibility,
     AdapterIncompatibilityReason,
@@ -21,6 +22,7 @@ from review_agent_eval.artifacts import (
     TrialMaterializationManifest,
 )
 from review_agent_eval.cases import RunCaseSnapshot, SuiteManifest
+from review_agent_eval.clarification import IntentContinuationMode
 from review_agent_eval.models import (
     EvalCase,
     EvalInput,
@@ -323,6 +325,29 @@ def _runner(tmp_path: Path, adapter: Any, *, case_provider: Any = None) -> EvalR
         materializer_factory=_materializer_factory(tmp_path / ".workspaces"),
         max_workers=1,
     )
+
+
+def test_runner_loads_only_case_authority_derived_intent_continuation_mode() -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.task_ids: list[str] = []
+
+        def intent_continuation_mode(
+            self, task_id: str
+        ) -> IntentContinuationMode:
+            self.task_ids.append(task_id)
+            return IntentContinuationMode.BENCHMARK_AUTO_ACCEPT
+
+    provider = Provider()
+    assert runner_module._load_intent_continuation_mode(
+        provider,
+        "task-public",
+    ) is IntentContinuationMode.BENCHMARK_AUTO_ACCEPT
+    assert provider.task_ids == ["task-public"]
+    assert runner_module._load_intent_continuation_mode(
+        {"task-core": object()},
+        "task-core",
+    ) is IntentContinuationMode.SCRIPTED
 
 
 def test_runner_commits_zero_finding_submission_and_run_preflight(tmp_path: Path):

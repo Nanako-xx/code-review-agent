@@ -285,6 +285,28 @@ def match_receipt(
     )
 
 
+def benchmark_auto_accept_receipt(
+    exchange: SubmissionClarificationExchange,
+    *,
+    matcher_digest: str = MATCHER_DIGEST,
+) -> MaterialClaimMatchReceipt:
+    return MaterialClaimMatchReceipt(
+        turn_index=exchange.turn_index,
+        question_id=exchange.question_id,
+        dimension=exchange.dimension,
+        actual_claim_digest=canonical_sha256(
+            {
+                "dimension": exchange.dimension.value,
+                "material_claim": exchange.material_claim,
+            }
+        ),
+        matcher_digest=matcher_digest,
+        candidates=(),
+        outcome=MaterialClaimMatchOutcome.BENCHMARK_AUTO_ACCEPTED,
+        matched_answer_id=None,
+    )
+
+
 def judge_decision(
     request: IntentSemanticJudgeRequest,
     relation: IntentJudgeRelation,
@@ -1604,6 +1626,74 @@ def test_missing_receipt_fails_closed_without_recomputing_materiality() -> None:
     assert IntentReasonCode.CLARIFICATION_RECEIPT_MISSING in (
         result.clarification.reason_codes
     )
+
+
+def test_benchmark_auto_accept_receipt_is_material_without_consuming_an_answer() -> None:
+    material_claim = "Support dry-run mode"
+    exchange = clarification_exchange(
+        material_claim=material_claim,
+        matched_answer_id=None,
+        action=ClarificationAction.CONFIRM,
+        response=None,
+        resolved_values=(material_claim,),
+    )
+    receipt = benchmark_auto_accept_receipt(exchange)
+    intent = submission_intent(
+        goal=material_claim,
+        claims=(submission_claim("claim-auto", material_claim),),
+        transcript=(exchange,),
+    )
+
+    result = evaluate(
+        intent,
+        intent_truth(scorable=False),
+        script=clarification_script(),
+        receipts=(receipt,),
+    )
+
+    exchange_result = result.clarification.exchanges[0]
+    assert exchange_result.material is True
+    assert exchange_result.answer_consumed is None
+    assert exchange_result.update_applied is True
+    assert IntentReasonCode.CLARIFICATION_ANSWER_NOT_CONSUMED not in (
+        exchange_result.reason_codes
+    )
+
+    with pytest.raises(IntentEvaluationError, match="requires its Harness receipt"):
+        evaluate(
+            intent,
+            intent_truth(scorable=False),
+            script=clarification_script(),
+        )
+
+
+def test_forged_benchmark_auto_accept_receipt_requires_private_case_authority() -> None:
+    material_claim = "Support dry-run mode"
+    exchange = clarification_exchange(
+        material_claim=material_claim,
+        matched_answer_id=None,
+        action=ClarificationAction.CONFIRM,
+        response=None,
+        resolved_values=(material_claim,),
+    )
+    receipt = benchmark_auto_accept_receipt(exchange)
+    intent = submission_intent(goal=material_claim, transcript=(exchange,))
+
+    with pytest.raises(IntentEvaluationError, match="unauthorized"):
+        evaluate(
+            intent,
+            intent_truth(policy=ClarificationPolicy.REQUIRED),
+            script=clarification_script(),
+            receipts=(receipt,),
+        )
+
+    with pytest.raises(IntentEvaluationError, match="unauthorized"):
+        evaluate(
+            intent,
+            intent_truth(scorable=False),
+            script=clarification_script(clarification_answer()),
+            receipts=(receipt,),
+        )
 
 
 def test_extra_and_duplicate_receipts_are_rejected() -> None:
