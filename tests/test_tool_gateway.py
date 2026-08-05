@@ -11,8 +11,21 @@ from review_agent.memory_retrieval import (
     SnapshotMemoryQueryService,
 )
 from review_agent.observations import ObservationStore
-from review_agent.tool_gateway import ToolGateway, ToolGatewayError
+from review_agent.tool_gateway import (
+    ToolGateway,
+    ToolGatewayError,
+    tool_gateway_limits_projection,
+)
 from tests.test_context import _combined_memory_snapshot, _memory_snapshot
+
+
+def test_tool_gateway_default_limits_have_one_product_projection():
+    assert tool_gateway_limits_projection() == {
+        "max_context_chars": 4_000,
+        "timeout_seconds": 10,
+        "max_commit_messages": 50,
+        "max_commit_body_chars": 4_000,
+    }
 
 
 def test_tool_gateway_read_range_records_observation(git_repo: Path, tmp_path: Path):

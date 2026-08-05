@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import hashlib
+import json
 import math
 from typing import Any
 
@@ -34,6 +36,13 @@ from review_agent.models import (
     ModelInvocationEnvelope,
 )
 from review_agent.tool_result_protocol import TOOL_RESULT_PROTOCOL_INSTRUCTIONS
+
+
+REVIEWER_PROTOCOL_VERSION = "reviewer-protocol-v1"
+REVIEWER_REASONING_EFFORT = "medium"
+REVIEWER_TEMPERATURE = 0
+REVIEWER_TOOL_CHOICE_POLICY = "auto_if_tools_else_none"
+REVIEWER_RESPONSE_SCHEMA = "reviewer_assignment_result_v2"
 
 
 REVIEWER_RESULT_JSON_EXAMPLE = """{
@@ -318,6 +327,60 @@ class ContextBudget:
         )
 
 
+def _reviewer_tool_catalog_payload() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": name,
+            "description": description,
+            "parameters": parameters_schema,
+        }
+        for name, description, parameters_schema in _REVIEWER_TOOL_DEFINITIONS
+    ]
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def reviewer_protocol_projection() -> dict[str, Any]:
+    return {
+        "version": REVIEWER_PROTOCOL_VERSION,
+        "system_prompt_sha256": hashlib.sha256(
+            REVIEWER_SYSTEM_PROMPT.encode("utf-8")
+        ).hexdigest(),
+        "result_contract_sha256": hashlib.sha256(
+            REVIEWER_RESULT_OUTPUT_INSTRUCTIONS.encode("utf-8")
+        ).hexdigest(),
+        "tool_result_protocol_sha256": hashlib.sha256(
+            TOOL_RESULT_PROTOCOL_INSTRUCTIONS.encode("utf-8")
+        ).hexdigest(),
+        "tool_catalog_sha256": _canonical_json_sha256(
+            _reviewer_tool_catalog_payload()
+        ),
+        "tool_names": list(REVIEWER_TOOL_NAMES),
+        "context_budget": asdict(ContextBudget()),
+        "invocation_defaults": {
+            "reasoning_effort": REVIEWER_REASONING_EFFORT,
+            "temperature": REVIEWER_TEMPERATURE,
+            "tool_choice_policy": REVIEWER_TOOL_CHOICE_POLICY,
+            "response_schema": REVIEWER_RESPONSE_SCHEMA,
+        },
+    }
+
+
+def _reviewer_tool_choice(has_tools: bool) -> str:
+    if REVIEWER_TOOL_CHOICE_POLICY != "auto_if_tools_else_none":
+        raise RuntimeError("reviewer tool choice policy is unsupported")
+    return "auto" if has_tools else "none"
+
+
 @dataclass(frozen=True)
 class ContextAssemblyResult:
     messages: list[dict[str, Any]]
@@ -462,7 +525,7 @@ def build_reviewer_envelope(
     model: str = "configured-reviewer-model",
     max_output_tokens: int | None = None,
     max_elapsed_seconds: float | None = None,
-    reasoning_effort: str = "medium",
+    reasoning_effort: str = REVIEWER_REASONING_EFFORT,
     allowed_tools: Iterable[str] | None = None,
     memory_snapshot: MemorySnapshot | None = None,
     memory_context: ReviewerMemoryContext | None = None,
@@ -542,9 +605,9 @@ def build_reviewer_envelope(
                 else max_elapsed_seconds
             ),
             "reasoning_effort": reasoning_effort,
-            "temperature": 0,
-            "tool_choice": "auto" if tools else "none",
-            "response_schema": "reviewer_assignment_result_v2",
+            "temperature": REVIEWER_TEMPERATURE,
+            "tool_choice": _reviewer_tool_choice(bool(tools)),
+            "response_schema": REVIEWER_RESPONSE_SCHEMA,
             "trace_id": trace_id,
             "context": context_payload.metadata,
         },

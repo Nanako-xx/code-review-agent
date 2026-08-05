@@ -397,6 +397,71 @@ class ReviewExecutionConfig:
             raise ValueError("memory_curator must be a ModelStageConfig")
 
 
+def model_stage_config_to_dict(config: ModelStageConfig) -> dict[str, Any]:
+    if not isinstance(config, ModelStageConfig):
+        raise TypeError("config must be ModelStageConfig")
+    return {
+        "mode": config.mode,
+        "provider": config.provider,
+        "model": config.model,
+        "base_url": config.base_url,
+        "api_key_env": config.api_key_env,
+        "max_output_tokens": config.max_output_tokens,
+        "max_provider_attempts": config.max_provider_attempts,
+        "max_elapsed_seconds": config.max_elapsed_seconds,
+    }
+
+
+def supplemental_policy_to_dict(config: SupplementalPolicy) -> dict[str, Any]:
+    if not isinstance(config, SupplementalPolicy):
+        raise TypeError("config must be SupplementalPolicy")
+    return {
+        "version": config.version,
+        "risk_level": config.risk_level,
+        "max_waves": config.max_waves,
+        "max_tasks": config.max_tasks,
+        "max_tasks_per_wave": config.max_tasks_per_wave,
+        "max_concurrency": config.max_concurrency,
+        "max_turns_per_task": config.max_turns_per_task,
+        "max_tool_calls_per_task": config.max_tool_calls_per_task,
+        "max_tokens_per_task": config.max_tokens_per_task,
+        "max_total_tokens": config.max_total_tokens,
+        "max_elapsed_seconds": config.max_elapsed_seconds,
+    }
+
+
+def review_execution_config_to_dict(
+    execution: ReviewExecutionConfig,
+) -> dict[str, Any]:
+    if not isinstance(execution, ReviewExecutionConfig):
+        raise TypeError("execution must be ReviewExecutionConfig")
+    return {
+        "reviewer_provider": execution.reviewer_provider,
+        "reviewer_model": execution.reviewer_model,
+        "reviewer_base_url": execution.reviewer_base_url,
+        "reviewer_api_key_env": execution.reviewer_api_key_env,
+        "reviewer_mode": execution.reviewer_mode,
+        "reviewer_loop": execution.reviewer_loop,
+        "non_interactive": execution.non_interactive,
+        "risk_assessor": model_stage_config_to_dict(execution.risk_assessor),
+        "portfolio_planner": model_stage_config_to_dict(
+            execution.portfolio_planner
+        ),
+        "semantic_reconciler": model_stage_config_to_dict(
+            execution.semantic_reconciler
+        ),
+        "supplemental_policy": supplemental_policy_to_dict(
+            execution.supplemental_policy
+        ),
+        "memory": (
+            None if execution.memory is None else execution.memory.to_dict()
+        ),
+        "memory_curator": model_stage_config_to_dict(
+            execution.memory_curator
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class ArtifactDescriptor:
     name: str
@@ -1353,33 +1418,6 @@ def child_session_manifest(
 
 
 def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
-    def model_stage_payload(config: ModelStageConfig) -> dict[str, Any]:
-        return {
-            "mode": config.mode,
-            "provider": config.provider,
-            "model": config.model,
-            "base_url": config.base_url,
-            "api_key_env": config.api_key_env,
-            "max_output_tokens": config.max_output_tokens,
-            "max_provider_attempts": config.max_provider_attempts,
-            "max_elapsed_seconds": config.max_elapsed_seconds,
-        }
-
-    def supplemental_policy_payload(config: SupplementalPolicy) -> dict[str, Any]:
-        return {
-            "version": config.version,
-            "risk_level": config.risk_level,
-            "max_waves": config.max_waves,
-            "max_tasks": config.max_tasks,
-            "max_tasks_per_wave": config.max_tasks_per_wave,
-            "max_concurrency": config.max_concurrency,
-            "max_turns_per_task": config.max_turns_per_task,
-            "max_tool_calls_per_task": config.max_tool_calls_per_task,
-            "max_tokens_per_task": config.max_tokens_per_task,
-            "max_total_tokens": config.max_total_tokens,
-            "max_elapsed_seconds": config.max_elapsed_seconds,
-        }
-
     def budget_payload(budget: SupplementalBudget) -> dict[str, Any]:
         return {
             "tasks": budget.tasks,
@@ -1411,7 +1449,7 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
             "wave_id": checkpoint.wave_id,
             "wave_index": checkpoint.wave_index,
             "trigger_digest": checkpoint.trigger_digest,
-            "effective_policy": supplemental_policy_payload(
+            "effective_policy": supplemental_policy_to_dict(
                 checkpoint.effective_policy
             ),
             "status": checkpoint.status.value,
@@ -1451,38 +1489,39 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
             payload["user_decisions"] = dict(checkpoint.user_decisions)
         return payload
 
+    complete_execution_payload = review_execution_config_to_dict(
+        manifest.execution
+    )
     execution_payload = {
-        "reviewer_provider": manifest.execution.reviewer_provider,
-        "reviewer_model": manifest.execution.reviewer_model,
-        "reviewer_base_url": manifest.execution.reviewer_base_url,
-        "reviewer_api_key_env": manifest.execution.reviewer_api_key_env,
-        "reviewer_mode": manifest.execution.reviewer_mode,
-        "reviewer_loop": manifest.execution.reviewer_loop,
-        "non_interactive": manifest.execution.non_interactive,
+        key: complete_execution_payload[key]
+        for key in (
+            "reviewer_provider",
+            "reviewer_model",
+            "reviewer_base_url",
+            "reviewer_api_key_env",
+            "reviewer_mode",
+            "reviewer_loop",
+            "non_interactive",
+        )
     }
     if manifest.schema_version >= MODEL_STAGE_SESSION_SCHEMA_VERSION:
         execution_payload.update(
             {
-                "risk_assessor": model_stage_payload(
-                    manifest.execution.risk_assessor
-                ),
-                "portfolio_planner": model_stage_payload(
-                    manifest.execution.portfolio_planner
-                ),
+                "risk_assessor": complete_execution_payload["risk_assessor"],
+                "portfolio_planner": complete_execution_payload[
+                    "portfolio_planner"
+                ],
             }
         )
-    if (
-        manifest.schema_version
-        >= SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
-    ):
+    if manifest.schema_version >= SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION:
         execution_payload.update(
             {
-                "semantic_reconciler": model_stage_payload(
-                    manifest.execution.semantic_reconciler
-                ),
-                "supplemental_policy": supplemental_policy_payload(
-                    manifest.execution.supplemental_policy
-                ),
+                "semantic_reconciler": complete_execution_payload[
+                    "semantic_reconciler"
+                ],
+                "supplemental_policy": complete_execution_payload[
+                    "supplemental_policy"
+                ],
             }
         )
     if manifest.schema_version >= SESSION_SCHEMA_VERSION:
@@ -1492,10 +1531,8 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
             )
         execution_payload.update(
             {
-                "memory": manifest.execution.memory.to_dict(),
-                "memory_curator": model_stage_payload(
-                    manifest.execution.memory_curator
-                ),
+                "memory": complete_execution_payload["memory"],
+                "memory_curator": complete_execution_payload["memory_curator"],
             }
         )
 

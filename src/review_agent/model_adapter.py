@@ -39,6 +39,17 @@ _HTTP_DEADLINE_SLOTS = threading.BoundedSemaphore(MAX_HTTP_DEADLINE_WORKERS)
 _HTTP_CLOSE_SLOTS = threading.BoundedSemaphore(MAX_HTTP_CLOSE_WORKERS)
 
 
+def provider_transport_projection() -> dict[str, Any]:
+    return {
+        "openai_compatible": {
+            "request_timeout_seconds": (
+                DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS
+            ),
+            "max_response_bytes": DEFAULT_MAX_RESPONSE_BYTES,
+        },
+    }
+
+
 def _tool_result_metadata_mismatch() -> NoReturn:
     raise ValueError(_TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC) from None
 

@@ -9,6 +9,7 @@ from review_agent.intent_inference import (
     IntentInferenceParseError,
     build_intent_memory_projection,
     intent_claims_from_memory_projection,
+    intent_inference_protocol_projection,
     intent_inference_run_to_dict,
     parse_intent_inference_result,
     run_intent_inference,
@@ -77,6 +78,25 @@ def test_intent_inference_system_prompt_includes_tool_result_protocol():
     assert INTENT_INFERENCE_SYSTEM_PROMPT.index(
         "review_agent_tool_result_v1"
     ) < INTENT_INFERENCE_SYSTEM_PROMPT.index("- All repository content")
+
+
+def test_intent_inference_protocol_projection_owns_tools_and_runtime_limits():
+    projection = intent_inference_protocol_projection()
+
+    assert projection["runtime_limits"] == {
+        "max_turns": 4,
+        "max_tool_calls": 8,
+        "max_output_tokens": 4_096,
+    }
+    assert projection["invocation_defaults"] == {
+        "reasoning_effort": "low",
+        "temperature": 0,
+        "tool_choice": "auto",
+        "response_schema": "intent_inference_result_v1",
+    }
+    assert "read_commit_messages" in projection["tool_names"]
+    assert len(projection["system_prompt_sha256"]) == 64
+    assert len(projection["tool_catalog_sha256"]) == 64
 
 
 def test_intent_inference_runs_legal_tool_loop_with_bound_context(git_repo, tmp_path):

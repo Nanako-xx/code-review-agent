@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 from review_agent.checkpoint import CheckpointStore
+from review_agent.execution_profile import AgentExecutionProfile
 from review_agent.artifacts import artifact_schema
 from review_agent.git_repo import ChangeSummary, collect_change_summary
 from review_agent.intent_clarification import ConsoleIntentClarifier
@@ -798,6 +799,66 @@ def _resolve_model_stage_config(
         )
     except ValueError as error:
         raise ValueError(f"{stage}: {error}") from error
+
+
+def resolve_review_execution_config(
+    args: argparse.Namespace,
+) -> ReviewExecutionConfig:
+    memory_config = _resolve_memory_execution_config(args)
+    execution = ReviewExecutionConfig(
+        reviewer_provider=args.reviewer_provider,
+        reviewer_model=args.reviewer_model,
+        reviewer_base_url=args.reviewer_base_url,
+        reviewer_api_key_env=args.reviewer_api_key_env,
+        reviewer_mode=args.reviewer_mode,
+        reviewer_loop=args.reviewer_loop,
+        non_interactive=args.non_interactive,
+        memory=memory_config,
+    )
+    return replace(
+        execution,
+        risk_assessor=_resolve_model_stage_config(
+            args,
+            "risk-assessor",
+            execution,
+        ),
+        portfolio_planner=_resolve_model_stage_config(
+            args,
+            "portfolio-planner",
+            execution,
+        ),
+        semantic_reconciler=_resolve_model_stage_config(
+            args,
+            "semantic-reconciler",
+            execution,
+        ),
+        memory_curator=_resolve_model_stage_config(
+            args,
+            "memory-curator",
+            execution,
+        ),
+    )
+
+
+def review_execution_profile_from_arguments(
+    review_arguments: Sequence[str],
+    *,
+    memory_mode: str,
+    memory_root: Path,
+) -> AgentExecutionProfile:
+    parsed = _build_parser().parse_args(
+        [
+            "review",
+            "--base=" + ("0" * 40),
+            "--head=" + ("1" * 40),
+            *review_arguments,
+            "--memory-mode=" + memory_mode,
+            "--memory-root=" + str(memory_root),
+        ]
+    )
+    return AgentExecutionProfile.from_execution(
+        resolve_review_execution_config(parsed)
+    )
 
 
 _MEMORY_CLI_SCHEMA = "memory_cli_v1"
@@ -4181,52 +4242,12 @@ def _run_review(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        memory_config = _resolve_memory_execution_config(args)
-    except (MemoryIdentityError, ValueError) as error:
+        execution_config = resolve_review_execution_config(args)
+    except MemoryIdentityError as error:
         print(f"Memory session configuration error: {error}")
         return 2
-
-    try:
-        execution_config = ReviewExecutionConfig(
-            reviewer_provider=args.reviewer_provider,
-            reviewer_model=args.reviewer_model,
-            reviewer_base_url=args.reviewer_base_url,
-            reviewer_api_key_env=args.reviewer_api_key_env,
-            reviewer_mode=args.reviewer_mode,
-            reviewer_loop=args.reviewer_loop,
-            non_interactive=args.non_interactive,
-            memory=memory_config,
-        )
     except ValueError as error:
         print(f"Reviewer session configuration error: {error}")
-        return 2
-
-    try:
-        execution_config = replace(
-            execution_config,
-            risk_assessor=_resolve_model_stage_config(
-                args,
-                "risk-assessor",
-                execution_config,
-            ),
-            portfolio_planner=_resolve_model_stage_config(
-                args,
-                "portfolio-planner",
-                execution_config,
-            ),
-            semantic_reconciler=_resolve_model_stage_config(
-                args,
-                "semantic-reconciler",
-                execution_config,
-            ),
-            memory_curator=_resolve_model_stage_config(
-                args,
-                "memory-curator",
-                execution_config,
-            ),
-        )
-    except ValueError as error:
-        print(f"Planning model stage configuration error: {error}")
         return 2
 
     review_id = f"review-{uuid.uuid4().hex[:12]}"
