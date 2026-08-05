@@ -19,6 +19,7 @@ from review_agent.brief import ReviewBrief
 from review_agent.execution_profile import AgentExecutionProfile
 from review_agent.hydration import (
     clarification_questions_from_dict,
+    completion_from_dict,
     intent_claims_from_dict,
     review_brief_from_dict,
 )
@@ -1345,6 +1346,19 @@ class CurrentAgentAdapter:
             + ".."
             + repository.head_revision
         )
+        completion_payload = _load_registered_json(
+            run_dir=run_dir,
+            store=store,
+            manifest=manifest,
+            name="completion",
+            expected_path="completion.json",
+            expected_phase=RunPhase.COMPLETION,
+            expected_revision=revision,
+        )
+        try:
+            completion = completion_from_dict(completion_payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _CurrentArtifactError("current Agent completion is invalid") from exc
         brief_payload = _load_registered_json(
             run_dir=run_dir,
             store=store,
@@ -1362,6 +1376,25 @@ class CurrentAgentAdapter:
         ):
             raise _CurrentArtifactError("review brief identity is invalid")
         intent = _intent_from_brief(brief, transcript)
+        if completion.status in {"blocked", "budget_exhausted"}:
+            return failure_submission(
+                eval_input=eval_input,
+                config=config,
+                target_materialization_id=target_materialization_id,
+                code=FailureCode.AGENT_BLOCKED,
+                message="Current Agent completion was " + completion.status,
+                retryable=False,
+                intent=intent,
+                review=None,
+                evidence=(),
+                usage=empty_usage(elapsed_seconds=elapsed),
+                trace_ref=trace_ref,
+            )
+        if completion.status not in {
+            "completed",
+            "completed_with_uncertainties",
+        }:
+            raise _CurrentArtifactError("current Agent completion status is invalid")
         findings = _findings_from_brief(brief)
         observations = _load_final_observations(
             run_dir=run_dir,
@@ -1390,13 +1423,28 @@ class CurrentAgentAdapter:
             intent=intent,
             review=SubmissionReview(
                 findings=findings,
-                uncertainties=tuple(brief.uncertainties),
+                uncertainties=_stable_unique_text(
+                    brief.uncertainties,
+                    completion.uncertainties,
+                    completion.missing_perspectives,
+                ),
             ),
             evidence=evidence,
             usage=empty_usage(elapsed_seconds=elapsed),
             trace_ref=trace_ref,
             failure=None,
         )
+
+
+def _stable_unique_text(*groups: Iterable[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for group in groups:
+        for value in group:
+            if value not in seen:
+                seen.add(value)
+                result.append(value)
+    return tuple(result)
 
 
 def _intent_from_brief(

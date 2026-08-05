@@ -18,7 +18,7 @@ from conftest import run_git
 import review_agent.command as command_module
 import review_agent_eval.adapters.current_agent as current_module
 import review_agent_eval.runner as runner_module
-from review_agent.brief import BriefFinding, ReviewBrief
+from review_agent.brief import BriefFinding, ReviewBrief, review_brief_to_dict
 from review_agent.observations import Observation
 from review_agent.run_state import RunPhase
 from review_agent.session import ReviewExecutionConfig, SESSION_SCHEMA_VERSION
@@ -51,6 +51,7 @@ from review_agent_eval.models import (
     EVAL_INPUT_SCHEMA_VERSION,
     EVAL_SUBMISSION_SCHEMA_VERSION,
     EvalInput,
+    EvalSubmission,
     ExistingCIEvidence,
     FailureCode,
     IntentDimension,
@@ -61,6 +62,8 @@ from review_agent_eval.models import (
     ReviewRequest,
     SubmissionClarificationExchange,
     SubmissionStatus,
+    TraceRef,
+    TraceType,
     MAX_EVAL_INPUT_BYTES,
     canonical_json_bytes,
     stable_id,
@@ -379,11 +382,12 @@ def test_current_adapter_runs_formal_cli_and_uses_verified_session_artifacts(
     )
 
     assert isinstance(CurrentAgentAdapter(), AgentUnderTestAdapter)
-    assert submission.status is SubmissionStatus.COMPLETED
-    assert submission.failure is None
+    assert submission.status is SubmissionStatus.BLOCKED
+    assert submission.failure is not None
+    assert submission.failure.code is FailureCode.AGENT_BLOCKED
     assert submission.task_id == eval_input.task_id
     assert submission.intent is not None
-    assert submission.review is not None
+    assert submission.review is None
     assert submission.intent.clarification_questions == tuple(channel.exchanges)
     assert all(
         claim.source.value in {"explicit", "inferred"}
@@ -949,10 +953,12 @@ def test_current_adapter_benchmark_auto_accept_promotes_intent_and_completes_rev
         channel,
     )
 
-    assert submission.status is SubmissionStatus.COMPLETED
+    assert submission.status is SubmissionStatus.BLOCKED
+    assert submission.failure is not None
+    assert submission.failure.code is FailureCode.AGENT_BLOCKED
     assert submission.intent is not None
     assert submission.intent.status.value == "sufficient"
-    assert submission.review is not None
+    assert submission.review is None
     assert submission.intent.clarification_questions == tuple(channel.exchanges)
     assert channel.exchanges
     assert all(item.matched_answer_id is None for item in channel.exchanges)
@@ -1434,7 +1440,17 @@ def _brief(
             "sources": {"goal": "inferred"},
             "provenance": [
                 {
-                    "claim_id": "claim_inferred",
+                    "claim_id": (
+                        "claim_"
+                        + hashlib.sha256(
+                            json.dumps(
+                                ("goal", "keep behavior deterministic"),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ).encode("utf-8")
+                        ).hexdigest()[:16]
+                    ),
                     "field": "goal",
                     "value": "Keep behavior deterministic",
                     "source": "inferred",
@@ -1467,6 +1483,174 @@ def _brief(
         human_review_checklist_and_reading_order=[],
         non_binding_recommendation="manual_review",
     )
+
+
+def _project_completion_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    completion_status: str,
+    completion_uncertainties: list[str] | None = None,
+    missing_perspectives: list[str] | None = None,
+    brief: ReviewBrief | None = None,
+) -> EvalSubmission:
+    eval_input = _eval_input("a" * 40, "b" * 40)
+    config = _config(eval_input)
+    brief = brief or _brief(findings=[])
+    payloads = {
+        "completion": {
+            "status": completion_status,
+            "recommendation": "manual_review",
+            "blockers": [],
+            "uncertainties": completion_uncertainties or [],
+            "missing_perspectives": missing_perspectives or [],
+        },
+        "review_brief": {},
+    }
+
+    def load_registered(*, name: str, **_kwargs: object) -> dict[str, object]:
+        return payloads[name]
+
+    observation_calls: list[object] = []
+    monkeypatch.setattr(current_module, "_load_registered_json", load_registered)
+    monkeypatch.setattr(
+        current_module,
+        "review_brief_from_dict",
+        lambda _payload: brief,
+    )
+    monkeypatch.setattr(
+        current_module,
+        "_load_final_observations",
+        lambda **_kwargs: observation_calls.append(True) or {},
+    )
+    monkeypatch.setattr(
+        current_module,
+        "_evidence_from_observations",
+        lambda **_kwargs: (),
+    )
+    submission = CurrentAgentAdapter()._completed_submission(
+        eval_input=eval_input,
+        config=config,
+        target_materialization_id="materialization-1",
+        run_dir=Path("run-review-123456789abc"),
+        store=SimpleNamespace(),
+        manifest=SimpleNamespace(review_id="review-123456789abc"),
+        transcript=(),
+        elapsed=1.0,
+        trace_ref=TraceRef(
+            type=TraceType.LOCAL_PATH,
+            value=".review-agent/runs/review-123456789abc",
+        ),
+    )
+    if completion_status in {"blocked", "budget_exhausted"}:
+        assert observation_calls == []
+    else:
+        assert observation_calls == [True]
+    return submission
+
+
+@pytest.mark.parametrize(
+    ("completion_status", "expected_status", "expected_failure"),
+    [
+        ("completed", SubmissionStatus.COMPLETED, None),
+        ("completed_with_uncertainties", SubmissionStatus.COMPLETED, None),
+        ("blocked", SubmissionStatus.BLOCKED, FailureCode.AGENT_BLOCKED),
+        (
+            "budget_exhausted",
+            SubmissionStatus.BLOCKED,
+            FailureCode.AGENT_BLOCKED,
+        ),
+    ],
+)
+def test_completion_artifact_is_authoritative_for_submission_status(
+    monkeypatch: pytest.MonkeyPatch,
+    completion_status: str,
+    expected_status: SubmissionStatus,
+    expected_failure: FailureCode | None,
+) -> None:
+    submission = _project_completion_submission(
+        monkeypatch,
+        completion_status=completion_status,
+        completion_uncertainties=(
+            ["uncertainty-a", "uncertainty-a"]
+            if completion_status == "completed_with_uncertainties"
+            else []
+        ),
+        missing_perspectives=(
+            ["uncertainty-b", "uncertainty-a"]
+            if completion_status == "completed_with_uncertainties"
+            else []
+        ),
+    )
+    assert submission.status is expected_status
+    if expected_failure is None:
+        assert submission.failure is None
+        assert submission.review is not None
+        if completion_status == "completed_with_uncertainties":
+            assert submission.review.uncertainties == (
+                "uncertainty-a",
+                "uncertainty-b",
+            )
+    else:
+        assert submission.failure is not None
+        assert submission.failure.code is expected_failure
+        assert submission.review is None
+
+
+def test_completed_with_uncertainties_does_not_depend_on_reconciler_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    brief = replace(
+        _brief(findings=[]),
+        semantic_reconciliation={"mode": "local_only"},
+    )
+    submission = _project_completion_submission(
+        monkeypatch,
+        completion_status="completed_with_uncertainties",
+        completion_uncertainties=["completion uncertainty"],
+        brief=brief,
+    )
+    assert submission.status is SubmissionStatus.COMPLETED
+    assert submission.review is not None
+    assert submission.review.uncertainties == ("completion uncertainty",)
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["missing", "malformed", "unregistered", "wrong_revision"],
+)
+def test_invalid_completion_artifact_is_invalid_output(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    eval_input = _eval_input("a" * 40, "b" * 40)
+    config = _config(eval_input)
+    brief = _brief(findings=[])
+
+    def load_registered(*, name: str, **_kwargs: object) -> dict[str, object]:
+        if name == "completion":
+            if failure_mode in {"missing", "unregistered", "wrong_revision"}:
+                raise current_module._CurrentArtifactError(
+                    "completion descriptor is invalid"
+                )
+            return {"status": "completed"}
+        return review_brief_to_dict(brief)
+
+    monkeypatch.setattr(current_module, "_load_registered_json", load_registered)
+    with pytest.raises(current_module._CurrentArtifactError):
+        CurrentAgentAdapter()._completed_submission(
+            eval_input=eval_input,
+            config=config,
+            target_materialization_id="materialization-1",
+            run_dir=Path("run-review-123456789abc"),
+            store=SimpleNamespace(),
+            manifest=SimpleNamespace(review_id="review-123456789abc"),
+            transcript=(),
+            elapsed=1.0,
+            trace_ref=TraceRef(
+                type=TraceType.LOCAL_PATH,
+                value=".review-agent/runs/review-123456789abc",
+            ),
+        )
 
 
 def test_brief_mapping_preserves_inferred_provenance_missing_location_and_zero_findings() -> None:
