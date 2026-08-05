@@ -188,6 +188,7 @@ def _run_config(
     current: bool,
     instance: str,
     capabilities: Any = None,
+    trial_count: int = 1,
 ) -> EvalRunConfig:
     capabilities = capabilities or (
         current_agent_capabilities()
@@ -204,7 +205,7 @@ def _run_config(
         evaluator=evaluator_config(),
         suite=SuiteRunConfig.from_case_snapshot(snapshot),
         adapter_capabilities=capabilities,
-        trial_count=1,
+        trial_count=trial_count,
         resource_budgets=budgets(parallel=1),
     )
 

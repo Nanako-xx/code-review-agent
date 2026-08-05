@@ -43,6 +43,7 @@ from review_agent_eval.models import (
     ReviewTargetKind,
     ReviewTruth,
     SubmissionEvidence,
+    SubmissionFailure,
     SubmissionFinding,
     SubmissionReview,
     SubmissionStatus,
@@ -203,6 +204,7 @@ class _FrozenRun:
     config: Any
     runner: EvalRunner
     trial: Any
+    trials: tuple[Any, ...]
     bank: CaseBank
 
     @property
@@ -219,6 +221,7 @@ def _run_frozen(
     review_truth: ReviewTruth | None = None,
     review_evaluator_context: ReviewEvaluatorContext | None = None,
     materializer: Any = None,
+    trial_count: int = 1,
 ) -> _FrozenRun:
     prepared = _prepared_bundle(tmp_path)
     snapshot, case = _frozen_snapshot_and_case(
@@ -227,7 +230,12 @@ def _run_frozen(
         review_truth=review_truth,
         review_evaluator_context=review_evaluator_context,
     )
-    config = _run_config(snapshot, current=False, instance=instance)
+    config = _run_config(
+        snapshot,
+        current=False,
+        instance=instance,
+        trial_count=trial_count,
+    )
     runner = _frozen_runner(
         tmp_path,
         prepared,
@@ -242,6 +250,7 @@ def _run_frozen(
         config=config,
         runner=runner,
         trial=result.trials[0],
+        trials=tuple(result.trials),
         bank=_case_bank(tmp_path, snapshot, case),
     )
 
@@ -284,6 +293,109 @@ class _CountingJudge:
     def execute(self, _request: BlindJudgeInput):
         self.calls += 1
         raise AssertionError("Judge must not be called")
+
+
+def _harness_materialization_failure(submission: EvalSubmission) -> EvalSubmission:
+    return replace(
+        submission,
+        status=SubmissionStatus.FAILED,
+        intent=None,
+        review=None,
+        evidence=(),
+        failure=SubmissionFailure(
+            code=FailureCode.HARNESS_MATERIALIZATION_ERROR,
+            message="fixture repository materialization failed",
+            retryable=False,
+        ),
+    )
+
+
+def test_evaluate_trial_rejects_harness_materialization_failure_before_judge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _run_frozen(
+        tmp_path,
+        _FrozenSuccessAdapter(),
+        instance="harness-materialization-evaluate-trial",
+    )
+    original = run.store.load_existing_submission(
+        run.config.run_id,
+        run.trial.task_id,
+        run.trial.trial_id,
+    )
+    failure = _harness_materialization_failure(original)
+    monkeypatch.setattr(
+        run.store,
+        "load_existing_submission",
+        lambda *_args: failure,
+    )
+    judge = _CountingJudge()
+
+    with pytest.raises(
+        orchestrator_module.EvaluationPreconditionError,
+        match="materialization failure",
+    ):
+        _evaluate(
+            run,
+            _frozen_orchestrator(run, judge=judge),
+            "harness-materialization-evaluate-trial-v1",
+        )
+
+    assert judge.calls == 0
+    assert run.store.list_evaluations(
+        run.config.run_id,
+        run.trial.task_id,
+        run.trial.trial_id,
+    ) == ()
+
+
+def test_evaluate_run_preflights_all_trials_before_judge_or_scoring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _run_frozen(
+        tmp_path,
+        _FrozenSuccessAdapter(),
+        instance="harness-materialization-evaluate-run",
+        trial_count=2,
+    )
+    bad_trial = run.trials[1]
+    original_load = run.store.load_existing_submission
+    original_bad = original_load(
+        run.config.run_id,
+        bad_trial.task_id,
+        bad_trial.trial_id,
+    )
+    failure = _harness_materialization_failure(original_bad)
+
+    def load_submission(run_id: str, task_id: str, trial_id: str):
+        if trial_id == bad_trial.trial_id:
+            return failure
+        return original_load(run_id, task_id, trial_id)
+
+    monkeypatch.setattr(run.store, "load_existing_submission", load_submission)
+    judge = _CountingJudge()
+    orchestrator = _frozen_orchestrator(run, judge=judge)
+
+    with pytest.raises(
+        orchestrator_module.EvaluationPreconditionError,
+        match="materialization failure",
+    ):
+        orchestrator.evaluate_run(
+            run.config.run_id,
+            evaluator_execution=_execution(),
+            evaluation_revision="harness-materialization-evaluate-run-v1",
+        )
+
+    assert judge.calls == 0
+    assert run.store.list_run_evaluations(run.config.run_id) == ()
+    for trial in run.trials:
+        assert run.store.list_evaluations(
+            run.config.run_id,
+            trial.task_id,
+            trial.trial_id,
+        ) == ()
 
 
 class _RecordingJudge:
@@ -924,6 +1036,8 @@ def test_pre_materialization_failure_without_review_needs_no_resolver(
     assert run.trial.submission is not None
     assert run.trial.submission.status is SubmissionStatus.FAILED
     assert run.trial.submission.review is None
+    assert run.trial.submission.failure is not None
+    assert run.trial.submission.failure.code is FailureCode.HARNESS_MATERIALIZATION_ERROR
     with pytest.raises(ArtifactStateError):
         run.store.load_trial_materialization(
             run.config.run_id,
@@ -933,18 +1047,18 @@ def test_pre_materialization_failure_without_review_needs_no_resolver(
     judge = _CountingJudge()
     orchestrator = EvaluationOrchestrator(run.store, run.bank, judge=judge)
 
-    evaluated = _evaluate(run, orchestrator, "pre-materialization-v1")
-    loaded = orchestrator.load_trial_evaluation(
+    with pytest.raises(
+        orchestrator_module.EvaluationPreconditionError,
+        match="materialization failure",
+    ):
+        _evaluate(run, orchestrator, "pre-materialization-v1")
+
+    assert judge.calls == 0
+    assert run.store.list_evaluations(
         run.config.run_id,
         run.trial.task_id,
         run.trial.trial_id,
-        evaluated.evaluation_id,
-    )
-
-    assert evaluated.review_result is None
-    assert loaded.review_result is None
-    assert loaded.trial_score == evaluated.trial_score
-    assert judge.calls == 0
+    ) == ()
 
 
 def test_target_replay_public_exports_are_canonical() -> None:

@@ -587,6 +587,11 @@ class EvaluationOrchestrator:
             raise EvaluationOrchestrationError("Run config identity mismatch")
         manifest = self.artifact_store.load_trial_manifest(run_id, task_id, trial_id)
         submission = self.artifact_store.load_existing_submission(run_id, task_id, trial_id)
+        if self._is_pre_materialization_failure(submission):
+            raise EvaluationPreconditionError(
+                "Run contains a Harness repository materialization failure; "
+                "capability scoring is invalid"
+            )
         case = self._case(config, task_id)
         review_source, replay = self._evaluation_source(
             run_id,
@@ -879,15 +884,30 @@ class EvaluationOrchestrator:
             raise EvaluationPreconditionError(
                 "partial Run evaluation requires a separately filtered Run identity"
             )
-        bundles = []
-        for plan in manifest.trials:
-            if selected is not None and plan.task_id not in selected:
-                continue
+        selected_plans = tuple(
+            plan
+            for plan in manifest.trials
+            if selected is None or plan.task_id in selected
+        )
+        for plan in selected_plans:
             state = self.artifact_store.load_trial_state(run_id, plan.task_id, plan.trial_id)
             if not _terminal(state.status):
                 raise EvaluationPreconditionError(
                     "evaluate requires every selected Trial to have a terminal Submission"
                 )
+            submission = self.artifact_store.load_existing_submission(
+                run_id,
+                plan.task_id,
+                plan.trial_id,
+            )
+            if self._is_pre_materialization_failure(submission):
+                raise EvaluationPreconditionError(
+                    "Run contains a Harness repository materialization failure; "
+                    "capability scoring is invalid"
+                )
+
+        bundles = []
+        for plan in selected_plans:
             bundles.append(
                 self.evaluate_trial(
                     run_id,

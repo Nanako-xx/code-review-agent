@@ -273,7 +273,14 @@ def _completed_submission(config, trial_index: int, finding_count: int = 1, *, u
     )
 
 
-def _failed_submission(config, trial_index: int, *, usage=None):
+def _failed_submission(
+    config,
+    trial_index: int,
+    *,
+    usage=None,
+    status: SubmissionStatus = SubmissionStatus.FAILED,
+    code: FailureCode = FailureCode.TIMEOUT,
+):
     return EvalSubmission(
         schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
         task_id=config.suite.cases[0].task_id,
@@ -281,7 +288,7 @@ def _failed_submission(config, trial_index: int, *, usage=None):
         trial_id=config.trial_id(config.suite.cases[0].task_id, trial_index),
         eval_input_digest=config.suite.cases[0].eval_input_digest,
         target_materialization_id=TARGET_MATERIALIZATION_ID,
-        status=SubmissionStatus.FAILED,
+        status=status,
         intent=None,
         review=None,
         evidence=(),
@@ -297,9 +304,13 @@ def _failed_submission(config, trial_index: int, *, usage=None):
         ),
         trace_ref=None,
         failure=SubmissionFailure(
-            code=FailureCode.TIMEOUT,
-            message="timed out",
-            retryable=True,
+            code=code,
+            message=(
+                "agent blocked"
+                if code is FailureCode.AGENT_BLOCKED
+                else "timed out"
+            ),
+            retryable=code is not FailureCode.AGENT_BLOCKED,
         ),
     )
 
@@ -709,10 +720,25 @@ def test_case_aggregation_uses_ratio_of_sums_not_average_of_percentages() -> Non
     }
 
 
-def test_failed_trial_counts_in_failure_rate_and_recall_by_explicit_policy() -> None:
+@pytest.mark.parametrize(
+    ("failure_status", "failure_code"),
+    [
+        (SubmissionStatus.FAILED, FailureCode.TIMEOUT),
+        (SubmissionStatus.BLOCKED, FailureCode.AGENT_BLOCKED),
+    ],
+)
+def test_failed_trial_counts_in_failure_rate_and_recall_by_explicit_policy(
+    failure_status: SubmissionStatus,
+    failure_code: FailureCode,
+) -> None:
     case, replay, execution, config = _score_sources(trial_count=2)
     _, _, _, passed = _score_completed(case, replay, execution, config, 1)
-    failed_submission = _failed_submission(config, 2)
+    failed_submission = _failed_submission(
+        config,
+        2,
+        status=failure_status,
+        code=failure_code,
+    )
     failed = TrialScorer().score(
         run_config=config,
         evaluator_execution=execution,
@@ -735,6 +761,7 @@ def test_failed_trial_counts_in_failure_rate_and_recall_by_explicit_policy() -> 
     assert aggregate.metric(CoreMetric.AGENT_FAILURE_RATE).denominator == 2
     assert aggregate.metric(CoreMetric.ISSUE_RECALL).numerator == 1
     assert aggregate.metric(CoreMetric.ISSUE_RECALL).denominator == 2
+    assert aggregate.metric(CoreMetric.ISSUE_RECALL).coverage.failure_as_miss_count == 1
     assert aggregate.metric(CoreMetric.ISSUE_PRECISION).coverage.failure_excluded_count == 1
     assert failed.trial_id in aggregate.failed_trial_ids
     assert failed.trial_id in aggregate.critical_high_miss_trial_ids
