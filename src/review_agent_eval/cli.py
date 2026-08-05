@@ -296,6 +296,7 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--agent-version", default="working-tree")
     prepare.add_argument("--agent-commit", default="unknown")
     prepare.add_argument("--memory-mode", choices=("off", "read", "read-write"), default="off")
+    prepare.add_argument("--task-id", action="append", default=[])
     prepare.add_argument(
         "--unanswered-clarification",
         choices=("defer", "continue-with-uncertainty"),
@@ -308,7 +309,7 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--agent-timeout-seconds",
         type=lambda value: _positive_float(value, name="agent_timeout_seconds"),
-        default=900.0,
+        default=None,
     )
     prepare.add_argument(
         "--evaluator-timeout-seconds",
@@ -556,6 +557,98 @@ def _default_evaluator_config(
     )
 
 
+_PROFILE_CONTROLLED_REVIEW_ARGUMENTS = frozenset(
+    {
+        "--reviewer-provider",
+        "--reviewer-model",
+        "--reviewer-base-url",
+        "--reviewer-api-key-env",
+        "--reviewer-loop",
+        "--memory-mode",
+        "--memory-root",
+    }
+)
+
+
+def _validate_user_review_arguments(arguments: Sequence[str]) -> None:
+    """Reject user arguments that would change the frozen product Profile."""
+
+    for argument in arguments:
+        option = argument.split("=", 1)[0]
+        controlled_abbreviation = (
+            option.startswith("--")
+            and len(option) > 2
+            and any(
+                value.startswith(option)
+                for value in _PROFILE_CONTROLLED_REVIEW_ARGUMENTS
+            )
+        )
+        if option in _PROFILE_CONTROLLED_REVIEW_ARGUMENTS or controlled_abbreviation:
+            raise CliUsageError(
+                "--agent-argument cannot override the product Profile"
+            )
+
+
+def _current_agent_profile(agent: Any):
+    """Hydrate the frozen product Profile from a current-Agent snapshot."""
+
+    import importlib
+
+    AgentExecutionProfile = importlib.import_module(
+        "review_agent.execution_profile"
+    ).AgentExecutionProfile
+    from .adapters.current_agent import CURRENT_AGENT_ADAPTER_KIND
+
+    parameters = getattr(agent, "parameters", None)
+    adapter = parameters.get("adapter") if isinstance(parameters, Mapping) else None
+    if not isinstance(adapter, Mapping) or adapter.get("kind") != CURRENT_AGENT_ADAPTER_KIND:
+        return None
+    binding = parameters.get("agent_execution_profile")
+    if not isinstance(binding, Mapping) or set(binding) != {"profile", "digest"}:
+        raise CliIntegrityError("current Agent execution Profile binding is invalid")
+    try:
+        profile = AgentExecutionProfile.from_dict(binding["profile"])
+    except (TypeError, ValueError) as exc:
+        raise CliIntegrityError("current Agent execution Profile is invalid") from exc
+    digest = binding["digest"]
+    if type(digest) is not str or profile.digest() != digest:
+        raise CliIntegrityError("current Agent execution Profile digest is invalid")
+    return profile
+
+
+def _validate_agent_timeout(
+    args: argparse.Namespace,
+    agent: Any,
+    configured_timeout: Any,
+) -> None:
+    profile = _current_agent_profile(agent)
+    if profile is None:
+        return
+    minimum = float(profile.payload["minimum_outer_timeout_seconds"])
+    if args.agent_timeout_seconds is not None and args.agent_timeout_seconds < minimum:
+        raise CliPreconditionError(
+            "agent_timeout_seconds is below the product execution profile minimum"
+        )
+    if float(configured_timeout) < minimum:
+        raise CliPreconditionError(
+            "run config agent timeout is below the product execution profile minimum"
+        )
+
+
+def _resolve_agent_timeout(args: argparse.Namespace, agent: Any) -> float:
+    profile = _current_agent_profile(agent)
+    if profile is None:
+        return 900.0 if args.agent_timeout_seconds is None else args.agent_timeout_seconds
+    minimum = float(profile.payload["minimum_outer_timeout_seconds"])
+    if args.agent_timeout_seconds is None:
+        return minimum
+    if args.agent_timeout_seconds < minimum:
+        raise CliPreconditionError(
+            "agent_timeout_seconds is below the product execution profile minimum"
+        )
+    return args.agent_timeout_seconds
+
+
 def _default_agent_snapshot(args: argparse.Namespace):
     from .adapters.current_agent import CURRENT_AGENT_ADAPTER_KIND
     from .adapters.subprocess_agent import (
@@ -573,12 +666,19 @@ def _default_agent_snapshot(args: argparse.Namespace):
         command[0] = str(Path(command[0]).resolve())
     if args.agent_adapter == "current":
         review_arguments = list(args.agent_argument)
+        _validate_user_review_arguments(review_arguments)
         if args.agent_provider:
             review_arguments.append("--reviewer-provider=" + args.agent_provider)
         if args.agent_model and args.agent_model != "none":
             review_arguments.append("--reviewer-model=" + args.agent_model)
         if args.agent_base_url:
             review_arguments.append("--reviewer-base-url=" + args.agent_base_url)
+        review_arguments.extend(
+            [
+                "--reviewer-loop=agent-loop",
+                "--reviewer-api-key-env=" + args.agent_api_key_env,
+            ]
+        )
         adapter = {
             "kind": CURRENT_AGENT_ADAPTER_KIND,
             "command": command,
@@ -606,6 +706,24 @@ def _default_agent_snapshot(args: argparse.Namespace):
             ),
         },
     }
+    if args.agent_adapter == "current":
+        import importlib
+
+        review_execution_profile_from_arguments = importlib.import_module(
+            "review_agent.command"
+        ).review_execution_profile_from_arguments
+
+        profile = review_execution_profile_from_arguments(
+            tuple(adapter["review_arguments"]),
+            memory_mode=args.memory_mode,
+            memory_root=(
+                Path.cwd() / ".review-agent" / "eval-profile-memory"
+            ).resolve(),
+        )
+        parameters["agent_execution_profile"] = {
+            "profile": profile.to_dict(),
+            "digest": profile.digest(),
+        }
     return AgentConfigSnapshot(
         agent_id=args.agent_id,
         agent_name=args.agent_name,
@@ -651,11 +769,11 @@ def _load_matcher(args: argparse.Namespace):
     return _default_matcher()
 
 
-def _budgets(args: argparse.Namespace):
+def _budgets(args: argparse.Namespace, *, agent_timeout_seconds: float):
     from .config import ResourceBudgets
 
     return ResourceBudgets(
-        agent_timeout_seconds=args.agent_timeout_seconds,
+        agent_timeout_seconds=agent_timeout_seconds,
         evaluator_timeout_seconds=args.evaluator_timeout_seconds,
         max_agent_output_bytes=_positive_int(
             args.max_agent_output_bytes, name="max_agent_output_bytes", maximum=2**31
@@ -681,16 +799,25 @@ def _load_run_config_for_prepare(args: argparse.Namespace, bank: Any):
     from .adapters.agent_factory import adapter_capabilities_from_snapshot
     from .config import EvalRunConfig, SuiteRunConfig
 
-    snapshot = bank.snapshot()
+    if len(set(args.task_id)) != len(args.task_id):
+        raise CliUsageError("--task-id contains a duplicate ID")
+    task_ids = None if not args.task_id else tuple(args.task_id)
+    snapshot = (
+        bank.snapshot()
+        if task_ids is None
+        else bank.snapshot(task_ids=task_ids)
+    )
     suite = SuiteRunConfig.from_case_snapshot(snapshot)
     if args.run_config:
         payload = _read_json(_path(args.run_config, name="run_config"), context="Run config")
         config = EvalRunConfig.from_dict(payload)
         if config.suite != suite:
             raise CliIntegrityError("Run config does not match the verified Suite snapshot")
+        _validate_agent_timeout(args, config.agent, config.resource_budgets.agent_timeout_seconds)
         return config, snapshot
     agent = _load_agent_snapshot(args)
     capabilities = adapter_capabilities_from_snapshot(agent)
+    agent_timeout_seconds = _resolve_agent_timeout(args, agent)
     config = EvalRunConfig.create(
         run_instance_key=args.run_instance_key,
         agent=agent,
@@ -699,7 +826,10 @@ def _load_run_config_for_prepare(args: argparse.Namespace, bank: Any):
         suite=suite,
         adapter_capabilities=capabilities,
         trial_count=_positive_int(args.trial_count, name="trial_count", maximum=10_000),
-        resource_budgets=_budgets(args),
+        resource_budgets=_budgets(
+            args,
+            agent_timeout_seconds=agent_timeout_seconds,
+        ),
     )
     return config, snapshot
 

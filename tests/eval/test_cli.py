@@ -11,14 +11,19 @@ from review_agent_eval.clarification import (
     BENCHMARK_AUTO_ACCEPT_POLICY_VERSION,
 )
 from review_agent_eval.cli import (
+    CliPreconditionError,
+    CliUsageError,
     EXIT_CONFLICT,
     EXIT_INTEGRITY,
     EXIT_OK,
     EXIT_PRECONDITION,
     _canonical_digest,
     _build_parser,
+    _current_agent_profile,
     _default_agent_snapshot,
     _domain_error_category,
+    _load_run_config_for_prepare,
+    _resolve_agent_timeout,
     main,
 )
 from review_agent_eval.repository import FixtureRepositoryBuilder
@@ -147,6 +152,96 @@ def test_prepare_binds_unanswered_clarification_policy_into_agent_identity() -> 
             BENCHMARK_AUTO_ACCEPT_POLICY_VERSION
         ),
     }
+
+
+def test_prepare_freezes_current_agent_loop_and_execution_profile() -> None:
+    args = _build_parser().parse_args(
+        [
+            "prepare",
+            "--suite-root=suite",
+            "--agent-provider=openai-compatible",
+            "--agent-model=deepseek-v4-pro",
+            "--agent-base-url=https://api.deepseek.com",
+        ]
+    )
+
+    snapshot = _default_agent_snapshot(args)
+    adapter = snapshot.parameters["adapter"]
+    assert [
+        item for item in adapter["review_arguments"]
+        if item.startswith("--reviewer-loop")
+    ] == ["--reviewer-loop=agent-loop"]
+    binding = snapshot.parameters["agent_execution_profile"]
+    profile = _current_agent_profile(snapshot)
+    assert profile is not None
+    assert binding["digest"] == profile.digest()
+    assert profile.payload["capabilities"] == {
+        "shell": "unavailable",
+        "network": "provider_only",
+        "repository": "read_only",
+        "run_safe_check": "unavailable",
+    }
+
+
+def test_public_profile_controls_cannot_be_overridden_by_agent_arguments() -> None:
+    args = _build_parser().parse_args(
+        [
+            "prepare",
+            "--suite-root=suite",
+            "--agent-argument=--reviewer-loop=single-shot",
+        ]
+    )
+
+    with pytest.raises(CliUsageError, match="cannot override"):
+        _default_agent_snapshot(args)
+
+
+def test_product_agent_timeout_uses_profile_floor() -> None:
+    args = _build_parser().parse_args(["prepare", "--suite-root=suite"])
+    snapshot = _default_agent_snapshot(args)
+    profile = _current_agent_profile(snapshot)
+    assert profile is not None
+    floor = float(profile.payload["minimum_outer_timeout_seconds"])
+
+    assert _resolve_agent_timeout(args, snapshot) == floor
+    args.agent_timeout_seconds = floor + 1
+    assert _resolve_agent_timeout(args, snapshot) == floor + 1
+    args.agent_timeout_seconds = floor - 1
+    with pytest.raises(CliPreconditionError, match="below"):
+        _resolve_agent_timeout(args, snapshot)
+
+
+def test_prepare_passes_exact_task_id_selection_to_case_bank() -> None:
+    from .test_runner import _two_case_snapshot
+
+    snapshot = _two_case_snapshot()
+    calls = []
+
+    class SnapshotBank:
+        def snapshot(self, task_ids=None):
+            calls.append(task_ids)
+            return snapshot
+
+    args = _build_parser().parse_args(
+        [
+            "prepare",
+            "--suite-root=suite",
+            "--task-id=task-kept",
+        ]
+    )
+    _load_run_config_for_prepare(args, SnapshotBank())
+    assert calls == [("task-kept",)]
+
+    duplicate_args = _build_parser().parse_args(
+        [
+            "prepare",
+            "--suite-root=suite",
+            "--task-id=task-kept",
+            "--task-id=task-kept",
+        ]
+    )
+    with pytest.raises(CliUsageError, match="duplicate"):
+        _load_run_config_for_prepare(duplicate_args, SnapshotBank())
 
 
 def test_prepare_dry_run_is_write_free_and_emits_stable_json(

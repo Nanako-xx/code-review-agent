@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from review_agent.artifacts import artifact_schema
 from review_agent.brief import ReviewBrief
+from review_agent.execution_profile import AgentExecutionProfile
 from review_agent.hydration import (
     clarification_questions_from_dict,
     intent_claims_from_dict,
@@ -177,6 +178,8 @@ class _CurrentAdapterConfiguration:
     environment_allowlist: Tuple[str, ...]
     memory_mode: str
     agent_snapshot_digest: str
+    execution_profile: AgentExecutionProfile
+    execution_profile_digest: str
 
 
 def _argument_array(
@@ -217,6 +220,15 @@ def _configuration(config: AgentRunConfig) -> _CurrentAdapterConfiguration:
         require_absolute=False,
         allow_empty=True,
     )
+    loop_arguments = [
+        argument
+        for argument in review_arguments
+        if argument.startswith("--reviewer-loop")
+    ]
+    if loop_arguments != ["--reviewer-loop=agent-loop"]:
+        raise _CurrentAdapterError(
+            "current Agent must use exactly one frozen agent-loop argument"
+        )
     for argument in review_arguments:
         option = argument.split("=", 1)[0]
         ci_file_abbreviation = (
@@ -248,12 +260,38 @@ def _configuration(config: AgentRunConfig) -> _CurrentAdapterConfiguration:
         raise _CurrentAdapterError("current Agent memory mode is invalid")
     if snapshot.digest() != digest:
         raise _CurrentAdapterError("current Agent snapshot changed during validation")
+    profile_binding = snapshot.parameters.get("agent_execution_profile")
+    if not isinstance(profile_binding, Mapping) or set(profile_binding) != {
+        "profile",
+        "digest",
+    }:
+        raise _CurrentAdapterError(
+            "current Agent execution profile binding is invalid"
+        )
+    try:
+        execution_profile = AgentExecutionProfile.from_dict(
+            profile_binding["profile"]
+        )
+    except (TypeError, ValueError) as exc:
+        raise _CurrentAdapterError(
+            "current Agent execution profile is invalid"
+        ) from exc
+    execution_profile_digest = profile_binding["digest"]
+    if (
+        type(execution_profile_digest) is not str
+        or execution_profile.digest() != execution_profile_digest
+    ):
+        raise _CurrentAdapterError(
+            "current Agent execution profile digest is invalid"
+        )
     return _CurrentAdapterConfiguration(
         command=command,
         review_arguments=review_arguments,
         environment_allowlist=tuple(environment),
         memory_mode=memory_mode,
         agent_snapshot_digest=digest,
+        execution_profile=execution_profile,
+        execution_profile_digest=execution_profile_digest,
     )
 
 
@@ -351,6 +389,7 @@ def _load_session(
     *,
     workspace: Path,
     eval_input: EvalInput,
+    execution_profile: AgentExecutionProfile,
 ) -> Tuple[SessionStore, SessionManifest]:
     store = SessionStore(run_dir)
     manifest = store.load()
@@ -375,6 +414,19 @@ def _load_session(
         or manifest.revisions.resolved_head_sha != repository.head_revision
     ):
         raise _CurrentArtifactError("current Agent Session binding is invalid")
+    try:
+        actual_profile = AgentExecutionProfile.from_execution(manifest.execution)
+    except (TypeError, ValueError) as exc:
+        raise _CurrentArtifactError(
+            "current Agent Session execution profile is invalid"
+        ) from exc
+    if (
+        actual_profile.digest() != execution_profile.digest()
+        or actual_profile.to_dict() != execution_profile.to_dict()
+    ):
+        raise AgentAdapterIncompatibleError(
+            AdapterIncompatibilityReason.EXECUTION_PROFILE_MISMATCH
+        )
     return store, manifest
 
 
@@ -1023,6 +1075,7 @@ class CurrentAgentAdapter:
                 run_dir,
                 workspace=resolved_workspace,
                 eval_input=eval_input,
+                execution_profile=adapter.execution_profile,
             )
 
             revision = (
@@ -1102,6 +1155,7 @@ class CurrentAgentAdapter:
                     run_dir,
                     workspace=resolved_workspace,
                     eval_input=eval_input,
+                    execution_profile=adapter.execution_profile,
                 )
                 if (
                     result.returncode not in (None, 0)

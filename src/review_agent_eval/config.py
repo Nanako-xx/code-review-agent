@@ -350,6 +350,7 @@ def validate_safe_json(
     context: str = "value",
     *,
     evaluator_context_policy: Optional[str] = None,
+    allow_execution_profile_environment_refs: bool = False,
 ) -> None:
     """Validate a JSON tree before it crosses the persistent artifact boundary."""
 
@@ -498,7 +499,16 @@ def validate_safe_json(
             for key, child in item.items():
                 if type(key) is not str:
                     raise SchemaError("%s contains a non-string object key" % item_context)
-                if _key_is_forbidden(key):
+                profile_environment_ref = (
+                    allow_execution_profile_environment_refs
+                    and any(
+                        path[index : index + 2]
+                        == ("agent_execution_profile", "profile")
+                        for index in range(len(path) - 1)
+                    )
+                    and key in {"api_key_env", "reviewer_api_key_env"}
+                )
+                if _key_is_forbidden(key) and not profile_environment_ref:
                     raise SchemaError(
                         "%s contains a forbidden secret, environment, or reasoning field"
                         % item_context
@@ -605,7 +615,11 @@ def _json_object(value: Any, context: str) -> Mapping[str, Any]:
                 count(child)
 
     count(parsed)
-    validate_safe_json(parsed, context)
+    validate_safe_json(
+        parsed,
+        context,
+        allow_execution_profile_environment_refs=context == "agent.parameters",
+    )
     return _freeze_json(parsed)
 
 
@@ -2313,7 +2327,11 @@ class EvalRunConfig(_JsonModel):
         )
         if self.run_id != expected_run_id:
             raise SchemaError("run_id does not match the canonical run identity")
-        validate_safe_json(self.to_dict(), "run_config")
+        validate_safe_json(
+            self.to_dict(),
+            "run_config",
+            allow_execution_profile_environment_refs=True,
+        )
         _check_model_size(self, MAX_EVAL_RUN_CONFIG_BYTES, "EvalRunConfig")
 
     @staticmethod

@@ -21,6 +21,7 @@ import review_agent_eval.runner as runner_module
 from review_agent.brief import BriefFinding, ReviewBrief
 from review_agent.observations import Observation
 from review_agent.run_state import RunPhase
+from review_agent.session import ReviewExecutionConfig, SESSION_SCHEMA_VERSION
 from review_agent.session_store import SessionStore
 from review_agent_eval.adapters.base import (
     AdapterIncompatibilityReason,
@@ -167,6 +168,8 @@ def _config(
 ) -> AgentRunConfig:
     adapter: object
     if adapter_override is ...:
+        canonical_review_arguments = list(review_arguments)
+        canonical_review_arguments.append("--reviewer-loop=agent-loop")
         adapter = {
             "kind": CURRENT_AGENT_ADAPTER_KIND,
             "command": list(
@@ -177,13 +180,25 @@ def _config(
                     "review_agent",
                 )
             ),
-            "review_arguments": list(review_arguments),
+            "review_arguments": canonical_review_arguments,
             "environment_allowlist": list(environment_allowlist),
             "memory_mode": memory_mode,
         }
     else:
         adapter = adapter_override
     parameters = {"adapter": adapter}
+    if adapter_override is ...:
+        from review_agent.command import review_execution_profile_from_arguments
+
+        profile = review_execution_profile_from_arguments(
+            tuple(adapter["review_arguments"]),
+            memory_mode=memory_mode,
+            memory_root=(Path.cwd() / ".review-agent" / "test-profile-memory").resolve(),
+        )
+        parameters["agent_execution_profile"] = {
+            "profile": profile.to_dict(),
+            "digest": profile.digest(),
+        }
     if unanswered_action is not None:
         parameters["clarification"] = {
             "unanswered_action": unanswered_action,
@@ -704,6 +719,62 @@ def test_current_adapter_configuration_is_strict_and_fails_before_launch(
     assert submission.status is SubmissionStatus.FAILED
     assert submission.failure is not None
     assert submission.failure.code is FailureCode.ADAPTER_ERROR
+
+
+def test_current_adapter_rejects_persisted_session_execution_profile_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_input = _eval_input("a" * 40, "b" * 40)
+    config = _config(eval_input)
+    adapter = current_module._configuration(config)
+    repository = _repository_target(eval_input).repository
+    drifted_execution = ReviewExecutionConfig(
+        reviewer_provider="none",
+        reviewer_model=None,
+        reviewer_base_url=None,
+        reviewer_api_key_env="REVIEW_AGENT_API_KEY",
+        reviewer_mode="single",
+        reviewer_loop="single-shot",
+        non_interactive=False,
+    )
+    manifest = SimpleNamespace(
+        schema_version=SESSION_SCHEMA_VERSION,
+        review_id="review-123456789abc",
+        root_review_id="review-123456789abc",
+        parent_review_id=None,
+        repository=SimpleNamespace(
+            git_common_dir=str(tmp_path),
+            canonical_path=str(tmp_path),
+        ),
+        revisions=SimpleNamespace(
+            requested_base=repository.base_revision,
+            requested_head=repository.head_revision,
+            resolved_base_sha=repository.base_revision,
+            resolved_head_sha=repository.head_revision,
+        ),
+        execution=drifted_execution,
+    )
+
+    class FakeSessionStore:
+        def __init__(self, _run_dir: Path) -> None:
+            pass
+
+        def load(self) -> object:
+            return manifest
+
+    monkeypatch.setattr(current_module, "SessionStore", FakeSessionStore)
+    with pytest.raises(AgentAdapterIncompatibleError) as raised:
+        current_module._load_session(
+            tmp_path / manifest.review_id,
+            workspace=tmp_path,
+            eval_input=eval_input,
+            execution_profile=adapter.execution_profile,
+        )
+    assert (
+        raised.value.reason
+        is AdapterIncompatibilityReason.EXECUTION_PROFILE_MISMATCH
+    )
 
 
 def test_cli_arguments_are_snapshot_bound_and_eval_fields_are_not_reclassified(

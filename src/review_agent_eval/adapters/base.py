@@ -297,6 +297,7 @@ class AdapterIncompatibilityReason(str, Enum):
     )
     TARGET_KIND = "adapter_incompatible.target_kind"
     CAPABILITY_MISMATCH = "adapter_incompatible.capability_mismatch"
+    EXECUTION_PROFILE_MISMATCH = "adapter_incompatible.execution_profile_mismatch"
 
 
 class AgentAdapterIncompatibleError(RuntimeError):
