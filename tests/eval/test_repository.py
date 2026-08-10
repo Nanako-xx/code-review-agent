@@ -677,6 +677,31 @@ def test_inherited_git_environment_cannot_redirect_preparation(
             assert _git(workspace.path, "rev-parse", "HEAD") == head
 
 
+def test_isolated_git_commands_enable_extended_length_paths(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+
+    with _preparer(tmp_path, suite) as preparer:
+        arguments = preparer._runner._base_args()
+
+    assert ("-c", "core.longpaths=true") in tuple(
+        zip(arguments, arguments[1:])
+    )
+
+
+def test_default_git_watchdog_is_bounded_for_large_public_worktrees(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+
+    with _preparer(tmp_path, suite) as preparer:
+        timeout_seconds = preparer._runner.timeout_seconds
+
+    assert repository_module.DEFAULT_GIT_TIMEOUT_SECONDS == 3600.0
+    assert timeout_seconds == 3600.0
+
+
 def test_prepare_git_processes_inherit_operation_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -902,18 +927,36 @@ def test_trials_are_independent_writable_detached_checkouts_without_remote_or_al
             assert (second.path / "app.py").write_text("agent edit\n", encoding="utf-8") > 0
 
 
-def test_gitlinks_and_lfs_are_rejected_by_fixed_v1_policy(tmp_path: Path) -> None:
+def test_gitlinks_are_opaque_and_lfs_is_still_rejected_by_isolation_policy(
+    tmp_path: Path,
+) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
     source = tmp_path / ".eval-data" / "imports" / "repo"
     base, _head = _init_local_repository(source)
+    (source / ".gitmodules").write_text(
+        '[submodule "vendor"]\n\tpath = vendor\n\turl = https://example.invalid/vendor.git\n',
+        encoding="utf-8",
+    )
+    run_git(source, "add", ".gitmodules")
     run_git(source, "update-index", "--add", "--cacheinfo", f"160000,{base},vendor")
     run_git(source, "commit", "-m", "gitlink")
     gitlink_head = run_git(source, "rev-parse", "HEAD")
 
     with _preparer(tmp_path, suite) as preparer:
-        with pytest.raises(RepositoryPolicyError, match="submodule|gitlink|nested"):
-            preparer.prepare(_local_descriptor("imports/repo", base, gitlink_head))
+        prepared = preparer.prepare(_local_descriptor("imports/repo", base, gitlink_head))
+        assert (
+            prepared.manifest.to_dict()["isolation_policy"]["gitlinks_or_submodules"]
+            == "opaque_gitlink_metadata_only"
+        )
+        with _trial_workspace(
+            preparer, prepared, _local_descriptor("imports/repo", base, gitlink_head)
+        ) as workspace:
+            assert (workspace.path / "vendor").is_dir()
+            assert not (workspace.path / "vendor" / ".git").exists()
+            assert (workspace.path / ".gitmodules").read_text(encoding="utf-8").startswith(
+                '[submodule "vendor"]'
+            )
 
     run_git(source, "reset", "--hard", base)
     pointer = (

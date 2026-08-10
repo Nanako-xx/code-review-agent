@@ -296,6 +296,8 @@ _EVALUATOR_CONTEXT_POLICIES = {
                 int,
                 "content",
             ),
+            ("expected_truth_findings", int, "claim"),
+            ("known_invalid_truth_findings", int, "claim"),
         ),
     ),
     "judge_input": (
@@ -343,6 +345,34 @@ _JUDGE_MODEL_CONTEXT_BLOCK_FIELDS = frozenset(
         "content_digest",
     }
 )
+_EXPECTED_TRUTH_FINDING_FIELDS = frozenset(
+    {
+        "truth_id",
+        "claim",
+        "severity",
+        "category",
+        "required",
+        "metric_authority",
+        "locations",
+        "evidence_anchors",
+        "required_context_level",
+        "rationale",
+    }
+)
+_KNOWN_INVALID_TRUTH_FINDING_FIELDS = frozenset(
+    {"truth_id", "claim", "category", "locations", "rationale"}
+)
+_REVIEW_TRUTH_CLAIM_FIELDS_BY_PATH = {
+    # Review truth is evaluator-private, source-bound input and may quote code
+    # with multiple ordinary assignments.  Only the generic environment-dump
+    # heuristic is suppressible for these exact typed finding projections.
+    ("expected_truth_findings", int, "claim"): _EXPECTED_TRUTH_FINDING_FIELDS,
+    (
+        "known_invalid_truth_findings",
+        int,
+        "claim",
+    ): _KNOWN_INVALID_TRUTH_FINDING_FIELDS,
+}
 
 
 def validate_safe_json(
@@ -425,6 +455,22 @@ def validate_safe_json(
         block = value_at_path(path[:-1])
         if not (type(block) is dict or isinstance(block, _MAPPING_PROXY_TYPE)):
             return False
+        if evaluator_context_policy == "review_matches":
+            truth_fields = next(
+                (
+                    fields
+                    for expected_path, fields in (
+                        _REVIEW_TRUTH_CLAIM_FIELDS_BY_PATH.items()
+                    )
+                    if path_matches(path, expected_path)
+                ),
+                None,
+            )
+            if truth_fields is not None:
+                return (
+                    frozenset(block) == truth_fields
+                    and block.get("claim") == content
+                )
         expected_block_fields = (
             _JUDGE_MODEL_CONTEXT_BLOCK_FIELDS
             if "context_blocks" in path

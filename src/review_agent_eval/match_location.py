@@ -50,7 +50,7 @@ from .repository import (
 )
 
 
-LOCATION_MATCH_POLICY_VERSION = "location_match_policy_v1"
+LOCATION_MATCH_POLICY_VERSION = "location_match_policy_v2"
 DEFAULT_MAX_LINE_DISTANCE = 5
 MAX_CONFIGURED_LINE_DISTANCE = 100_000
 
@@ -71,7 +71,7 @@ MAX_LOCATION_CANDIDATES_JSON_BYTES = 64 * 1024 * 1024
 
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _VCS_METADATA_LABELS = frozenset(
-    {".git", ".hg", ".svn", ".gitmodules", ".lfsconfig"}
+    {".git", ".hg", ".svn", ".lfsconfig"}
 )
 _OTHER_SPLITLINE_BOUNDARIES = frozenset(
     ("\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")

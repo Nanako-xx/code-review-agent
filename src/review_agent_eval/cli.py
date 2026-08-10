@@ -1296,7 +1296,10 @@ def _completed_evaluation_metadata(
         intent = trial_bundle.intent_matches
         review = trial_bundle.review_matches
         score = trial_bundle.score
-        if not isinstance(intent, Mapping) or not isinstance(score, Mapping):
+        if (
+            intent is not None
+            and not isinstance(intent, Mapping)
+        ) or not isinstance(score, Mapping):
             raise CliIntegrityError("committed Trial evaluation payload is invalid")
         if review is not None and not isinstance(review, Mapping):
             raise CliIntegrityError("committed Review evaluation payload is invalid")
@@ -1311,7 +1314,7 @@ def _completed_evaluation_metadata(
                 "evaluation_id": evaluation_id,
                 "evaluation_revision": revision,
                 "submission_status": submission.status.value,
-                "intent_status": intent.get("status"),
+                "intent_status": None if intent is None else intent.get("status"),
                 "review_status": None if review is None else review.get("status"),
                 "score_digest": _canonical_digest(score),
                 "report_digest": hashlib.sha256(

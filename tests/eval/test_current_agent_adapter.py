@@ -18,6 +18,7 @@ from conftest import run_git
 import review_agent.command as command_module
 import review_agent_eval.adapters.current_agent as current_module
 import review_agent_eval.runner as runner_module
+import review_agent_eval.submission as submission_module
 from review_agent.brief import BriefFinding, ReviewBrief, review_brief_to_dict
 from review_agent.observations import Observation
 from review_agent.run_state import RunPhase
@@ -1858,6 +1859,97 @@ def test_evidence_conversion_uses_only_referenced_replayable_observations(
     assert evidence[0].source.path == "feature.py"
     assert evidence[0].source.target_materialization_id == materialization_id
     assert findings[0].evidence_refs == ("O-read", "O-search", "O-missing")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path regression")
+def test_evidence_conversion_reads_extended_length_observation(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path
+    index = 0
+    while len(str(run_dir / "observations" / "O-read.txt")) < 270:
+        run_dir /= "deep%04d" % index
+        index += 1
+    raw = "return bool(value)\n"
+    raw_path = run_dir / "observations" / "O-read.txt"
+    storage_path = Path("\\\\?\\" + os.path.abspath(raw_path))
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    storage_path.write_bytes(raw.encode("utf-8"))
+    assert len(str(raw_path)) > 260
+    base = "a" * 40
+    head = "b" * 40
+    observation = Observation(
+        observation_id="O-read",
+        source="git.read_range",
+        revision="head@" + head,
+        path="feature.py",
+        line_start=2,
+        line_end=2,
+        content_hash=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        raw_artifact_ref="observations/O-read.txt",
+        context_view="summary",
+    )
+    brief = _brief(
+        findings=[
+            BriefFinding(
+                claim="Check the return path",
+                severity="medium",
+                confidence="high",
+                evidence_refs=["O-read"],
+                path="feature.py",
+                line=2,
+            )
+        ]
+    )
+    findings = current_module._findings_from_brief(brief)
+
+    evidence = current_module._evidence_from_observations(
+        run_dir=run_dir,
+        brief=brief,
+        findings=findings,
+        observations={"O-read": observation},
+        eval_input=_eval_input(base, head),
+        target_materialization_id=stable_id(
+            "materialization", "extended-evidence-conversion"
+        ),
+    )
+
+    assert len(evidence) == 1
+    assert evidence[0].excerpt == raw
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path regression")
+def test_submission_trace_enumerates_extended_length_product_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    trace_root = workspace / "trace"
+    deep = trace_root
+    index = 0
+    while len(str(deep / "artifact.txt")) < 270:
+        deep /= "deep%04d" % index
+        index += 1
+    artifact = deep / "artifact.txt"
+    storage_artifact = Path("\\\\?\\" + os.path.abspath(artifact))
+    storage_artifact.parent.mkdir(parents=True, exist_ok=True)
+    storage_artifact.write_text("trace\n", encoding="utf-8")
+    assert len(str(artifact)) > 260
+    submission = replace(
+        _project_completion_submission(
+            monkeypatch,
+            completion_status="completed",
+        ),
+        trace_ref=TraceRef(type=TraceType.LOCAL_PATH, value="trace"),
+    )
+
+    validated = submission_module.validate_submission_trace(
+        submission,
+        workspace=workspace,
+        max_trace_bytes=1024,
+    )
+
+    assert validated is submission
 
 
 @pytest.mark.parametrize("output_truncated", [False, True])

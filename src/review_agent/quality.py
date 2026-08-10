@@ -34,6 +34,11 @@ QUALITY_GATE_SOURCES = frozenset({"builtin", "repository_config"})
 RISK_LEVELS = ("low", "medium", "high", "critical")
 DEFAULT_CHEAP_TIMEOUT_SECONDS = 60.0
 DEFAULT_EXPENSIVE_TIMEOUT_SECONDS = 300.0
+# Discovery reads immutable Git objects rather than running repository code.
+# Large official repositories backed by verified loose-object stores can need
+# several minutes for ls-tree/cat-file on Windows, so keep this watchdog
+# finite but aligned with the evaluation repository watchdog.
+DEFAULT_GIT_TIMEOUT_SECONDS = 3600.0
 MAX_CONFIG_BYTES = 1_048_576
 MAX_REVISION_BLOB_BYTES = 268_435_456
 MAX_REVISION_FILES = 20_000
@@ -721,7 +726,7 @@ def _run_git(
             input=input_data,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=30,
+            timeout=DEFAULT_GIT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:
         raise RuntimeError("Git command timed out") from error

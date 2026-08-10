@@ -812,7 +812,11 @@ class RunReportSummary:
         if summary_id != stable_id("run-report-summary-v1", identity):
             raise _error("Run report summary ID is not canonical")
         try:
-            validate_safe_json(payload, "Run report summary")
+            validate_safe_json(
+                payload,
+                "Run report summary",
+                allow_execution_profile_environment_refs=True,
+            )
         except (SchemaError, ValueError) as exc:
             raise _error(str(exc)) from exc
         _canonical_payload(payload, "Run report summary")

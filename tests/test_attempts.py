@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from review_agent.attempts import AttemptWorkspace
+from review_agent.observations import ObservationStore
 from review_agent.run_state import RunPhase
 
 
@@ -97,6 +99,83 @@ def test_attempt_workspace_writes_then_atomically_promotes_file(tmp_path: Path) 
     assert promoted == tmp_path / "intent.json"
     assert promoted.read_text(encoding="utf-8").endswith("}")
     assert not list(tmp_path.glob(".promote-*"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path regression")
+def test_attempt_workspace_promotes_extended_length_observation(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path
+    index = 0
+    promoted_probe = (
+        run_dir
+        / "repository-intelligence"
+        / "observations"
+        / ("O-" + "0" * 32 + ".txt")
+    )
+    while len(str(promoted_probe)) <= 260:
+        run_dir /= "deep%04d" % index
+        index += 1
+        promoted_probe = (
+            run_dir
+            / "repository-intelligence"
+            / "observations"
+            / ("O-" + "0" * 32 + ".txt")
+        )
+    workspace = AttemptWorkspace(
+        run_dir,
+        RunPhase.REPOSITORY_INTELLIGENCE,
+        1,
+    )
+    observations = ObservationStore(workspace.prepare() / "obs")
+    observation = observations.record(
+        source="repo_intelligence.snapshot",
+        revision="head@abc",
+        path="src/app.py",
+        line_start=1,
+        line_end=1,
+        raw_content="value = 1\n",
+        context_view="src/app.py:1",
+    )
+    source_relative = "obs/" + observation.raw_artifact_ref
+    source = workspace.path.joinpath(*source_relative.split("/"))
+    assert len(str(source)) > 260
+
+    promoted = workspace.promote_file(
+        source_relative,
+        "repository-intelligence/" + observation.raw_artifact_ref,
+    )
+
+    assert len(str(promoted)) > 260
+    storage_path = Path("\\\\?\\" + os.path.abspath(promoted))
+    assert storage_path.read_bytes() == b"value = 1\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path regression")
+def test_attempt_workspace_writes_extended_length_supplemental_wave_plan(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path
+    index = 0
+    while len(str(run_dir)) < 180:
+        run_dir /= "deep%04d" % index
+        index += 1
+    workspace = AttemptWorkspace(
+        run_dir,
+        RunPhase.SUPPLEMENTAL_INVESTIGATION,
+        1,
+    )
+    workspace.prepare()
+    wave_id = "W-" + "a" * 64
+
+    written = workspace.write_json(
+        "s/w-" + wave_id.removeprefix("W-")[:32] + "/plan.json",
+        {"wave_id": wave_id},
+    )
+
+    assert len(str(written)) > 260
+    storage_path = Path("\\\\?\\" + os.path.abspath(written))
+    assert storage_path.read_text(encoding="utf-8").endswith("\n}")
 
 
 def test_failed_attempt_never_overwrites_authoritative_artifact(tmp_path: Path) -> None:

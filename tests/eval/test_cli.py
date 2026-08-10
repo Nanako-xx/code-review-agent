@@ -540,6 +540,8 @@ def test_full_prepare_run_evaluate_inspect_flow_keeps_stages_separate(
 def _prepare_and_run_cli_fixture(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    *,
+    agent_mode: str = "success",
 ) -> tuple[dict[str, Path], list[str], str]:
     """Create one terminal Run and return its roots, common args and ID."""
 
@@ -548,7 +550,7 @@ def _prepare_and_run_cli_fixture(
     agent_command = [
         str(Path(sys.executable).resolve()),
         str(program),
-        "success",
+        agent_mode,
         "{agent_id}",
         "{task_id}",
         "{trial_id}",
@@ -620,6 +622,89 @@ def test_evaluate_resume_reuses_trial_and_run_namespaces_without_reexecution(
     assert resumed["trials"][0]["evaluation_id"] == first_trial["evaluation_id"]
     assert after_trial_namespaces == before_trial_namespaces
     assert after_run_namespaces == before_run_namespaces
+
+
+def test_evaluate_resume_reuses_terminal_failure_with_null_intent_payload(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, common, run_id = _prepare_and_run_cli_fixture(
+        tmp_path,
+        capsys,
+        agent_mode="nonzero",
+    )
+    evaluate_args = [
+        "evaluate",
+        run_id,
+        *common,
+        "--revision",
+        "resume-terminal-failure-v1",
+        "--judge-provider",
+        "none",
+        "--json",
+    ]
+
+    assert main(evaluate_args) == EXIT_OK
+    first = _json_stdout(capsys)
+    assert first["trials"][0]["submission_status"] == "failed"
+    assert first["trials"][0]["intent_status"] is None
+    assert first["trials"][0]["review_status"] is None
+
+    from review_agent_eval.orchestrator import EvaluationOrchestrator
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("terminal failure resume re-executed an evaluator phase")
+
+    monkeypatch.setattr(EvaluationOrchestrator, "_evaluate_intent", forbidden)
+    monkeypatch.setattr(EvaluationOrchestrator, "_evaluate_review", forbidden)
+
+    assert main(evaluate_args) == EXIT_OK
+    resumed = _json_stdout(capsys)
+    assert _without_message(resumed) == _without_message(first)
+
+
+def test_evaluate_resume_completes_an_exact_orphan_run_report(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, common, run_id = _prepare_and_run_cli_fixture(tmp_path, capsys)
+    evaluate_args = [
+        "evaluate",
+        run_id,
+        *common,
+        "--revision",
+        "orphan-run-report-v1",
+        "--judge-provider",
+        "none",
+        "--json",
+    ]
+    assert main(evaluate_args) == EXIT_OK
+    first = _json_stdout(capsys)
+    from review_agent_eval.artifacts import ArtifactStore
+
+    store = ArtifactStore(roots["runs"], create_root=False)
+    namespace = "evaluations/%s" % first["evaluation_id"]
+    summary_path = store._target(run_id, namespace + "/summary.json")
+    report_path = store._target(run_id, namespace + "/report.md")
+    expected_summary = summary_path.read_bytes()
+    expected_report = report_path.read_bytes()
+    summary_path.unlink()
+
+    from review_agent_eval.orchestrator import EvaluationOrchestrator
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("orphan Run report resume re-executed an evaluator phase")
+
+    monkeypatch.setattr(EvaluationOrchestrator, "_evaluate_intent", forbidden)
+    monkeypatch.setattr(EvaluationOrchestrator, "_evaluate_review", forbidden)
+
+    assert main(evaluate_args) == EXIT_OK
+    resumed = _json_stdout(capsys)
+    assert _without_message(resumed) == _without_message(first)
+    assert summary_path.read_bytes() == expected_summary
+    assert report_path.read_bytes() == expected_report
 
 
 def test_evaluate_no_resume_rejects_existing_namespace_before_reexecution(

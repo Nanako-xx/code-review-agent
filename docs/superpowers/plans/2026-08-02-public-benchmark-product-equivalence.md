@@ -74,7 +74,10 @@ LOGICAL_GIT_SOURCE_VERSION = "logical_git_review_closure_v2"
 CACHE_INDEX_SCHEMA_VERSION = "repository_cache_index_v2"
 ```
 
-Keep `REPOSITORY_ISOLATION_POLICY_VERSION = "repository_isolation_v1"`: this plan deliberately avoids shallow/graft/replace behavior, so the isolation contract itself does not change.
+Use `REPOSITORY_ISOLATION_POLICY_VERSION = "repository_isolation_v2"`: the
+parent repository may retain `.gitmodules` and opaque gitlink metadata, but it
+still never fetches, materializes, or executes submodule repositories. Shallow,
+graft, replace, symlink, LFS, and nested-repository boundaries remain strict.
 
 - [ ] **Step 2: Replace the fixed object maximum with observational fields**
 

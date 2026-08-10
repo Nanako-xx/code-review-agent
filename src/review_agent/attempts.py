@@ -19,6 +19,27 @@ from review_agent.run_state import RunPhase
 from review_agent.session import SESSION_PHASES
 
 
+def _storage_path(path: Path) -> Path:
+    """Use the extended-length namespace for Windows filesystem syscalls."""
+
+    raw = os.fspath(path)
+    if os.name != "nt" or raw.startswith("\\\\?\\"):
+        return Path(raw)
+    absolute = os.path.abspath(raw)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
+def _path_is_symlink(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        pass
+    return os.path.islink(_storage_path(path))
+
+
 @dataclass(frozen=True)
 class AttemptWorkspace:
     """Isolated, auditable workspace for one phase or reviewer attempt."""
@@ -77,7 +98,7 @@ class AttemptWorkspace:
         return path
 
     def prepare(self) -> Path:
-        self.path.mkdir(parents=True, exist_ok=True)
+        _storage_path(self.path).mkdir(parents=True, exist_ok=True)
         return self.path
 
     def write_json(self, relative_path: str, payload: Mapping[str, Any]) -> Path:
@@ -95,8 +116,9 @@ class AttemptWorkspace:
         if not isinstance(content, str):
             raise ValueError("attempt artifact content must be text")
         destination = self._attempt_path(relative_path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(destination, content)
+        storage_destination = _storage_path(destination)
+        storage_destination.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(storage_destination, content)
         return destination
 
     def promote_file(
@@ -108,18 +130,23 @@ class AttemptWorkspace:
 
         source = self._regular_attempt_file(source_relative_path)
         destination = self._run_path(destination_relative_path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
         staging = destination.with_name(f".promote-{uuid.uuid4().hex[:12]}")
+        storage_source = _storage_path(source)
+        storage_staging = _storage_path(staging)
+        storage_destination = _storage_path(destination)
+        storage_destination.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with source.open("rb") as source_handle, staging.open("xb") as target_handle:
+            with storage_source.open("rb") as source_handle, storage_staging.open(
+                "xb"
+            ) as target_handle:
                 shutil.copyfileobj(source_handle, target_handle)
                 target_handle.flush()
                 os.fsync(target_handle.fileno())
-            os.replace(staging, destination)
-            _fsync_parent_directory(destination.parent)
+            os.replace(storage_staging, storage_destination)
+            _fsync_parent_directory(_storage_path(destination.parent))
         finally:
             try:
-                staging.unlink(missing_ok=True)
+                storage_staging.unlink(missing_ok=True)
             except OSError:
                 pass
         return destination
@@ -143,10 +170,10 @@ class AttemptWorkspace:
     def _regular_attempt_file(self, relative_path: str) -> Path:
         path = self._attempt_path(relative_path)
         try:
-            metadata = path.lstat()
+            metadata = os.lstat(_storage_path(path))
         except OSError as error:
             raise ValueError(f"attempt artifact does not exist: {relative_path}") from error
-        if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        if not stat.S_ISREG(metadata.st_mode) or _path_is_symlink(path):
             raise ValueError(f"attempt artifact must be a regular file: {relative_path}")
         return path
 

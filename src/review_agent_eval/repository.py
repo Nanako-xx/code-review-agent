@@ -106,7 +106,7 @@ WORKSPACE_DIRECTORY_DIGEST_CHARS = 32
 REPOSITORY_ACQUISITION_BINDING_SCHEMA_VERSION = (
     "repository_acquisition_binding_v2"
 )
-REPOSITORY_ISOLATION_POLICY_VERSION = "repository_isolation_v1"
+REPOSITORY_ISOLATION_POLICY_VERSION = "repository_isolation_v2"
 REPOSITORY_PATH_POLICY_VERSION = "repository_path_policy_v1"
 REPOSITORY_BUDGET_POLICY_VERSION = "repository_budget_policy_v2"
 LOGICAL_GIT_SOURCE_VERSION = "logical_git_review_closure_v2"
@@ -134,7 +134,10 @@ MAX_PATH_COMPONENT_BYTES = 255
 MAX_LOGICAL_TREE_ENTRIES = MAX_MATERIALIZED_FILES * 2 + MAX_PATH_DEPTH
 MAX_GIT_METADATA_OBJECT_BYTES = 8 * 1024 * 1024
 MAX_TRIAL_ATTEMPT = 10_000
-DEFAULT_GIT_TIMEOUT_SECONDS = 180.0
+# Large verified Windows worktrees can spend several minutes in the final
+# index/status consistency check even after bounded manual materialization.
+# Keep the watchdog finite while allowing official public-suite repositories.
+DEFAULT_GIT_TIMEOUT_SECONDS = 3600.0
 DEFAULT_LOCK_TIMEOUT_SECONDS = 180.0
 DEFAULT_MAX_RETAINED_WORKSPACES = 3
 DEFAULT_MAX_RETAINED_BYTES = 2 * 1024 * 1024 * 1024
@@ -149,7 +152,7 @@ _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _GIT_OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _HEX_RE = re.compile(r"^[0-9a-f]+$")
 _WINDOWS_FORBIDDEN = frozenset('<>:"\\|?*')
-_VCS_METADATA = frozenset({".git", ".hg", ".svn", ".gitmodules"})
+_VCS_METADATA = frozenset({".git", ".hg", ".svn"})
 _LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1\n"
 _LFS_ATTRIBUTE_RE = re.compile(
     rb"(?:^|[ \t])(?:filter|diff|merge)=lfs(?:[ \t]|$)", re.IGNORECASE
@@ -187,7 +190,7 @@ class RepositorySecurityError(RepositoryPreparationError):
 
 
 class RepositoryPolicyError(RepositoryPreparationError):
-    """Repository content is outside ``repository_isolation_v1``."""
+    """Repository content is outside the fixed repository isolation policy."""
 
 
 class RepositoryLimitError(RepositoryPolicyError):
@@ -298,7 +301,7 @@ def _fixed_isolation_policy() -> Dict[str, Any]:
         "shallow_or_grafts": "rejected",
         "replace_refs": "rejected",
         "symlinks": "rejected",
-        "gitlinks_or_submodules": "rejected",
+        "gitlinks_or_submodules": "opaque_gitlink_metadata_only",
         "nested_repositories": "rejected",
         "lfs": "rejected",
         "hooks": "never_executed",
@@ -353,7 +356,7 @@ def _validate_fixed_policy(
     payload = _object(value, context)
     _exact_fields(payload, tuple(expected), context)
     if payload != dict(expected):
-        raise SchemaError("%s must be the fixed official v1 policy" % context)
+        raise SchemaError("%s must be the fixed official isolation policy" % context)
     return dict(payload)
 
 
@@ -629,7 +632,7 @@ def _validate_https_url(value: Any):
     except ValueError as exc:
         raise SchemaError("remote repository URL is invalid") from exc
     if parsed.scheme != "https":
-        raise SchemaError("repository_isolation_v1 permits HTTPS remotes only")
+        raise SchemaError("repository isolation permits HTTPS remotes only")
     if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         raise SchemaError("remote repository URL may not contain credentials")
     if not parsed.hostname:
@@ -783,6 +786,28 @@ def _absolute_path(value: os.PathLike[str] | str) -> Path:
     return Path(os.path.abspath(raw))
 
 
+def _absolute_storage_path(value: os.PathLike[str] | str) -> Path:
+    """Return an absolute path suitable for Win32 filesystem primitives.
+
+    Keep the repository's public/runtime handles in ordinary absolute form,
+    but use the extended-length Win32 namespace at the syscall boundary.  A
+    SHA-256 loose-object filename is 22 characters longer than a SHA-1 one;
+    under a normal pytest temporary root that difference can cross MAX_PATH.
+    """
+
+    raw = os.fspath(value)
+    if "\x00" in raw:
+        raise RepositorySecurityError("filesystem path contains NUL")
+    if os.name != "nt":
+        return Path(os.path.abspath(raw))
+    if raw.startswith("\\\\?\\"):
+        return Path(raw)
+    absolute = os.path.abspath(raw)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
 def _path_prefixes(path: Path) -> Iterator[Path]:
     parts = path.parts
     if not parts:
@@ -804,13 +829,14 @@ def _ensure_secure_directory(
     if os.name == "nt" and str(path).startswith("\\\\"):
         raise RepositorySecurityError("%s may not use a UNC path" % context)
     for candidate in _path_prefixes(path):
+        storage_candidate = _absolute_storage_path(candidate)
         try:
-            info = os.lstat(candidate)
+            info = os.lstat(storage_candidate)
         except FileNotFoundError:
             if not create:
                 raise RepositorySecurityError("%s does not exist" % context)
             try:
-                os.mkdir(candidate, 0o700)
+                os.mkdir(storage_candidate, 0o700)
             except FileExistsError:
                 pass
             except OSError as exc:
@@ -818,7 +844,7 @@ def _ensure_secure_directory(
                     "could not create secure %s" % context
                 ) from exc
             try:
-                info = os.lstat(candidate)
+                info = os.lstat(storage_candidate)
             except OSError as exc:
                 raise RepositorySecurityError(
                     "could not verify newly created %s" % context
@@ -838,7 +864,7 @@ def _assert_secure_directory(path: Path, context: str) -> os.stat_result:
     secured = _ensure_secure_directory(path, create=False, context=context)
     if _normalized_path(secured) != _normalized_path(path):
         raise RepositorySecurityError("%s resolved unexpectedly" % context)
-    return os.lstat(secured)
+    return os.lstat(_absolute_storage_path(secured))
 
 
 def _secure_join(root: Path, relative_posix: str, context: str) -> Path:
@@ -863,7 +889,7 @@ def _secure_join(root: Path, relative_posix: str, context: str) -> Path:
     for index, component in enumerate(parts):
         current = current / component
         try:
-            info = os.lstat(current)
+            info = os.lstat(_absolute_storage_path(current))
         except FileNotFoundError:
             if index != len(parts) - 1:
                 raise RepositorySecurityError("%s has a missing parent" % context)
@@ -962,7 +988,9 @@ def _copy_regular_descriptor(
         | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
-        destination_descriptor = os.open(destination, flags, 0o600)
+        destination_descriptor = os.open(
+            _absolute_storage_path(destination), flags, 0o600
+        )
     except OSError as exc:
         raise RepositorySecurityError(
             "could not create repository source snapshot"
@@ -1173,7 +1201,7 @@ def _windows_open_directory_handle(path: Path) -> int:
         )
         kernel32.SetHandleInformation.restype = wintypes.BOOL
         handle = create_file(
-            str(path),
+            str(_absolute_storage_path(path)),
             0x0080,
             0x00000001 | 0x00000002,
             None,
@@ -1305,7 +1333,7 @@ def _windows_open_regular_descriptor(path: Path) -> int:
         )
         create_file.restype = wintypes.HANDLE
         handle = create_file(
-            str(path),
+            str(_absolute_storage_path(path)),
             0x80000000,
             0x00000001,
             None,
@@ -1991,8 +2019,9 @@ def _read_regular_file(
     maximum: int,
     context: str,
 ) -> bytes:
+    storage_path = _absolute_storage_path(path)
     try:
-        before = os.lstat(path)
+        before = os.lstat(storage_path)
     except OSError as exc:
         raise RepositorySecurityError("could not inspect %s" % context) from exc
     if _is_link_or_reparse(before):
@@ -2003,7 +2032,7 @@ def _read_regular_file(
         raise RepositoryLimitError("%s exceeds its byte budget" % context)
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(storage_path, flags)
     except OSError as exc:
         raise RepositorySecurityError("could not open %s safely" % context) from exc
     try:
@@ -2033,8 +2062,9 @@ def _read_regular_file(
 
 
 def _sha256_regular_file(path: Path, *, maximum: int, context: str) -> str:
+    storage_path = _absolute_storage_path(path)
     try:
-        before = os.lstat(path)
+        before = os.lstat(storage_path)
     except OSError as exc:
         raise RepositorySecurityError("could not inspect %s" % context) from exc
     if _is_link_or_reparse(before) or not stat.S_ISREG(before.st_mode):
@@ -2043,7 +2073,7 @@ def _sha256_regular_file(path: Path, *, maximum: int, context: str) -> str:
         raise RepositoryLimitError("%s exceeds its byte budget" % context)
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(storage_path, flags)
     except OSError as exc:
         raise RepositorySecurityError("could not open %s" % context) from exc
     digest = hashlib.sha256()
@@ -2075,6 +2105,7 @@ def _write_regular_file_exclusive(
     mode: int = 0o600,
     fsync: bool = False,
 ) -> None:
+    storage_path = _absolute_storage_path(path)
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -2083,7 +2114,7 @@ def _write_regular_file_exclusive(
         | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
-        descriptor = os.open(path, flags, mode)
+        descriptor = os.open(storage_path, flags, mode)
     except OSError as exc:
         raise RepositorySecurityError("could not create repository file safely") from exc
     try:
@@ -2115,8 +2146,9 @@ def _secure_tree_usage(
     stack = [root]
     while stack:
         directory = stack.pop()
+        storage_directory = _absolute_storage_path(directory)
         try:
-            entries = list(os.scandir(directory))
+            entries = list(os.scandir(storage_directory))
         except FileNotFoundError:
             # Concurrent prepare cleanup can remove an operation staging tree
             # after it was queued.  Quota accounting is repeated after each
@@ -2129,9 +2161,9 @@ def _secure_tree_usage(
             if nodes > maximum_nodes:
                 raise RepositoryLimitError(
                     "%s contains too many filesystem nodes" % context
-                )
+            )
             try:
-                info = entry.stat(follow_symlinks=False)
+                info = os.lstat(_absolute_storage_path(entry.path))
             except FileNotFoundError:
                 continue
             except OSError as exc:
@@ -2145,7 +2177,7 @@ def _secure_tree_usage(
                     )
                 continue
             if stat.S_ISDIR(info.st_mode):
-                stack.append(Path(entry.path))
+                stack.append(_absolute_storage_path(entry.path))
             elif stat.S_ISREG(info.st_mode):
                 total += info.st_size
                 if total > maximum_bytes:
@@ -2471,6 +2503,13 @@ class _GitRunner:
             "filter.lfs.required=false",
             "-c",
             "core.fsmonitor=false",
+            "-c",
+            # The repository path policy permits paths beyond Win32 MAX_PATH.
+            # Keep every isolated Git invocation aligned with the extended-
+            # length syscall boundary used by the Python materializer.
+            "core.longpaths=true",
+            "-c",
+            "maintenance.auto=false",
             "-c",
             "submodule.recurse=false",
             "-c",
@@ -2874,7 +2913,9 @@ class _GitRunner:
         _assert_secure_directory(parent, "Git output parent")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
         try:
-            descriptor = os.open(output_path, flags, 0o600)
+            descriptor = os.open(
+                _absolute_storage_path(output_path), flags, 0o600
+            )
             output_handle = os.fdopen(descriptor, "w+b")
         except OSError as exc:
             raise RepositorySecurityError("could not create bounded Git output") from exc
@@ -2916,6 +2957,7 @@ class _RepositoryClosure:
     base_source_digest: str
     head_source_digest: str
     source_digest: str
+    gitlink_paths: Tuple[str, ...]
     materialized_files: Tuple[Tuple[str, int, bytes, str], ...]
     materialized_bytes: int
     raw_object_bytes: int
@@ -3042,10 +3084,14 @@ def _parse_tree(obj: _GitObject, object_format: str) -> Tuple[_TreeEntry, ...]:
         elif mode == 0o040000:
             object_type = "tree"
             sort_key = name_bytes + b"/"
+        elif mode == 0o160000:
+            # A submodule entry is an opaque commit identity in the parent
+            # repository.  Its commit object belongs to another repository
+            # and is intentionally not fetched, materialized, or executed.
+            object_type = "gitlink"
+            sort_key = name_bytes + b"\0"
         elif mode == 0o120000:
             raise RepositoryPolicyError("symlink mode 120000 is rejected")
-        elif mode == 0o160000:
-            raise RepositoryPolicyError("submodule/gitlink mode 160000 is rejected")
         else:
             raise RepositoryPolicyError("tree contains a non-regular Git mode")
         folded = unicodedata.normalize("NFC", name).casefold()
@@ -3160,9 +3206,9 @@ def _closure_from_objects(
                 )
             reachable.add(oid)
             if expected_type == "tree":
-                pending.extend(
-                    (entry.oid, entry.object_type) for entry in tree_data(oid)
-                )
+                for entry in tree_data(oid):
+                    if entry.object_type != "gitlink":
+                        pending.append((entry.oid, entry.object_type))
         return reachable
 
     all_commits = reachable_commits((base_revision, head_revision))
@@ -3203,7 +3249,8 @@ def _closure_from_objects(
             else:
                 max_depth = max(max_depth, 1)
                 max_bytes = max(max_bytes, component_size)
-                _check_blob_policy(canonical[entry.oid].raw, entry.name)
+                if entry.object_type == "blob":
+                    _check_blob_policy(canonical[entry.oid].raw, entry.name)
         depth_stack.remove(oid)
         if max_depth > MAX_PATH_DEPTH or max_bytes > MAX_PATH_BYTES:
             raise RepositoryLimitError("repository tree exceeds fixed path policy")
@@ -3213,6 +3260,7 @@ def _closure_from_objects(
     tree_extent(base_tree)
     tree_extent(head_tree)
     materialized: List[Tuple[str, int, bytes, str]] = []
+    gitlink_paths: List[str] = []
     materialized_bytes = 0
     materialized_entries = 0
     materialized_folded: Set[str] = set()
@@ -3231,10 +3279,13 @@ def _closure_from_objects(
             folded = unicodedata.normalize("NFC", path).casefold()
             if folded in materialized_folded:
                 raise RepositoryPolicyError("head tree has a path collision")
+            materialized_folded.add(folded)
             if entry.object_type == "tree":
                 enumerate_tree(entry.oid, parts)
                 continue
-            materialized_folded.add(folded)
+            if entry.object_type == "gitlink":
+                gitlink_paths.append(path)
+                continue
             blob = canonical[entry.oid].raw
             _check_blob_policy(blob, entry.name)
             materialized_bytes += len(blob)
@@ -3245,6 +3296,7 @@ def _closure_from_objects(
             materialized.append((path, entry.mode, blob, entry.oid))
 
     enumerate_tree(head_tree, ())
+    gitlink_paths.sort(key=lambda item: item.encode("utf-8"))
     materialized.sort(key=lambda item: item[0].encode("utf-8"))
     return _RepositoryClosure(
         object_format=object_format,
@@ -3256,6 +3308,7 @@ def _closure_from_objects(
         base_source_digest=_subset_digest(canonical, base_reachable),
         head_source_digest=_subset_digest(canonical, head_reachable),
         source_digest=_subset_digest(canonical, union_reachable),
+        gitlink_paths=tuple(gitlink_paths),
         materialized_files=tuple(materialized),
         materialized_bytes=materialized_bytes,
         raw_object_bytes=raw_object_bytes,
@@ -3280,12 +3333,13 @@ def _git_config_bytes(object_format: str, *, bare: bool) -> bytes:
 
 
 def _mkdir_exclusive(path: Path, mode: int = 0o700) -> None:
+    storage_path = _absolute_storage_path(path)
     try:
-        os.mkdir(path, mode)
+        os.mkdir(storage_path, mode)
     except OSError as exc:
         raise RepositorySecurityError("could not create repository directory safely") from exc
     try:
-        info = os.lstat(path)
+        info = os.lstat(storage_path)
     except OSError as exc:
         raise RepositorySecurityError("could not verify repository directory") from exc
     if _is_link_or_reparse(info) or not stat.S_ISDIR(info.st_mode):
@@ -3294,8 +3348,9 @@ def _mkdir_exclusive(path: Path, mode: int = 0o700) -> None:
 
 def _ensure_child_directory(parent: Path, name: str) -> Path:
     path = parent / name
+    storage_path = _absolute_storage_path(path)
     try:
-        info = os.lstat(path)
+        info = os.lstat(storage_path)
     except FileNotFoundError:
         _mkdir_exclusive(path)
         return path
@@ -3344,7 +3399,16 @@ def _write_loose_repository(
         cache_bytes += len(loose)
         if cache_bytes > MAX_CACHE_BYTES:
             raise RepositoryLimitError("loose object database exceeds cache byte budget")
-        _write_regular_file_exclusive(prefix / obj.oid[2:], loose, mode=0o444)
+        # Flush each immutable loose object before the containing repository
+        # directory is published.  Windows can otherwise expose the renamed
+        # cache directory before a just-created object entry is durably visible
+        # to the subsequent verification pass.
+        _write_regular_file_exclusive(
+            prefix / obj.oid[2:],
+            loose,
+            mode=0o444,
+            fsync=True,
+        )
     # The fixed metadata is also part of the on-disk cache budget.
     cache_bytes = _secure_tree_size(repository_path, MAX_CACHE_BYTES)
     if cache_bytes > MAX_CACHE_BYTES:
@@ -3415,19 +3479,22 @@ def _read_loose_repository(
     if cache_bytes > MAX_CACHE_BYTES:
         raise RepositoryLimitError("repository cache exceeds its fixed byte budget")
     try:
-        entries = sorted(os.scandir(objects_root), key=lambda entry: entry.name)
+        with os.scandir(_absolute_storage_path(objects_root)) as iterator:
+            entries = sorted(iterator, key=lambda entry: entry.name)
     except OSError as exc:
         raise RepositorySecurityError("could not enumerate canonical object database") from exc
     for entry in entries:
         try:
-            info = entry.stat(follow_symlinks=False)
+            info = os.lstat(_absolute_storage_path(entry.path))
         except OSError as exc:
             raise RepositorySecurityError("could not inspect canonical object database") from exc
         if _is_link_or_reparse(info) or not stat.S_ISDIR(info.st_mode):
             raise RepositorySecurityError("canonical object database contains unsafe node")
         if entry.name in {"info", "pack"}:
             try:
-                if any(os.scandir(entry.path)):
+                with os.scandir(_absolute_storage_path(entry.path)) as iterator:
+                    has_entries = next(iterator, None) is not None
+                if has_entries:
                     raise RepositoryPolicyError(
                         "alternates, packs, promisor metadata, or grafts are rejected"
                     )
@@ -3437,12 +3504,13 @@ def _read_loose_repository(
         if len(entry.name) != 2 or _HEX_RE.fullmatch(entry.name) is None:
             raise RepositoryIntegrityError("canonical object directory is malformed")
         try:
-            loose_entries = sorted(os.scandir(entry.path), key=lambda child: child.name)
+            with os.scandir(_absolute_storage_path(entry.path)) as iterator:
+                loose_entries = sorted(iterator, key=lambda child: child.name)
         except OSError as exc:
             raise RepositorySecurityError("could not enumerate loose objects") from exc
         for loose_entry in loose_entries:
             try:
-                loose_info = loose_entry.stat(follow_symlinks=False)
+                loose_info = os.lstat(_absolute_storage_path(loose_entry.path))
             except OSError as exc:
                 raise RepositorySecurityError("could not inspect loose object") from exc
             if _is_link_or_reparse(loose_info) or not stat.S_ISREG(loose_info.st_mode):
@@ -3452,7 +3520,7 @@ def _read_loose_repository(
             if len(oid) != expected_length or _HEX_RE.fullmatch(oid) is None:
                 raise RepositoryIntegrityError("loose object path is malformed")
             compressed = _read_regular_file(
-                Path(loose_entry.path),
+                objects_root / entry.name / loose_entry.name,
                 maximum=MAX_CACHE_BYTES,
                 context="loose Git object",
             )
@@ -3643,6 +3711,7 @@ def _fetch_quarantine(
         "--no-tags",
         "--no-recurse-submodules",
         "--no-write-fetch-head",
+        "--no-auto-maintenance",
         "--force",
     ])
     if not remote:
@@ -3817,7 +3886,12 @@ def _extract_quarantine_closure(
         batch_output = runner.tmp_root / ("batch-" + uuid.uuid4().hex)
         try:
             runner.run_to_file(
-                ["--git-dir", str(quarantine), "cat-file", "--batch"],
+                [
+                    "--git-dir",
+                    str(quarantine),
+                    "cat-file",
+                    "--batch",
+                ],
                 batch_output,
                 input_bytes=batch_input,
                 stdout_limit=MAX_CACHE_BYTES + MAX_GIT_STDOUT_BYTES,
@@ -4287,8 +4361,9 @@ def _remove_tree_windows(root: Path, target: Path) -> None:
     # lstat(follow_symlinks=False) checked, and reparse points are removed as
     # leaves rather than traversed.  The caller holds the controlled root
     # namespace and the target is always a direct child of it.
+    storage_target = _absolute_storage_path(target)
     try:
-        info = os.lstat(target)
+        info = os.lstat(storage_target)
     except FileNotFoundError:
         return
     except OSError as exc:
@@ -4296,41 +4371,41 @@ def _remove_tree_windows(root: Path, target: Path) -> None:
     if _is_link_or_reparse(info) or not stat.S_ISDIR(info.st_mode):
         try:
             if stat.S_ISREG(info.st_mode):
-                os.chmod(target, stat.S_IREAD | stat.S_IWRITE)
-            os.unlink(target)
+                os.chmod(storage_target, stat.S_IREAD | stat.S_IWRITE)
+            os.unlink(storage_target)
         except PermissionError:
-            os.rmdir(target)
+            os.rmdir(storage_target)
         except OSError as exc:
             raise RepositorySecurityError("could not remove controlled deletion leaf") from exc
         return
     try:
-        entries = list(os.scandir(target))
+        entries = list(os.scandir(storage_target))
     except OSError as exc:
         raise RepositorySecurityError("could not enumerate controlled deletion target") from exc
     for entry in entries:
         child = Path(entry.path)
         try:
-            child_info = entry.stat(follow_symlinks=False)
+            child_info = os.lstat(_absolute_storage_path(child))
         except OSError as exc:
             raise RepositorySecurityError("could not inspect controlled deletion node") from exc
         if _is_link_or_reparse(child_info) or not stat.S_ISDIR(child_info.st_mode):
             try:
                 if stat.S_ISREG(child_info.st_mode):
-                    os.chmod(child, stat.S_IREAD | stat.S_IWRITE)
-                os.unlink(child)
+                    os.chmod(_absolute_storage_path(child), stat.S_IREAD | stat.S_IWRITE)
+                os.unlink(_absolute_storage_path(child))
             except PermissionError:
-                os.rmdir(child)
+                os.rmdir(_absolute_storage_path(child))
         else:
             _remove_tree_windows(target, child)
     try:
-        os.rmdir(target)
+        os.rmdir(storage_target)
     except OSError as exc:
         raise RepositorySecurityError("could not remove controlled deletion directory") from exc
 
 
 def _remove_tree_safely(root: Path, target: Path) -> None:
     root, target = _validate_direct_child(root, target, "controlled deletion")
-    if not os.path.lexists(target):
+    if not os.path.lexists(_absolute_storage_path(target)):
         return
     if os.name == "nt":
         _remove_tree_windows(root, target)
@@ -4831,6 +4906,10 @@ def _tree_file_index(
             if entry.object_type == "tree":
                 visit(entry.oid, parts)
                 continue
+            if entry.object_type == "gitlink":
+                # A gitlink is a directory identity, not a readable blob in
+                # this parent-repository closure.
+                continue
             if path in files:
                 raise RepositoryIntegrityError(
                     "repository replay tree contains a duplicate path"
@@ -5038,10 +5117,11 @@ class RepositoryAcquisitionBinding(_JsonModel):
         )
         if canonical_redirects != tuple(sorted(set(canonical_redirects))):
             raise SchemaError("redirect_allowlist must be unique and sorted")
-        # Git cannot enforce an origin allowlist across redirects.  Official v1
-        # therefore binds an explicit empty allowlist and disables redirects.
+        # Git cannot enforce an origin allowlist across redirects.  The fixed
+        # isolation policy therefore binds an explicit empty allowlist and
+        # disables redirects.
         if canonical_redirects:
-            raise SchemaError("repository_isolation_v1 does not permit redirects")
+            raise SchemaError("repository isolation does not permit redirects")
 
     @classmethod
     def from_dict(cls, value: Any) -> "RepositoryAcquisitionBinding":
@@ -5351,7 +5431,7 @@ class WorkspaceManifest(_JsonModel):
 
 def _filesystem_identity(path: Path, context: str) -> Tuple[int, int]:
     try:
-        info = os.lstat(path)
+        info = os.lstat(_absolute_storage_path(path))
     except OSError as exc:
         raise RepositorySecurityError("%s is unavailable" % context) from exc
     if _is_link_or_reparse(info) or not stat.S_ISDIR(info.st_mode):
@@ -6164,7 +6244,13 @@ class RepositoryPreparer:
     ) -> None:
         try:
             result = runner.run(
-                ["--git-dir", str(git_dir), "cat-file", "-t", revision],
+                [
+                    "--git-dir",
+                    str(git_dir),
+                    "cat-file",
+                    "-t",
+                    revision,
+                ],
                 stdout_limit=64,
             )
         except _GitCommandFailure as exc:
@@ -6823,6 +6909,10 @@ class RepositoryPreparer:
 
     @staticmethod
     def _materialize_tree(workspace: Path, closure: _RepositoryClosure) -> None:
+        for relative in closure.gitlink_paths:
+            parent = workspace
+            for component in relative.split("/"):
+                parent = _ensure_child_directory(parent, component)
         for relative, mode, data, _blob_oid in closure.materialized_files:
             parts = relative.split("/")
             parent = workspace

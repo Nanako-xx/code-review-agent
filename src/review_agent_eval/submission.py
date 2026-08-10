@@ -29,6 +29,18 @@ from .models import (
 )
 
 
+def _storage_path(path: Path) -> Path:
+    """Use the extended-length namespace for Windows filesystem syscalls."""
+
+    raw = os.fspath(path)
+    if os.name != "nt" or raw.startswith("\\\\?\\"):
+        return Path(raw)
+    absolute = os.path.abspath(raw)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
 def empty_usage(*, elapsed_seconds: Any = None) -> SubmissionUsage:
     """Return an honest Usage object without estimating unavailable values."""
 
@@ -303,7 +315,7 @@ def trace_path_within_workspace(trace_ref: TraceRef, workspace: Path) -> Path:
             if part in {"", "."}:
                 continue
             current = current / part
-            info = os.lstat(current)
+            info = os.lstat(_storage_path(current))
             attributes = getattr(info, "st_file_attributes", 0)
             reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
             if stat.S_ISLNK(info.st_mode) or attributes & reparse:
@@ -355,7 +367,8 @@ def validate_submission_trace(
     while stack:
         current = stack.pop()
         try:
-            info = os.lstat(current)
+            storage_current = _storage_path(current)
+            info = os.lstat(storage_current)
         except OSError as exc:
             raise AgentAdapterError(
                 FailureCode.SCHEMA_MISMATCH,
@@ -379,7 +392,7 @@ def validate_submission_trace(
             )
         if stat.S_ISDIR(info.st_mode):
             try:
-                with os.scandir(current) as entries:
+                with os.scandir(storage_current) as entries:
                     for entry in entries:
                         if nodes + len(stack) >= 100_000:
                             raise AgentAdapterError(

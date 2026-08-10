@@ -122,6 +122,18 @@ ADAPTER_IDENTITY_MISMATCH = "runner_incompatible.adapter_identity_mismatch"
 _RUN_PLAN_SEAL_TOKEN = object()
 
 
+def _storage_path(path: Path) -> Path:
+    """Use the extended-length namespace for Windows filesystem syscalls."""
+
+    raw = os.fspath(path)
+    if os.name != "nt" or raw.startswith("\\\\?\\"):
+        return Path(raw)
+    absolute = os.path.abspath(raw)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
 class RunnerError(RuntimeError):
     """Base class for orchestration failures."""
 
@@ -1438,7 +1450,7 @@ def _capture_trace_summary(
                 expected_kind: str,
                 for_read: bool = False,
             ) -> Tuple[int, Tuple[Any, ...], str]:
-                before = os.lstat(path)
+                before = os.lstat(_storage_path(path))
                 _assert_safe_node(before, expected_kind=expected_kind)
                 access = file_read_attributes
                 flags = flag_open_reparse_point
@@ -1510,7 +1522,7 @@ def _capture_trace_summary(
 
             def _directory_names(path: Path) -> Tuple[str, ...]:
                 _verify_chain()
-                with os.scandir(path) as entries:
+                with os.scandir(_storage_path(path)) as entries:
                     names = tuple(sorted(entry.name for entry in entries))
                 _verify_chain()
                 if any(
@@ -1578,7 +1590,7 @@ def _capture_trace_summary(
                 names = _directory_names(frame[0])
                 for name in names:
                     child_path = frame[0] / name
-                    before = os.lstat(child_path)
+                    before = os.lstat(_storage_path(child_path))
                     child_kind = _assert_safe_node(before)
                     child_handle, child_info, child_final = _open_path(
                         child_path,

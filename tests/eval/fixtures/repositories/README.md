@@ -21,9 +21,11 @@ host checkout's Git configuration do not affect the resulting revisions.
 Fixture trees may contain regular files and directories only. Symlinks,
 reparse points, special files, VCS metadata components and nested repositories
 are rejected. Empty directories are not represented by Git. The fixed
-`repository_isolation_v1` policy also rejects Git symlink entries, gitlinks,
-submodules, LFS attributes/pointers, non-portable paths and case/NFC path
-collisions. Hooks, filters, LFS and submodule materialization are never run.
+The repository isolation policy also rejects Git symlink entries, LFS
+attributes/pointers, non-portable paths and case/NFC path collisions. Gitlinks
+and `.gitmodules` are retained as opaque parent-repository metadata; their
+submodule repositories are never fetched or materialized. Hooks, filters, and
+LFS are never run.
 
 Case authors first run the builder, then copy the returned full base/head
 object IDs into the canonical `EvalInput.repository` descriptor. Runtime

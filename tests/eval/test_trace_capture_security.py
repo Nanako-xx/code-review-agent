@@ -39,6 +39,37 @@ def _assert_fail_closed(result: Dict[str, Any], secret: bytes) -> None:
     assert encoded not in str(result)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path regression")
+def test_trace_capture_reads_extended_length_product_tree(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    trace_dir = workspace / "trace"
+    deep = trace_dir
+    index = 0
+    while len(str(deep / "events.jsonl")) < 270:
+        deep /= "deep%04d" % index
+        index += 1
+    trace_file = deep / "events.jsonl"
+    storage_file = Path("\\\\?\\" + os.path.abspath(trace_file))
+    storage_file.parent.mkdir(parents=True, exist_ok=True)
+    raw = b'{"event":"long-path"}\n'
+    storage_file.write_bytes(raw)
+    assert len(str(trace_file)) > 260
+
+    result = _capture(workspace, "trace")
+
+    assert result["captured"] is True
+    assert result["total_bytes"] == len(raw)
+    assert result["files"] == [
+        {
+            "path": trace_file.relative_to(workspace).as_posix(),
+            "size_bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "content_base64": base64.b64encode(raw).decode("ascii"),
+            "content_truncated": False,
+        }
+    ]
+
+
 def test_trace_capture_rejects_hard_link_to_file_outside_workspace(
     tmp_path: Path,
 ) -> None:

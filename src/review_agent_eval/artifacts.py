@@ -43,6 +43,7 @@ from .cases import (
     portable_repository_path,
 )
 from .config import (
+    EVAL_RUN_CONFIG_SCHEMA_VERSION,
     MAX_EVAL_RUN_CONFIG_BYTES,
     EvalRunConfig,
     EvaluatorExecutionConfig,
@@ -111,8 +112,13 @@ EVAL_RUN_EVALUATION_NAMESPACE_SCHEMA_VERSION = (
 
 MAX_RUN_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_TRIAL_MANIFEST_BYTES = 1024 * 1024
-MAX_STAGE_RECEIPT_BYTES = 2 * 1024 * 1024
 MAX_TRIAL_MATERIALIZATION_BYTES = 64 * 1024 * 1024
+# A PREPARE receipt intentionally repeats the materialization's complete
+# Agent-visible file inventory and TargetAccess grant so the commit marker is
+# independently verifiable.  Its byte budget therefore has to cover every
+# legal materialization plus a bounded receipt envelope; the former 2 MiB
+# limit rejected official repositories with large, otherwise valid trees.
+MAX_STAGE_RECEIPT_BYTES = MAX_TRIAL_MATERIALIZATION_BYTES + 2 * 1024 * 1024
 MAX_RUN_PREFLIGHT_BYTES = MAX_RUN_CASE_SNAPSHOT_BYTES
 MAX_PREFLIGHT_CANDIDATE_BYTES = MAX_RUN_CASE_SNAPSHOT_BYTES
 MAX_MANIFEST_TRIALS = 100_000
@@ -2309,6 +2315,45 @@ def _artifact_validation_projection(value: Any) -> Any:
     return payload
 
 
+def _allows_execution_profile_environment_refs(value: Any) -> bool:
+    """Allow only named environment references in a persisted Agent profile.
+
+    The profile records environment-variable *names* such as
+    ``REVIEW_AGENT_API_KEY`` as reproducibility identity.  It never contains
+    the corresponding secret value.  The generic artifact boundary normally
+    rejects keys named ``api_key_env``/``reviewer_api_key_env``; enable the
+    narrow exception only for a canonical Run config or Run report summary
+    whose Agent identity contains ``agent_execution_profile.profile``.
+    """
+
+    payload = value.to_dict() if isinstance(value, _JsonModel) else value
+    if not isinstance(payload, Mapping):
+        return False
+    schema_version = payload.get("schema_version")
+    if schema_version == EVAL_RUN_CONFIG_SCHEMA_VERSION:
+        agent = payload.get("agent")
+    else:
+        # Imported lazily because report.py intentionally imports ArtifactStore
+        # models from this module.
+        from .report import RUN_REPORT_SUMMARY_SCHEMA_VERSION
+
+        if schema_version != RUN_REPORT_SUMMARY_SCHEMA_VERSION:
+            return False
+        identity = payload.get("identity")
+        if not isinstance(identity, Mapping):
+            return False
+        agent = identity.get("agent")
+    if not isinstance(agent, Mapping):
+        return False
+    parameters = agent.get("parameters")
+    if not isinstance(parameters, Mapping):
+        return False
+    profile_binding = parameters.get("agent_execution_profile")
+    return isinstance(profile_binding, Mapping) and isinstance(
+        profile_binding.get("profile"), Mapping
+    )
+
+
 @dataclass(frozen=True)
 class TrialState:
     trial_id: str
@@ -2404,6 +2449,9 @@ def _canonical_payload_text(
         evaluator_context_policy=_evaluator_context_policy_for_payload(
             value,
             evaluator_context_policy,
+        ),
+        allow_execution_profile_environment_refs=(
+            _allows_execution_profile_environment_refs(value)
         ),
     )
     return canonical_json_bytes(value).decode("utf-8", "strict")
@@ -3943,6 +3991,9 @@ class ArtifactStore:
                 value,
                 evaluator_context_policy,
             ),
+            allow_execution_profile_environment_refs=(
+                _allows_execution_profile_environment_refs(value)
+            ),
         )
         return value
 
@@ -4011,6 +4062,9 @@ class ArtifactStore:
                 value,
                 evaluator_context_policy,
             ),
+            allow_execution_profile_environment_refs=(
+                _allows_execution_profile_environment_refs(value)
+            ),
         )
         data = canonical_json_bytes(value)
         if len(data) > min(self.max_file_bytes, maximum or self.max_file_bytes):
@@ -4066,7 +4120,11 @@ class ArtifactStore:
         if canonical_json_bytes(value) != data:
             raise ArtifactIntegrityError("orphan JSON artifact is not canonical")
         validate_safe_json(
-            _artifact_validation_projection(value), "artifact"
+            _artifact_validation_projection(value),
+            "artifact",
+            allow_execution_profile_environment_refs=(
+                _allows_execution_profile_environment_refs(value)
+            ),
         )
         return value, self._artifact_ref(run_id, path, data)
 
@@ -7731,6 +7789,12 @@ class ArtifactStore:
         directory = self._target(run_id, base)
         names = self._run_evaluation_directory_entries(directory)
         if not names:
+            raise ArtifactStateError("Run evaluation namespace is not committed")
+        if names == frozenset({"report.md"}):
+            # summary.json is the create-last Run-level commit marker.  An
+            # exact orphan report is intentionally resumable by
+            # write_run_evaluation; callers probing the committed fast path
+            # must therefore treat this state as uncommitted, not corrupt.
             raise ArtifactStateError("Run evaluation namespace is not committed")
         if names != _RUN_EVALUATION_FILENAMES:
             raise ArtifactIntegrityError(

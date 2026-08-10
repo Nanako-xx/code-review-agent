@@ -1143,6 +1143,36 @@ def _review_context_payload(content: Any) -> Dict[str, Any]:
     return payload
 
 
+def _expected_truth_finding_payload(claim: str) -> Dict[str, Any]:
+    return {
+        "truth_id": "truth-expected-001",
+        "claim": claim,
+        "severity": None,
+        "category": "Code Defect",
+        "required": True,
+        "metric_authority": {
+            "severity_scorable": False,
+            "severity_authority": None,
+            "location_scorable": False,
+            "location_authority": None,
+        },
+        "locations": [],
+        "evidence_anchors": [],
+        "required_context_level": "diff",
+        "rationale": "Source-bound evaluator truth",
+    }
+
+
+def _known_invalid_truth_finding_payload(claim: str) -> Dict[str, Any]:
+    return {
+        "truth_id": "truth-invalid-001",
+        "claim": claim,
+        "category": "Code Defect",
+        "locations": [],
+        "rationale": "Source-bound evaluator truth",
+    }
+
+
 def _judge_input_context_payload(content: Any) -> Dict[str, Any]:
     return {
         "schema_version": "eval_judge_input_artifact_v1",
@@ -1205,6 +1235,55 @@ def test_safe_json_typed_evaluator_context_is_artifact_and_path_scoped(
         validate_safe_json(payload)
 
     validate_safe_json(payload, evaluator_context_policy=policy)
+
+
+@pytest.mark.parametrize(
+    ("collection", "finding_factory"),
+    [
+        ("expected_truth_findings", _expected_truth_finding_payload),
+        ("known_invalid_truth_findings", _known_invalid_truth_finding_payload),
+    ],
+)
+def test_review_policy_allows_env_like_source_truth_claims(
+    collection: str,
+    finding_factory: Any,
+) -> None:
+    payload = _review_context_payload("ordinary context")
+    payload[collection] = [finding_factory(_ENV_LIKE_CODE_CONTEXT)]
+
+    with pytest.raises(SchemaError, match="full environment dump"):
+        validate_safe_json(payload)
+
+    validate_safe_json(payload, evaluator_context_policy="review_matches")
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "count = len(items)\napi_key=ordinary-secret",
+        "<think>private intermediate steps</think>",
+    ],
+)
+def test_review_truth_claim_exception_still_rejects_sensitive_text(
+    claim: str,
+) -> None:
+    payload = _review_context_payload("ordinary context")
+    payload["expected_truth_findings"] = [
+        _expected_truth_finding_payload(claim)
+    ]
+
+    with pytest.raises(SchemaError):
+        validate_safe_json(payload, evaluator_context_policy="review_matches")
+
+
+def test_review_truth_claim_exception_requires_exact_finding_shape() -> None:
+    payload = _review_context_payload("ordinary context")
+    finding = _expected_truth_finding_payload(_ENV_LIKE_CODE_CONTEXT)
+    finding["unexpected"] = "field"
+    payload["expected_truth_findings"] = [finding]
+
+    with pytest.raises(SchemaError, match="full environment dump"):
+        validate_safe_json(payload, evaluator_context_policy="review_matches")
 
 
 def test_evaluator_context_policy_rejects_review_bypass_and_invalid_bindings() -> None:

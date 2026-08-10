@@ -182,7 +182,6 @@ def replay_with_files(
         ("src/app.py\x00tail", LocationMatchReason.GENERATED_PATH_NUL),
         ("src/app.py\n", LocationMatchReason.GENERATED_PATH_CONTROL),
         ("src/.GiT/config", LocationMatchReason.GENERATED_PATH_VCS_METADATA),
-        ("src/.gitmodules", LocationMatchReason.GENERATED_PATH_VCS_METADATA),
         ("a" * 256, LocationMatchReason.GENERATED_PATH_COMPONENT_TOO_LONG),
         ("/".join(("a",) * 65), LocationMatchReason.GENERATED_PATH_TOO_DEEP),
         ("/".join(("a" * 200,) * 6), LocationMatchReason.GENERATED_PATH_TOO_LONG),
@@ -195,6 +194,11 @@ def test_generated_path_reasons_classify_shared_policy_rejections(
         normalize_generated_path(path)
 
     assert captured.value.reason is reason
+
+
+def test_gitmodules_is_a_valid_parent_repository_path() -> None:
+    assert normalize_generated_path(".gitmodules") == ".gitmodules"
+    assert normalize_generated_path("deps/.gitmodules") == "deps/.gitmodules"
 
 
 @pytest.mark.parametrize(
@@ -756,7 +760,7 @@ def test_policy_is_versioned_validated_and_has_stable_identity() -> None:
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"version": "location_match_policy_v2"},
+        {"version": "location_match_policy_v1"},
         {"max_line_distance": -1},
         {"max_line_distance": MAX_CONFIGURED_LINE_DISTANCE + 1},
         {"max_line_distance": True},

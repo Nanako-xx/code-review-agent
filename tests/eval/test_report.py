@@ -45,7 +45,7 @@ from tests.eval.test_metrics import (
     _score_completed,
     _score_sources,
 )
-from tests.eval.test_config import run_config
+from tests.eval.test_config import agent_config, run_config
 from tests.eval.test_review_evaluator import _run_scripted_judge
 
 
@@ -134,6 +134,67 @@ def test_summary_round_trip_is_sealed_and_source_bound() -> None:
             eval_cases=(case,),
             trial_sources=sources,
         )
+
+
+def test_summary_allows_frozen_agent_profile_environment_references() -> None:
+    case, snapshot, replay = _case_and_snapshot()
+    _same_case, _same_replay, execution, _default_config = _score_sources()
+    config = run_config(
+        snapshot,
+        agent=agent_config(
+            parameters={
+                "agent_execution_profile": {
+                    "profile": {
+                        "execution": {
+                            "memory_curator": {
+                                "api_key_env": "REVIEW_AGENT_API_KEY",
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        evaluator=execution.evaluator,
+        trial_count=1,
+    )
+    submission, intent_result, review_result, score = _score_completed(
+        case,
+        replay,
+        execution,
+        config,
+        1,
+    )
+    source = TrialEvaluationSource(
+        eval_case=case,
+        submission=submission,
+        intent_result=intent_result,
+        review_result=review_result,
+        trial_score=score,
+    )
+
+    builder = ReportBuilder()
+    summary = builder.build_summary(
+        config,
+        execution,
+        "metrics-eval-v1",
+        eval_cases=(case,),
+        trial_sources=(source,),
+    )
+    profile = summary.identity["agent"]["parameters"]["agent_execution_profile"]
+    assert (
+        profile["profile"]["execution"]["memory_curator"]["api_key_env"]
+        == "REVIEW_AGENT_API_KEY"
+    )
+    hydrated = RunReportSummary.from_json(
+        summary.to_json(),
+        builder=builder,
+        run_config=config,
+        evaluator_execution=execution,
+        evaluation_revision="metrics-eval-v1",
+        eval_cases=(case,),
+        trial_sources=(source,),
+    )
+    assert hydrated.to_json() == summary.to_json()
 
 
 def test_summary_keeps_planned_terminal_and_score_coverage_distinct() -> None:

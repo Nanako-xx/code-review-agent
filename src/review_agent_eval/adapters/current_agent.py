@@ -172,6 +172,18 @@ class _CurrentArtifactError(_CurrentAdapterError):
     pass
 
 
+def _storage_path(path: Path) -> Path:
+    """Use the extended-length namespace for Windows filesystem syscalls."""
+
+    raw = os.fspath(path)
+    if os.name != "nt" or raw.startswith("\\\\?\\"):
+        return Path(raw)
+    absolute = os.path.abspath(raw)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
 @dataclass(frozen=True)
 class _CurrentAdapterConfiguration:
     command: Tuple[str, ...]
@@ -433,7 +445,8 @@ def _load_session(
 
 def _read_bounded_regular_file(path: Path, maximum: int, context: str) -> bytes:
     try:
-        before = os.lstat(path)
+        storage_path = _storage_path(path)
+        before = os.lstat(storage_path)
         if (
             not stat.S_ISREG(before.st_mode)
             or stat.S_ISLNK(before.st_mode)
@@ -442,7 +455,7 @@ def _read_bounded_regular_file(path: Path, maximum: int, context: str) -> bytes:
             or before.st_size > maximum
         ):
             raise _CurrentArtifactError("%s is not a bounded regular file" % context)
-        with path.open("rb") as handle:
+        with storage_path.open("rb") as handle:
             data = handle.read(maximum + 1)
             after = os.fstat(handle.fileno())
         if (

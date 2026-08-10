@@ -26,6 +26,7 @@ from review_agent_eval.artifacts import (
     RunStatus,
     StageName,
     StageReceipt,
+    TargetAccess,
     TrialMaterializationManifest,
     TrialManifest,
     derive_receipt_id,
@@ -54,7 +55,9 @@ from review_agent_eval.models import (
 )
 
 from .test_config import (
+    _expected_truth_finding_payload,
     _judge_input_context_payload,
+    _known_invalid_truth_finding_payload,
     _model_turn_context_block_payload,
     _review_context_payload,
     adapter_capabilities,
@@ -1778,6 +1781,61 @@ def test_stage_receipt_create_bounds_input_iterables(
     assert consumed == [0, 1, 2]
 
 
+def test_prepare_receipt_accepts_large_legal_agent_file_inventory():
+    # The AACR smoke repository contains 16,426 visible files.  Exercise the
+    # same scale while keeping paths synthetic and filesystem-independent.
+    visible_files = tuple(
+        AgentVisibleFileBinding(
+            role="repository_file",
+            relative_path="target/repository/src/file-%05d.cs" % index,
+            size_bytes=1,
+            sha256="0" * 64,
+        )
+        for index in range(14_000)
+    )
+    materialization_ref = ArtifactRef(
+        relative_path=(
+            "cases/case-large/trials/trial-large/materializations/"
+            "attempt-0001/materialization_manifest.json"
+        ),
+        size_bytes=1,
+        sha256="1" * 64,
+    )
+    input_ref = ArtifactRef(
+        relative_path="cases/case-large/trials/trial-large/input.json",
+        size_bytes=1,
+        sha256="2" * 64,
+    )
+    materialization_id = "materialization-" + "3" * 64
+
+    receipt = StageReceipt.create(
+        run_id="run-" + "0" * 64,
+        task_id="task-001",
+        trial_id="trial-" + "0" * 64,
+        stage=StageName.PREPARE,
+        config_digest="4" * 64,
+        artifacts=(input_ref, materialization_ref),
+        attempt=1,
+        materialization_manifest=materialization_ref,
+        materialization_manifest_digest=materialization_ref.sha256,
+        materialization_id=materialization_id,
+        eval_input_digest="5" * 64,
+        review_target_digest="6" * 64,
+        prepared_source_id="prepared-repository-001",
+        agent_visible_files=visible_files,
+        adapter_capabilities_digest="7" * 64,
+        target_access=TargetAccess(
+            target_materialization_id=materialization_id,
+            readable_relative_paths=("target/repository",),
+        ),
+    )
+    encoded = canonical_json_bytes(receipt)
+
+    assert len(encoded) > 2 * 1024 * 1024
+    assert len(encoded) <= artifact_module.MAX_STAGE_RECEIPT_BYTES
+    assert StageReceipt.from_json(encoded) == receipt
+
+
 def test_materialization_schema_and_persisted_content_drift_fail_closed(tmp_path):
     store, config, _, plan, _trial = make_store(tmp_path)
     running = store.start_trial(config.run_id, TASK_ID, plan.trial_id)
@@ -2637,6 +2695,44 @@ def test_evaluation_typed_context_artifacts_round_trip_env_like_code(tmp_path):
     assert bundle.judge_output == output_payload
 
 
+def test_evaluation_truth_claims_round_trip_env_like_code(tmp_path):
+    store, config, _, plan, _ = make_store(tmp_path)
+    complete_trial(store, config, plan)
+    execution = EvaluatorExecutionConfig.from_resource_budgets(
+        evaluator_config(), config.resource_budgets
+    )
+    content = "width = Math.Abs(value)\nfrac = value / width"
+    review_payload = _review_context_payload("ordinary context")
+    review_payload["expected_truth_findings"] = [
+        _expected_truth_finding_payload(content)
+    ]
+    review_payload["known_invalid_truth_findings"] = [
+        _known_invalid_truth_finding_payload(content)
+    ]
+
+    receipt = store.write_evaluation(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        evaluator_execution=execution,
+        revision="typed-truth-claim-round-trip",
+        intent_matches={},
+        review_matches=review_payload,
+        judge_input=_judge_input_context_payload("ordinary context"),
+        judge_output=_model_turn_context_block_payload("ordinary context"),
+        score={"total": 1},
+    )
+    assert receipt.evaluation_id is not None
+
+    bundle = store.load_evaluation_bundle(
+        config.run_id,
+        TASK_ID,
+        plan.trial_id,
+        receipt.evaluation_id,
+    )
+    assert bundle.review_matches == review_payload
+
+
 def _safe_evaluation_context_payloads() -> dict:
     return {
         "review_matches": _review_context_payload("ordinary context"),
@@ -2865,6 +2961,59 @@ def test_artifacts_reject_secrets_userinfo_env_and_hidden_reasoning(tmp_path, pa
     with pytest.raises(SchemaError):
         store._write_json(config.run_id, "auxiliary/unsafe.json", payload)
     assert not (store.root / config.run_id / "auxiliary" / "unsafe.json").exists()
+
+
+def test_artifact_boundary_allows_profile_environment_refs_in_run_summary(
+    tmp_path,
+):
+    store, config, _, _, _ = make_store(tmp_path)
+    profile = {
+        "identity": {
+            "agent": {
+                "parameters": {
+                    "agent_execution_profile": {
+                        "profile": {
+                            "execution": {
+                                "memory_curator": {
+                                    "api_key_env": "REVIEW_AGENT_API_KEY",
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    summary = {
+        "schema_version": "eval_run_report_summary_v1",
+        **profile,
+    }
+
+    ref = store._write_json(
+        config.run_id,
+        "auxiliary/summary-profile.json",
+        summary,
+    )
+    assert store._read_json(
+        store.root / config.run_id / "auxiliary" / "summary-profile.json",
+        expected=ref,
+    ) == summary
+    assert artifact_module._canonical_payload_text(
+        summary,
+        "Run evaluation summary",
+    ) == canonical_json_bytes(summary).decode("utf-8")
+
+    with pytest.raises(SchemaError):
+        store._write_json(
+            config.run_id,
+            "auxiliary/untyped-profile.json",
+            {"schema_version": "untyped", **profile},
+        )
+    with pytest.raises(SchemaError):
+        artifact_module._canonical_payload_text(
+            {"schema_version": "untyped", **profile},
+            "untyped artifact",
+        )
 
 
 @pytest.mark.parametrize(
