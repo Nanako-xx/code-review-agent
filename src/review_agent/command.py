@@ -890,42 +890,24 @@ def _add_risk_model_arguments_v6(parser: argparse.ArgumentParser) -> None:
 def review_execution_profile_from_arguments(
     review_arguments: Sequence[str],
     *,
-    memory_mode: str,
-    memory_root: Path,
+    memory_mode: str | None = None,
+    memory_root: Path | None = None,
 ) -> AgentExecutionProfile:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--reviewer-provider",
-        choices=["none", "fake", "openai-compatible"],
-        default="none",
-    )
-    parser.add_argument("--reviewer-model")
-    parser.add_argument("--reviewer-base-url")
-    parser.add_argument("--reviewer-api-key-env", default="REVIEW_AGENT_API_KEY")
-    parser.add_argument("--reviewer-mode", choices=["single", "multi"], default="single")
-    parser.add_argument(
-        "--reviewer-loop",
-        choices=["single-shot", "agent-loop"],
-        default="single-shot",
-    )
-    parser.add_argument("--non-interactive", action="store_true")
-    _add_review_memory_arguments(parser)
-    for stage in (
-        "risk-assessor",
-        "portfolio-planner",
-        "semantic-reconciler",
-        "memory-curator",
-    ):
-        _add_model_stage_arguments(parser, stage)
-    parsed = parser.parse_args(
+    del memory_mode, memory_root
+    parsed = _build_parser().parse_args(
         [
+            "review",
+            "--base=" + ("0" * 40),
+            "--head=" + ("1" * 40),
+            "--external-review-id=execution-profile",
+            "--workspace-root=.",
             *review_arguments,
-            "--memory-mode=" + memory_mode,
-            "--memory-root=" + str(memory_root),
         ]
     )
-    return AgentExecutionProfile.from_execution(
-        resolve_review_execution_config(parsed)
+    config = _product_runtime_config_v6(parsed)
+    return AgentExecutionProfile.from_product_configuration(
+        reviewer=config.reviewer,
+        risk=config.risk,
     )
 
 

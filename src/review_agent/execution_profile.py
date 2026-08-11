@@ -7,66 +7,56 @@ import json
 from types import MappingProxyType
 from typing import Any
 
-from review_agent.completion import COMPLETION_POLICY_VERSION
-from review_agent.context import (
-    REVIEWER_TOOL_NAMES_V2,
-    reviewer_protocol_projection,
-    reviewer_tool_schemas_v2,
+from review_agent.aggregation import AGGREGATION_RECORD_SCHEMA
+from review_agent.context import REVIEWER_TOOL_NAMES_V2, reviewer_tool_schemas_v2
+from review_agent.context_window import (
+    COMPACTION_SYSTEM_PROMPT,
+    COMPACTION_USER_PROMPT,
+    ContextWindowPolicy,
 )
-from review_agent.intent_inference import (
-    INTENT_INFERENCE_MAX_TOOL_CALLS,
-    INTENT_INFERENCE_MAX_TURNS,
-    intent_inference_protocol_projection,
-)
-from review_agent.memory_curator import MEMORY_CURATOR_SYSTEM_PROMPT
 from review_agent.model_adapter import (
     DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
     provider_transport_projection,
 )
-from review_agent.model_risk import RISK_MODEL_SYSTEM_PROMPT
-from review_agent.models import ReviewProfile, RiskLevel
-from review_agent.portfolio import PORTFOLIO_PLANNER_SYSTEM_PROMPT
-from review_agent.reconciler import (
-    RECONCILIATION_POLICY_VERSION,
-    SEMANTIC_RECONCILER_SYSTEM_PROMPT,
-)
-from review_agent.review_contract import REVIEW_CONTRACT_VALIDATION_VERSION
-from review_agent.session import (
-    ReviewExecutionConfig,
-    reviewer_runtime_limits_v2_to_dict,
-    review_execution_config_to_dict,
-)
-from review_agent.tool_gateway import (
-    DEFAULT_TOOL_TIMEOUT_SECONDS,
-    tool_gateway_limits_projection,
-)
+from review_agent.model_adapter_factory import ModelAdapterConfig
+from review_agent.model_risk import RISK_MODEL_SYSTEM_PROMPT_V2
 from review_agent.review_context import DiffFitPolicy
+from review_agent.review_pipeline import REVIEWER_EXECUTION_RECORD_SCHEMA
+from review_agent.review_planning import fixed_reviewer_slots
 from review_agent.review_policy import (
+    DEFAULT_DEVELOPER_REVIEW_POLICY,
     DeveloperReviewPolicy,
     build_reviewer_system_prompt,
 )
+from review_agent.review_protocol import RiskLevel
+from review_agent.reviewer_output import REVIEWER_OUTPUT_JSON_SCHEMA_V2
+from review_agent.reviewer_runtime import ReviewerRuntimeLimitsV2
+from review_agent.session import SESSION_V6_PHASES, SESSION_V6_SCHEMA_VERSION
+from review_agent.tool_artifacts import (
+    MAX_ARTIFACT_PAGE_CHARS,
+    ToolResultLimits,
+)
 
 
-AGENT_EXECUTION_PROFILE_SCHEMA_VERSION = "agent_execution_profile_v1"
-PRODUCT_ORCHESTRATION_MARGIN_SECONDS = 300.0
+AGENT_EXECUTION_PROFILE_SCHEMA_VERSION = "agent_execution_profile_v2"
 REVIEWER_EXECUTION_PROFILE_V2_SCHEMA = "reviewer_execution_profile_v2"
+PRODUCT_ORCHESTRATION_MARGIN_SECONDS = 300.0
 
 
 def _text_sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def stage_prompt_digests() -> dict[str, str]:
-    return {
-        "risk_assessor": _text_sha256(RISK_MODEL_SYSTEM_PROMPT),
-        "portfolio_planner": _text_sha256(
-            PORTFOLIO_PLANNER_SYSTEM_PROMPT
-        ),
-        "semantic_reconciler": _text_sha256(
-            SEMANTIC_RECONCILER_SYSTEM_PROMPT
-        ),
-        "memory_curator": _text_sha256(MEMORY_CURATOR_SYSTEM_PROMPT),
-    }
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def reviewer_execution_profile_v2(
@@ -74,8 +64,6 @@ def reviewer_execution_profile_v2(
     *,
     diff_fit_policy: DiffFitPolicy | None = None,
 ) -> dict[str, Any]:
-    """Return the v6 Reviewer product identity without v5 character budgets."""
-
     if not isinstance(policy, DeveloperReviewPolicy):
         raise TypeError("policy must be DeveloperReviewPolicy")
     fit = diff_fit_policy or DiffFitPolicy()
@@ -83,24 +71,20 @@ def reviewer_execution_profile_v2(
         raise TypeError("diff_fit_policy must be DiffFitPolicy")
     system = build_reviewer_system_prompt(policy)
     tools = reviewer_tool_schemas_v2(REVIEWER_TOOL_NAMES_V2)
-    runtime_limits = reviewer_runtime_limits_v2_to_dict()
+    runtime = ReviewerRuntimeLimitsV2()
     return {
         "schema_version": REVIEWER_EXECUTION_PROFILE_V2_SCHEMA,
         "invocation_inputs": ["system", "tools", "messages", "parameters"],
         "developer_policy_sha256": policy.digest(),
         "reviewer_system_prompt_sha256": _text_sha256(system),
-        "tool_catalog_sha256": hashlib.sha256(
-            json.dumps(
-                list(tools),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest(),
+        "tool_catalog_sha256": _canonical_sha256(list(tools)),
         "tool_names": list(REVIEWER_TOOL_NAMES_V2),
         "diff_fit_policy": fit.to_dict(),
-        "runtime_limits": runtime_limits,
-        "global_memory": "immutable_snapshot_projection",
+        "runtime_limits": {
+            "max_elapsed_seconds": runtime.max_elapsed_seconds,
+            "max_provider_attempts": runtime.max_provider_attempts,
+            "tool_timeout_seconds": runtime.tool_timeout_seconds,
+        },
         "invocation_defaults": {
             "reasoning_effort": "medium",
             "temperature": 0,
@@ -108,6 +92,116 @@ def reviewer_execution_profile_v2(
             "response_schema": "reviewer_output_v2",
         },
     }
+
+
+def _adapter_projection(config: ModelAdapterConfig) -> dict[str, Any]:
+    if not isinstance(config, ModelAdapterConfig):
+        raise TypeError("adapter configuration must be ModelAdapterConfig")
+    return {
+        "provider": config.provider_name or "none",
+        "model": config.model,
+        "base_url": config.base_url,
+        "api_key_env": config.api_key_env,
+        "timeout_seconds": config.timeout_seconds,
+        "max_response_bytes": config.max_response_bytes,
+    }
+
+
+def _slot_projection() -> dict[str, list[dict[str, str]]]:
+    return {
+        level.value: [
+            {
+                "slot_id": slot.slot_id,
+                "role": slot.role,
+                "role_kind": slot.role_kind.value,
+            }
+            for slot in fixed_reviewer_slots(level)
+        ]
+        for level in RiskLevel
+    }
+
+
+def _product_protocol_projection(
+    policy: DeveloperReviewPolicy,
+) -> dict[str, Any]:
+    return {
+        "session": {
+            "schema_version": SESSION_V6_SCHEMA_VERSION,
+            "phases": [phase.value for phase in SESSION_V6_PHASES],
+        },
+        "diff_artifact": {
+            "patch_schema": "diff_artifact_patch_v1",
+            "index_schema": "diff_artifact_index_v1",
+            "full_patch_persisted": True,
+            "truncated_excerpt_fields": [],
+        },
+        "intent": {
+            "schema": "intent_packet_v2_minimal",
+            "fields": ["goal", "source", "uncertainties"],
+            "sources": ["explicit", "inferred", None],
+        },
+        "risk": {
+            "schema": "risk_decision_v2",
+            "fields": ["level"],
+            "levels": [level.value for level in RiskLevel],
+            "model_prompt_sha256": _text_sha256(RISK_MODEL_SYSTEM_PROMPT_V2),
+            "runtime_merge": "max_deterministic_and_model",
+        },
+        "review_planning": {
+            "slot_policy": "fixed_by_final_risk_v1",
+            "slots": _slot_projection(),
+        },
+        "reviewer_output": {
+            "schema": "reviewer_output_v2",
+            "top_level_fields": ["findings", "uncertainties"],
+            "finding_fields": [
+                "claim",
+                "severity",
+                "path",
+                "line",
+                "suggestion",
+            ],
+            "json_schema_sha256": _canonical_sha256(
+                REVIEWER_OUTPUT_JSON_SCHEMA_V2
+            ),
+        },
+        "aggregation": {
+            "record_schema": AGGREGATION_RECORD_SCHEMA,
+            "reviewer_record_schema": REVIEWER_EXECUTION_RECORD_SCHEMA,
+            "review_result_schema": "review_result_v1",
+            "review_result_fields": [
+                "pr_id",
+                "snapshot_id",
+                "status",
+                "risk_level",
+                "findings",
+                "uncertainties",
+            ],
+            "merge_policy": "exact_normalized_issue_identity_v1",
+            "model_calls": 0,
+        },
+        "developer_policy_sha256": policy.digest(),
+    }
+
+
+def _minimum_outer_timeout_seconds(
+    reviewer: ModelAdapterConfig,
+    risk: ModelAdapterConfig | None,
+) -> float:
+    reviewer_seconds = (
+        0.0
+        if (reviewer.provider_name or "none") == "none"
+        else ReviewerRuntimeLimitsV2().max_elapsed_seconds
+    )
+    risk_seconds = 0.0
+    if risk is not None and (risk.provider_name or "none") != "none":
+        attempt_seconds = (
+            DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS
+            if risk.timeout_seconds is None
+            else float(risk.timeout_seconds)
+        )
+        risk_seconds = 3.0 * attempt_seconds
+    return reviewer_seconds + risk_seconds + PRODUCT_ORCHESTRATION_MARGIN_SECONDS
 
 
 def _freeze_json(value: Any) -> Any:
@@ -130,102 +224,62 @@ def _thaw_json(value: Any) -> Any:
     return value
 
 
-def _minimum_outer_timeout_seconds(
-    execution: ReviewExecutionConfig,
-    profiles: Mapping[str, Mapping[str, Any]],
-) -> float:
-    stage_seconds = sum(
-        stage.max_elapsed_seconds
-        for stage in (
-            execution.risk_assessor,
-            execution.portfolio_planner,
-            execution.semantic_reconciler,
-            execution.memory_curator,
-        )
-        if stage.mode == "model"
-    )
-    initial_review_seconds = (
-        max(
-            float(profile["max_elapsed_seconds"])
-            * (
-                int(profile["reviewer_count"])
-                if execution.reviewer_mode == "single"
-                else 1
-            )
-            for profile in profiles.values()
-        )
-        if execution.reviewer_provider != "none"
-        else 0.0
-    )
-    intent_inference_seconds = (
-        INTENT_INFERENCE_MAX_TURNS
-        * DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS
-        if execution.reviewer_provider == "openai-compatible"
-        else 0.0
-    )
-    intent_tool_seconds = (
-        INTENT_INFERENCE_MAX_TOOL_CALLS * DEFAULT_TOOL_TIMEOUT_SECONDS
-        if execution.reviewer_provider != "none"
-        else 0.0
-    )
-    return float(
-        stage_seconds
-        + intent_inference_seconds
-        + intent_tool_seconds
-        + initial_review_seconds
-        + execution.supplemental_policy.max_elapsed_seconds
-        + PRODUCT_ORCHESTRATION_MARGIN_SECONDS
-    )
-
-
 @dataclass(frozen=True)
 class AgentExecutionProfile:
     payload: Mapping[str, Any]
 
     @classmethod
-    def from_execution(
+    def from_product_configuration(
         cls,
-        execution: ReviewExecutionConfig,
+        *,
+        reviewer: ModelAdapterConfig,
+        risk: ModelAdapterConfig | None,
+        policy: DeveloperReviewPolicy = DEFAULT_DEVELOPER_REVIEW_POLICY,
     ) -> "AgentExecutionProfile":
-        if not isinstance(execution, ReviewExecutionConfig):
-            raise TypeError("execution must be ReviewExecutionConfig")
-        execution_payload = review_execution_config_to_dict(execution)
-        memory = execution_payload["memory"]
-        if memory is not None:
-            memory = dict(memory)
-            memory.pop("root_path")
-            memory["root_binding"] = "trial_private"
-            execution_payload["memory"] = memory
-        profiles = {
-            risk.value: asdict(ReviewProfile.for_risk(risk))
-            for risk in RiskLevel
-        }
+        if not isinstance(reviewer, ModelAdapterConfig):
+            raise TypeError("reviewer must be ModelAdapterConfig")
+        if risk is not None and not isinstance(risk, ModelAdapterConfig):
+            raise TypeError("risk must be ModelAdapterConfig or null")
+        if not isinstance(policy, DeveloperReviewPolicy):
+            raise TypeError("policy must be DeveloperReviewPolicy")
+        tool_limits = ToolResultLimits()
+        context_policy = ContextWindowPolicy()
         return cls(
             _freeze_json(
                 {
                     "schema_version": AGENT_EXECUTION_PROFILE_SCHEMA_VERSION,
-                    "execution": execution_payload,
-                    "risk_profiles": profiles,
-                    "reviewer_protocol": reviewer_protocol_projection(),
-                    "intent_protocol": intent_inference_protocol_projection(),
-                    "tool_gateway_limits": tool_gateway_limits_projection(),
+                    "configuration": {
+                        "reviewer": _adapter_projection(reviewer),
+                        "risk": (
+                            None if risk is None else _adapter_projection(risk)
+                        ),
+                    },
+                    "product_protocol": _product_protocol_projection(policy),
+                    "reviewer_execution": reviewer_execution_profile_v2(policy),
+                    "tool_result_policy": {
+                        **asdict(tool_limits),
+                        "max_artifact_page_chars": MAX_ARTIFACT_PAGE_CHARS,
+                    },
+                    "context_window_policy": {
+                        **asdict(context_policy),
+                        "compaction_system_prompt_sha256": _text_sha256(
+                            COMPACTION_SYSTEM_PROMPT
+                        ),
+                        "compaction_user_prompt_sha256": _text_sha256(
+                            COMPACTION_USER_PROMPT
+                        ),
+                    },
                     "provider_transport": provider_transport_projection(),
-                    "stage_prompt_sha256": stage_prompt_digests(),
-                    "review_contract_version": (
-                        REVIEW_CONTRACT_VALIDATION_VERSION
-                    ),
-                    "reconciliation_policy_version": (
-                        RECONCILIATION_POLICY_VERSION
-                    ),
-                    "completion_policy_version": COMPLETION_POLICY_VERSION,
-                    "minimum_outer_timeout_seconds": (
-                        _minimum_outer_timeout_seconds(execution, profiles)
+                    "minimum_outer_timeout_seconds": _minimum_outer_timeout_seconds(
+                        reviewer,
+                        risk,
                     ),
                     "capabilities": {
                         "shell": "unavailable",
                         "network": "provider_only",
                         "repository": "read_only",
-                        "run_safe_check": "unavailable",
+                        "edit": "unavailable",
+                        "write": "unavailable",
                     },
                 }
             )
@@ -237,16 +291,12 @@ class AgentExecutionProfile:
             raise ValueError("execution profile must be a JSON object")
         expected = {
             "schema_version",
-            "execution",
-            "risk_profiles",
-            "reviewer_protocol",
-            "intent_protocol",
-            "tool_gateway_limits",
+            "configuration",
+            "product_protocol",
+            "reviewer_execution",
+            "tool_result_policy",
+            "context_window_policy",
             "provider_transport",
-            "stage_prompt_sha256",
-            "review_contract_version",
-            "reconciliation_policy_version",
-            "completion_policy_version",
             "minimum_outer_timeout_seconds",
             "capabilities",
         }
@@ -254,17 +304,22 @@ class AgentExecutionProfile:
             raise ValueError("execution profile fields are not canonical")
         if value["schema_version"] != AGENT_EXECUTION_PROFILE_SCHEMA_VERSION:
             raise ValueError("execution profile schema is unsupported")
-        return cls(_freeze_json(value))
+        profile = cls(_freeze_json(value))
+        if profile.to_dict() != _thaw_json(value):
+            raise ValueError("execution profile is not canonical JSON data")
+        return profile
 
     def to_dict(self) -> dict[str, Any]:
         return _thaw_json(self.payload)
 
     def digest(self) -> str:
-        return hashlib.sha256(
-            json.dumps(
-                self.to_dict(),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        return _canonical_sha256(self.to_dict())
+
+
+__all__ = [
+    "AGENT_EXECUTION_PROFILE_SCHEMA_VERSION",
+    "AgentExecutionProfile",
+    "PRODUCT_ORCHESTRATION_MARGIN_SECONDS",
+    "REVIEWER_EXECUTION_PROFILE_V2_SCHEMA",
+    "reviewer_execution_profile_v2",
+]

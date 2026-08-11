@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from review_agent.artifacts import artifact_schema
 from review_agent.brief import ReviewBrief
+from review_agent.diff_artifact import DiffArtifact, DiffArtifactStore
 from review_agent.execution_profile import AgentExecutionProfile
 from review_agent.hydration import (
     clarification_questions_from_dict,
@@ -32,9 +33,21 @@ from review_agent.models import (
     IntentSource as ProductIntentSource,
 )
 from review_agent.observations import Observation, ObservationStore
+from review_agent.pr_workspace import PRWorkspaceStore, SessionWorkspace
+from review_agent.review_protocol import (
+    FindingSeverity as ProductFindingSeverityV2,
+    IntentSource as ProductIntentSourceV2,
+    IntentVersionEnvelope,
+    ReviewResult as ProductReviewResultV2,
+)
+from review_agent.revision import RevisionResolver, canonical_repository_identity
 from review_agent.run_state import RunPhase, RunStatus
-from review_agent.session import SESSION_SCHEMA_VERSION, SessionManifest
-from review_agent.session_store import SessionStore
+from review_agent.session import (
+    SESSION_SCHEMA_VERSION,
+    PhaseStatus,
+    SessionManifest,
+)
+from review_agent.session_store import SessionStore, SessionV6Store
 
 from ..clarification import (
     UNANSWERED_CLARIFICATION_CONTINUE,
@@ -52,12 +65,14 @@ from ..models import (
     ClarificationAction,
     EvalInput,
     EvalSubmission,
+    DiffSide,
     EvidenceKind,
     FailureCode,
     FindingSeverity,
     IntentClaimSource,
     IntentDimension,
     IntentResult,
+    MAX_EVIDENCE_EXCERPT_BYTES,
     ReviewTargetKind,
     RepositoryDiffEvidenceSource,
     RepositoryFileEvidenceSource,
@@ -96,7 +111,7 @@ from .subprocess_agent import (
 
 
 CURRENT_AGENT_ADAPTER_KIND = "current-agent-cli-v2"
-CURRENT_AGENT_ADAPTER_VERSION = "2"
+CURRENT_AGENT_ADAPTER_VERSION = "3"
 
 
 def current_agent_capabilities() -> AdapterCapabilitiesV2:
@@ -129,7 +144,6 @@ _ADAPTER_FIELDS = frozenset(
         "command",
         "review_arguments",
         "environment_allowlist",
-        "memory_mode",
     }
 )
 _ENVIRONMENT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -157,6 +171,11 @@ _FORBIDDEN_REVIEW_ARGUMENTS = frozenset(
         "--project-rule",
         "--ci-evidence",
         "--ci-evidence-file",
+        "--external-review-id",
+        "--workspace-root",
+        "--format",
+        "--reviewer-mode",
+        "--reviewer-loop",
         "--memory-mode",
         "--memory-root",
         "--non-interactive",
@@ -189,7 +208,6 @@ class _CurrentAdapterConfiguration:
     command: Tuple[str, ...]
     review_arguments: Tuple[str, ...]
     environment_allowlist: Tuple[str, ...]
-    memory_mode: str
     agent_snapshot_digest: str
     execution_profile: AgentExecutionProfile
     execution_profile_digest: str
@@ -233,15 +251,6 @@ def _configuration(config: AgentRunConfig) -> _CurrentAdapterConfiguration:
         require_absolute=False,
         allow_empty=True,
     )
-    loop_arguments = [
-        argument
-        for argument in review_arguments
-        if argument.startswith("--reviewer-loop")
-    ]
-    if loop_arguments != ["--reviewer-loop=agent-loop"]:
-        raise _CurrentAdapterError(
-            "current Agent must use exactly one frozen agent-loop argument"
-        )
     for argument in review_arguments:
         option = argument.split("=", 1)[0]
         ci_file_abbreviation = (
@@ -268,9 +277,6 @@ def _configuration(config: AgentRunConfig) -> _CurrentAdapterConfiguration:
             raise _CurrentAdapterError("adapter environment key is duplicated")
         seen.add(folded)
         environment.append(item)
-    memory_mode = raw["memory_mode"]
-    if memory_mode not in {"off", "read", "read-write"}:
-        raise _CurrentAdapterError("current Agent memory mode is invalid")
     if snapshot.digest() != digest:
         raise _CurrentAdapterError("current Agent snapshot changed during validation")
     profile_binding = snapshot.parameters.get("agent_execution_profile")
@@ -297,11 +303,20 @@ def _configuration(config: AgentRunConfig) -> _CurrentAdapterConfiguration:
         raise _CurrentAdapterError(
             "current Agent execution profile digest is invalid"
         )
+    from review_agent.command import review_execution_profile_from_arguments
+
+    expected_profile = review_execution_profile_from_arguments(review_arguments)
+    if (
+        expected_profile.digest() != execution_profile.digest()
+        or expected_profile.to_dict() != execution_profile.to_dict()
+    ):
+        raise AgentAdapterIncompatibleError(
+            AdapterIncompatibilityReason.EXECUTION_PROFILE_MISMATCH
+        )
     return _CurrentAdapterConfiguration(
         command=command,
         review_arguments=review_arguments,
         environment_allowlist=tuple(environment),
-        memory_mode=memory_mode,
         agent_snapshot_digest=digest,
         execution_profile=execution_profile,
         execution_profile_digest=execution_profile_digest,
@@ -525,6 +540,199 @@ def _load_registered_json(
     if hashlib.sha256(data).hexdigest() != descriptor.sha256:
         raise _CurrentArtifactError("current Agent artifact changed after validation")
     return _strict_json_object(data, name)
+
+
+@dataclass(frozen=True)
+class _CurrentV6Run:
+    runtime_root: Path
+    workspace_store: PRWorkspaceStore
+    session: SessionWorkspace
+    review_result: ProductReviewResultV2
+    diff: DiffArtifact
+    intent: IntentVersionEnvelope
+
+
+def _single_managed_directory(
+    parent: Path,
+    pattern: re.Pattern[str],
+    context: str,
+) -> Path:
+    try:
+        parent_info = os.lstat(parent)
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or stat.S_ISLNK(parent_info.st_mode)
+            or getattr(parent_info, "st_file_attributes", 0) & _REPARSE_POINT
+        ):
+            raise _CurrentArtifactError(f"{context} root is unsafe")
+        values: list[Path] = []
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                info = os.lstat(entry.path)
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0) & _REPARSE_POINT
+                    or pattern.fullmatch(entry.name) is None
+                ):
+                    raise _CurrentArtifactError(
+                        f"{context} contains an unsafe entry"
+                    )
+                values.append(Path(entry.path))
+    except _CurrentArtifactError:
+        raise
+    except OSError as error:
+        raise _CurrentArtifactError(f"{context} is unavailable") from error
+    if len(values) != 1:
+        raise _CurrentArtifactError(
+            f"{context} must contain exactly one directory"
+        )
+    return values[0]
+
+
+def _discover_v6_run(
+    *,
+    runtime_root: Path,
+    workspace: Path,
+    eval_input: EvalInput,
+    stdout: bytes,
+) -> _CurrentV6Run:
+    product_workspace = _single_managed_directory(
+        runtime_root / "pr",
+        re.compile(r"p-[0-9a-f]{32}"),
+        "current Agent PRWorkspace catalog",
+    )
+    snapshot_path = _single_managed_directory(
+        product_workspace / "Snapshots",
+        re.compile(r"s-[0-9a-f]{32}"),
+        "current Agent Snapshot catalog",
+    )
+    session_path = _single_managed_directory(
+        product_workspace / "Sessions",
+        re.compile(r"u-[0-9a-f]{32}"),
+        "current Agent Session catalog",
+    )
+    pr_payload = _strict_json_object(
+        _read_bounded_regular_file(
+            product_workspace / "PR" / "pr.json",
+            _MAX_PRODUCT_JSON_BYTES,
+            "current Agent PR metadata",
+        ),
+        "current Agent PR metadata",
+    )
+    snapshot_payload = _strict_json_object(
+        _read_bounded_regular_file(
+            snapshot_path / "snapshot.json",
+            _MAX_PRODUCT_JSON_BYTES,
+            "current Agent Snapshot manifest",
+        ),
+        "current Agent Snapshot manifest",
+    )
+    session_payload = _strict_json_object(
+        _read_bounded_regular_file(
+            session_path / "state.json",
+            _MAX_PRODUCT_JSON_BYTES,
+            "current Agent Session binding",
+        ),
+        "current Agent Session binding",
+    )
+    if (
+        pr_payload.get("provider") != "cli"
+        or pr_payload.get("pr_number_or_external_review_id") != eval_input.task_id
+        or snapshot_payload.get("pr_id") != pr_payload.get("pr_id")
+        or session_payload.get("pr_id") != pr_payload.get("pr_id")
+        or session_payload.get("snapshot_id") != snapshot_payload.get("snapshot_id")
+    ):
+        raise _CurrentArtifactError(
+            "current Agent PRWorkspace locator binding is invalid"
+        )
+    try:
+        store = PRWorkspaceStore(runtime_root)
+        session = store.open_session(
+            pr_id=pr_payload["pr_id"],
+            snapshot_id=snapshot_payload["snapshot_id"],
+            session_id=session_payload["session_id"],
+        )
+        repository_identity = canonical_repository_identity(
+            RevisionResolver().repository_identity(workspace)
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise _CurrentArtifactError(
+            "current Agent PRWorkspace cannot be opened"
+        ) from error
+    repository = repository_from_eval_input(eval_input)
+    if (
+        session.workspace.resolved_pr.repository != repository_identity
+        or session.snapshot.base_sha != repository.base_revision
+        or session.snapshot.head_sha != repository.head_revision
+    ):
+        raise _CurrentArtifactError(
+            "current Agent Snapshot authority does not match the Trial"
+        )
+    try:
+        manifest = SessionV6Store(store, session).load()
+    except (TypeError, ValueError) as error:
+        raise _CurrentArtifactError(
+            "current Agent Session v6 manifest is invalid"
+        ) from error
+    if (
+        manifest.status is not RunStatus.COMPLETED
+        or any(
+            checkpoint.status is not PhaseStatus.COMPLETED
+            for checkpoint in manifest.phases.values()
+        )
+    ):
+        raise _CurrentArtifactError(
+            "current Agent Session v6 is not terminal-completed"
+        )
+    try:
+        bundle = store.load_review_result_bundle(session.snapshot)
+        if bundle is None:
+            raise ValueError("missing ReviewResult")
+        review_result = ProductReviewResultV2.from_json(
+            bundle.review_result_bytes
+        )
+    except (TypeError, ValueError) as error:
+        raise _CurrentArtifactError(
+            "current Agent ReviewResult is invalid"
+        ) from error
+    if (
+        review_result.pr_id != session.workspace.pr_id
+        or review_result.snapshot_id != session.snapshot.snapshot_id
+        or stdout != bundle.review_result_bytes + b"\n"
+    ):
+        raise _CurrentArtifactError(
+            "current Agent public output or ReviewResult binding changed"
+        )
+    try:
+        diff = DiffArtifactStore(store).load(session.snapshot)
+        intent_ref = next(
+            item
+            for item in manifest.phases["intent"].artifacts
+            if item.logical_name == "intent.packet"
+        )
+        intent = IntentVersionEnvelope.from_json(
+            store.read_verified_artifact(
+                session.snapshot,
+                intent_ref.artifact_id,
+            )
+        )
+    except (StopIteration, TypeError, ValueError) as error:
+        raise _CurrentArtifactError(
+            "current Agent Intent or DiffArtifact is invalid"
+        ) from error
+    if intent.source_snapshot_id != session.snapshot.snapshot_id:
+        raise _CurrentArtifactError(
+            "current Agent Intent Snapshot binding changed"
+        )
+    return _CurrentV6Run(
+        runtime_root=runtime_root,
+        workspace_store=store,
+        session=session,
+        review_result=review_result,
+        diff=diff,
+        intent=intent,
+    )
 
 
 _FIELD_TO_DIMENSION = {
@@ -902,7 +1110,7 @@ def _initial_argv(
     adapter: _CurrentAdapterConfiguration,
     eval_input: EvalInput,
     workspace: Path,
-    memory_root: Path,
+    runtime_root: Path,
     ci_evidence_file: Optional[str] = None,
 ) -> List[str]:
     target = eval_input.review_target
@@ -917,8 +1125,9 @@ def _initial_argv(
         "--repo=" + str(workspace),
         "--base=" + repository.base_revision,
         "--head=" + repository.head_revision,
-        "--memory-mode=" + adapter.memory_mode,
-        "--memory-root=" + str(memory_root),
+        "--external-review-id=" + eval_input.task_id,
+        "--workspace-root=" + str(runtime_root),
+        "--format=json",
     ]
     for option, value in (
         ("--title=", request.title),
@@ -984,6 +1193,217 @@ class CurrentAgentAdapter:
         return AdapterCompatibility(unsupported=frozenset())
 
     def run(
+        self,
+        eval_input: EvalInput,
+        workspace: Path,
+        config: AgentRunConfig,
+        clarification_channel: ClarificationChannel,
+        *,
+        target_access: TargetAccess,
+        target_materialization_id: str,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> EvalSubmission:
+        return self._run_v6(
+            eval_input,
+            workspace,
+            config,
+            clarification_channel,
+            target_access=target_access,
+            target_materialization_id=target_materialization_id,
+            cancel_event=cancel_event,
+        )
+
+    def _run_v6(
+        self,
+        eval_input: EvalInput,
+        workspace: Path,
+        config: AgentRunConfig,
+        clarification_channel: ClarificationChannel,
+        *,
+        target_access: TargetAccess,
+        target_materialization_id: str,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> EvalSubmission:
+        del clarification_channel
+        if (
+            not isinstance(eval_input, EvalInput)
+            or not isinstance(config, AgentRunConfig)
+            or eval_input.task_id != config.task_id
+            or eval_input.digest() != config.eval_input_digest
+        ):
+            raise AgentAdapterError(
+                FailureCode.SCHEMA_MISMATCH,
+                "current Agent invocation does not match its Trial binding",
+                retryable=False,
+            )
+        started = time.monotonic()
+        try:
+            if not isinstance(workspace, Path):
+                raise _CurrentAdapterError("current Agent workspace is invalid")
+            if not isinstance(target_access, TargetAccess):
+                raise _CurrentAdapterError(
+                    "current Agent TargetAccess is invalid"
+                )
+            if target_access.target_materialization_id != target_materialization_id:
+                raise _CurrentAdapterError(
+                    "current Agent TargetAccess identity drifted"
+                )
+            resolved_workspace = workspace.resolve(strict=True)
+            if not resolved_workspace.is_dir():
+                raise _CurrentAdapterError(
+                    "current Agent workspace is not a directory"
+                )
+            adapter = _configuration(config)
+            if not self.compatibility(eval_input, config).compatible:
+                raise _CurrentAdapterError(
+                    "current Agent input is incompatible with the product CLI"
+                )
+            runtime_root = resolved_workspace / ".ra-v6"
+            if os.path.lexists(runtime_root):
+                raise _CurrentAdapterError(
+                    "current Agent requires a fresh private v6 Runtime root"
+                )
+            ci_evidence_file = _write_ci_evidence_bundle(
+                resolved_workspace,
+                eval_input,
+            )
+            environment = build_subprocess_environment(
+                adapter.environment_allowlist
+            )
+            result = self._invoke(
+                _initial_argv(
+                    adapter,
+                    eval_input,
+                    resolved_workspace,
+                    runtime_root,
+                    ci_evidence_file,
+                ),
+                stdin_bytes=b"",
+                workspace=resolved_workspace,
+                environment=environment,
+                deadline=started + float(config.timeout_seconds),
+                remaining_output=config.max_output_bytes,
+                cancel_event=cancel_event,
+            )
+            if result.failure_code is not None:
+                return _failure(
+                    eval_input=eval_input,
+                    config=config,
+                    target_materialization_id=target_materialization_id,
+                    code=result.failure_code,
+                    elapsed=time.monotonic() - started,
+                    retryable=result.failure_code
+                    in {FailureCode.TIMEOUT, FailureCode.PROCESS_KILLED},
+                )
+            if result.returncode not in (None, 0):
+                code = (
+                    FailureCode.PROCESS_KILLED
+                    if returncode_was_killed(result.returncode)
+                    else FailureCode.NON_ZERO_EXIT
+                )
+                return _failure(
+                    eval_input=eval_input,
+                    config=config,
+                    target_materialization_id=target_materialization_id,
+                    code=code,
+                    elapsed=time.monotonic() - started,
+                    retryable=code is FailureCode.PROCESS_KILLED,
+                )
+            if result.returncode is None:
+                return _failure(
+                    eval_input=eval_input,
+                    config=config,
+                    target_materialization_id=target_materialization_id,
+                    code=FailureCode.UNKNOWN,
+                    elapsed=time.monotonic() - started,
+                    retryable=True,
+                )
+            run = _discover_v6_run(
+                runtime_root=runtime_root,
+                workspace=resolved_workspace,
+                eval_input=eval_input,
+                stdout=result.stdout,
+            )
+            intent = _submission_intent_v6(run.intent)
+            findings, evidence = _findings_and_evidence_v6(
+                run=run,
+                eval_input=eval_input,
+                target_materialization_id=target_materialization_id,
+            )
+            trace_ref = TraceRef(
+                type=TraceType.LOCAL_PATH,
+                value=runtime_root.relative_to(resolved_workspace).as_posix(),
+            )
+            submission = EvalSubmission(
+                schema_version=EVAL_SUBMISSION_SCHEMA_VERSION,
+                task_id=eval_input.task_id,
+                agent_id=config.agent_id,
+                trial_id=config.trial_id,
+                eval_input_digest=config.eval_input_digest,
+                target_materialization_id=target_materialization_id,
+                status=SubmissionStatus.COMPLETED,
+                intent=intent,
+                review=SubmissionReview(
+                    findings=findings,
+                    uncertainties=run.review_result.uncertainties,
+                ),
+                evidence=evidence,
+                usage=empty_usage(
+                    elapsed_seconds=max(0.0, time.monotonic() - started)
+                ),
+                trace_ref=trace_ref,
+                failure=None,
+            )
+            return validate_submission_trace(
+                submission,
+                workspace=resolved_workspace,
+                max_trace_bytes=config.max_trace_bytes,
+            )
+        except AgentAdapterIncompatibleError:
+            raise
+        except AgentAdapterError as error:
+            return _failure(
+                eval_input=eval_input,
+                config=config,
+                target_materialization_id=target_materialization_id,
+                code=(
+                    error.code
+                    if error.code
+                    in {FailureCode.OUTPUT_OVERFLOW, FailureCode.SCHEMA_MISMATCH}
+                    else FailureCode.ADAPTER_ERROR
+                ),
+                elapsed=time.monotonic() - started,
+                retryable=error.retryable,
+            )
+        except _CurrentArtifactError:
+            return _failure(
+                eval_input=eval_input,
+                config=config,
+                target_materialization_id=target_materialization_id,
+                code=FailureCode.SCHEMA_MISMATCH,
+                elapsed=time.monotonic() - started,
+                retryable=False,
+            )
+        except _CurrentAdapterError:
+            return _failure(
+                eval_input=eval_input,
+                config=config,
+                target_materialization_id=target_materialization_id,
+                code=FailureCode.ADAPTER_ERROR,
+                elapsed=time.monotonic() - started,
+                retryable=False,
+            )
+        except Exception:
+            return _failure(
+                eval_input=eval_input,
+                config=config,
+                target_materialization_id=target_materialization_id,
+                code=FailureCode.SCHEMA_MISMATCH,
+                elapsed=time.monotonic() - started,
+                retryable=False,
+            )
+
+    def _run_legacy(
         self,
         eval_input: EvalInput,
         workspace: Path,
@@ -1458,6 +1878,172 @@ def _stable_unique_text(*groups: Iterable[str]) -> tuple[str, ...]:
                 seen.add(value)
                 result.append(value)
     return tuple(result)
+
+
+def _submission_intent_v6(
+    envelope: IntentVersionEnvelope,
+) -> SubmissionIntent:
+    packet = envelope.packet
+    if packet.goal is None:
+        status = IntentResult.INSUFFICIENT
+        claims: tuple[SubmissionIntentClaim, ...] = ()
+    else:
+        status = (
+            IntentResult.SUFFICIENT
+            if packet.source is ProductIntentSourceV2.EXPLICIT
+            else IntentResult.PARTIAL
+        )
+        source = (
+            IntentClaimSource.EXPLICIT
+            if packet.source is ProductIntentSourceV2.EXPLICIT
+            else IntentClaimSource.INFERRED
+        )
+        claims = (
+            SubmissionIntentClaim(
+                claim_id=stable_id(
+                    "intent-goal",
+                    envelope.source_snapshot_id,
+                    packet.goal,
+                ),
+                dimension=IntentDimension.GOAL,
+                text=packet.goal,
+                source=source,
+            ),
+        )
+    return SubmissionIntent(
+        status=status,
+        goal=packet.goal,
+        acceptance_criteria=(),
+        scope=(),
+        constraints=(),
+        claims=claims,
+        clarification_questions=(),
+        uncertainties=packet.uncertainties,
+    )
+
+
+def _fit_diff_excerpt(raw: bytes, *, line: int, new_start: int) -> str:
+    if len(raw) <= MAX_EVIDENCE_EXCERPT_BYTES:
+        try:
+            return raw.decode("utf-8", "strict")
+        except UnicodeError as error:
+            raise _CurrentArtifactError(
+                "current Agent Diff hunk is not UTF-8"
+            ) from error
+    lines = raw.splitlines(keepends=True)
+    target_index = 0
+    current = new_start
+    for index, value in enumerate(lines):
+        if value.startswith((b"+", b" ")) and not value.startswith(b"+++"):
+            if current == line:
+                target_index = index
+                break
+            current += 1
+    start = max(0, target_index - 100)
+    end = min(len(lines), target_index + 101)
+    selected = b"".join(lines[start:end])
+    prefix = b"...[earlier diff lines omitted]...\n" if start else b""
+    suffix = b"\n...[later diff lines omitted]..." if end < len(lines) else b""
+    budget = MAX_EVIDENCE_EXCERPT_BYTES - len(prefix) - len(suffix)
+    selected = selected[: max(0, budget)]
+    while selected:
+        try:
+            text = selected.decode("utf-8", "strict")
+            break
+        except UnicodeDecodeError as error:
+            selected = selected[: error.start]
+    else:
+        text = ""
+    return prefix.decode("ascii") + text + suffix.decode("ascii")
+
+
+def _findings_and_evidence_v6(
+    *,
+    run: _CurrentV6Run,
+    eval_input: EvalInput,
+    target_materialization_id: str,
+) -> tuple[tuple[SubmissionFinding, ...], tuple[SubmissionEvidence, ...]]:
+    repository = repository_from_eval_input(eval_input)
+    diff_store = DiffArtifactStore(run.workspace_store)
+    findings: list[SubmissionFinding] = []
+    evidence: list[SubmissionEvidence] = []
+    severity_mapping = {
+        ProductFindingSeverityV2.LOW: FindingSeverity.LOW,
+        ProductFindingSeverityV2.MEDIUM: FindingSeverity.MEDIUM,
+        ProductFindingSeverityV2.HIGH: FindingSeverity.HIGH,
+        ProductFindingSeverityV2.BLOCKER: FindingSeverity.CRITICAL,
+    }
+    for finding in run.review_result.findings:
+        file_match = next(
+            (
+                (file_index, file_entry)
+                for file_index, file_entry in enumerate(run.diff.index.files)
+                if file_entry.path == finding.path
+            ),
+            None,
+        )
+        if file_match is None:
+            raise _CurrentArtifactError(
+                "current Agent Finding path is outside DiffArtifact"
+            )
+        file_index, file_entry = file_match
+        hunk_match = next(
+            (
+                (hunk_index, hunk)
+                for hunk_index, hunk in enumerate(file_entry.hunks)
+                if hunk.new_count > 0
+                and hunk.new_start
+                <= finding.line
+                < hunk.new_start + hunk.new_count
+            ),
+            None,
+        )
+        if hunk_match is None:
+            raise _CurrentArtifactError(
+                "current Agent Finding line is outside DiffArtifact"
+            )
+        hunk_index, hunk = hunk_match
+        excerpt = _fit_diff_excerpt(
+            diff_store.read_hunk(run.diff, file_index, hunk_index),
+            line=finding.line,
+            new_start=hunk.new_start,
+        )
+        excerpt_hash = hashlib.sha256(excerpt.encode("utf-8")).hexdigest()
+        evidence_id = stable_id(
+            "diff-evidence",
+            finding.finding_id,
+            finding.path,
+            finding.line,
+            excerpt_hash,
+        )
+        evidence.append(
+            SubmissionEvidence(
+                evidence_id=evidence_id,
+                source=RepositoryDiffEvidenceSource(
+                    kind=EvidenceKind.REPOSITORY_DIFF,
+                    target_materialization_id=target_materialization_id,
+                    base_revision=repository.base_revision,
+                    head_revision=repository.head_revision,
+                    path=finding.path,
+                ),
+                content_hash=excerpt_hash,
+                excerpt=excerpt,
+            )
+        )
+        findings.append(
+            SubmissionFinding(
+                finding_id=finding.finding_id,
+                claim=finding.claim,
+                severity=severity_mapping[finding.severity],
+                path=finding.path,
+                side=DiffSide.RIGHT,
+                from_line=finding.line,
+                to_line=finding.line,
+                evidence_refs=(evidence_id,),
+                suggested_action=finding.suggestion,
+            )
+        )
+    return tuple(findings), tuple(evidence)
 
 
 def _intent_from_brief(
