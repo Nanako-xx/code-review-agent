@@ -14,6 +14,9 @@ from review_agent.repository_intelligence import (
     repository_intelligence_to_dict,
     search_repository_text,
     summarize_repository_intelligence,
+    build_changed_symbols_v2,
+    changed_symbols_cache_key,
+    changed_symbols_v2_to_dict,
 )
 from review_agent.revision import RevisionResolver
 
@@ -335,3 +338,125 @@ def test_repository_intelligence_rejects_mismatched_repository_namespace(
             cache_backend=RepositoryKnowledgeCache(None, mode=MemoryMode.OFF),
             repository_key="f" * 64,
         )
+
+
+def test_changed_symbols_v2_records_analyzer_configuration_and_language_coverage(
+    git_repo: Path,
+) -> None:
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "app.py").write_text(
+        "def add(a, b):\n    return a + b + 1\n",
+        encoding="utf-8",
+    )
+    (git_repo / "web.ts").write_text(
+        "export const value = 1;\n",
+        encoding="utf-8",
+    )
+    run_git(git_repo, "add", "app.py", "web.ts")
+    run_git(git_repo, "commit", "-m", "change two languages")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    result = build_changed_symbols_v2(
+        git_repo,
+        snapshot_id="S-" + "a" * 64,
+        base_sha=base,
+        head_sha=head,
+        changed_files=["app.py", "web.ts"],
+        analyzer_version="python-ast-v-test",
+        analysis_configuration={"feature_version": "runtime"},
+    )
+
+    assert result.snapshot_id == "S-" + "a" * 64
+    assert result.analyzer == "python-ast"
+    assert result.analyzer_version == "python-ast-v-test"
+    assert {item.language: item.status for item in result.language_coverage} == {
+        "python": "covered",
+        "typescript": "not_analyzed",
+    }
+    assert result.symbols
+    symbol = result.symbols[0]
+    assert symbol.analyzer == "python-ast"
+    assert symbol.analyzer_version == "python-ast-v-test"
+    assert symbol.analysis_configuration == '{"feature_version":"runtime"}'
+    assert symbol.language_coverage == "covered"
+    payload = changed_symbols_v2_to_dict(result)
+    assert payload["symbols"][0]["analyzer"] == "python-ast"
+    assert payload["symbols"][0]["language_coverage"] == "covered"
+
+
+def test_changed_symbols_v2_does_not_claim_python_coverage_after_parse_failure(
+    git_repo: Path,
+) -> None:
+    (git_repo / "broken.py").write_text(
+        "def value():\n    return 1\n",
+        encoding="utf-8",
+    )
+    run_git(git_repo, "add", "broken.py")
+    run_git(git_repo, "commit", "-m", "valid python")
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    (git_repo / "broken.py").write_text("def value(:\n", encoding="utf-8")
+    run_git(git_repo, "add", "broken.py")
+    run_git(git_repo, "commit", "-m", "broken python")
+    head = run_git(git_repo, "rev-parse", "HEAD")
+
+    result = build_changed_symbols_v2(
+        git_repo,
+        snapshot_id="S-" + "b" * 64,
+        base_sha=base,
+        head_sha=head,
+        changed_files=["broken.py"],
+    )
+
+    assert result.symbols == ()
+    assert [(item.language, item.status) for item in result.language_coverage] == [
+        ("python", "partial")
+    ]
+
+
+def test_changed_symbols_cache_key_binds_revisions_analyzer_and_configuration() -> None:
+    baseline = changed_symbols_cache_key(
+        repository_key="a" * 64,
+        base_sha="b" * 40,
+        head_sha="c" * 40,
+        analyzer="python-ast",
+        analyzer_version="v1",
+        analysis_configuration={"feature_version": "runtime"},
+    )
+
+    variants = {
+        changed_symbols_cache_key(
+            repository_key="a" * 64,
+            base_sha="d" * 40,
+            head_sha="c" * 40,
+            analyzer="python-ast",
+            analyzer_version="v1",
+            analysis_configuration={"feature_version": "runtime"},
+        ),
+        changed_symbols_cache_key(
+            repository_key="a" * 64,
+            base_sha="b" * 40,
+            head_sha="d" * 40,
+            analyzer="python-ast",
+            analyzer_version="v1",
+            analysis_configuration={"feature_version": "runtime"},
+        ),
+        changed_symbols_cache_key(
+            repository_key="a" * 64,
+            base_sha="b" * 40,
+            head_sha="c" * 40,
+            analyzer="python-ast",
+            analyzer_version="v2",
+            analysis_configuration={"feature_version": "runtime"},
+        ),
+        changed_symbols_cache_key(
+            repository_key="a" * 64,
+            base_sha="b" * 40,
+            head_sha="c" * 40,
+            analyzer="python-ast",
+            analyzer_version="v1",
+            analysis_configuration={"feature_version": "3.12"},
+        ),
+    }
+
+    assert baseline not in variants
+    assert len(variants) == 4

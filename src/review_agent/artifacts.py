@@ -67,6 +67,8 @@ ARTIFACT_SCHEMAS = {
     "snapshot_manifest": "snapshot_manifest_v1",
     "diff_artifact_index": "diff_artifact_index_v1",
     "preflight_result": "preflight_result_v1",
+    "quality_gate_v2": "quality_gate_result_v2",
+    "changed_symbols_v2": "changed_symbols_v2",
     "intent_packet": "intent_packet_v2_minimal",
     "risk_decision": "risk_decision_v2",
     "review_plan": "review_plan_v2",

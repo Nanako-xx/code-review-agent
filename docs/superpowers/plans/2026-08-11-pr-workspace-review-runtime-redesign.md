@@ -2,7 +2,7 @@
 
 > **For agentic workers:** 按 Task 顺序实施，使用 checkbox 跟踪进度；每个 Task 在定向测试通过后形成一个独立提交。不要把协议、存储、Agent Loop 和 Eval 切换压成一次大提交。
 
-**状态：** 实施中（Task 1–3 已完成）
+**状态：** 实施中（Task 1–4 已完成）
 
 **设计来源：** `docs/superpowers/specs/2026-08-10-pr-workspace-preflight-reviewer-runtime-redesign.md`
 
@@ -384,11 +384,11 @@ feat: persist complete indexed diff artifacts
 - Create: `tests/test_local_quality.py`
 - Modify: `tests/test_repository_intelligence.py`
 
-- [ ] **Step 1：写唯一 Preflight 顺序 RED 测试**
+- [x] **Step 1：写唯一 Preflight 顺序 RED 测试**
 
 断言顺序严格为 `DiffArtifact -> QualityGate -> ChangedSymbols`，三类产物都绑定同一 snapshot_id；Diff 或 Snapshot 不可建立时阻断，普通 QualityGate failed/unavailable/error 不阻断 Planning。
 
-- [ ] **Step 2：简化 QualityGate 状态和发现规则**
+- [x] **Step 2：简化 QualityGate 状态和发现规则**
 
 只保留：
 
@@ -405,15 +405,15 @@ error
 
 QualityGate 单命令和阶段总 watchdog 均不得超过 1,800 秒；更短的项目级超时可以保留。
 
-- [ ] **Step 3：把大 gate stdout/stderr 接到通用 Artifact 接口占位**
+- [x] **Step 3：把大 gate stdout/stderr 接到通用 Artifact 接口占位**
 
 本 Task 先定义 `PreflightArtifactSink` protocol；Task 8 提供统一实现。测试使用内存 sink，避免 Preflight 依赖 ToolGateway。
 
-- [ ] **Step 4：扩展 ChangedSymbols provenance**
+- [x] **Step 4：扩展 ChangedSymbols provenance**
 
 每条保存 analyzer、version、configuration 和 language coverage；缓存 key 必须覆盖 repository/base/head、配置和 analyzer version。Python AST 成功不得宣称其他语言已覆盖。
 
-- [ ] **Step 5：运行测试**
+- [x] **Step 5：运行测试**
 
 Run:
 
@@ -427,7 +427,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；没有 deep gate 调度，failed gate 仍允许后续阶段读取结果。
 
-- [ ] **Step 6：提交**
+- [x] **Step 6：提交**
 
 ```text
 refactor: collapse preflight to deterministic checks
