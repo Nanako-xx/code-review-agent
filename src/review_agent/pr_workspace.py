@@ -397,6 +397,45 @@ class PRWorkspaceStore:
         relative_path: str,
         content: bytes,
     ) -> ArtifactDescriptor:
+        descriptor = self.describe_artifact(snapshot, relative_path, content)
+        destination = descriptor.path
+        digest = descriptor.sha256
+
+        if _path_exists(destination):
+            try:
+                existing = read_verified_bytes(destination, digest)
+            except SafeIOError as error:
+                raise PRWorkspaceError(
+                    "Artifact path already exists with different content"
+                ) from error
+            if existing != content:
+                raise PRWorkspaceError(
+                    "Artifact path already exists with different content"
+                )
+        else:
+            self._publish_bytes_create_only(destination, content)
+
+        receipt_path = self._artifact_receipt_path(snapshot, descriptor.artifact_id)
+        if not _path_exists(receipt_path):
+            self._publish_json_create_only(receipt_path, descriptor.to_receipt())
+        stored = self._load_artifact_descriptor(snapshot, descriptor.artifact_id)
+        if stored.to_receipt() != descriptor.to_receipt():
+            raise PRWorkspaceSecurityError("Artifact physical ID collision detected")
+        return descriptor
+
+    def verify_snapshot(self, snapshot: SnapshotWorkspace) -> None:
+        """Fail closed unless a Snapshot handle belongs to this Store."""
+
+        self._assert_snapshot_authority(snapshot)
+
+    def describe_artifact(
+        self,
+        snapshot: SnapshotWorkspace,
+        relative_path: str,
+        content: bytes,
+    ) -> ArtifactDescriptor:
+        """Build the deterministic descriptor without publishing any bytes."""
+
         self._assert_snapshot_authority(snapshot)
         if type(content) is not bytes:
             raise PRWorkspaceError("Artifact content must be bytes")
@@ -429,27 +468,6 @@ class PRWorkspaceStore:
             size_bytes=len(content),
             path=destination,
         )
-
-        if _path_exists(destination):
-            try:
-                existing = read_verified_bytes(destination, digest)
-            except SafeIOError as error:
-                raise PRWorkspaceError(
-                    "Artifact path already exists with different content"
-                ) from error
-            if existing != content:
-                raise PRWorkspaceError(
-                    "Artifact path already exists with different content"
-                )
-        else:
-            self._publish_bytes_create_only(destination, content)
-
-        receipt_path = self._artifact_receipt_path(snapshot, artifact_id)
-        if not _path_exists(receipt_path):
-            self._publish_json_create_only(receipt_path, descriptor.to_receipt())
-        stored = self._load_artifact_descriptor(snapshot, artifact_id)
-        if stored.to_receipt() != descriptor.to_receipt():
-            raise PRWorkspaceSecurityError("Artifact physical ID collision detected")
         return descriptor
 
     def resolve_snapshot_artifact(
@@ -459,6 +477,53 @@ class PRWorkspaceStore:
     ) -> Path:
         descriptor, _content = self._resolve_artifact(snapshot, artifact_id)
         return descriptor.path
+
+    def find_snapshot_artifact(
+        self,
+        snapshot: SnapshotWorkspace,
+        relative_path: str,
+    ) -> ArtifactDescriptor:
+        """Resolve a trusted runtime path to its opaque Snapshot Artifact."""
+
+        self._assert_snapshot_authority(snapshot)
+        try:
+            relative = canonical_relative_path(relative_path)
+            receipt_paths = sorted(
+                (snapshot.path / ".artifacts").iterdir(),
+                key=lambda item: item.name,
+            )
+        except (OSError, SafeIOError) as error:
+            raise PRWorkspaceSecurityError(
+                "Snapshot Artifact catalog is unavailable"
+            ) from error
+        matches: list[ArtifactDescriptor] = []
+        for receipt_path in receipt_paths:
+            if re.fullmatch(r"a-[0-9a-f]{32}\.json", receipt_path.name) is None:
+                raise PRWorkspaceSecurityError(
+                    "Snapshot Artifact catalog contains an invalid entry"
+                )
+            payload = self._read_json(receipt_path, "Artifact receipt")
+            if type(payload) is not dict or "artifact_id" not in payload:
+                raise PRWorkspaceSecurityError("Artifact receipt is invalid")
+            descriptor = self._load_artifact_descriptor(
+                snapshot,
+                payload["artifact_id"],
+            )
+            if descriptor.relative_path == relative:
+                matches.append(descriptor)
+        if not matches:
+            raise PRWorkspaceSecurityError(
+                "Artifact path is not authorized for this PR Snapshot"
+            )
+        if len(matches) != 1:
+            raise PRWorkspaceSecurityError(
+                "Artifact path has duplicate Snapshot authorizations"
+            )
+        descriptor, _content = self._resolve_artifact(
+            snapshot,
+            matches[0].artifact_id,
+        )
+        return descriptor
 
     def read_verified_json(
         self,

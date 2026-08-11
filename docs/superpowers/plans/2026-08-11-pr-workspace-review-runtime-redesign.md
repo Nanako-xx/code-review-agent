@@ -2,7 +2,7 @@
 
 > **For agentic workers:** 按 Task 顺序实施，使用 checkbox 跟踪进度；每个 Task 在定向测试通过后形成一个独立提交。不要把协议、存储、Agent Loop 和 Eval 切换压成一次大提交。
 
-**状态：** 实施中（Task 1–2 已完成）
+**状态：** 实施中（Task 1–3 已完成）
 
 **设计来源：** `docs/superpowers/specs/2026-08-10-pr-workspace-preflight-reviewer-runtime-redesign.md`
 
@@ -332,7 +332,7 @@ feat: add isolated PR workspace and snapshot store
 - Create: `tests/test_diff_artifact.py`
 - Modify: `tests/test_git_repo.py`
 
-- [ ] **Step 1：写完整性和索引 RED 测试**
+- [x] **Step 1：写完整性和索引 RED 测试**
 
 覆盖普通修改、新增、删除、rename/copy、binary、mode change、无换行文件、Unicode path、CRLF、SHA-1 和 SHA-256 仓库：
 
@@ -343,15 +343,15 @@ feat: add isolated PR workspace and snapshot store
 - 50K 分页读取返回 cursor/has_more；
 - Git 调用显式使用 `-c core.longpaths=true`、`--no-ext-diff` 和固定 diff 配置。
 
-- [ ] **Step 2：实现两阶段发布**
+- [x] **Step 2：实现两阶段发布**
 
 先在 Snapshot staging 写完整 patch，再从已经写入的 patch 机械生成 index；二者 hash 校验成功后一起 create-only 发布。不得分别运行逐文件 Git diff 形成不一致视图。
 
-- [ ] **Step 3：保留旧 ChangeSummary 只供 v5**
+- [x] **Step 3：保留旧 ChangeSummary 只供 v5**
 
 新模块不得导出 `diff_excerpt/file_diff_excerpts/diff_truncated`。Task 13 切换前，旧 Pipeline 仍可调用 `collect_change_summary()`。
 
-- [ ] **Step 4：运行测试**
+- [x] **Step 4：运行测试**
 
 Run:
 
@@ -364,7 +364,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；完整 Diff 与所有索引切片字节一致。
 
-- [ ] **Step 5：提交**
+- [x] **Step 5：提交**
 
 ```text
 feat: persist complete indexed diff artifacts
