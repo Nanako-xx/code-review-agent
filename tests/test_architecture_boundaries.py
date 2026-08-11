@@ -286,6 +286,28 @@ def test_v6_tool_gateway_has_no_observation_store_or_legacy_gateway_dependency()
     assert "ObservationStore" not in _definitions(tree)
 
 
+def test_v6_reviewer_loop_does_not_import_legacy_loop_assignment_or_observations() -> None:
+    forbidden_modules = {
+        "review_agent.agent_loop",
+        "review_agent.models",
+        "review_agent.observations",
+        "review_agent.tool_gateway",
+        "review_agent.pipeline",
+    }
+    for filename in (
+        "execution_journal.py",
+        "review_agent_loop.py",
+        "reviewer_executor.py",
+    ):
+        violations = [
+            (module, symbol)
+            for module, symbol in _imports(_tree(filename))
+            if _module_matches(module, forbidden_modules)
+            or symbol in {"Assignment", "ObservationStore", "ToolGateway"}
+        ]
+        assert not violations, f"{filename}: {violations}"
+
+
 def test_quality_business_logic_does_not_own_subprocess_execution() -> None:
     quality = _tree("quality.py")
     pipeline = _tree("pipeline.py")

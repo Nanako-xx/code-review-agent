@@ -33,6 +33,7 @@ from review_agent.reconciler import (
 from review_agent.review_contract import REVIEW_CONTRACT_VALIDATION_VERSION
 from review_agent.session import (
     ReviewExecutionConfig,
+    reviewer_runtime_limits_v2_to_dict,
     review_execution_config_to_dict,
 )
 from review_agent.tool_gateway import (
@@ -82,6 +83,7 @@ def reviewer_execution_profile_v2(
         raise TypeError("diff_fit_policy must be DiffFitPolicy")
     system = build_reviewer_system_prompt(policy)
     tools = reviewer_tool_schemas_v2(REVIEWER_TOOL_NAMES_V2)
+    runtime_limits = reviewer_runtime_limits_v2_to_dict()
     return {
         "schema_version": REVIEWER_EXECUTION_PROFILE_V2_SCHEMA,
         "invocation_inputs": ["system", "tools", "messages", "parameters"],
@@ -97,6 +99,7 @@ def reviewer_execution_profile_v2(
         ).hexdigest(),
         "tool_names": list(REVIEWER_TOOL_NAMES_V2),
         "diff_fit_policy": fit.to_dict(),
+        "runtime_limits": runtime_limits,
         "global_memory": "immutable_snapshot_projection",
         "invocation_defaults": {
             "reasoning_effort": "medium",

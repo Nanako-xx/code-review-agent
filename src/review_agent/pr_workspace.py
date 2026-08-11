@@ -431,6 +431,9 @@ class PRWorkspaceStore:
     def verify_workspace(self, workspace: PRWorkspace) -> None:
         self._assert_workspace_authority(workspace)
 
+    def verify_session(self, session: SessionWorkspace) -> None:
+        self._assert_session_authority(session)
+
     def publish_intent_history(
         self,
         workspace: PRWorkspace,
@@ -801,6 +804,43 @@ class PRWorkspaceStore:
         if snapshot.snapshot_id != expected_id or snapshot.path != expected_path:
             raise PRWorkspaceSecurityError("Snapshot handle binding does not match")
         self._validate_snapshot_manifest(snapshot)
+
+    def _assert_session_authority(self, session: SessionWorkspace) -> None:
+        if not isinstance(session, SessionWorkspace):
+            raise PRWorkspaceSecurityError("Session handle is invalid")
+        self._assert_snapshot_authority(session.snapshot)
+        if (
+            session.workspace != session.snapshot.workspace
+            or session.workspace.store_root != self.root
+        ):
+            raise PRWorkspaceSecurityError("Session PR binding does not match")
+        _validate_id(session.session_id, _SESSION_ID, "session_id")
+        expected_path = session.workspace.path / "Sessions" / (
+            "u-" + session.session_id[8:40]
+        )
+        if session.path != expected_path:
+            raise PRWorkspaceSecurityError("Session physical binding does not match")
+        payload = self._read_json(session.path / "state.json", "Session state")
+        value = _strict_object(
+            payload,
+            (
+                "schema_version",
+                "session_id",
+                "pr_id",
+                "snapshot_id",
+                "status",
+            ),
+            "Session state",
+        )
+        if (
+            value["schema_version"] != SESSION_BINDING_SCHEMA
+            or value["session_id"] != session.session_id
+            or value["pr_id"] != session.workspace.pr_id
+            or value["snapshot_id"] != session.snapshot.snapshot_id
+        ):
+            raise PRWorkspaceSecurityError("Session state binding does not match")
+        if type(value["status"]) is not str or not value["status"]:
+            raise PRWorkspaceSecurityError("Session status is invalid")
 
     def _validate_workspace_manifest(self, workspace: PRWorkspace) -> dict[str, Any]:
         payload = self._read_json(workspace.path / "manifest.json", "Workspace manifest")

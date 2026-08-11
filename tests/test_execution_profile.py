@@ -225,6 +225,11 @@ def test_v2_reviewer_profile_binds_developer_policy_without_legacy_budgets() -> 
     assert profile["developer_policy_sha256"] == policy.digest()
     assert len(profile["reviewer_system_prompt_sha256"]) == 64
     assert profile["diff_fit_policy"]["target_initial_tokens"] >= 500_000
+    assert profile["runtime_limits"] == {
+        "max_elapsed_seconds": 1_800.0,
+        "max_provider_attempts": 3,
+        "tool_timeout_seconds": 300.0,
+    }
     assert "max_message_chars" not in encoded
     assert "compacted_section_min_chars" not in encoded
     assert "memory_subbudget_ratio" not in encoded

@@ -471,9 +471,18 @@ def _build_openai_tool_payload(
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": request.parameters.get("max_output_tokens", 4096),
         "temperature": request.parameters.get("temperature", 0),
     }
+    configured_output = request.parameters.get("max_output_tokens")
+    if configured_output is not None:
+        payload["max_tokens"] = configured_output
+    elif request.parameters.get("requires_max_output_tokens") is True:
+        provider_maximum = request.parameters.get("model_max_output_tokens")
+        if type(provider_maximum) is not int or provider_maximum <= 0:
+            raise ValueError(
+                "provider requires a positive model_max_output_tokens capability"
+            )
+        payload["max_tokens"] = provider_maximum
     response_format = request.parameters.get("response_format")
     if response_format is not None:
         if response_format != "json_object":

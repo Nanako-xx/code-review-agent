@@ -2000,3 +2000,52 @@ def test_openai_adapter_accepts_canonical_v2_tool_transcript_without_legacy_meta
 
     assert response.kind is ModelResponseKind.FINAL
     assert captured["messages"][-1] == tool_message
+
+
+def test_openai_adapter_omits_reviewer_output_limit_when_runtime_does_not_set_one() -> None:
+    captured = {}
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured.update(payload)
+        return {"choices": [{"message": {"content": "{}"}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+
+    adapter.complete_turn(make_request())
+
+    assert "max_tokens" not in captured
+
+
+def test_adapter_uses_model_capability_only_when_provider_requires_output_limit() -> None:
+    captured = {}
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured.update(payload)
+        return {"choices": [{"message": {"content": "{}"}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    request = make_request()
+    request.parameters.update(
+        {
+            "requires_max_output_tokens": True,
+            "model_max_output_tokens": 131_072,
+        }
+    )
+
+    adapter.complete_turn(request)
+
+    assert captured["max_tokens"] == 131_072

@@ -36,6 +36,19 @@ DEFAULT_MODEL_STAGE_API_KEY_ENV = "REVIEW_AGENT_API_KEY"
 DEFAULT_MODEL_STAGE_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_MODEL_STAGE_MAX_PROVIDER_ATTEMPTS = 2
 DEFAULT_MODEL_STAGE_MAX_ELAPSED_SECONDS = 60.0
+
+
+def reviewer_runtime_limits_v2_to_dict() -> dict[str, object]:
+    """Project the three v6 Reviewer safety limits into Session configuration."""
+
+    from review_agent.reviewer_runtime import ReviewerRuntimeLimitsV2
+
+    limits = ReviewerRuntimeLimitsV2()
+    return {
+        "max_elapsed_seconds": limits.max_elapsed_seconds,
+        "max_provider_attempts": limits.max_provider_attempts,
+        "tool_timeout_seconds": limits.tool_timeout_seconds,
+    }
 LEGACY_SESSION_PHASES = (
     RunPhase.PREFLIGHT,
     RunPhase.REPOSITORY_INTELLIGENCE,

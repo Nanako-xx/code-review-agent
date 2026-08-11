@@ -705,7 +705,7 @@ feat: add bounded tool result artifact protocol
 - Modify: `tests/test_agent_loop.py`
 - Modify: `tests/test_resume.py`
 
-- [ ] **Step 1：写每个 crash window 的 RED 测试**
+- [x] **Step 1：写每个 crash window 的 RED 测试**
 
 在以下事件后模拟中断并 Resume：
 
@@ -718,15 +718,15 @@ turn_committed
 
 断言已提交 Tool Call 不重跑；started 无终态的只读调用可恢复；相同 call_id 不同参数 fail closed；每个 assistant tool_call 恰好有匹配且相邻的 tool result。
 
-- [ ] **Step 2：实现 append-only journal 和 Tool Call ledger**
+- [x] **Step 2：实现 append-only journal 和 Tool Call ledger**
 
 事件先完整单行写入、flush/fsync，再推进状态。Tool Call identity 绑定 session/assignment/call/tool/args hash/snapshot。Resume 只重放到最后一个 `turn_committed`。
 
-- [ ] **Step 3：移除人工 Turn/Tool/Token 停止条件**
+- [x] **Step 3：移除人工 Turn/Tool/Token 停止条件**
 
 新 ReviewAgentLoop 使用 active-time 控制的 while loop，不接收 max_turns、max_tool_calls、max_total_tokens 或 8,192 max_output 停止参数。保留 Usage 统计、用户取消、重复无进展调用检测和 Provider/Tool 安全超时。旧 `agent_loop.py` 在 Task 16 前保持 v5 行为。
 
-- [ ] **Step 4：固定运行保护**
+- [x] **Step 4：固定运行保护**
 
 ```text
 active elapsed        1,800 seconds
@@ -736,11 +736,11 @@ tool timeout          300 seconds
 
 离线/暂停时间不计 active elapsed，Resume 不重置已消费时间。Provider transport retry 不执行工具；协议无效结果不伪装成 transport retry。
 
-- [ ] **Step 5：省略 Reviewer max_output_tokens**
+- [x] **Step 5：省略 Reviewer max_output_tokens**
 
 Provider 支持省略时不发送；强制要求时使用配置的模型能力。内部 Compaction output 在 Task 10 使用独立 50K 上限，不影响 Reviewer 最终输出。
 
-- [ ] **Step 6：运行测试**
+- [x] **Step 6：运行测试**
 
 Run:
 
@@ -754,7 +754,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；无 budget_exhausted 来自 turn/tool/token，所有 crash point 可恢复。
 
-- [ ] **Step 7：提交**
+- [x] **Step 7：提交**
 
 ```text
 feat: make reviewer turns durable and resumable
