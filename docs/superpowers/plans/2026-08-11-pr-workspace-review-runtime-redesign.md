@@ -2,7 +2,7 @@
 
 > **For agentic workers:** 按 Task 顺序实施，使用 checkbox 跟踪进度；每个 Task 在定向测试通过后形成一个独立提交。不要把协议、存储、Agent Loop 和 Eval 切换压成一次大提交。
 
-**状态：** Draft，等待实施
+**状态：** 实施中（Task 1 已完成）
 
 **设计来源：** `docs/superpowers/specs/2026-08-10-pr-workspace-preflight-reviewer-runtime-redesign.md`
 
@@ -198,7 +198,7 @@ Tasks 3～6 可以在独立分支并行开发，但合并和集成必须遵守�
 - Create: `tests/test_review_protocol_v2.py`
 - Modify: `tests/test_architecture_boundaries.py`
 
-- [ ] **Step 1：为所有新 wire model 写 RED 测试**
+- [x] **Step 1：为所有新 wire model 写 RED 测试**
 
 覆盖：
 
@@ -212,11 +212,11 @@ Tasks 3～6 可以在独立分支并行开发，但合并和集成必须遵守�
 - unknown key、duplicate JSON key、空文本、非安全 path、非正 line、非法 enum 全部 fail closed；
 - canonical serializer 固定 UTF-8、键顺序和 separators，不写时间字段。
 
-- [ ] **Step 2：实现不可变 dataclass、codec 和 canonical JSON**
+- [x] **Step 2：实现不可变 dataclass、codec 和 canonical JSON**
 
 不要复用旧 `models.py` 中同名但字段不同的模型。新代码只从 `review_protocol.py` 导入新协议；旧模型留给 v5 兼容读取。
 
-- [ ] **Step 3：注册新 Artifact schema version**
+- [x] **Step 3：注册新 Artifact schema version**
 
 至少增加：
 
@@ -236,7 +236,7 @@ context_manifest_v1
 execution_journal_event_v1
 ```
 
-- [ ] **Step 4：运行协议测试**
+- [x] **Step 4：运行协议测试**
 
 Run:
 
@@ -249,7 +249,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；新协议不导入 Pipeline、MemoryStore、Model Adapter 或 Eval。
 
-- [ ] **Step 5：提交**
+- [x] **Step 5：提交**
 
 ```text
 feat: add minimal review protocol v2

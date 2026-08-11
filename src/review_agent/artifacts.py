@@ -61,6 +61,21 @@ ARTIFACT_SCHEMAS = {
     "review_brief": "review_brief_v1",
     "report": "review_report_markdown_v1",
     "observations": "observation_log_jsonl_v1",
+    # Session v6 / PRWorkspace artifacts use distinct logical names so the
+    # v1-v5 readers above retain their original schema bindings.
+    "pr_workspace_manifest": "pr_workspace_manifest_v1",
+    "snapshot_manifest": "snapshot_manifest_v1",
+    "diff_artifact_index": "diff_artifact_index_v1",
+    "preflight_result": "preflight_result_v1",
+    "intent_packet": "intent_packet_v2_minimal",
+    "risk_decision": "risk_decision_v2",
+    "review_plan": "review_plan_v2",
+    "reviewer_assignment": "reviewer_assignment_v2",
+    "reviewer_output": "reviewer_output_v2",
+    "aggregation_record": "aggregation_record_v1",
+    "review_result": "review_result_v1",
+    "context_manifest": "context_manifest_v1",
+    "execution_journal_event": "execution_journal_event_v1",
 }
 
 # This contract intentionally contains only stable wire strings so SessionStore

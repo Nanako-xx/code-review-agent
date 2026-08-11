@@ -28,6 +28,16 @@ REVIEW_EXECUTION_MODULES = (
     "tool_gateway.py",
 )
 
+V6_PROTOCOL_FORBIDDEN_MODULES = {
+    "review_agent.pipeline",
+    "review_agent.review_pipeline",
+    "review_agent.memory_store",
+    "review_agent.provider",
+    "review_agent.model_adapter",
+    "review_agent.model_adapter_factory",
+    "review_agent_eval",
+}
+
 
 def _module_path(filename: str) -> Path:
     return SOURCE_ROOT / filename
@@ -213,6 +223,23 @@ def test_reviewer_business_modules_do_not_import_legacy_model_provider() -> None
             or symbol in forbidden_symbols
         ], filename
         assert not set(_definitions(tree)).intersection(forbidden_symbols), filename
+
+
+def test_v6_review_protocol_does_not_depend_on_runtime_or_eval_layers() -> None:
+    violations = [
+        (module, symbol)
+        for module, symbol in _imports(_tree("review_protocol.py"))
+        if _module_matches(module, V6_PROTOCOL_FORBIDDEN_MODULES)
+        or symbol in {
+            "MemoryStore",
+            "ModelAdapter",
+            "ModelAdapterFactory",
+            "Pipeline",
+            "ReviewPipelineV6",
+        }
+    ]
+
+    assert not violations
 
 
 def test_quality_business_logic_does_not_own_subprocess_execution() -> None:
