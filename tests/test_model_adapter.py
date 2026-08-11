@@ -17,6 +17,7 @@ from review_agent.model_adapter import (
     _urllib_transport,
     model_response_to_assistant_message,
     model_tool_result_to_message,
+    review_tool_projection_to_message,
 )
 from review_agent.model_protocol import (
     ModelResponse,
@@ -28,6 +29,10 @@ from review_agent.model_protocol import (
     ModelTurnResponse,
 )
 from review_agent.tool_result_protocol import serialize_tool_result_envelope
+from review_agent.tool_result_protocol import (
+    ReviewToolResult,
+    ToolResultProjectionV2,
+)
 
 
 class _BoundedHttpResponse:
@@ -1914,3 +1919,84 @@ def test_openai_compatible_adapter_caps_transport_timeout_to_runtime_budget():
     adapter.complete_turn(request)
 
     assert captured["timeout_seconds"] == 2.5
+
+
+def test_v2_tool_projection_serializes_directly_to_tool_message() -> None:
+    raw = ReviewToolResult.success(
+        tool_call_id="call-v2",
+        session_id="session-v2",
+        snapshot_id="S-" + "a" * 64,
+        tool_name="read_range",
+        arguments={"path": "src/api.py"},
+        content="line 1",
+        reacquirable=True,
+    )
+
+    message = review_tool_projection_to_message(
+        ToolResultProjectionV2.inline(raw)
+    )
+    payload = json.loads(message["content"])
+
+    assert message["role"] == "tool"
+    assert message["tool_call_id"] == "call-v2"
+    assert payload["schema_version"] == "review_tool_result_v2"
+    assert payload["content"] == "line 1"
+    assert "observation_ids" not in payload
+
+
+def test_openai_adapter_accepts_canonical_v2_tool_transcript_without_legacy_metadata() -> None:
+    captured = {}
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured.update(payload)
+        return {"choices": [{"message": {"content": '{"findings":[]}'}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    raw = ReviewToolResult.success(
+        tool_call_id="call-v2-transcript",
+        session_id="session-v2",
+        snapshot_id="S-" + "b" * 64,
+        tool_name="read_range",
+        arguments={"path": "src/api.py"},
+        content="line 1",
+        reacquirable=True,
+    )
+    tool_message = review_tool_projection_to_message(
+        ToolResultProjectionV2.inline(raw)
+    )
+    request = ModelTurnRequest(
+        system="system",
+        tools=[],
+        messages=[
+            {"role": "user", "content": "Review"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-v2-transcript",
+                        "type": "function",
+                        "function": {
+                            "name": "read_range",
+                            "arguments": '{"path":"src/api.py"}',
+                        },
+                    }
+                ],
+            },
+            tool_message,
+        ],
+        tool_results=[],
+        parameters={"tool_choice": "none"},
+    )
+
+    response = adapter.complete_turn(request)
+
+    assert response.kind is ModelResponseKind.FINAL
+    assert captured["messages"][-1] == tool_message

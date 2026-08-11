@@ -19,8 +19,11 @@ from review_agent.model_protocol import (
     ModelTurnResponse,
 )
 from review_agent.tool_result_protocol import (
+    ToolResultProjectionV2,
     parse_tool_result_envelope,
+    serialize_tool_result_projection_v2,
     serialize_tool_result_envelope,
+    validate_serialized_tool_result_projection_v2,
 )
 
 
@@ -504,6 +507,20 @@ def model_tool_result_to_message(result: ModelToolResult) -> dict[str, Any]:
     }
 
 
+def review_tool_projection_to_message(
+    projection: ToolResultProjectionV2,
+) -> dict[str, Any]:
+    """Serialize a v6 Tool Result without the legacy Observation envelope."""
+
+    if not isinstance(projection, ToolResultProjectionV2):
+        raise ValueError("projection must be ToolResultProjectionV2")
+    return {
+        "role": "tool",
+        "tool_call_id": projection.tool_call_id,
+        "content": serialize_tool_result_projection_v2(projection),
+    }
+
+
 def _pair_tool_results_with_assistant_calls(
     messages: list[dict[str, Any]],
     tool_results: list[ModelToolResult],
@@ -563,10 +580,10 @@ def _validate_complete_tool_transcript(
     messages: list[dict[str, Any]],
     assistant_batches: list[tuple[int, list[str]]],
     assistant_call_ids: set[str],
-) -> dict[str, ModelToolResult]:
+) -> dict[str, ModelToolResult | None]:
     tool_message_ids: set[str] = set()
     tool_message_indices: dict[int, str] = {}
-    tool_message_results: dict[str, ModelToolResult] = {}
+    tool_message_results: dict[str, ModelToolResult | None] = {}
     for message_index, message in enumerate(messages):
         if message.get("role") != "tool":
             continue
@@ -581,10 +598,19 @@ def _validate_complete_tool_transcript(
             )
         tool_message_ids.add(call_id)
         tool_message_indices[message_index] = call_id
-        tool_message_results[call_id] = parse_tool_result_envelope(
-            call_id,
-            message.get("content"),
-        )
+        try:
+            tool_message_results[call_id] = parse_tool_result_envelope(
+                call_id,
+                message.get("content"),
+            )
+        except ValueError as legacy_error:
+            try:
+                validate_serialized_tool_result_projection_v2(
+                    message.get("content")
+                )
+            except ValueError:
+                raise legacy_error
+            tool_message_results[call_id] = None
 
     for call_id in assistant_call_ids:
         if call_id not in tool_message_ids:
@@ -617,7 +643,7 @@ def _validate_complete_tool_transcript(
 
 
 def _validate_tool_result_metadata(
-    message_tool_results: dict[str, ModelToolResult],
+    message_tool_results: dict[str, ModelToolResult | None],
     tool_results: list[ModelToolResult],
 ) -> None:
     metadata_by_call_id: dict[str, ModelToolResult] = {}
@@ -635,10 +661,13 @@ def _validate_tool_result_metadata(
         _tool_result_metadata_mismatch()
 
     for call_id, result in metadata_by_call_id.items():
+        transcript_result = message_tool_results[call_id]
+        if not isinstance(transcript_result, ModelToolResult):
+            _tool_result_metadata_mismatch()
         try:
             metadata_canonical = serialize_tool_result_envelope(result)
             transcript_canonical = serialize_tool_result_envelope(
-                message_tool_results[call_id]
+                transcript_result
             )
         except Exception:
             _tool_result_metadata_mismatch()

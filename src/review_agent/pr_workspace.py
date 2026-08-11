@@ -628,6 +628,16 @@ class PRWorkspaceStore:
             raise PRWorkspaceSecurityError("Artifact JSON root must be an object")
         return value
 
+    def read_verified_artifact(
+        self,
+        snapshot: SnapshotWorkspace,
+        artifact_id: str,
+    ) -> bytes:
+        """Read one Snapshot-authorized Artifact with its receipt binding verified."""
+
+        _descriptor, content = self._resolve_artifact(snapshot, artifact_id)
+        return content
+
     def _resolve_artifact(
         self,
         snapshot: SnapshotWorkspace,

@@ -267,6 +267,25 @@ def test_v6_reviewer_context_uses_frozen_memory_not_live_store_or_legacy_models(
         assert not _live_memory_store_bindings(tree), filename
 
 
+def test_v6_tool_gateway_has_no_observation_store_or_legacy_gateway_dependency() -> None:
+    forbidden_modules = {
+        "review_agent.observations",
+        "review_agent.tool_gateway",
+        "review_agent.memory_store",
+        "review_agent.pipeline",
+    }
+    tree = _tree("review_tool_gateway.py")
+    violations = [
+        (module, symbol)
+        for module, symbol in _imports(tree)
+        if _module_matches(module, forbidden_modules)
+        or symbol in {"ObservationStore", "ToolGateway", "MemoryStore"}
+    ]
+
+    assert not violations
+    assert "ObservationStore" not in _definitions(tree)
+
+
 def test_quality_business_logic_does_not_own_subprocess_execution() -> None:
     quality = _tree("quality.py")
     pipeline = _tree("pipeline.py")

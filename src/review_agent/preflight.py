@@ -19,6 +19,7 @@ from review_agent.repository_intelligence import (
     changed_symbols_v2_to_dict,
 )
 from review_agent.safe_io import canonical_json_bytes
+from review_agent.tool_artifacts import ToolResultArtifactStore
 
 
 class PreflightBlockedError(RuntimeError):
@@ -73,7 +74,7 @@ class DeterministicPreflight:
         snapshot: SnapshotWorkspace,
         quality_plan: LocalQualityPlan,
         *,
-        sink: PreflightArtifactSink,
+        sink: PreflightArtifactSink | None = None,
     ) -> PreflightResult:
         try:
             diff = self._diff_store.materialize(Path(repository), snapshot)
@@ -86,12 +87,19 @@ class DeterministicPreflight:
                 "DiffArtifact Snapshot binding does not match"
             )
 
+        effective_sink = (
+            sink
+            if sink is not None
+            else ToolResultArtifactStore(
+                self._workspace_store, snapshot
+            ).preflight_sink()
+        )
         try:
             quality = self._quality_runner.run(
                 Path(repository),
                 snapshot.snapshot_id,
                 quality_plan,
-                sink,
+                effective_sink,
             )
         except Exception:
             quality = QualityGateResult(

@@ -643,7 +643,7 @@ refactor: rebuild reviewer context and policy boundary
 - Modify: `tests/test_tool_result_protocol.py`
 - Modify: `tests/test_model_adapter.py`
 
-- [ ] **Step 1：写边界值 RED 测试**
+- [x] **Step 1：写边界值 RED 测试**
 
 覆盖 49,999、50,000、50,001、199,999、200,000、200,001 字符，以及 Unicode 序列化后字符数：
 
@@ -654,21 +654,21 @@ refactor: rebuild reviewer context and policy boundary
 - `read_artifact` 每页 <=50K，cursor/has_more 正确；
 - Artifact write 失败形成显式 Tool Error，不能丢内容。
 
-- [ ] **Step 2：增加调用级 reacquirable metadata**
+- [x] **Step 2：增加调用级 reacquirable metadata**
 
 当前 Snapshot-bound `read_range/compare_base_head/search_code/list_symbols/inspect_symbol/find_references/read_commit_messages/query_project_memory` 都可重新获取。分类记录在 Tool Result index，不依赖名称硬编码的上下文清理逻辑。
 
 新 `ReviewToolGateway` 不要求 ObservationStore，也不返回 observation IDs；它返回统一 ToolExecutionResult/Artifact envelope。旧 `ToolGateway` 只留给 v5 compatibility，不能进入新 Reviewer path。
 
-- [ ] **Step 3：统一 Tool Error envelope**
+- [x] **Step 3：统一 Tool Error envelope**
 
 只保留 `is_error/code/retryable/message` 和必要 exit metadata。timeout、临时锁、transient I/O 可重试；非法参数、越权路径、缺 Artifact、path_too_long 和确定性 parse error 不可重试。
 
-- [ ] **Step 4：接入 Preflight 大日志**
+- [x] **Step 4：接入 Preflight 大日志**
 
 QualityGate stdout/stderr 使用同一 Artifact Store，但不通过 Reviewer ToolGateway 执行。
 
-- [ ] **Step 5：运行测试**
+- [x] **Step 5：运行测试**
 
 Run:
 
@@ -682,7 +682,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；所有边界值和分页完整性通过。
 
-- [ ] **Step 6：提交**
+- [x] **Step 6：提交**
 
 ```text
 feat: add bounded tool result artifact protocol
