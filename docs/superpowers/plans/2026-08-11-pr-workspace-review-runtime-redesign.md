@@ -954,27 +954,27 @@ feat: add deterministic review result aggregation
 - Modify: `tests/test_session_store.py`
 - Modify: `tests/test_resume.py`
 
-- [ ] **Step 1：写 v6 phase/state RED 测试**
+- [x] **Step 1：写 v6 phase/state RED 测试**
 
 新 Session 只包含 PREFLIGHT/INTENT/PLANNING/REVIEWERS/AGGREGATION。每个 Phase 的 predecessor、artifact ownership、running restart、completed reuse 和 invalidation 规则单独测试。
 
-- [ ] **Step 2：实现新 PipelineContext 和 Phase dispatcher**
+- [x] **Step 2：实现新 PipelineContext 和 Phase dispatcher**
 
 使用 Tasks 2～12 的服务，不导入 reconciler/supplemental/evidence/completion/final_risk/brief。Context Assembly 在每个 Reviewer 启动时执行；Markdown rendering 属于 AGGREGATION 的确定性尾部，不成为独立 Phase。
 
-- [ ] **Step 3：实现并行 Reviewer failure isolation**
+- [x] **Step 3：实现并行 Reviewer failure isolation**
 
 所有计划 Reviewer 终态后才聚合；单个 failed/timeout/invalid_output 不终止其他 Reviewer。主线程按 Assignment order 提交结果，保证确定性。
 
-- [ ] **Step 4：定义 legacy Session 边界**
+- [x] **Step 4：定义 legacy Session 边界**
 
 v1-v5 manifest 仍可读并显示 schema/status/artifact diagnostics，但 Resume 返回明确 unsupported。删除 `--upgrade-to-v5` 对新路径的影响，不提供 v5 -> v6 自动字段迁移。
 
-- [ ] **Step 5：添加架构禁止项**
+- [x] **Step 5：添加架构禁止项**
 
 `review_pipeline.py` 和新 Reviewer execution modules 不得导入旧后处理模块、live MemoryStore、Eval、SQLite 或 subprocess QualityGate 实现。
 
-- [ ] **Step 6：运行测试**
+- [x] **Step 6：运行测试**
 
 Run:
 
@@ -988,7 +988,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；新 Pipeline 无任何旧后处理 import，legacy fixture 只读诊断通过。
 
-- [ ] **Step 7：提交**
+- [x] **Step 7：提交**
 
 ```text
 feat: cut product pipeline over to session v6

@@ -105,6 +105,42 @@ MEMORY_ARTIFACT_SCHEMAS = MappingProxyType(
     }
 )
 
+SESSION_V6_ARTIFACT_PHASES = MappingProxyType(
+    {
+        "preflight.diff_patch": "preflight",
+        "preflight.diff_index": "preflight",
+        "preflight.quality_gate": "preflight",
+        "preflight.changed_symbols": "preflight",
+        "intent.packet": "intent",
+        "planning.risk": "planning",
+        "planning.review_plan": "planning",
+        "aggregation.record": "aggregation",
+        "aggregation.review_result": "aggregation",
+        "aggregation.review_markdown": "aggregation",
+    }
+)
+
+_SESSION_V6_DYNAMIC_ARTIFACTS = (
+    (re.compile(r"\Aplanning\.assignment:ASG-[0-9a-f]{64}\Z"), "planning"),
+    (re.compile(r"\Areviewer\.result:ASG-[0-9a-f]{64}\Z"), "reviewers"),
+)
+
+
+def session_v6_artifact_phase(logical_name: str) -> str:
+    """Return the sole v6 phase allowed to own a logical artifact."""
+
+    if type(logical_name) is not str:
+        raise ValueError("Session v6 artifact name must be text")
+    owner = SESSION_V6_ARTIFACT_PHASES.get(logical_name)
+    if owner is not None:
+        return owner
+    for pattern, dynamic_owner in _SESSION_V6_DYNAMIC_ARTIFACTS:
+        if pattern.fullmatch(logical_name) is not None:
+            return dynamic_owner
+    raise ValueError(
+        f"No Session v6 artifact owner is defined for: {logical_name}"
+    )
+
 PER_REVIEWER_SCHEMAS = {
     "_envelope": "model_request_envelope_v1",
     "_raw_response": "model_raw_response_v1",

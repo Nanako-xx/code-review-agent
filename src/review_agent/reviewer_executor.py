@@ -172,8 +172,75 @@ class ReviewerExecutorV2:
         )
 
 
+def reviewer_execution_result_v2_to_dict(
+    result: ReviewerExecutionResultV2,
+) -> dict[str, Any]:
+    if not isinstance(result, ReviewerExecutionResultV2):
+        raise ValueError("result must be ReviewerExecutionResultV2")
+    return {
+        "assignment_id": result.assignment_id,
+        "status": result.status,
+        "output": result.output,
+        "reviewer_output": (
+            result.reviewer_output.to_dict()
+            if result.reviewer_output is not None
+            else None
+        ),
+        "rejected_findings": [
+            item.to_dict() for item in result.rejected_findings
+        ],
+        "error_code": result.error_code,
+        "active_elapsed_seconds": round(result.active_elapsed_seconds, 6),
+    }
+
+
+def reviewer_execution_result_v2_from_dict(
+    payload: Any,
+) -> ReviewerExecutionResultV2:
+    expected = {
+        "assignment_id",
+        "status",
+        "output",
+        "reviewer_output",
+        "rejected_findings",
+        "error_code",
+        "active_elapsed_seconds",
+    }
+    if type(payload) is not dict or set(payload) != expected:
+        raise ValueError("Reviewer execution result v2 schema is invalid")
+    reviewer_output_payload = payload["reviewer_output"]
+    reviewer_output = (
+        ReviewerOutput.from_dict(reviewer_output_payload)
+        if reviewer_output_payload is not None
+        else None
+    )
+    rejected = payload["rejected_findings"]
+    if type(rejected) is not list:
+        raise ValueError("Reviewer execution rejections must be an array")
+    result = ReviewerExecutionResultV2(
+        assignment_id=payload["assignment_id"],
+        status=payload["status"],
+        output=payload["output"],
+        reviewer_output=reviewer_output,
+        rejected_findings=tuple(
+            RejectedReviewerFinding.from_dict(item) for item in rejected
+        ),
+        error_code=payload["error_code"],
+        active_elapsed_seconds=payload["active_elapsed_seconds"],
+    )
+    if result.status == "completed" and (
+        result.reviewer_output is None
+        or result.output != result.reviewer_output.to_json()
+        or result.error_code is not None
+    ):
+        raise ValueError("Completed Reviewer execution result is inconsistent")
+    return result
+
+
 __all__ = [
     "ReviewerExecutionResultV2",
     "ReviewerExecutorV2",
     "ReviewerLoopV2",
+    "reviewer_execution_result_v2_from_dict",
+    "reviewer_execution_result_v2_to_dict",
 ]

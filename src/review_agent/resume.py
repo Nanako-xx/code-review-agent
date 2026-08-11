@@ -34,11 +34,13 @@ from review_agent.session import (
     ReviewExecutionConfig,
     RevisionChangeKind,
     SESSION_SCHEMA_VERSION,
+    SESSION_V6_PHASES,
     SessionManifest,
+    SessionV6Manifest,
     child_session_manifest,
     session_phases_for_schema,
 )
-from review_agent.session_store import SessionStore
+from review_agent.session_store import SessionStore, SessionV6Store
 
 
 class ResumeAction(str, Enum):
@@ -447,3 +449,78 @@ def _canonical_path(value: str) -> str:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class LegacySessionUnsupportedError(RuntimeError):
+    def __init__(self, diagnostic: "LegacySessionDiagnostic") -> None:
+        self.diagnostic = diagnostic
+        super().__init__(
+            f"Session schema v{diagnostic.schema_version} is read-only and "
+            "cannot be resumed by the v6 product pipeline"
+        )
+
+
+@dataclass(frozen=True)
+class LegacyArtifactDiagnostic:
+    name: str
+    schema: str
+    path: str
+    valid: bool
+
+
+@dataclass(frozen=True)
+class LegacySessionDiagnostic:
+    schema_version: int
+    status: str
+    current_phase: str
+    artifacts: tuple[LegacyArtifactDiagnostic, ...]
+
+
+@dataclass(frozen=True)
+class SessionV6ResumeResult:
+    manifest: SessionV6Manifest
+    starting_phase: RunPhase | None
+    reused_phases: tuple[RunPhase, ...]
+
+
+def diagnose_legacy_session(run_dir: Path) -> LegacySessionDiagnostic:
+    store = SessionStore(Path(run_dir))
+    manifest = store.load()
+    if manifest.schema_version > SESSION_SCHEMA_VERSION:
+        raise ValueError("diagnose_legacy_session accepts only v1-v5 Sessions")
+    artifacts = tuple(
+        LegacyArtifactDiagnostic(
+            name=name,
+            schema=descriptor.schema,
+            path=descriptor.path,
+            valid=store.validate_artifact(descriptor),
+        )
+        for name, descriptor in sorted(manifest.artifacts.items())
+    )
+    return LegacySessionDiagnostic(
+        schema_version=manifest.schema_version,
+        status=manifest.status.value,
+        current_phase=manifest.current_phase.value,
+        artifacts=artifacts,
+    )
+
+
+def require_v6_resume_from_legacy(run_dir: Path) -> None:
+    raise LegacySessionUnsupportedError(diagnose_legacy_session(run_dir))
+
+
+def resume_session_v6(store: SessionV6Store) -> SessionV6ResumeResult:
+    if not isinstance(store, SessionV6Store):
+        raise ValueError("store must be SessionV6Store")
+    manifest = store.load()
+    starting_phase = store.next_incomplete_phase()
+    reused = tuple(
+        phase
+        for phase in SESSION_V6_PHASES
+        if manifest.phases[phase.value].status is PhaseStatus.COMPLETED
+    )
+    return SessionV6ResumeResult(
+        manifest=manifest,
+        starting_phase=starting_phase,
+        reused_phases=reused,
+    )

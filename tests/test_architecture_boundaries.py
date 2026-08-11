@@ -308,6 +308,47 @@ def test_v6_reviewer_loop_does_not_import_legacy_loop_assignment_or_observations
         assert not violations, f"{filename}: {violations}"
 
 
+def test_v6_product_pipeline_has_no_legacy_post_processing_or_live_store() -> None:
+    forbidden_modules = {
+        "review_agent.pipeline",
+        "review_agent.reconciler",
+        "review_agent.supplemental",
+        "review_agent.evidence",
+        "review_agent.completion",
+        "review_agent.final_risk",
+        "review_agent.brief",
+        "review_agent.memory_store",
+        "review_agent.provider",
+        "review_agent_eval",
+        "sqlite3",
+        "subprocess",
+    }
+    forbidden_symbols = {
+        "MemoryStore",
+        "SemanticReconciliation",
+        "CompletionResult",
+        "FinalRiskAssessment",
+        "ReviewBrief",
+        "Popen",
+    }
+    for filename in (
+        "review_pipeline.py",
+        "review_agent_loop.py",
+        "reviewer_executor.py",
+        "reviewer_output.py",
+        "aggregation.py",
+        "review_renderer.py",
+    ):
+        violations = [
+            (module, symbol)
+            for module, symbol in _imports(_tree(filename))
+            if _module_matches(module, forbidden_modules)
+            or symbol in forbidden_symbols
+        ]
+        assert not violations, f"{filename}: {violations}"
+        assert not _live_memory_store_bindings(_tree(filename)), filename
+
+
 def test_quality_business_logic_does_not_own_subprocess_execution() -> None:
     quality = _tree("quality.py")
     pipeline = _tree("pipeline.py")

@@ -13,7 +13,14 @@ from review_agent.checkpoint import CheckpointStore
 from review_agent.memory_models import MemoryExecutionConfig, MemoryMode
 from review_agent.models import ReviewRequest
 from review_agent.pipeline import PipelineStageError, ReviewPipeline
-from review_agent.resume import ResumeAction, ResumeBlockedError, ReviewSessionResumer
+from review_agent.resume import (
+    LegacySessionUnsupportedError,
+    ResumeAction,
+    ResumeBlockedError,
+    ReviewSessionResumer,
+    diagnose_legacy_session,
+    require_v6_resume_from_legacy,
+)
 from review_agent.revision import RevisionResolver
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
@@ -30,6 +37,22 @@ from review_agent.session import (
     session_phases_for_schema,
 )
 from review_agent.session_store import SessionStore
+
+
+@pytest.mark.parametrize("version", ("v1", "v2", "v3", "v4"))
+def test_legacy_session_is_diagnostic_only_for_v6_product_resume(version: str) -> None:
+    run_dir = Path(__file__).parent / "fixtures" / "sessions" / version
+
+    diagnostic = diagnose_legacy_session(run_dir)
+
+    assert diagnostic.schema_version == int(version[1:])
+    assert diagnostic.status
+    assert diagnostic.current_phase
+    assert all(item.name and item.schema and item.path for item in diagnostic.artifacts)
+    with pytest.raises(LegacySessionUnsupportedError) as caught:
+        require_v6_resume_from_legacy(run_dir)
+    assert caught.value.diagnostic == diagnostic
+    assert "read-only" in str(caught.value)
 
 
 def _session_pipeline(
