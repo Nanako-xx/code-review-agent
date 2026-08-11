@@ -92,8 +92,13 @@ Tool and Artifact protocol:
 Reviewer output contract:
 - Return exactly one JSON object with findings and uncertainties.
 - Each finding has exactly claim, severity, path, line, and suggestion.
+- claim must be self-contained and state the defect, its trigger, and its concrete impact; do not repeat the fix there.
+- severity is exactly one of blocker, high, medium, or low.
+- path and line identify one resolvable location in the current Snapshot Diff.
+- suggestion must name a concrete corrective action or regression test; generic text such as "please fix" is invalid.
 - Report only confirmed defects; put unresolved evidence gaps in uncertainties.
-- Do not emit Markdown, merge advice, internal artifact IDs, reviewer provenance, or extra fields.
+- Never emit finding_id or status. Runtime alone owns IDs and execution status.
+- Do not emit confidence, impact, evidence_refs, verification narratives, contract assessments, Markdown, merge advice, internal artifact IDs, reviewer provenance, or any extra field.
 
 Completion:
 - Finish after investigating the Assignment's mission, targets, and checks sufficiently to report confirmed defects and explicit uncertainties.

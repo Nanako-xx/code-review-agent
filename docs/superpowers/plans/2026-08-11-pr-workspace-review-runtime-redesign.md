@@ -2,7 +2,7 @@
 
 > **For agentic workers:** 按 Task 顺序实施，使用 checkbox 跟踪进度；每个 Task 在定向测试通过后形成一个独立提交。不要把协议、存储、Agent Loop 和 Eval 切换压成一次大提交。
 
-**状态：** 实施中（Task 1–10 已完成）
+**状态：** 实施中（Task 1–11 已完成）
 
 **设计来源：** `docs/superpowers/specs/2026-08-10-pr-workspace-preflight-reviewer-runtime-redesign.md`
 
@@ -834,7 +834,7 @@ feat: add three-layer reviewer context compaction
 - Modify: `tests/test_reviewer_executor_v2.py`
 - Modify: `tests/test_reviewer.py`
 
-- [ ] **Step 1：写严格输出 RED 测试**
+- [x] **Step 1：写严格输出 RED 测试**
 
 Reviewer 最终响应只接受：
 
@@ -844,19 +844,19 @@ Reviewer 最终响应只接受：
 
 每个 Finding 只接受 claim/severity/path/line/suggestion。删除 confidence、impact、evidence_refs、verification_performed、contract_assessments、rejected_hypotheses、observation_refs、investigation_summary 和模型声明 status。
 
-- [ ] **Step 2：更新 System Prompt 和 JSON Schema**
+- [x] **Step 2：更新 System Prompt 和 JSON Schema**
 
 Finding claim 覆盖缺陷、触发条件、影响；suggestion 必须具体。模型不生成 finding_id。Runtime safety、DeveloperReviewPolicy、数据不可信边界和工具协议继续位于 System。
 
-- [ ] **Step 3：实现 envelope 与候选级校验**
+- [x] **Step 3：实现 envelope 与候选级校验**
 
 顶层 JSON/字段非法 -> Reviewer `invalid_output`。单个 Finding 非法 -> 只拒绝该候选并记录稳定 reason，其他合法 Finding 保留。path/line 必须能在当前 Snapshot/Diff index 解析。
 
-- [ ] **Step 4：移除 Review Contract completion 校验**
+- [x] **Step 4：移除 Review Contract completion 校验**
 
 新 Reviewer 路径不调用 `validate_reviewer_completion()` 或构造 ContractAssessment。旧 `reviewer.py/review_contract.py` 只供 v5 tests，Task 16 决定删除范围。
 
-- [ ] **Step 5：运行测试**
+- [x] **Step 5：运行测试**
 
 Run:
 
@@ -870,7 +870,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；模型无法伪造 Runtime status，单个坏 Finding 不丢掉同结果的好 Finding。
 
-- [ ] **Step 6：提交**
+- [x] **Step 6：提交**
 
 ```text
 refactor: adopt minimal reviewer output v2

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import json
 
 import pytest
@@ -11,6 +12,7 @@ from review_agent.context_window import (
     ContextWindowPolicy,
 )
 from review_agent.execution_journal import ExecutionJournal, ToolCallIdentity
+from review_agent.diff_artifact import DiffArtifactIndex, DiffFileIndex, DiffHunkIndex
 from review_agent.model_protocol import (
     ModelResponseKind,
     ModelToolCall,
@@ -21,6 +23,7 @@ from review_agent.review_agent_loop import ReviewAgentLoopV2
 from review_agent.review_context import ReviewerInvocationV2
 from review_agent.review_planning import compile_review_plan
 from review_agent.review_protocol import RiskLevel
+from review_agent.reviewer_output import ReviewerOutputParser
 from review_agent.review_tool_gateway import (
     ReviewToolGateway,
     ToolBackendResult,
@@ -66,6 +69,7 @@ def _runtime(
     *,
     context_window_policy=None,
     token_estimator=None,
+    with_output_index: bool = False,
 ):
     repository = tmp_path / "repo"
     git_common = repository / ".git"
@@ -114,6 +118,14 @@ def _runtime(
         invocation=invocation,
         context_window_policy=context_window_policy,
         token_estimator=token_estimator,
+        output_parser=(
+            ReviewerOutputParser(
+                diff_index=_output_index(snapshot.snapshot_id),
+                assignment=assignment,
+            )
+            if with_output_index
+            else None
+        ),
     )
     return loop, journal, backend, assignment
 
@@ -132,6 +144,43 @@ def _tool_response(call_count: int = 1) -> ModelTurnResponse:
         raw={"choices": [{"message": {"content": "Inspect files."}}]},
         provider_name="fake",
         model="fake",
+    )
+
+
+def _output_index(snapshot_id: str) -> DiffArtifactIndex:
+    patch = b"diff --git a/src/api.py b/src/api.py\n@@ -1,3 +1,3 @@\n"
+    return DiffArtifactIndex(
+        snapshot_id=snapshot_id,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+        patch_artifact_id="A-" + "d" * 64,
+        diff_sha256=hashlib.sha256(patch).hexdigest(),
+        diff_size_bytes=len(patch),
+        files=(
+            DiffFileIndex(
+                file_index=0,
+                path="src/api.py",
+                previous_path=None,
+                status="modify",
+                additions=1,
+                deletions=1,
+                binary=False,
+                submodule=False,
+                byte_start=0,
+                byte_end=len(patch),
+                hunks=(
+                    DiffHunkIndex(
+                        hunk_index=0,
+                        old_start=1,
+                        old_count=3,
+                        new_start=1,
+                        new_count=3,
+                        byte_start=40,
+                        byte_end=len(patch),
+                    ),
+                ),
+            ),
+        ),
     )
 
 
@@ -385,6 +434,83 @@ def test_invalid_model_output_is_not_a_transport_retry(tmp_path: Path) -> None:
     assert run.status == "invalid_output"
     assert len(adapter.requests) == 1
     assert backend.calls == []
+
+
+def test_model_cannot_forge_runtime_status_in_final_output(tmp_path: Path) -> None:
+    adapter = _Adapter(
+        (
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=(
+                    '{"findings":[],"uncertainties":[],"status":"completed"}'
+                ),
+            ),
+        )
+    )
+    loop, journal, _backend, _assignment = _runtime(tmp_path, adapter)
+
+    run = loop.run()
+
+    assert run.status == "invalid_output"
+    assert run.error_code == "invalid_reviewer_output"
+    assert journal.replay().final_text is None
+
+
+def test_loop_keeps_good_finding_and_persists_bad_candidate_rejection(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "findings": [
+            {
+                "claim": (
+                    "When the value is absent, dereferencing it raises and the "
+                    "request returns 500."
+                ),
+                "severity": "high",
+                "path": "src/api.py",
+                "line": 1,
+                "suggestion": (
+                    "Handle the absent value before dereferencing it and add a test."
+                ),
+            },
+            {
+                "claim": "This candidate points outside the changed line range.",
+                "severity": "low",
+                "path": "src/api.py",
+                "line": 99,
+                "suggestion": "Add a guard and a regression test for this path.",
+            },
+        ],
+        "uncertainties": [],
+    }
+    adapter = _Adapter(
+        (
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(payload),
+            ),
+        )
+    )
+    loop, journal, _backend, _assignment = _runtime(
+        tmp_path,
+        adapter,
+        with_output_index=True,
+    )
+
+    first = loop.run()
+    resumed = loop.run()
+
+    assert first.status == resumed.status == "completed"
+    assert first.reviewer_output is not None
+    assert len(first.reviewer_output.findings) == 1
+    assert first.final_text == first.reviewer_output.to_json()
+    assert len(first.rejected_findings) == 1
+    assert first.rejected_findings[0].reason == "line_not_in_diff"
+    assert resumed.rejected_findings == first.rejected_findings
+    assert journal.replay().final_rejections == (
+        {"candidate_index": 1, "reason": "line_not_in_diff"},
+    )
+    assert len(adapter.requests) == 1
 
 
 def test_provider_transport_stops_after_three_attempts(tmp_path: Path) -> None:

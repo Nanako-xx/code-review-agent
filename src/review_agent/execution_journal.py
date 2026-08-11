@@ -17,6 +17,7 @@ from review_agent.pr_workspace import (
     SessionWorkspace,
 )
 from review_agent.review_protocol import ReviewerAssignment
+from review_agent.reviewer_output import RejectedReviewerFinding
 from review_agent.safe_io import (
     SafeIOError,
     assert_regular_file,
@@ -235,6 +236,7 @@ class JournalReplay:
     active_elapsed_seconds: float
     committed_turns: tuple[int, ...]
     final_text: str | None
+    final_rejections: tuple[dict[str, Any], ...]
     provider_attempts: int
     model_turns: int
     tool_calls: int
@@ -534,6 +536,7 @@ class ExecutionJournal:
         max_compaction_generation = 0
         active_elapsed = 0.0
         final_text: str | None = None
+        final_rejections: tuple[dict[str, Any], ...] = ()
         provider_attempts = 0
         model_turns = 0
         tool_calls = 0
@@ -770,9 +773,38 @@ class ExecutionJournal:
                 candidate = event.payload.get("final_text")
                 if type(candidate) is not str or not candidate.strip():
                     raise JournalIntegrityError("Final result payload is invalid")
+                if set(event.payload) not in (
+                    {"final_text"},
+                    {"final_text", "rejected_findings"},
+                ):
+                    raise JournalIntegrityError("Final result schema is invalid")
+                raw_rejections = event.payload.get("rejected_findings", [])
+                if type(raw_rejections) is not list:
+                    raise JournalIntegrityError(
+                        "Final result rejection records are invalid"
+                    )
+                try:
+                    normalized_rejections = tuple(
+                        RejectedReviewerFinding.from_dict(item).to_dict()
+                        for item in raw_rejections
+                    )
+                except ValueError as error:
+                    raise JournalIntegrityError(
+                        "Final result rejection record is invalid"
+                    ) from error
+                rejection_indices = [
+                    item["candidate_index"] for item in normalized_rejections
+                ]
+                if rejection_indices != sorted(set(rejection_indices)):
+                    raise JournalIntegrityError(
+                        "Final result rejection records are not ordered and unique"
+                    )
                 if final_text is not None and final_text != candidate:
                     raise JournalIntegrityError("Final result changed")
+                if final_text is not None and final_rejections != normalized_rejections:
+                    raise JournalIntegrityError("Final result rejections changed")
                 final_text = candidate
+                final_rejections = normalized_rejections
         return JournalReplay(
             committed_messages=tuple(committed_messages),
             committed_turn_messages=tuple(committed_turn_messages),
@@ -782,6 +814,7 @@ class ExecutionJournal:
             active_elapsed_seconds=active_elapsed,
             committed_turns=tuple(committed_turns),
             final_text=final_text,
+            final_rejections=final_rejections,
             provider_attempts=provider_attempts,
             model_turns=model_turns,
             tool_calls=tool_calls,
@@ -1139,13 +1172,33 @@ class ExecutionJournal:
         self,
         *,
         final_text: str,
+        rejected_findings: tuple[Mapping[str, Any], ...] = (),
         active_elapsed_seconds: float,
     ) -> JournalEvent:
         if type(final_text) is not str or not final_text.strip():
             raise JournalError("final_text must be non-empty")
+        if type(rejected_findings) is not tuple:
+            raise JournalError("rejected_findings must be a tuple")
+        try:
+            normalized_rejections = tuple(
+                RejectedReviewerFinding.from_dict(item).to_dict()
+                for item in rejected_findings
+            )
+        except ValueError as error:
+            raise JournalError("rejected_findings contains an invalid record") from error
+        rejection_indices = [
+            item["candidate_index"] for item in normalized_rejections
+        ]
+        if rejection_indices != sorted(set(rejection_indices)):
+            raise JournalError(
+                "rejected_findings must be ordered by unique candidate index"
+            )
         replay = self.replay()
         if replay.final_text is not None:
-            if replay.final_text != final_text:
+            if (
+                replay.final_text != final_text
+                or replay.final_rejections != normalized_rejections
+            ):
                 raise JournalIntegrityError("Final result changed")
             return next(
                 event
@@ -1155,11 +1208,10 @@ class ExecutionJournal:
             )
         if replay.pending_turn is not None:
             raise JournalIntegrityError("cannot finalize an uncommitted Tool Turn")
-        return self._append(
-            "final_result",
-            {"final_text": final_text},
-            active_elapsed_seconds,
-        )
+        payload: dict[str, Any] = {"final_text": final_text}
+        if normalized_rejections:
+            payload["rejected_findings"] = list(normalized_rejections)
+        return self._append("final_result", payload, active_elapsed_seconds)
 
     def _append(
         self,

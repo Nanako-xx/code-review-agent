@@ -310,6 +310,22 @@ def test_initial_message_contains_only_current_pinned_review_inputs() -> None:
         assert forbidden not in message
 
 
+def test_reviewer_prompt_and_parameters_bind_minimal_output_v2() -> None:
+    invocation = build_reviewer_invocation_v2(_context_input())
+
+    assert invocation.parameters["response_schema"] == "reviewer_output_v2"
+    assert len(invocation.parameters["response_schema_digest"]) == 64
+    assert "defect, its trigger, and its concrete impact" in invocation.system
+    assert "Never emit finding_id or status" in invocation.system
+    for forbidden in (
+        "contract_assessments",
+        "confirmed_findings",
+        "evidence_refs",
+        "verification_performed",
+    ):
+        assert forbidden not in invocation.messages[0]["content"]
+
+
 def test_large_diff_uses_complete_index_and_relevant_hunk_without_line_truncation() -> None:
     patch, _index = _diff()
     large_patch = patch + (b"# filler\n" * 500)

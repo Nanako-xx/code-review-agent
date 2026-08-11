@@ -20,6 +20,7 @@ from review_agent.review_protocol import (
     ReviewRequest,
     ReviewerAssignment,
 )
+from review_agent.reviewer_output import REVIEWER_OUTPUT_JSON_SCHEMA_V2
 
 
 _PR_ID = re.compile(r"\APR-[0-9a-f]{64}\Z")
@@ -447,6 +448,15 @@ def build_reviewer_invocation_v2(
         "temperature": 0,
         "tool_choice": "auto" if tools else "none",
         "response_schema": "reviewer_output_v2",
+        "response_schema_digest": hashlib.sha256(
+            json.dumps(
+                REVIEWER_OUTPUT_JSON_SCHEMA_V2,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
     }
     fixed_character_count = sum(
         len(part)

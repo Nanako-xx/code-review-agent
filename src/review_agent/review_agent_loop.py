@@ -30,6 +30,12 @@ from review_agent.model_protocol import (
 )
 from review_agent.review_context import ReviewerInvocationV2
 from review_agent.review_protocol import ReviewerAssignment
+from review_agent.review_protocol import ReviewerOutput
+from review_agent.reviewer_output import (
+    RejectedReviewerFinding,
+    ReviewerOutputEnvelopeError,
+    ReviewerOutputParser,
+)
 from review_agent.review_tool_gateway import ReviewToolGateway
 from review_agent.reviewer_runtime import (
     ReviewerRuntimeLimitsV2,
@@ -50,6 +56,8 @@ class ReviewAgentRunV2:
     error_code: str | None
     messages: tuple[dict[str, Any], ...]
     runtime: ReviewerRuntimeStateV2
+    reviewer_output: ReviewerOutput | None = None
+    rejected_findings: tuple[RejectedReviewerFinding, ...] = ()
 
 
 class ReviewAgentLoopError(ValueError):
@@ -71,6 +79,7 @@ class ReviewAgentLoopV2:
         utc_now: Callable[[], datetime] | None = None,
         context_window_policy: ContextWindowPolicy | None = None,
         token_estimator: TokenEstimator | None = None,
+        output_parser: ReviewerOutputParser | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> None:
         if not hasattr(adapter, "complete_turn"):
@@ -102,6 +111,24 @@ class ReviewAgentLoopV2:
             )
         self.clock = clock or time.monotonic
         self.cancelled = cancelled or (lambda: False)
+        if output_parser is not None and not isinstance(
+            output_parser, ReviewerOutputParser
+        ):
+            raise ReviewAgentLoopError(
+                "output_parser must be ReviewerOutputParser or None"
+            )
+        if (
+            output_parser is not None
+            and output_parser.assignment is not None
+            and output_parser.assignment != assignment
+        ):
+            raise ReviewAgentLoopError(
+                "Reviewer output parser Assignment binding does not match"
+            )
+        self.output_parser = output_parser or ReviewerOutputParser(
+            diff_index=None,
+            assignment=assignment,
+        )
         self.context_window = ContextWindowManager(
             journal=journal,
             invocation=invocation,
@@ -135,12 +162,33 @@ class ReviewAgentLoopV2:
             )
 
         if replay.final_text is not None:
+            try:
+                parsed = self.output_parser.parse(replay.final_text)
+                persisted_rejections = tuple(
+                    RejectedReviewerFinding.from_dict(item)
+                    for item in replay.final_rejections
+                )
+                if (
+                    parsed.output.to_json() != replay.final_text
+                    or parsed.rejected_findings
+                ):
+                    raise ValueError("Persisted ReviewerOutput validation changed")
+            except ValueError:
+                return self._result(
+                    "failed",
+                    None,
+                    "journal_integrity_error",
+                    messages,
+                    runtime,
+                )
             return self._result(
                 "completed",
                 replay.final_text,
                 None,
                 messages,
                 runtime,
+                reviewer_output=parsed.output,
+                rejected_findings=persisted_rejections,
             )
 
         if replay.pending_turn is not None:
@@ -340,16 +388,32 @@ class ReviewAgentLoopV2:
                         messages,
                         runtime,
                     )
+                try:
+                    parsed = self.output_parser.parse(response.final_text)
+                except ReviewerOutputEnvelopeError:
+                    return self._result(
+                        "invalid_output",
+                        None,
+                        "invalid_reviewer_output",
+                        messages,
+                        runtime,
+                    )
+                canonical_output = parsed.output.to_json()
                 self.journal.record_final_result(
-                    final_text=response.final_text,
+                    final_text=canonical_output,
+                    rejected_findings=tuple(
+                        item.to_dict() for item in parsed.rejected_findings
+                    ),
                     active_elapsed_seconds=runtime.active_elapsed_seconds,
                 )
                 return self._result(
                     "completed",
-                    response.final_text,
+                    canonical_output,
                     None,
                     messages,
                     runtime,
+                    reviewer_output=parsed.output,
+                    rejected_findings=parsed.rejected_findings,
                 )
             if response.kind is not ModelResponseKind.TOOL_CALLS or not response.tool_calls:
                 return self._result(
@@ -444,7 +508,12 @@ class ReviewAgentLoopV2:
                 runtime,
                 self.limits,
             )
-            for key in ("context_window", "response_format", "response_schema"):
+            for key in (
+                "context_window",
+                "response_format",
+                "response_schema",
+                "response_schema_digest",
+            ):
                 parameters.pop(key, None)
             parameters.update(
                 {
@@ -616,6 +685,9 @@ class ReviewAgentLoopV2:
         error_code: str | None,
         messages: list[dict[str, Any]],
         runtime: ReviewerRuntimeStateV2,
+        *,
+        reviewer_output: ReviewerOutput | None = None,
+        rejected_findings: tuple[RejectedReviewerFinding, ...] = (),
     ) -> ReviewAgentRunV2:
         return ReviewAgentRunV2(
             status=status,
@@ -623,6 +695,8 @@ class ReviewAgentLoopV2:
             error_code=error_code,
             messages=tuple(dict(message) for message in messages),
             runtime=runtime,
+            reviewer_output=reviewer_output,
+            rejected_findings=rejected_findings,
         )
 
 
