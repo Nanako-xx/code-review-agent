@@ -141,6 +141,14 @@ class ArtifactDescriptor:
         }
 
 
+@dataclass(frozen=True)
+class ReviewResultArtifactBundle:
+    aggregation_descriptor: ArtifactDescriptor
+    review_result_descriptor: ArtifactDescriptor
+    aggregation_bytes: bytes
+    review_result_bytes: bytes
+
+
 def _stable_id(prefix: str, payload: Mapping[str, Any]) -> str:
     return f"{prefix}-{hashlib.sha256(canonical_json_bytes(payload)).hexdigest()}"
 
@@ -433,6 +441,93 @@ class PRWorkspaceStore:
 
     def verify_session(self, session: SessionWorkspace) -> None:
         self._assert_session_authority(session)
+
+    def publish_review_result_bundle(
+        self,
+        snapshot: SnapshotWorkspace,
+        *,
+        aggregation_bytes: bytes,
+        review_result_bytes: bytes,
+    ) -> ReviewResultArtifactBundle:
+        """Create the internal record first, then the authoritative result."""
+
+        self._assert_snapshot_authority(snapshot)
+        if type(aggregation_bytes) is not bytes or type(review_result_bytes) is not bytes:
+            raise PRWorkspaceError("Review Result bundle content must be bytes")
+        aggregation = self.publish_create_only(
+            snapshot,
+            "Results/aggregation.json",
+            aggregation_bytes,
+        )
+        review_result = self.publish_create_only(
+            snapshot,
+            "Results/review-result.json",
+            review_result_bytes,
+        )
+        return ReviewResultArtifactBundle(
+            aggregation_descriptor=aggregation,
+            review_result_descriptor=review_result,
+            aggregation_bytes=aggregation_bytes,
+            review_result_bytes=review_result_bytes,
+        )
+
+    def load_review_result_bundle(
+        self,
+        snapshot: SnapshotWorkspace,
+    ) -> ReviewResultArtifactBundle | None:
+        """Load both create-only result files or fail closed on a partial bundle."""
+
+        self._assert_snapshot_authority(snapshot)
+        aggregation_path = snapshot.path / "Results" / "aggregation.json"
+        review_result_path = snapshot.path / "Results" / "review-result.json"
+        aggregation_exists = _path_exists(aggregation_path)
+        review_result_exists = _path_exists(review_result_path)
+        if not aggregation_exists and not review_result_exists:
+            return None
+        if aggregation_exists != review_result_exists:
+            raise PRWorkspaceSecurityError(
+                "Review Result bundle is only partially published"
+            )
+        aggregation = self.find_snapshot_artifact(
+            snapshot, "Results/aggregation.json"
+        )
+        review_result = self.find_snapshot_artifact(
+            snapshot, "Results/review-result.json"
+        )
+        return ReviewResultArtifactBundle(
+            aggregation_descriptor=aggregation,
+            review_result_descriptor=review_result,
+            aggregation_bytes=self.read_verified_artifact(
+                snapshot, aggregation.artifact_id
+            ),
+            review_result_bytes=self.read_verified_artifact(
+                snapshot, review_result.artifact_id
+            ),
+        )
+
+    def review_result_bundle_state(self, snapshot: SnapshotWorkspace) -> str:
+        """Return absent, aggregation_only, or complete after authority checks."""
+
+        self._assert_snapshot_authority(snapshot)
+        aggregation_exists = _path_exists(
+            snapshot.path / "Results" / "aggregation.json"
+        )
+        review_result_exists = _path_exists(
+            snapshot.path / "Results" / "review-result.json"
+        )
+        if review_result_exists and not aggregation_exists:
+            raise PRWorkspaceSecurityError(
+                "Review Result exists without its Aggregation Record"
+            )
+        if not aggregation_exists:
+            return "absent"
+        if not review_result_exists:
+            return "aggregation_only"
+        aggregation = self.find_snapshot_artifact(
+            snapshot, "Results/aggregation.json"
+        )
+        self.read_verified_artifact(snapshot, aggregation.artifact_id)
+        return "complete"
 
     def publish_intent_history(
         self,
@@ -984,6 +1079,7 @@ __all__ = [
     "PRWorkspaceSecurityError",
     "PRWorkspaceStore",
     "ResolvedPR",
+    "ReviewResultArtifactBundle",
     "SessionWorkspace",
     "SnapshotWorkspace",
 ]

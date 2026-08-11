@@ -2,7 +2,7 @@
 
 > **For agentic workers:** 按 Task 顺序实施，使用 checkbox 跟踪进度；每个 Task 在定向测试通过后形成一个独立提交。不要把协议、存储、Agent Loop 和 Eval 切换压成一次大提交。
 
-**状态：** 实施中（Task 1–11 已完成）
+**状态：** 实施中（Task 1–12 已完成）
 
 **设计来源：** `docs/superpowers/specs/2026-08-10-pr-workspace-preflight-reviewer-runtime-redesign.md`
 
@@ -888,7 +888,7 @@ refactor: adopt minimal reviewer output v2
 - Create: `tests/test_aggregation.py`
 - Create: `tests/test_review_renderer.py`
 
-- [ ] **Step 1：写 fingerprint 与 merge RED 测试**
+- [x] **Step 1：写 fingerprint 与 merge RED 测试**
 
 问题身份严格由 snapshot_id + canonical path + line + NFKC/trim/whitespace-collapse claim 组成并保留大小写。severity、suggestion、Reviewer role/order/time 不进入 identity。
 
@@ -899,7 +899,7 @@ refactor: adopt minimal reviewer output v2
 - 同位置不同 claim 不合并；`Foo`/`foo` 不合并；
 - 相同输入重复聚合得到相同 Finding ID、排序和 canonical JSON bytes。
 
-- [ ] **Step 2：实现状态和 uncertainty 规则**
+- [x] **Step 2：实现状态和 uncertainty 规则**
 
 ```text
 all valid     completed
@@ -909,15 +909,15 @@ none valid    failed
 
 Core 失败但其他有效时返回 partial 和已有 Findings。Runtime error 生成稳定、清洗后的 coverage uncertainty；Reviewer uncertainties 只做确定性规范化和去重。
 
-- [ ] **Step 3：实现 create-only ReviewResult 发布**
+- [x] **Step 3：实现 create-only ReviewResult 发布**
 
 写 `aggregation.json` 后原子发布 `review-result.json`；Result 严格六字段且无时间戳。Resume 验证 Snapshot/hash 后复用，不重新聚合。
 
-- [ ] **Step 4：实现纯 Markdown renderer**
+- [x] **Step 4：实现纯 Markdown renderer**
 
 只显示 status、risk、severity、path:line、claim、suggestion 和 uncertainties。不得生成 summary、recommendation 或 JSON 中不存在的事实。
 
-- [ ] **Step 5：运行测试**
+- [x] **Step 5：运行测试**
 
 Run:
 
@@ -930,7 +930,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；重复运行字节一致，Markdown 可删除后重建。
 
-- [ ] **Step 6：提交**
+- [x] **Step 6：提交**
 
 ```text
 feat: add deterministic review result aggregation
