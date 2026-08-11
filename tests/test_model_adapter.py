@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 import review_agent.model_adapter as model_adapter_module
+from review_agent.context_window import canonical_context_eviction_marker
 from review_agent.model_adapter import (
     MAX_ALLOWED_RESPONSE_BYTES,
     MAX_HTTP_DEADLINE_WORKERS,
@@ -33,6 +34,77 @@ from review_agent.tool_result_protocol import (
     ReviewToolResult,
     ToolResultProjectionV2,
 )
+
+
+def test_openai_payload_accepts_context_eviction_marker_with_tool_pair() -> None:
+    marker = canonical_context_eviction_marker(
+        tool_call_id="call-evicted",
+        tool_name="read_range",
+        canonical_arguments_hash="a" * 64,
+    )
+    request = ModelTurnRequest(
+        system="system",
+        tools=[ModelToolSpec("read_range", "Read", {"type": "object"})],
+        messages=[
+            {
+                "role": "assistant",
+                "content": "Read it.",
+                "tool_calls": [
+                    {
+                        "id": "call-evicted",
+                        "type": "function",
+                        "function": {
+                            "name": "read_range",
+                            "arguments": '{"path":"src/a.py"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-evicted",
+                "content": marker,
+            },
+        ],
+        tool_results=[],
+        parameters={"temperature": 0},
+    )
+
+    payload = model_adapter_module._build_openai_tool_payload("model", request)
+
+    assert payload["messages"][-1]["content"] == marker
+
+
+def test_openai_adapter_exposes_configured_exact_token_estimators() -> None:
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="model",
+        ),
+        transport=lambda *_args: {},
+        request_token_estimator=lambda _request: 123,
+        text_token_estimator=lambda text: len(text),
+    )
+    request = ModelTurnRequest("system", [], [], [], {})
+
+    assert adapter.estimate_request_tokens(request) == 123
+    assert adapter.estimate_text_tokens("four") == 4
+
+
+def test_openai_payload_omits_empty_tools_for_plain_compaction_request() -> None:
+    request = ModelTurnRequest(
+        "compact",
+        [],
+        [{"role": "user", "content": "Summarize."}],
+        [],
+        {"tool_choice": "none", "max_output_tokens": 50_000},
+    )
+
+    payload = model_adapter_module._build_openai_tool_payload("model", request)
+
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
 
 
 class _BoundedHttpResponse:

@@ -1,9 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import time
 from typing import Any, Callable
 
+from review_agent.context_window import (
+    COMPACTION_SYSTEM_PROMPT,
+    COMPACTION_USER_PROMPT,
+    CompactionSummaryResult,
+    CompactionWork,
+    ContextCompactionError,
+    ContextWindowIntegrityError,
+    ContextWindowManager,
+    ContextWindowPolicy,
+    TokenEstimator,
+)
 from review_agent.execution_journal import (
     ExecutionJournal,
     JournalIntegrityError,
@@ -13,7 +25,6 @@ from review_agent.execution_journal import (
 from review_agent.model_adapter import model_response_to_assistant_message
 from review_agent.model_protocol import (
     ModelResponseKind,
-    ModelToolSpec,
     ModelTurnRequest,
     ModelTurnResponse,
 )
@@ -57,6 +68,9 @@ class ReviewAgentLoopV2:
         invocation: ReviewerInvocationV2,
         limits: ReviewerRuntimeLimitsV2 | None = None,
         clock: Callable[[], float] | None = None,
+        utc_now: Callable[[], datetime] | None = None,
+        context_window_policy: ContextWindowPolicy | None = None,
+        token_estimator: TokenEstimator | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> None:
         if not hasattr(adapter, "complete_turn"):
@@ -88,6 +102,14 @@ class ReviewAgentLoopV2:
             )
         self.clock = clock or time.monotonic
         self.cancelled = cancelled or (lambda: False)
+        self.context_window = ContextWindowManager(
+            journal=journal,
+            invocation=invocation,
+            adapter=adapter,
+            policy=context_window_policy,
+            estimator=token_estimator,
+            utc_now=utc_now,
+        )
 
     def run(self) -> ReviewAgentRunV2:
         replay = self.journal.replay()
@@ -101,8 +123,16 @@ class ReviewAgentLoopV2:
             total_tokens=replay.total_tokens,
             all_usage_available=replay.all_usage_available,
         )
-        messages = [dict(message) for message in self.invocation.messages]
-        messages.extend(dict(message) for message in replay.committed_messages)
+        try:
+            messages = [dict(message) for message in self.context_window.active_messages()]
+        except ContextWindowIntegrityError:
+            return self._result(
+                "failed",
+                None,
+                "context_window_integrity_error",
+                [],
+                runtime,
+            )
 
         if replay.final_text is not None:
             return self._result(
@@ -119,11 +149,20 @@ class ReviewAgentLoopV2:
                     replay.pending_turn,
                     runtime,
                 )
-                messages.append(dict(replay.pending_turn.assistant_message))
-                messages.extend(_tool_message(item) for item in projections)
+                messages = [
+                    dict(message) for message in self.context_window.active_messages()
+                ]
             except TimeoutError:
                 return self._result(
                     "timeout", None, "active_time_exhausted", messages, runtime
+                )
+            except ContextWindowIntegrityError:
+                return self._result(
+                    "failed",
+                    None,
+                    "context_window_integrity_error",
+                    messages,
+                    runtime,
                 )
             except (JournalIntegrityError, ValueError):
                 return self._result(
@@ -163,13 +202,58 @@ class ReviewAgentLoopV2:
                         messages,
                         runtime,
                     )
-                request = ModelTurnRequest(
-                    system=self.invocation.system,
-                    tools=_tool_specs(self.invocation),
-                    messages=[dict(message) for message in messages],
-                    tool_results=[],
-                    parameters=parameters,
-                )
+                try:
+                    prepared = self.context_window.prepare_request(
+                        parameters=parameters,
+                        active_elapsed_seconds=runtime.active_elapsed_seconds,
+                        summarizer=lambda work: self._summarize_compaction(
+                            work,
+                            runtime=runtime,
+                            turn_index=request_turn_index,
+                        ),
+                    )
+                    if prepared.compacted:
+                        parameters = request_parameters_v2(
+                            self.invocation.parameters,
+                            runtime,
+                            self.limits,
+                        )
+                        prepared = self.context_window.prepare_request(
+                            parameters=parameters,
+                            active_elapsed_seconds=runtime.active_elapsed_seconds,
+                            summarizer=lambda work: self._summarize_compaction(
+                                work,
+                                runtime=runtime,
+                                turn_index=request_turn_index,
+                            ),
+                        )
+                    request = prepared.request
+                    messages = [dict(message) for message in request.messages]
+                    self.context_window.mark_api_request()
+                except TimeoutError:
+                    return self._result(
+                        "timeout",
+                        None,
+                        "active_time_exhausted",
+                        messages,
+                        runtime,
+                    )
+                except ContextCompactionError:
+                    return self._result(
+                        "failed",
+                        None,
+                        "context_compaction_failed",
+                        messages,
+                        runtime,
+                    )
+                except ContextWindowIntegrityError:
+                    return self._result(
+                        "failed",
+                        None,
+                        "context_window_integrity_error",
+                        messages,
+                        runtime,
+                    )
                 started = self.clock()
                 try:
                     candidate = self.adapter.complete_turn(request)
@@ -330,8 +414,139 @@ class ReviewAgentLoopV2:
                 return self._result(
                     "failed", None, "journal_integrity_error", messages, runtime
                 )
-            messages.append(dict(assistant_message))
-            messages.extend(_tool_message(item) for item in projections)
+            try:
+                messages = [
+                    dict(message) for message in self.context_window.active_messages()
+                ]
+            except ContextWindowIntegrityError:
+                return self._result(
+                    "failed",
+                    None,
+                    "context_window_integrity_error",
+                    messages,
+                    runtime,
+                )
+
+    def _summarize_compaction(
+        self,
+        work: CompactionWork,
+        *,
+        runtime: ReviewerRuntimeStateV2,
+        turn_index: int,
+    ) -> CompactionSummaryResult:
+        for provider_attempt in range(1, self.limits.max_provider_attempts + 1):
+            if runtime.remaining_seconds(self.limits) <= 0:
+                raise ContextCompactionError(
+                    "Reviewer active time was exhausted during Compaction"
+                )
+            parameters = request_parameters_v2(
+                self.invocation.parameters,
+                runtime,
+                self.limits,
+            )
+            for key in ("context_window", "response_format", "response_schema"):
+                parameters.pop(key, None)
+            parameters.update(
+                {
+                    "tool_choice": "none",
+                    "temperature": 0,
+                    "max_output_tokens": (
+                        self.context_window.policy.compaction_summary_max_tokens
+                    ),
+                }
+            )
+            request = ModelTurnRequest(
+                system=COMPACTION_SYSTEM_PROMPT,
+                tools=[],
+                messages=[
+                    {"role": "user", "content": COMPACTION_USER_PROMPT},
+                    *(dict(message) for message in work.messages),
+                ],
+                tool_results=[],
+                parameters=parameters,
+            )
+            estimate = self.context_window.estimate_request(
+                request,
+                output_reserve_tokens=(
+                    self.context_window.policy.compaction_summary_max_tokens
+                ),
+            )
+            if (
+                estimate.input_tokens > estimate.hard_input_limit_tokens
+                or estimate.total_tokens
+                > self.context_window.policy.context_window_tokens
+            ):
+                raise ContextCompactionError(
+                    "Compaction source exceeds the physical context window"
+                )
+            self.context_window.mark_api_request()
+            started = self.clock()
+            try:
+                candidate = self.adapter.complete_turn(request)
+            except Exception:
+                runtime.consume_active(max(0.0, self.clock() - started))
+                usage = runtime.record_provider_attempt(None)
+                self.journal.record_provider_attempt(
+                    turn_index=turn_index,
+                    attempt=provider_attempt,
+                    status="failed",
+                    response_kind=None,
+                    error_code="context_compaction_transport_error",
+                    usage={
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "total_tokens": usage.total_tokens,
+                        "available": usage.available,
+                    },
+                    active_elapsed_seconds=runtime.active_elapsed_seconds,
+                )
+                continue
+
+            runtime.consume_active(max(0.0, self.clock() - started))
+            usage = runtime.record_provider_attempt(
+                candidate.raw if isinstance(candidate, ModelTurnResponse) else None
+            )
+            self.journal.record_provider_attempt(
+                turn_index=turn_index,
+                attempt=provider_attempt,
+                status="succeeded",
+                response_kind=(
+                    candidate.kind.value
+                    if isinstance(candidate, ModelTurnResponse)
+                    else None
+                ),
+                error_code=(
+                    None
+                    if isinstance(candidate, ModelTurnResponse)
+                    else "context_compaction_invalid_provider_response"
+                ),
+                usage={
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "available": usage.available,
+                },
+                active_elapsed_seconds=runtime.active_elapsed_seconds,
+            )
+            if not isinstance(candidate, ModelTurnResponse):
+                continue
+            runtime.model_turns += 1
+            if (
+                candidate.kind is not ModelResponseKind.FINAL
+                or type(candidate.final_text) is not str
+                or not candidate.final_text.strip()
+            ):
+                continue
+            if (
+                self.context_window.estimator.estimate_text(candidate.final_text)
+                > self.context_window.policy.compaction_summary_max_tokens
+            ):
+                continue
+            return CompactionSummaryResult(
+                summary=candidate.final_text,
+                active_elapsed_seconds=runtime.active_elapsed_seconds,
+            )
+        raise ContextCompactionError("Compaction Provider attempts were exhausted")
 
     def _complete_pending_turn(
         self,
@@ -409,23 +624,6 @@ class ReviewAgentLoopV2:
             messages=tuple(dict(message) for message in messages),
             runtime=runtime,
         )
-
-
-def _tool_specs(invocation: ReviewerInvocationV2) -> list[ModelToolSpec]:
-    return [
-        ModelToolSpec(
-            name=tool["name"],
-            description=tool["description"],
-            parameters_schema=dict(tool["parameters"]),
-        )
-        for tool in invocation.tools
-    ]
-
-
-def _tool_message(projection: ToolResultProjectionV2) -> dict[str, Any]:
-    from review_agent.model_adapter import review_tool_projection_to_message
-
-    return review_tool_projection_to_message(projection)
 
 
 __all__ = [

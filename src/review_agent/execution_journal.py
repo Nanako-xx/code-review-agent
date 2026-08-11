@@ -50,6 +50,7 @@ _SESSION_ID = re.compile(r"\ASESSION-[0-9a-f]{64}\Z")
 _ASSIGNMENT_ID = re.compile(r"\AASG-[0-9a-f]{64}\Z")
 _SNAPSHOT_ID = re.compile(r"\AS-[0-9a-f]{64}\Z")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
+_COMPACTION_PATH = re.compile(r"\Acontext-compaction-(?P<generation>[0-9]{8})\.txt\Z")
 _PATH_LOCKS: dict[str, threading.Lock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
 
@@ -207,8 +208,27 @@ class PendingTurn:
 
 
 @dataclass(frozen=True)
+class CommittedTurnRecord:
+    turn_index: int
+    messages: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class ContextCompactionRecord:
+    generation: int
+    through_turn: int
+    source_start_turn: int
+    source_end_turn: int
+    trigger: str
+    summary_path: str
+    summary_hash: str
+    committed_sequence: int
+
+
+@dataclass(frozen=True)
 class JournalReplay:
     committed_messages: tuple[dict[str, Any], ...]
+    committed_turn_messages: tuple[CommittedTurnRecord, ...]
     pending_turn: PendingTurn | None
     completed_calls: dict[str, CompletedToolCall]
     started_without_terminal: dict[str, ToolCallIdentity]
@@ -222,6 +242,9 @@ class JournalReplay:
     output_tokens: int
     total_tokens: int
     all_usage_available: bool
+    context_eviction_markers: dict[str, dict[str, Any]]
+    context_compaction: ContextCompactionRecord | None
+    max_compaction_generation: int
 
 
 def _projection_to_record(value: ToolResultProjectionV2) -> dict[str, Any]:
@@ -285,6 +308,103 @@ def _projection_from_record(value: Any) -> ToolResultProjectionV2:
         reacquire_arguments=value["reacquire_arguments"],
         error=error,
     )
+
+
+def _context_eviction_marker(value: object) -> dict[str, Any]:
+    marker = _json_object(value, "Context eviction marker")
+    expected = {
+        "status",
+        "reason",
+        "tool_call_id",
+        "tool_name",
+        "arguments_hash",
+        "reacquirable",
+    }
+    if set(marker) != expected:
+        raise JournalIntegrityError("Context eviction marker schema is invalid")
+    if marker["status"] != "context_evicted":
+        raise JournalIntegrityError("Context eviction marker status is invalid")
+    if marker["reason"] != "prompt_cache_idle_60m":
+        raise JournalIntegrityError("Context eviction marker reason is invalid")
+    if (
+        type(marker["tool_call_id"]) is not str
+        or not marker["tool_call_id"].strip()
+        or type(marker["tool_name"]) is not str
+        or not marker["tool_name"].strip()
+    ):
+        raise JournalIntegrityError("Context eviction marker identity is invalid")
+    arguments_hash = marker["arguments_hash"]
+    if (
+        type(arguments_hash) is not str
+        or not arguments_hash.startswith("sha256:")
+        or _SHA256.fullmatch(arguments_hash[7:]) is None
+    ):
+        raise JournalIntegrityError("Context eviction arguments hash is invalid")
+    if marker["reacquirable"] is not True:
+        raise JournalIntegrityError("Context eviction must be reacquirable")
+    return marker
+
+
+def _context_compaction_started_payload(value: object) -> dict[str, Any]:
+    payload = _json_object(value, "Context compaction start")
+    expected = {
+        "generation",
+        "through_turn",
+        "source_start_turn",
+        "source_end_turn",
+        "trigger",
+    }
+    if set(payload) != expected:
+        raise JournalIntegrityError("Context compaction start schema is invalid")
+    generation = payload["generation"]
+    through_turn = payload["through_turn"]
+    source_start_turn = payload["source_start_turn"]
+    source_end_turn = payload["source_end_turn"]
+    if type(generation) is not int or generation <= 0:
+        raise JournalIntegrityError("Context compaction generation is invalid")
+    if type(through_turn) is not int or through_turn < 0:
+        raise JournalIntegrityError("Context compaction Turn is invalid")
+    if (
+        type(source_start_turn) is not int
+        or source_start_turn < 0
+        or type(source_end_turn) is not int
+        or source_end_turn != through_turn
+        or source_start_turn > source_end_turn
+    ):
+        raise JournalIntegrityError("Context compaction source range is invalid")
+    if payload["trigger"] not in {"soft_threshold", "hard_input_limit"}:
+        raise JournalIntegrityError("Context compaction trigger is invalid")
+    return payload
+
+
+def _context_compaction_committed_payload(value: object) -> dict[str, Any]:
+    payload = _json_object(value, "Context compaction commit")
+    expected = {
+        "generation",
+        "through_turn",
+        "source_start_turn",
+        "source_end_turn",
+        "trigger",
+        "summary_path",
+        "summary_hash",
+    }
+    if set(payload) != expected:
+        raise JournalIntegrityError("Context compaction commit schema is invalid")
+    _context_compaction_started_payload(
+        {key: payload[key] for key in expected if key not in {"summary_path", "summary_hash"}}
+    )
+    summary_path = payload["summary_path"]
+    match = _COMPACTION_PATH.fullmatch(summary_path) if type(summary_path) is str else None
+    if (
+        match is None
+        or int(match.group("generation")) != payload["generation"]
+    ):
+        raise JournalIntegrityError("Context compaction summary path is invalid")
+    if type(payload["summary_hash"]) is not str or _SHA256.fullmatch(
+        payload["summary_hash"]
+    ) is None:
+        raise JournalIntegrityError("Context compaction summary hash is invalid")
+    return payload
 
 
 class ExecutionJournal:
@@ -402,11 +522,16 @@ class ExecutionJournal:
             if event.assignment_id == self.assignment.assignment_id
         )
         committed_messages: list[dict[str, Any]] = []
+        committed_turn_messages: list[CommittedTurnRecord] = []
         pending: PendingTurn | None = None
         identities: dict[str, ToolCallIdentity] = {}
         started: dict[str, ToolCallIdentity] = {}
         completed: dict[str, CompletedToolCall] = {}
         committed_turns: list[int] = []
+        context_eviction_markers: dict[str, dict[str, Any]] = {}
+        compactions_started: dict[int, dict[str, Any]] = {}
+        context_compaction: ContextCompactionRecord | None = None
+        max_compaction_generation = 0
         active_elapsed = 0.0
         final_text: str | None = None
         provider_attempts = 0
@@ -544,8 +669,99 @@ class ExecutionJournal:
                         )
                 committed_messages.append(assistant)
                 committed_messages.extend(dict(message) for message in tool_messages)
+                committed_turn_messages.append(
+                    CommittedTurnRecord(
+                        turn_index=turn_index,
+                        messages=(
+                            dict(assistant),
+                            *(dict(message) for message in tool_messages),
+                        ),
+                    )
+                )
                 committed_turns.append(turn_index)
                 pending = None
+            elif event.event_type == "context_idle_eviction":
+                marker_values = event.payload.get("markers")
+                if set(event.payload) != {"markers"} or type(marker_values) is not list:
+                    raise JournalIntegrityError(
+                        "Context idle eviction payload is invalid"
+                    )
+                for marker_value in marker_values:
+                    marker = _context_eviction_marker(marker_value)
+                    call_id = marker["tool_call_id"]
+                    terminal = completed.get(call_id)
+                    if terminal is None:
+                        raise JournalIntegrityError(
+                            "Context eviction references an unknown Tool Call"
+                        )
+                    if (
+                        terminal.identity.tool_name != marker["tool_name"]
+                        or "sha256:"
+                        + terminal.identity.canonical_arguments_hash
+                        != marker["arguments_hash"]
+                        or not terminal.projection.reacquirable
+                    ):
+                        raise JournalIntegrityError(
+                            "Context eviction Tool Call binding changed"
+                        )
+                    existing_marker = context_eviction_markers.get(call_id)
+                    if existing_marker is not None and existing_marker != marker:
+                        raise JournalIntegrityError(
+                            "Context eviction marker changed"
+                        )
+                    context_eviction_markers[call_id] = marker
+            elif event.event_type == "context_compaction_started":
+                candidate = _context_compaction_started_payload(event.payload)
+                generation = candidate["generation"]
+                if generation in compactions_started:
+                    if compactions_started[generation] != candidate:
+                        raise JournalIntegrityError(
+                            "Context compaction start changed"
+                        )
+                    raise JournalIntegrityError(
+                        "Context compaction generation started more than once"
+                    )
+                if candidate["through_turn"] not in committed_turns:
+                    raise JournalIntegrityError(
+                        "Context compaction does not end at a committed Turn"
+                    )
+                if generation <= max_compaction_generation:
+                    raise JournalIntegrityError(
+                        "Context compaction generation did not advance"
+                    )
+                compactions_started[generation] = candidate
+                max_compaction_generation = generation
+            elif event.event_type == "context_compaction_committed":
+                candidate = _context_compaction_committed_payload(event.payload)
+                generation = candidate["generation"]
+                started_payload = compactions_started.get(generation)
+                if started_payload is None:
+                    raise JournalIntegrityError(
+                        "Context compaction committed without a start"
+                    )
+                if {
+                    key: candidate[key] for key in started_payload
+                } != started_payload:
+                    raise JournalIntegrityError(
+                        "Context compaction commit changed its source"
+                    )
+                if (
+                    context_compaction is not None
+                    and generation <= context_compaction.generation
+                ):
+                    raise JournalIntegrityError(
+                        "Context compaction commit did not advance"
+                    )
+                context_compaction = ContextCompactionRecord(
+                    generation=generation,
+                    through_turn=candidate["through_turn"],
+                    source_start_turn=candidate["source_start_turn"],
+                    source_end_turn=candidate["source_end_turn"],
+                    trigger=candidate["trigger"],
+                    summary_path=candidate["summary_path"],
+                    summary_hash=candidate["summary_hash"],
+                    committed_sequence=event.sequence,
+                )
             elif event.event_type == "final_result":
                 if pending is not None:
                     raise JournalIntegrityError(
@@ -559,6 +775,7 @@ class ExecutionJournal:
                 final_text = candidate
         return JournalReplay(
             committed_messages=tuple(committed_messages),
+            committed_turn_messages=tuple(committed_turn_messages),
             pending_turn=pending,
             completed_calls=completed,
             started_without_terminal=started,
@@ -572,6 +789,9 @@ class ExecutionJournal:
             output_tokens=output_tokens,
             total_tokens=total_tokens,
             all_usage_available=all_usage_available,
+            context_eviction_markers=context_eviction_markers,
+            context_compaction=context_compaction,
+            max_compaction_generation=max_compaction_generation,
         )
 
     def record_provider_attempt(
@@ -775,6 +995,146 @@ class ExecutionJournal:
             active_elapsed_seconds,
         )
 
+    def record_context_idle_eviction(
+        self,
+        markers: tuple[Mapping[str, Any], ...],
+        *,
+        active_elapsed_seconds: float,
+    ) -> JournalEvent:
+        if type(markers) is not tuple or not markers:
+            raise JournalError("Context eviction markers must be a non-empty tuple")
+        normalized = tuple(_context_eviction_marker(marker) for marker in markers)
+        if len({marker["tool_call_id"] for marker in normalized}) != len(normalized):
+            raise JournalError("Context eviction marker call IDs must be unique")
+        replay = self.replay()
+        new_markers: list[dict[str, Any]] = []
+        for marker in normalized:
+            call_id = marker["tool_call_id"]
+            terminal = replay.completed_calls.get(call_id)
+            if terminal is None:
+                raise JournalIntegrityError(
+                    "Context eviction references an unknown Tool Call"
+                )
+            if (
+                terminal.identity.tool_name != marker["tool_name"]
+                or "sha256:" + terminal.identity.canonical_arguments_hash
+                != marker["arguments_hash"]
+                or not terminal.projection.reacquirable
+            ):
+                raise JournalIntegrityError(
+                    "Context eviction Tool Call binding changed"
+                )
+            existing = replay.context_eviction_markers.get(call_id)
+            if existing is not None:
+                if existing != marker:
+                    raise JournalIntegrityError("Context eviction marker changed")
+                continue
+            new_markers.append(marker)
+        if not new_markers:
+            return next(
+                event
+                for event in reversed(self.read_events())
+                if event.assignment_id == self.assignment.assignment_id
+                and event.event_type == "context_idle_eviction"
+            )
+        return self._append(
+            "context_idle_eviction",
+            {"markers": new_markers},
+            active_elapsed_seconds,
+        )
+
+    def record_context_compaction_started(
+        self,
+        *,
+        generation: int,
+        through_turn: int,
+        source_start_turn: int,
+        source_end_turn: int,
+        trigger: str,
+        active_elapsed_seconds: float,
+    ) -> JournalEvent:
+        payload = _context_compaction_started_payload(
+            {
+                "generation": generation,
+                "through_turn": through_turn,
+                "source_start_turn": source_start_turn,
+                "source_end_turn": source_end_turn,
+                "trigger": trigger,
+            }
+        )
+        replay = self.replay()
+        if through_turn not in replay.committed_turns or replay.pending_turn is not None:
+            raise JournalIntegrityError(
+                "Context compaction requires a committed Turn boundary"
+            )
+        if generation <= replay.max_compaction_generation:
+            raise JournalIntegrityError(
+                "Context compaction generation must advance"
+            )
+        return self._append(
+            "context_compaction_started",
+            payload,
+            active_elapsed_seconds,
+        )
+
+    def record_context_compaction_committed(
+        self,
+        *,
+        generation: int,
+        through_turn: int,
+        source_start_turn: int,
+        source_end_turn: int,
+        trigger: str,
+        summary_path: str,
+        summary_hash: str,
+        active_elapsed_seconds: float,
+    ) -> JournalEvent:
+        payload = _context_compaction_committed_payload(
+            {
+                "generation": generation,
+                "through_turn": through_turn,
+                "source_start_turn": source_start_turn,
+                "source_end_turn": source_end_turn,
+                "trigger": trigger,
+                "summary_path": summary_path,
+                "summary_hash": summary_hash,
+            }
+        )
+        events = tuple(
+            event
+            for event in self.read_events()
+            if event.assignment_id == self.assignment.assignment_id
+        )
+        matching_start = next(
+            (
+                event
+                for event in reversed(events)
+                if event.event_type == "context_compaction_started"
+                and event.payload.get("generation") == generation
+            ),
+            None,
+        )
+        if matching_start is None:
+            raise JournalIntegrityError(
+                "Context compaction has no matching start"
+            )
+        started = _context_compaction_started_payload(matching_start.payload)
+        if {key: payload[key] for key in started} != started:
+            raise JournalIntegrityError("Context compaction source changed")
+        replay = self.replay()
+        if (
+            replay.context_compaction is not None
+            and generation <= replay.context_compaction.generation
+        ):
+            raise JournalIntegrityError(
+                "Context compaction generation must advance"
+            )
+        return self._append(
+            "context_compaction_committed",
+            payload,
+            active_elapsed_seconds,
+        )
+
     def record_final_result(
         self,
         *,
@@ -949,7 +1309,9 @@ def _check_replay_identity(
 
 
 __all__ = [
+    "CommittedTurnRecord",
     "CompletedToolCall",
+    "ContextCompactionRecord",
     "EXECUTION_JOURNAL_SCHEMA",
     "ExecutionJournal",
     "JournalError",

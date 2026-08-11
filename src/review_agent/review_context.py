@@ -231,6 +231,32 @@ class ReviewerInvocationV2:
         _json_mapping(self.parameters, "parameters")
 
 
+def canonical_pinned_context_bytes_v2(
+    invocation: ReviewerInvocationV2,
+) -> bytes:
+    """Return the immutable Reviewer input projection used across compactions."""
+
+    if not isinstance(invocation, ReviewerInvocationV2):
+        raise ReviewerContextError("invocation must be ReviewerInvocationV2")
+    try:
+        return json.dumps(
+            {
+                "system": invocation.system,
+                "tools": list(invocation.tools),
+                "messages": list(invocation.messages),
+                "parameters": invocation.parameters,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8", "strict")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise ReviewerContextError(
+            "Pinned Reviewer context must be canonical JSON"
+        ) from error
+
+
 def _json_mapping(value: object, field_name: str) -> None:
     if not isinstance(value, Mapping):
         raise ReviewerContextError(f"{field_name} must be a mapping")
@@ -460,4 +486,5 @@ __all__ = [
     "ReviewerContextInput",
     "ReviewerInvocationV2",
     "build_reviewer_invocation_v2",
+    "canonical_pinned_context_bytes_v2",
 ]

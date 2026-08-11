@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
+from review_agent.context_window import (
+    COMPACTION_SUMMARY_TAG,
+    COMPACTION_SYSTEM_PROMPT,
+    ContextWindowPolicy,
+)
 from review_agent.execution_journal import ExecutionJournal, ToolCallIdentity
 from review_agent.model_protocol import (
     ModelResponseKind,
@@ -54,7 +60,13 @@ class _Backend:
         )
 
 
-def _runtime(tmp_path: Path, adapter: _Adapter):
+def _runtime(
+    tmp_path: Path,
+    adapter: _Adapter,
+    *,
+    context_window_policy=None,
+    token_estimator=None,
+):
     repository = tmp_path / "repo"
     git_common = repository / ".git"
     git_common.mkdir(parents=True)
@@ -100,6 +112,8 @@ def _runtime(tmp_path: Path, adapter: _Adapter):
         journal=journal,
         assignment=assignment,
         invocation=invocation,
+        context_window_policy=context_window_policy,
+        token_estimator=token_estimator,
     )
     return loop, journal, backend, assignment
 
@@ -131,6 +145,30 @@ def _final() -> ModelTurnResponse:
     )
 
 
+class _CompactionEstimator:
+    def estimate_request(self, request) -> int:
+        if request.system == COMPACTION_SYSTEM_PROMPT:
+            return 100
+        if any(
+            COMPACTION_SUMMARY_TAG in str(message.get("content", ""))
+            for message in request.messages
+        ):
+            return 100
+        if any(message.get("role") == "assistant" for message in request.messages):
+            return 700_000
+        return 100
+
+    def estimate_text(self, text: str) -> int:
+        return len(text.encode("utf-8"))
+
+
+def _context_policy() -> ContextWindowPolicy:
+    return ContextWindowPolicy(
+        output_reserve_tokens=100_000,
+        safety_reserve_tokens=50_000,
+    )
+
+
 def test_v2_loop_has_no_turn_tool_or_token_stop_condition(tmp_path: Path) -> None:
     adapter = _Adapter((_tool_response(30), _final()))
     loop, journal, backend, _assignment = _runtime(tmp_path, adapter)
@@ -148,6 +186,86 @@ def test_v2_loop_has_no_turn_tool_or_token_stop_condition(tmp_path: Path) -> Non
         assert "max_tool_calls" not in request.parameters
         assert "max_total_tokens" not in request.parameters
         assert "max_output_tokens" not in request.parameters
+
+
+def test_loop_compacts_full_dynamic_history_before_next_reviewer_call(
+    tmp_path: Path,
+) -> None:
+    summary_response = ModelTurnResponse(
+        kind=ModelResponseKind.FINAL,
+        final_text=(
+            "Completed one investigation. Retain the read result. "
+            "No candidate finding yet. No uncertainty. Next: finish review."
+        ),
+        raw={
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 10,
+                "total_tokens": 30,
+            }
+        },
+        provider_name="fake",
+        model="fake",
+    )
+    adapter = _Adapter((_tool_response(1), summary_response, _final()))
+    loop, journal, backend, _assignment = _runtime(
+        tmp_path,
+        adapter,
+        context_window_policy=_context_policy(),
+        token_estimator=_CompactionEstimator(),
+    )
+
+    run = loop.run()
+
+    assert run.status == "completed", run.error_code
+    assert len(backend.calls) == 1
+    assert len(adapter.requests) == 3
+    assert adapter.requests[1].system == COMPACTION_SYSTEM_PROMPT
+    assert adapter.requests[1].tools == []
+    assert adapter.requests[1].parameters["max_output_tokens"] == 50_000
+    final_dynamic = adapter.requests[2].messages[1:]
+    assert len(final_dynamic) == 1
+    assert final_dynamic[0]["role"] == "user"
+    assert COMPACTION_SUMMARY_TAG in final_dynamic[0]["content"]
+    assert not any(
+        message.get("role") in {"assistant", "tool"}
+        for message in final_dynamic
+    )
+    assert journal.replay().context_compaction is not None
+    assert run.runtime.provider_attempts == 3
+    assert run.runtime.total_tokens == 45
+    manifest = json.loads(
+        (journal.session.path / "context-manifest.json").read_text("utf-8")
+    )
+    assert manifest["last_api_request_at"] is not None
+
+
+def test_compaction_provider_failure_rolls_back_without_reexecuting_tool(
+    tmp_path: Path,
+) -> None:
+    adapter = _Adapter(
+        (
+            _tool_response(1),
+            ConnectionError("one"),
+            TimeoutError("two"),
+            ConnectionError("three"),
+        )
+    )
+    loop, journal, backend, _assignment = _runtime(
+        tmp_path,
+        adapter,
+        context_window_policy=_context_policy(),
+        token_estimator=_CompactionEstimator(),
+    )
+
+    run = loop.run()
+
+    assert run.status == "failed"
+    assert run.error_code == "context_compaction_failed"
+    assert len(backend.calls) == 1
+    assert journal.replay().context_compaction is None
+    assert journal.replay().pending_turn is None
+    assert run.runtime.provider_attempts == 4
 
 
 def test_provider_transport_retries_three_times_without_executing_tools_twice(

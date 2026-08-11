@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, NoReturn, Protocol, Union, cast
 
+from review_agent.context_window import validate_context_eviction_marker
 from review_agent.model_protocol import (
     ModelResponseKind,
     ModelToolCall,
@@ -186,6 +187,8 @@ class OpenAICompatibleConfig:
 
 
 Transport = Callable[[str, dict[str, str], dict[str, Any], float], dict[str, Any]]
+RequestTokenEstimator = Callable[[ModelTurnRequest], int]
+TextTokenEstimator = Callable[[str], int]
 
 
 class _ProviderResponseTooLargeError(OSError):
@@ -357,6 +360,8 @@ class OpenAICompatibleToolAdapter:
         transport: Transport | None = None,
         *,
         capabilities: ModelAdapterCapabilities | None = None,
+        request_token_estimator: RequestTokenEstimator | None = None,
+        text_token_estimator: TextTokenEstimator | None = None,
     ) -> None:
         if not isinstance(config, OpenAICompatibleConfig):
             raise TypeError("config must be an OpenAICompatibleConfig")
@@ -367,6 +372,12 @@ class OpenAICompatibleToolAdapter:
             raise TypeError(
                 "capabilities must be a ModelAdapterCapabilities or None"
             )
+        if request_token_estimator is not None and not callable(
+            request_token_estimator
+        ):
+            raise TypeError("request_token_estimator must be callable or None")
+        if text_token_estimator is not None and not callable(text_token_estimator):
+            raise TypeError("text_token_estimator must be callable or None")
         if transport is None:
             if capabilities is not None:
                 raise ValueError(
@@ -395,10 +406,22 @@ class OpenAICompatibleToolAdapter:
         self._config = config
         self._transport = transport
         self._capabilities = resolved_capabilities
+        self._request_token_estimator = request_token_estimator
+        self._text_token_estimator = text_token_estimator
 
     @property
     def capabilities(self) -> ModelAdapterCapabilities:
         return self._capabilities
+
+    def estimate_request_tokens(self, request: ModelTurnRequest) -> int:
+        if self._request_token_estimator is None:
+            raise NotImplementedError("No exact request Token estimator is configured")
+        return self._request_token_estimator(request)
+
+    def estimate_text_tokens(self, text: str) -> int:
+        if self._text_token_estimator is None:
+            raise NotImplementedError("No exact text Token estimator is configured")
+        return self._text_token_estimator(text)
 
     def complete_turn(self, request: ModelTurnRequest) -> ModelTurnResponse:
         payload = _build_openai_tool_payload(self._config.model, request)
@@ -490,6 +513,9 @@ def _build_openai_tool_payload(
         if request.tools:
             raise ValueError("json_object response_format requires a no-tool request")
         payload["response_format"] = {"type": "json_object"}
+        return payload
+
+    if not request.tools:
         return payload
 
     payload["tools"] = [_tool_spec_to_openai(tool) for tool in request.tools]
@@ -618,7 +644,13 @@ def _validate_complete_tool_transcript(
                     message.get("content")
                 )
             except ValueError:
-                raise legacy_error
+                try:
+                    validate_context_eviction_marker(
+                        message.get("content"),
+                        expected_call_id=call_id,
+                    )
+                except ValueError:
+                    raise legacy_error
             tool_message_results[call_id] = None
 
     for call_id in assistant_call_ids:

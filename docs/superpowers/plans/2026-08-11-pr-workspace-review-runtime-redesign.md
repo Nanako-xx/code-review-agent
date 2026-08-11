@@ -2,7 +2,7 @@
 
 > **For agentic workers:** 按 Task 顺序实施，使用 checkbox 跟踪进度；每个 Task 在定向测试通过后形成一个独立提交。不要把协议、存储、Agent Loop 和 Eval 切换压成一次大提交。
 
-**状态：** 实施中（Task 1–5 已完成）
+**状态：** 实施中（Task 1–10 已完成）
 
 **设计来源：** `docs/superpowers/specs/2026-08-10-pr-workspace-preflight-reviewer-runtime-redesign.md`
 
@@ -775,31 +775,31 @@ feat: make reviewer turns durable and resumable
 - Modify: `tests/test_review_agent_loop_v2.py`
 - Modify: `tests/test_model_adapter.py`
 
-- [ ] **Step 1：写 Token Window 和固定顺序 RED 测试**
+- [x] **Step 1：写 Token Window 和固定顺序 RED 测试**
 
 断言每次 Provider 调用前顺序为 assemble -> Layer 1 -> Layer 2 -> token estimate -> Layer 3 -> re-estimate -> hard check。Layer 1 每轮检查，Layer 2/3 只在触发时改变投影。
 
-- [ ] **Step 2：实现 TokenEstimator protocol**
+- [x] **Step 2：实现 TokenEstimator protocol**
 
 精确 provider estimator 优先；fallback 使用 UTF-8 bytes 的保守 upper bound。完整请求计入 System、tools、messages、tool results、output reserve 和 50K safety reserve。
 
-- [ ] **Step 3：实现 60 分钟清理**
+- [x] **Step 3：实现 60 分钟清理**
 
 3,599 秒不触发，3,600 秒触发；按完成顺序保留最近 5 个 context-evictable Tool Result 完整正文，旧正文替换为包含 call ID/tool/args hash/reason/reacquirable 的 marker。不得留下孤立 Tool Call。
 
 `last_api_request_at` 使用真实 UTC，在请求交给 Provider Adapter 前持久化；Layer 2 清理后的第一轮请求立即建立新的时间基线。
 
-- [ ] **Step 4：实现 700K full compaction**
+- [x] **Step 4：实现 700K full compaction**
 
 用当前 Reviewer model 生成一个 <=50K Token 的 Summary，覆盖已完成调查、关键事实、候选 Findings、uncertainties 和下一步。压缩所有 committed 动态历史，不保留最近尾巴；System、规则、用户请求、Intent、Assignment、Preflight、ChangedSymbols、Diff/Index 字节不变。
 
 Compaction Summary 作为 user-level 不可信数据块重新注入，不得提升为 System/Developer 指令。Compaction 调用计入 Reviewer active elapsed 和该 Turn 的 Provider attempt 保护。
 
-- [ ] **Step 5：实现 Compaction 原子提交与 Resume**
+- [x] **Step 5：实现 Compaction 原子提交与 Resume**
 
 写 `context_compaction_started`，Summary/hash/manifest 安全发布后写 committed。孤立 started 忽略；失败不改变活动投影。压缩后完整请求必须 <700K，否则返回 `context_compaction_failed`。
 
-- [ ] **Step 6：运行测试**
+- [x] **Step 6：运行测试**
 
 Run:
 
@@ -812,7 +812,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；阈值、Pinned 不变、marker 配对、Compaction rollback 和 Resume 全部通过。
 
-- [ ] **Step 7：提交**
+- [x] **Step 7：提交**
 
 ```text
 feat: add three-layer reviewer context compaction
