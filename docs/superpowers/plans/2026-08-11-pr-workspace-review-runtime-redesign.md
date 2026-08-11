@@ -501,7 +501,7 @@ refactor: project minimal intent packet v2
 - Modify: `tests/test_model_risk.py`
 - Modify: `tests/test_portfolio.py`
 
-- [ ] **Step 1：写 Risk floor RED 测试**
+- [x] **Step 1：写 Risk floor RED 测试**
 
 固定：
 
@@ -515,11 +515,11 @@ source=null      high intent floor
 
 模型只返回 `{"level":"..."}`；最终等级为所有 deterministic floors 与模型等级的 max。业务敏感度、影响范围和可撤销性由模型判断，但非敏感普通改动的 Prompt 不应无依据升级。
 
-- [ ] **Step 2：删除 Risk 下游冗余字段**
+- [x] **Step 2：删除 Risk 下游冗余字段**
 
 新路径不产生 dimensions、reasons、signal_refs、uncertainties 或 suggested_focus。内部 Risk analysis 可以保留审计，但 `risk.json` 只保存 snapshot binding、最终 level、floor/model level 的最小审计字段。旧多字段 Risk/Portfolio API 在 Task 16 前继续只服务 v5。
 
-- [ ] **Step 3：实现固定 Slot mapping**
+- [x] **Step 3：实现固定 Slot mapping**
 
 ```text
 low       core
@@ -530,11 +530,11 @@ critical  core + adversarial + dynamic + dynamic
 
 Critical 两个 Dynamic perspective 必须不同。Planner 只能填 perspective、mission、targets 和 checks，不能改变 Slot 数、基础角色、权限、Provider 或 Runtime 限制。
 
-- [ ] **Step 4：精简 Assignment**
+- [x] **Step 4：精简 Assignment**
 
 删除 risk reasons/signals、旧 Contract、max_turns/max_tool_calls/max_output_tokens/max_total_tokens。保留 assignment_id、role、role_kind、perspective、mission、targets、checks、snapshot_id 和只读权限。
 
-- [ ] **Step 5：运行测试**
+- [x] **Step 5：运行测试**
 
 Run:
 
@@ -548,7 +548,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；每个风险等级得到固定 1/2/3/4 Slots，Planner 无法增删。
 
-- [ ] **Step 6：提交**
+- [x] **Step 6：提交**
 
 ```text
 refactor: simplify risk and fix reviewer slots

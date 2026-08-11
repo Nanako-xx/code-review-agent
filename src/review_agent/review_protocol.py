@@ -53,6 +53,7 @@ _PR_ID_PATTERN = re.compile(r"\APR-[0-9a-f]{64}\Z")
 _SNAPSHOT_ID_PATTERN = re.compile(r"\AS-[0-9a-f]{64}\Z")
 _FINDING_ID_PATTERN = re.compile(r"\AF-[0-9a-f]{64}\Z")
 _INTENT_ANALYSIS_ID_PATTERN = re.compile(r"\AIA-[0-9a-f]{64}\Z")
+_ASSIGNMENT_ID_PATTERN = re.compile(r"\AASG-[0-9a-f]{64}\Z")
 _WINDOWS_DRIVE_PATTERN = re.compile(r"\A[A-Za-z]:")
 
 
@@ -412,6 +413,187 @@ class RiskDecision(WireModel):
         return cls(level=_enum_member(RiskLevel, value["level"], "level"))
 
 
+@dataclass(frozen=True)
+class AssignmentTargets(WireModel):
+    files: tuple[str, ...]
+    symbols: tuple[str, ...]
+    hunks: tuple[str, ...]
+
+    _WIRE_FIELDS = ("files", "symbols", "hunks")
+
+    def __post_init__(self) -> None:
+        files = _text_tuple(self.files, "files")
+        for file_path in files:
+            _repository_path(file_path)
+        _text_tuple(self.symbols, "symbols")
+        _text_tuple(self.hunks, "hunks")
+        for name, values in (
+            ("files", self.files),
+            ("symbols", self.symbols),
+            ("hunks", self.hunks),
+        ):
+            if len(values) != len(set(values)):
+                raise WireProtocolError(f"{name} must not contain duplicates")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "files": list(self.files),
+            "symbols": list(self.symbols),
+            "hunks": list(self.hunks),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "AssignmentTargets":
+        value = _exact_object(payload, cls._WIRE_FIELDS, "AssignmentTargets")
+        return cls(
+            files=_text_tuple(value["files"], "files", wire=True),
+            symbols=_text_tuple(value["symbols"], "symbols", wire=True),
+            hunks=_text_tuple(value["hunks"], "hunks", wire=True),
+        )
+
+
+@dataclass(frozen=True)
+class ReviewerAssignment(WireModel):
+    assignment_id: str
+    snapshot_id: str
+    role: str
+    role_kind: ReviewerRoleKind
+    perspective: str | None
+    mission: str
+    targets: AssignmentTargets
+    checks: tuple[str, ...]
+    permissions: tuple[str, ...]
+
+    _WIRE_FIELDS = (
+        "assignment_id",
+        "snapshot_id",
+        "role",
+        "role_kind",
+        "perspective",
+        "mission",
+        "targets",
+        "checks",
+        "permissions",
+    )
+
+    def __post_init__(self) -> None:
+        _stable_id(self.assignment_id, _ASSIGNMENT_ID_PATTERN, "assignment_id")
+        _stable_id(self.snapshot_id, _SNAPSHOT_ID_PATTERN, "snapshot_id")
+        _text(self.role, "role")
+        _require_enum_instance(ReviewerRoleKind, self.role_kind, "role_kind")
+        _optional_text(self.perspective, "perspective")
+        if self.role_kind is ReviewerRoleKind.DYNAMIC and self.perspective is None:
+            raise WireProtocolError("dynamic Assignment requires a perspective")
+        _text(self.mission, "mission")
+        if type(self.targets) is not AssignmentTargets:
+            raise WireProtocolError("targets must be AssignmentTargets")
+        _text_tuple(self.checks, "checks")
+        permissions = _text_tuple(self.permissions, "permissions")
+        if not permissions:
+            raise WireProtocolError("permissions must not be empty")
+        if len(permissions) != len(set(permissions)):
+            raise WireProtocolError("permissions must not contain duplicates")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "assignment_id": self.assignment_id,
+            "snapshot_id": self.snapshot_id,
+            "role": self.role,
+            "role_kind": self.role_kind.value,
+            "perspective": self.perspective,
+            "mission": self.mission,
+            "targets": self.targets.to_dict(),
+            "checks": list(self.checks),
+            "permissions": list(self.permissions),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ReviewerAssignment":
+        value = _exact_object(payload, cls._WIRE_FIELDS, "ReviewerAssignment")
+        return cls(
+            assignment_id=_stable_id(
+                value["assignment_id"],
+                _ASSIGNMENT_ID_PATTERN,
+                "assignment_id",
+            ),
+            snapshot_id=_stable_id(
+                value["snapshot_id"], _SNAPSHOT_ID_PATTERN, "snapshot_id"
+            ),
+            role=_text(value["role"], "role"),
+            role_kind=_enum_member(
+                ReviewerRoleKind, value["role_kind"], "role_kind"
+            ),
+            perspective=_optional_text(value["perspective"], "perspective"),
+            mission=_text(value["mission"], "mission"),
+            targets=AssignmentTargets.from_dict(value["targets"]),
+            checks=_text_tuple(value["checks"], "checks", wire=True),
+            permissions=_text_tuple(
+                value["permissions"], "permissions", wire=True
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ReviewPlan(WireModel):
+    snapshot_id: str
+    risk_level: RiskLevel
+    assignments: tuple[ReviewerAssignment, ...]
+
+    _WIRE_FIELDS = ("snapshot_id", "risk_level", "assignments")
+
+    def __post_init__(self) -> None:
+        _stable_id(self.snapshot_id, _SNAPSHOT_ID_PATTERN, "snapshot_id")
+        _require_enum_instance(RiskLevel, self.risk_level, "risk_level")
+        if type(self.assignments) is not tuple or not self.assignments:
+            raise WireProtocolError("assignments must be a non-empty tuple")
+        if any(
+            type(assignment) is not ReviewerAssignment
+            for assignment in self.assignments
+        ):
+            raise WireProtocolError(
+                "assignments must contain only ReviewerAssignment values"
+            )
+        if any(
+            assignment.snapshot_id != self.snapshot_id
+            for assignment in self.assignments
+        ):
+            raise WireProtocolError(
+                "all Assignments must be bound to the ReviewPlan Snapshot"
+            )
+        assignment_ids = [
+            assignment.assignment_id for assignment in self.assignments
+        ]
+        if len(assignment_ids) != len(set(assignment_ids)):
+            raise WireProtocolError("assignments must have unique assignment_id values")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "snapshot_id": self.snapshot_id,
+            "risk_level": self.risk_level.value,
+            "assignments": [
+                assignment.to_dict() for assignment in self.assignments
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ReviewPlan":
+        value = _exact_object(payload, cls._WIRE_FIELDS, "ReviewPlan")
+        assignments = value["assignments"]
+        if type(assignments) is not list or not assignments:
+            raise WireProtocolError("assignments must be a non-empty array")
+        return cls(
+            snapshot_id=_stable_id(
+                value["snapshot_id"], _SNAPSHOT_ID_PATTERN, "snapshot_id"
+            ),
+            risk_level=_enum_member(
+                RiskLevel, value["risk_level"], "risk_level"
+            ),
+            assignments=tuple(
+                ReviewerAssignment.from_dict(item) for item in assignments
+            ),
+        )
+
+
 def _validate_finding(
     *,
     claim: Any,
@@ -624,6 +806,7 @@ class ReviewResult(WireModel):
 
 
 __all__ = [
+    "AssignmentTargets",
     "ConversationMessage",
     "ConversationSpeaker",
     "FinalFinding",
@@ -632,9 +815,11 @@ __all__ = [
     "IntentSource",
     "IntentVersionEnvelope",
     "ReviewRequest",
+    "ReviewerAssignment",
     "ReviewerFinding",
     "ReviewerOutput",
     "ReviewerRoleKind",
+    "ReviewPlan",
     "ReviewResult",
     "ReviewResultStatus",
     "RiskDecision",
