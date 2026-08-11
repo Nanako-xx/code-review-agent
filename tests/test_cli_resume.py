@@ -1,392 +1,268 @@
-from pathlib import Path
+from __future__ import annotations
+
 import json
+from pathlib import Path
+import re
+import subprocess
 
 import pytest
 
-from conftest import run_git
 from review_agent.cli import main
-from review_agent.session import (
-    SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION,
-    session_phases_for_schema,
-)
 
 
-@pytest.fixture(autouse=True)
-def cli_memory_root(tmp_path: Path, monkeypatch) -> Path:
-    root = (tmp_path / "memory-root").resolve()
-    monkeypatch.setenv("REVIEW_AGENT_MEMORY_ROOT", str(root))
-    return root
+def _git(repo: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return completed.stdout.strip()
 
 
-def test_cli_resume_prints_completed_run_summary(
+def _commit(repo: Path) -> tuple[str, str]:
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "auth.py").write_text(
+        "def check(token):\n    return bool(token)\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "auth.py")
+    _git(repo, "commit", "-m", "add auth check")
+    return base, _git(repo, "rev-parse", "HEAD")
+
+
+def _review_args(repo: Path, root: Path, base: str, head: str) -> list[str]:
+    return [
+        "review",
+        "--repo",
+        str(repo),
+        "--base",
+        base,
+        "--head",
+        head,
+        "--external-review-id",
+        "resume-pr",
+        "--workspace-root",
+        str(root),
+        "--intent",
+        "Review the authentication behavior change.",
+        "--reviewer-provider",
+        "fake",
+        "--format",
+        "json",
+    ]
+
+
+def _locator(stderr: str) -> dict[str, str]:
+    match = re.search(r"^Review locator: (\{.*\})$", stderr, re.MULTILINE)
+    assert match is not None, stderr
+    return json.loads(match.group(1))
+
+
+def _resume_args(
+    repo: Path,
+    root: Path,
+    locator: dict[str, str],
+    *,
+    provider: str = "none",
+) -> list[str]:
+    return [
+        "resume",
+        locator["session_id"],
+        "--repo",
+        str(repo),
+        "--workspace-root",
+        str(root),
+        "--pr-id",
+        locator["pr_id"],
+        "--snapshot-id",
+        locator["snapshot_id"],
+        "--reviewer-provider",
+        provider,
+        "--format",
+        "json",
+    ]
+
+
+def _snapshot(root: Path) -> Path:
+    values = list(root.glob("pr/p-*/Snapshots/s-*"))
+    assert len(values) == 1
+    return values[0]
+
+
+def _session(root: Path) -> Path:
+    values = list(root.glob("pr/p-*/Sessions/u-*"))
+    assert len(values) == 1
+    return values[0]
+
+
+def test_cli_resume_completed_v6_result_is_byte_stable(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    base, head = _commit(git_repo)
+    root = tmp_path / "workspace"
+    assert main(_review_args(git_repo, root, base, head)) == 0
+    first = capsys.readouterr()
+    locator = _locator(first.err)
+
+    assert main(_resume_args(git_repo, root, locator)) == 0
+
+    resumed = capsys.readouterr()
+    assert resumed.out == first.out
+    assert _locator(resumed.err) == locator
+
+
+def test_cli_resume_rebuilds_missing_pure_markdown(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    base, head = _commit(git_repo)
+    root = tmp_path / "workspace"
+    assert main(_review_args(git_repo, root, base, head)) == 0
+    locator = _locator(capsys.readouterr().err)
+    markdown = _snapshot(root) / "Results" / "review.md"
+    expected = markdown.read_bytes()
+    markdown.unlink()
+
+    assert main(_resume_args(git_repo, root, locator)) == 0
+
+    capsys.readouterr()
+    assert markdown.read_bytes() == expected
+
+
+def test_cli_resume_rejects_tampered_authoritative_result(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    base, head = _commit(git_repo)
+    root = tmp_path / "workspace"
+    assert main(_review_args(git_repo, root, base, head)) == 0
+    locator = _locator(capsys.readouterr().err)
+    result_path = _snapshot(root) / "Results" / "review-result.json"
+    payload = json.loads(result_path.read_text("utf-8"))
+    payload["uncertainties"].append("tampered")
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert main(_resume_args(git_repo, root, locator)) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "integrity" in captured.err.casefold() or "configuration" in captured.err.casefold()
+
+
+def test_cli_resume_restarts_failed_preflight_without_new_session(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    base, head = _commit(git_repo)
+    root = tmp_path / "workspace"
+    from review_agent.product_runtime import DeterministicPreflight
+
+    original = DeterministicPreflight.run
+
+    def fail_once(*_args, **_kwargs):
+        raise RuntimeError("transient preflight failure")
+
+    monkeypatch.setattr(DeterministicPreflight, "run", fail_once)
+    assert main(_review_args(git_repo, root, base, head)) == 1
+    locator = _locator(capsys.readouterr().err)
+    monkeypatch.setattr(DeterministicPreflight, "run", original)
+
+    assert main(_resume_args(git_repo, root, locator, provider="fake")) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    state = json.loads((_session(root) / "pipeline-state.json").read_text("utf-8"))
+    assert result["status"] == "completed"
+    assert state["status"] == "completed"
+    assert state["phases"]["preflight"]["attempt"] == 2
+    assert len(list(root.glob("pr/p-*/Sessions/u-*"))) == 1
+
+
+def test_cli_resume_rejects_wrong_repository_identity(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    base, head = _commit(git_repo)
+    root = tmp_path / "workspace"
+    assert main(_review_args(git_repo, root, base, head)) == 0
+    locator = _locator(capsys.readouterr().err)
+    other = tmp_path / "other"
+    other.mkdir()
+    _git(other, "init")
+    _git(other, "config", "user.email", "other@example.test")
+    _git(other, "config", "user.name", "Other")
+    (other / "x.py").write_text("x = 1\n", encoding="utf-8")
+    _git(other, "add", "x.py")
+    _git(other, "commit", "-m", "initial")
+
+    assert main(_resume_args(other, root, locator)) == 2
+
+    assert "repository identity" in capsys.readouterr().err
+
+
+def test_cli_legacy_review_is_inspect_only_and_never_resumed(
     git_repo: Path,
     capsys,
-    cli_memory_root: Path,
+    monkeypatch,
 ) -> None:
-    base = run_git(git_repo, "rev-parse", "HEAD")
-    (git_repo / "auth.py").write_text("def check(token):\n    return token == 'ok'\n", encoding="utf-8")
-    run_git(git_repo, "add", "auth.py")
-    run_git(git_repo, "commit", "-m", "add auth check")
-    head = run_git(git_repo, "rev-parse", "HEAD")
-    assert (
-        main(
-            [
-                "review",
-                "--repo",
-                str(git_repo),
-                "--base",
-                "HEAD~1",
-                "--head",
-                "HEAD",
-                "--intent",
-                "Add auth token check",
-                "--non-interactive",
-            ]
-        )
-        == 0
-    )
-    capsys.readouterr()
-    run_id = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1].name
-
-    assert main(["resume", run_id, "--repo", str(git_repo)]) == 0
-
-    output = capsys.readouterr().out
-    assert "Resume" in output
-    assert f"Review ID: {run_id}" in output
-    assert "Status: completed" in output
-    assert "Phase: completed" in output
-    assert "Requested Base: HEAD~1" in output
-    assert "Requested Head: HEAD" in output
-    assert f"Resolved Base: {base}" in output
-    assert f"Resolved Head: {head}" in output
-    assert "final_risk.json (present)" in output
-    assert "report.md (present)" in output
-    assert "review_brief.json (present)" in output
-    assert "Memory mode: read-write" in output
-    assert "Memory root fingerprint:" in output
-    assert "Audit: valid" in output
-
-
-def test_cli_resume_legacy_run_without_session_uses_state_revisions(git_repo: Path, capsys) -> None:
     review_id = "review-legacy"
     run_dir = git_repo / ".review-agent" / "runs" / review_id
     run_dir.mkdir(parents=True)
-    (run_dir / "state.json").write_text(
-        json.dumps(
-            {
-                "review_id": review_id,
-                "status": "completed",
-                "phase": "completed",
-                "repository_path": str(git_repo),
-                "base_revision": "legacy-base",
-                "head_revision": "legacy-head",
-                "message": "Legacy run completed",
-                "artifacts": {"request": "request.json"},
-                "errors": [],
-            }
-        ),
-        encoding="utf-8",
+    state = {"review_id": review_id, "status": "running"}
+    (run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    def legacy_must_not_run(*_args, **_kwargs):
+        raise AssertionError("legacy pipeline must not run")
+
+    monkeypatch.setattr(
+        "review_agent.command.ReviewSessionResumer",
+        legacy_must_not_run,
     )
-    (run_dir / "request.json").write_text(
-        json.dumps(
-            {
-                "repository_path": str(git_repo),
-                "base_revision": "legacy-base",
-                "head_revision": "legacy-head",
-                "user_intent": None,
-                "review_focus": None,
-            }
-        ),
-        encoding="utf-8",
-    )
+    assert main(["resume", review_id, "--repo", str(git_repo)]) == 2
 
-    assert main(["resume", review_id, "--repo", str(git_repo)]) == 0
-
-    output = capsys.readouterr().out
-    assert "Base: legacy-base" in output
-    assert "Head: legacy-head" in output
-    assert "Resolved Base:" not in output
-    assert "Resolved Head:" not in output
+    captured = capsys.readouterr()
+    assert "inspect-only" in captured.err
+    assert "no legacy Phase was run" in captured.err
+    assert json.loads((run_dir / "state.json").read_text("utf-8")) == state
 
 
-def test_cli_resume_session_does_not_require_legacy_state(git_repo: Path, capsys) -> None:
-    base = run_git(git_repo, "rev-parse", "HEAD")
-    (git_repo / "auth.py").write_text("def check(token):\n    return bool(token)\n", encoding="utf-8")
-    run_git(git_repo, "add", "auth.py")
-    run_git(git_repo, "commit", "-m", "add auth check")
-    head = run_git(git_repo, "rev-parse", "HEAD")
-    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head, "--non-interactive"]) == 0
-    capsys.readouterr()
-    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
-    (run_dir / "state.json").unlink()
-
-    assert main(["resume", run_dir.name, "--repo", str(git_repo)]) == 0
-
-    output = capsys.readouterr().out
-    assert "Status: completed" in output
-    assert "Phase: completed" in output
-    assert f"Repository: {git_repo}" in output
-    assert f"Resolved Base: {base}" in output
-    assert f"Resolved Head: {head}" in output
-    assert "report.md (present)" in output
-    assert "Audit: valid" in output
-
-
-def test_cli_resume_session_ignores_stale_legacy_state(git_repo: Path, capsys) -> None:
-    base = run_git(git_repo, "rev-parse", "HEAD")
-    (git_repo / "auth.py").write_text("def check(token):\n    return bool(token)\n", encoding="utf-8")
-    run_git(git_repo, "add", "auth.py")
-    run_git(git_repo, "commit", "-m", "add auth check")
-    head = run_git(git_repo, "rev-parse", "HEAD")
-    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head, "--non-interactive"]) == 0
-    capsys.readouterr()
-    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
-    state_path = run_dir / "state.json"
-    stale_state = json.loads(state_path.read_text(encoding="utf-8"))
-    stale_state.update(
-        {
-            "status": "failed",
-            "phase": "failed",
-            "repository_path": "stale-repository",
-            "errors": ["stale-state-error"],
-        }
-    )
-    state_path.write_text(json.dumps(stale_state), encoding="utf-8")
-
-    assert main(["resume", run_dir.name, "--repo", str(git_repo)]) == 0
-
-    output = capsys.readouterr().out
-    assert "Status: completed" in output
-    assert "Phase: completed" in output
-    assert f"Repository: {git_repo}" in output
-    assert "stale-repository" not in output
-    assert "stale-state-error" not in output
-    assert "Audit: valid" in output
-
-
-def test_cli_resume_completed_session_rebuilds_tampered_reporting_phase(git_repo: Path, capsys) -> None:
-    base = run_git(git_repo, "rev-parse", "HEAD")
-    (git_repo / "auth.py").write_text("def check(token):\n    return bool(token)\n", encoding="utf-8")
-    run_git(git_repo, "add", "auth.py")
-    run_git(git_repo, "commit", "-m", "add auth check")
-    head = run_git(git_repo, "rev-parse", "HEAD")
-    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head, "--non-interactive"]) == 0
-    capsys.readouterr()
-    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
-    (run_dir / "report.md").write_text("tampered report\n", encoding="utf-8")
-
-    exit_code = main(["resume", run_dir.name, "--repo", str(git_repo)])
-
-    output = capsys.readouterr().out
-    assert exit_code == 0
-    assert "Action: continue_session" in output
-    assert "Starting phase: reporting" in output
-    assert "tampered report" not in (run_dir / "report.md").read_text(encoding="utf-8")
-
-
-def test_cli_resume_completed_session_rebuilds_missing_reporting_artifact(git_repo: Path, capsys) -> None:
-    base = run_git(git_repo, "rev-parse", "HEAD")
-    (git_repo / "auth.py").write_text("def check(token):\n    return bool(token)\n", encoding="utf-8")
-    run_git(git_repo, "add", "auth.py")
-    run_git(git_repo, "commit", "-m", "add auth check")
-    head = run_git(git_repo, "rev-parse", "HEAD")
-    assert main(["review", "--repo", str(git_repo), "--base", base, "--head", head, "--non-interactive"]) == 0
-    capsys.readouterr()
-    run_dir = sorted((git_repo / ".review-agent" / "runs").iterdir())[-1]
-    (run_dir / "report.md").unlink()
-
-    exit_code = main(["resume", run_dir.name, "--repo", str(git_repo)])
-
-    output = capsys.readouterr().out
-    assert exit_code == 0
-    assert "Action: continue_session" in output
-    assert "Starting phase: reporting" in output
-    assert (run_dir / "report.md").exists()
-
-
-def test_cli_resume_revision_drift_creates_and_prints_child_session(
+def test_cli_resume_missing_session_or_locator_returns_two(
     git_repo: Path,
-    capsys,
-    cli_memory_root: Path,
-    monkeypatch,
     tmp_path: Path,
-) -> None:
-    base = run_git(git_repo, "rev-parse", "HEAD")
-    (git_repo / "auth.py").write_text(
-        "def check(token):\n    return bool(token)\n",
-        encoding="utf-8",
-    )
-    run_git(git_repo, "add", "auth.py")
-    run_git(git_repo, "commit", "-m", "add auth check")
-    parent_head = run_git(git_repo, "rev-parse", "HEAD")
-    assert (
-        main(
-            [
-                "review",
-                "--repo",
-                str(git_repo),
-                "--base",
-                base,
-                "--head",
-                "HEAD",
-                "--intent",
-                "Add auth token check",
-                "--memory-mode",
-                "read",
-                "--memory-curator-mode",
-                "model",
-                "--memory-curator-provider",
-                "fake",
-                "--memory-curator-model",
-                "fixed-curator-model",
-                "--memory-curator-api-key-env",
-                "FIXED_CURATOR_API_KEY",
-                "--non-interactive",
-            ]
-        )
-        == 0
-    )
-    capsys.readouterr()
-    runs_root = git_repo / ".review-agent" / "runs"
-    parent_id = next(runs_root.iterdir()).name
-    (git_repo / "later.py").write_text("value = 1\n", encoding="utf-8")
-    run_git(git_repo, "add", "later.py")
-    run_git(git_repo, "commit", "-m", "move symbolic head")
-    child_head = run_git(git_repo, "rev-parse", "HEAD")
-    changed_environment_root = (tmp_path / "changed-memory-root").resolve()
-    monkeypatch.setenv("REVIEW_AGENT_MEMORY_ROOT", str(changed_environment_root))
-    monkeypatch.setenv("FIXED_CURATOR_API_KEY", "changed-secret-value")
-
-    assert main(["resume", parent_id, "--repo", str(git_repo)]) == 0
-
-    output = capsys.readouterr().out
-    child_line = next(
-        line for line in output.splitlines() if line.strip().startswith("New review:")
-    )
-    child_id = child_line.split(":", 1)[1].strip()
-    assert "Action: create_incremental_session" in output
-    assert f"Parent review: {parent_id}" in output
-    assert f"Review ID: {child_id}" in output
-    assert "Change: head_moved" in output
-    assert f"Full range: {base}..{child_head}" in output
-    assert f"Incremental priority range: {parent_head}..{child_head}" in output
-    assert (runs_root / child_id / "incremental_priority.json").exists()
-    assert (runs_root / child_id / "report.md").exists()
-    child_session_text = (runs_root / child_id / "session.json").read_text(
-        encoding="utf-8"
-    )
-    child_session = json.loads(child_session_text)
-    assert child_session["execution"]["memory"]["mode"] == "read"
-    assert (
-        child_session["execution"]["memory"]["root_path"]
-        == cli_memory_root.as_posix()
-    )
-    assert child_session["execution"]["memory_curator"]["model"] == (
-        "fixed-curator-model"
-    )
-    assert child_session["execution"]["memory_curator"]["api_key_env"] == (
-        "FIXED_CURATOR_API_KEY"
-    )
-    assert "changed-secret-value" not in child_session_text
-    assert not changed_environment_root.exists()
-
-
-def test_cli_resume_legacy_drift_requires_and_accepts_explicit_v5_upgrade(
-    git_repo: Path,
     capsys,
-    cli_memory_root: Path,
 ) -> None:
-    base = run_git(git_repo, "rev-parse", "HEAD")
-    (git_repo / "auth.py").write_text(
-        "def check(token):\n    return bool(token)\n",
-        encoding="utf-8",
-    )
-    run_git(git_repo, "add", "auth.py")
-    run_git(git_repo, "commit", "-m", "add auth check")
-    assert (
-        main(
-            [
-                "review",
-                "--repo",
-                str(git_repo),
-                "--base",
-                base,
-                "--head",
-                "HEAD",
-                "--intent",
-                "Add auth token check",
-                "--memory-mode",
-                "read",
-                "--non-interactive",
-            ]
-        )
-        == 0
-    )
-    capsys.readouterr()
-    runs_root = git_repo / ".review-agent" / "runs"
-    parent_id = next(path.name for path in runs_root.iterdir() if path.is_dir())
-    parent_dir = runs_root / parent_id
-    payload = json.loads((parent_dir / "session.json").read_text(encoding="utf-8"))
-    payload["schema_version"] = SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
-    payload["execution"].pop("memory", None)
-    payload["execution"].pop("memory_curator", None)
-    legacy_phases = {
-        phase.value
-        for phase in session_phases_for_schema(
-            SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
-        )
+    missing = {
+        "pr_id": "PR-" + "a" * 64,
+        "snapshot_id": "S-" + "b" * 64,
+        "session_id": "SESSION-" + "c" * 64,
     }
-    payload["phases"] = {
-        name: checkpoint
-        for name, checkpoint in payload["phases"].items()
-        if name in legacy_phases
-    }
-    payload["artifacts"] = {
-        name: descriptor
-        for name, descriptor in payload["artifacts"].items()
-        if descriptor["phase"] in legacy_phases
-    }
-    (parent_dir / "session.json").write_text(
-        json.dumps(payload),
-        encoding="utf-8",
-    )
-    (git_repo / "later.py").write_text("value = 1\n", encoding="utf-8")
-    run_git(git_repo, "add", "later.py")
-    run_git(git_repo, "commit", "-m", "move legacy symbolic head")
 
-    assert main(["resume", parent_id, "--repo", str(git_repo)]) == 2
-    assert "explicit compatible v5" in capsys.readouterr().err
+    assert main(_resume_args(git_repo, tmp_path / "missing", missing)) == 2
 
-    memory_root = (git_repo / "explicit-memory-root").resolve()
-    assert (
+    assert "required regular file does not exist" in capsys.readouterr().err
+
+
+def test_cli_resume_rejects_legacy_upgrade_flag(
+    git_repo: Path,
+) -> None:
+    with pytest.raises(SystemExit) as raised:
         main(
             [
                 "resume",
-                parent_id,
+                "review-legacy",
                 "--repo",
                 str(git_repo),
                 "--upgrade-to-v5",
-                "--memory-mode",
-                "read",
-                "--memory-root",
-                str(memory_root),
             ]
         )
-        == 0
-    )
-    output = capsys.readouterr().out
-    child_line = next(
-        line for line in output.splitlines() if line.strip().startswith("New review:")
-    )
-    child_id = child_line.split(":", 1)[1].strip()
-    child = json.loads((runs_root / child_id / "session.json").read_text(encoding="utf-8"))
-    assert child["schema_version"] == 5
-    assert child["execution"]["memory"]["mode"] == "read"
-    assert child["execution"]["memory"]["root_path"] == memory_root.as_posix()
 
-
-def test_cli_resume_missing_run_returns_usage_error(tmp_path: Path, capsys) -> None:
-    exit_code = main(["resume", "missing-review", "--repo", str(tmp_path)])
-
-    assert exit_code == 2
-    assert "Review run not found" in capsys.readouterr().err
+    assert raised.value.code == 2

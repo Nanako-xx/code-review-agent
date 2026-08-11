@@ -314,6 +314,8 @@ class PRWorkspaceStore:
             for relative in (
                 ".artifacts",
                 "DiffArtifact",
+                "Intent",
+                "Requests",
                 "QualityGate",
                 "ChangedSymbols",
                 "Risk",
@@ -398,6 +400,112 @@ class PRWorkspaceStore:
             path=path,
             session_id=session_id,
         )
+
+    def open_session(
+        self,
+        *,
+        pr_id: str,
+        snapshot_id: str,
+        session_id: str,
+    ) -> SessionWorkspace:
+        """Open one existing Session through its complete stable locator."""
+
+        _validate_id(pr_id, _PR_ID, "pr_id")
+        _validate_id(snapshot_id, _SNAPSHOT_ID, "snapshot_id")
+        _validate_id(session_id, _SESSION_ID, "session_id")
+
+        workspace_path = self._workspace_path(pr_id)
+        pr_payload = self._read_json(
+            workspace_path / "PR" / "pr.json",
+            "PR metadata",
+        )
+        pr_value = _strict_object(
+            pr_payload,
+            (
+                "schema_version",
+                "pr_id",
+                "repository_identity",
+                "provider",
+                "pr_number_or_external_review_id",
+                "title",
+                "description",
+                "base_ref",
+                "head_ref",
+                "author",
+                "status",
+            ),
+            "PR metadata",
+        )
+        identity_value = _strict_object(
+            pr_value["repository_identity"],
+            ("repository_key", "git_common_dir", "origin_url"),
+            "repository identity",
+        )
+        try:
+            repository = CanonicalRepositoryIdentity(
+                repository_key=identity_value["repository_key"],
+                git_common_dir=identity_value["git_common_dir"],
+                origin_url=identity_value["origin_url"],
+            )
+        except (TypeError, ValueError) as error:
+            raise PRWorkspaceSecurityError(
+                "persisted repository identity is invalid"
+            ) from error
+        resolved_pr = ResolvedPR(
+            repository=repository,
+            provider=pr_value["provider"],
+            external_review_id=pr_value["pr_number_or_external_review_id"],
+            pr_id=pr_id,
+        )
+        workspace = PRWorkspace(
+            store_root=self.root,
+            path=workspace_path,
+            resolved_pr=resolved_pr,
+        )
+        self._assert_workspace_authority(workspace)
+
+        snapshot_path = (
+            workspace.path
+            / "Snapshots"
+            / self._physical_snapshot_id(snapshot_id)
+        )
+        snapshot_payload = self._read_json(
+            snapshot_path / "snapshot.json",
+            "Snapshot manifest",
+        )
+        snapshot_value = _strict_object(
+            snapshot_payload,
+            (
+                "schema_version",
+                "repository_identity",
+                "pr_id",
+                "snapshot_id",
+                "base_sha",
+                "head_sha",
+            ),
+            "Snapshot manifest",
+        )
+        snapshot = SnapshotWorkspace(
+            workspace=workspace,
+            path=snapshot_path,
+            snapshot_id=snapshot_id,
+            base_sha=snapshot_value["base_sha"],
+            head_sha=snapshot_value["head_sha"],
+        )
+        self._assert_snapshot_authority(snapshot)
+
+        session = SessionWorkspace(
+            workspace=workspace,
+            snapshot=snapshot,
+            path=(
+                workspace.path
+                / "Sessions"
+                / ("u-" + session_id[8:40])
+            ),
+            session_id=session_id,
+        )
+        self._assert_session_authority(session)
+        return session
 
     def publish_create_only(
         self,

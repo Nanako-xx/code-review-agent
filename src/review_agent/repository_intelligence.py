@@ -8,7 +8,7 @@ import json
 import re
 import subprocess
 import sys
-from typing import Mapping
+from typing import Any, Mapping
 
 from review_agent.memory_identity import repository_key as canonical_repository_key
 from review_agent.memory_models import (
@@ -524,6 +524,92 @@ def changed_symbols_v2_to_dict(result: ChangedSymbolsV2) -> dict[str, object]:
         ],
         "symbols": [symbol.to_dict() for symbol in result.symbols],
     }
+
+
+def changed_symbols_v2_from_dict(payload: Mapping[str, Any]) -> ChangedSymbolsV2:
+    expected = {
+        "schema_version",
+        "snapshot_id",
+        "base_sha",
+        "head_sha",
+        "analyzer",
+        "analyzer_version",
+        "analysis_configuration",
+        "cache_key",
+        "language_coverage",
+        "symbols",
+    }
+    if type(payload) is not dict or set(payload) != expected:
+        raise ValueError("ChangedSymbols v2 artifact schema is invalid")
+    if payload["schema_version"] != "changed_symbols_v2":
+        raise ValueError("ChangedSymbols v2 artifact version is unsupported")
+    if type(payload["language_coverage"]) is not list or type(
+        payload["symbols"]
+    ) is not list:
+        raise ValueError("ChangedSymbols v2 arrays are invalid")
+    try:
+        coverage = tuple(
+            LanguageCoverageV2(**_exact_changed_symbol_row(
+                item,
+                {"language", "status", "reason_code"},
+                "language coverage",
+            ))
+            for item in payload["language_coverage"]
+        )
+        symbols = tuple(
+            ChangedSymbolV2(**_exact_changed_symbol_row(
+                item,
+                {
+                    "path",
+                    "qualified_name",
+                    "kind",
+                    "change_type",
+                    "line_start",
+                    "line_end",
+                    "analyzer",
+                    "analyzer_version",
+                    "analysis_configuration",
+                    "language_coverage",
+                },
+                "changed symbol",
+            ))
+            for item in payload["symbols"]
+        )
+        result = ChangedSymbolsV2(
+            snapshot_id=payload["snapshot_id"],
+            base_sha=payload["base_sha"],
+            head_sha=payload["head_sha"],
+            analyzer=payload["analyzer"],
+            analyzer_version=payload["analyzer_version"],
+            analysis_configuration=payload["analysis_configuration"],
+            cache_key=payload["cache_key"],
+            language_coverage=coverage,
+            symbols=symbols,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("ChangedSymbols v2 artifact is invalid") from error
+    if changed_symbols_v2_to_dict(result) != dict(payload):
+        raise ValueError("ChangedSymbols v2 artifact is not canonical")
+    if re.fullmatch(r"S-[0-9a-f]{64}", result.snapshot_id) is None:
+        raise ValueError("ChangedSymbols v2 Snapshot ID is invalid")
+    object_id = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+    if (
+        object_id.fullmatch(result.base_sha) is None
+        or object_id.fullmatch(result.head_sha) is None
+        or re.fullmatch(r"[0-9a-f]{64}", result.cache_key) is None
+    ):
+        raise ValueError("ChangedSymbols v2 binding is invalid")
+    return result
+
+
+def _exact_changed_symbol_row(
+    value: Any,
+    expected: set[str],
+    context: str,
+) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != expected:
+        raise ValueError(f"ChangedSymbols v2 {context} schema is invalid")
+    return dict(value)
 
 
 def _language_for_path(path: str) -> str:

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** 按 Task 顺序实施，使用 checkbox 跟踪进度；每个 Task 在定向测试通过后形成一个独立提交。不要把协议、存储、Agent Loop 和 Eval 切换压成一次大提交。
 
-**状态：** 实施中（Task 1–12 已完成）
+**状态：** 实施中（Task 1–14 已完成）
 
 **设计来源：** `docs/superpowers/specs/2026-08-10-pr-workspace-preflight-reviewer-runtime-redesign.md`
 
@@ -1008,19 +1008,19 @@ feat: cut product pipeline over to session v6
 - Modify: `tests/test_cli_smoke.py`
 - Modify: `tests/test_cli_resume.py`
 
-- [ ] **Step 1：更新 review 参数**
+- [x] **Step 1：更新 review 参数**
 
 增加 `--external-review-id`、`--workspace-root` 和 `--format json|markdown`。移除 review 主命令的 semantic-reconciler、memory-curator 和 supplemental 配置；保留 Risk model 与 Reviewer provider 配置。
 
-- [ ] **Step 2：切换执行入口**
+- [x] **Step 2：切换执行入口**
 
 新 review 创建/复用 PRWorkspace 和 Snapshot，创建 Session v6，调用 `ReviewPipelineV6`，最终直接输出 ReviewResult 或纯 Markdown。CLI 不再读取 completion/final_risk/review_brief，也不打印 Recommendation。
 
-- [ ] **Step 3：更新 Resume**
+- [x] **Step 3：更新 Resume**
 
 CLI 打印 pr_id、snapshot_id、session_id。Resume 使用稳定 locator 定位 PRWorkspace Session；已完成 ReviewResult 直接复用。Legacy review ID 只提供 inspect 指引，不启动旧 Pipeline。
 
-- [ ] **Step 4：定义退出码**
+- [x] **Step 4：定义退出码**
 
 建议固定：
 
@@ -1032,7 +1032,7 @@ CLI 打印 pr_id、snapshot_id、session_id。Resume 使用稳定 locator 定位
 
 ReviewResult `status=failed` 已是权威产品结果时仍返回 0，调用方读取 JSON status；不能把可测产品失败伪装成 CLI infrastructure crash。
 
-- [ ] **Step 5：运行 fake CLI E2E**
+- [x] **Step 5：运行 fake CLI E2E**
 
 Run:
 
@@ -1045,7 +1045,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；输出只来自 ReviewResult，resume 不运行旧 phases。
 
-- [ ] **Step 6：提交**
+- [x] **Step 6：提交**
 
 ```text
 refactor: switch cli and resume to pr workspace v6

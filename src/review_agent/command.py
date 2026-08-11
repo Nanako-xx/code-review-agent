@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import stat
 import sys
 import tempfile
@@ -94,7 +95,10 @@ from review_agent.memory_store import (
     MemoryStoreErrorCode,
     WriteResult,
 )
-from review_agent.model_adapter_factory import build_model_adapter_factory_from_config
+from review_agent.model_adapter_factory import (
+    ModelAdapterConfig,
+    build_model_adapter_factory_from_config,
+)
 from review_agent.models import IntentPacket, QualityGateResult, ReviewRequest, RiskAssessment
 from review_agent.pipeline import (
     MemoryOutboxReplayPreview,
@@ -105,8 +109,28 @@ from review_agent.pipeline import (
     validate_memory_outbox_replay_audit,
     validate_memory_outbox_replay_receipt,
 )
+from review_agent.product_runtime import (
+    ProductReviewInputV6,
+    ProductReviewOutcomeV6,
+    ProductRuntimeConfigV6,
+    ProductRuntimeInfrastructureError,
+    ProductRuntimeIntegrityError,
+    ProductRuntimeUsageError,
+    resume_product_review_v6,
+    start_product_review_v6,
+)
+from review_agent.review_protocol import (
+    ConversationMessage,
+    ConversationSpeaker,
+    ReviewRequest as ReviewRequestV6,
+)
 from review_agent.revision import RevisionResolver
-from review_agent.resume import ResumeAction, ResumeBlockedError, ReviewSessionResumer
+from review_agent.resume import (
+    ResumeAction,
+    ResumeBlockedError,
+    ReviewSessionResumer,
+    diagnose_legacy_session,
+)
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
     DEFAULT_MODEL_STAGE_MAX_ELAPSED_SECONDS,
@@ -218,13 +242,21 @@ def _memory_json_output_requested(arguments: Sequence[str]) -> bool:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="review-agent")
+    parser = argparse.ArgumentParser(prog="review-agent", allow_abbrev=False)
     subparsers = parser.add_subparsers(dest="command")
 
-    review = subparsers.add_parser("review")
+    review = subparsers.add_parser("review", allow_abbrev=False)
     review.add_argument("--repo", default=".")
     review.add_argument("--base", required=True)
     review.add_argument("--head", required=True)
+    review.add_argument("--external-review-id")
+    review.add_argument("--workspace-root")
+    review.add_argument(
+        "--format",
+        dest="output_format",
+        choices=["json", "markdown"],
+        default="json",
+    )
     review.add_argument("--intent")
     review.add_argument("--focus")
     review.add_argument("--title")
@@ -240,37 +272,36 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["none", "fake", "openai-compatible"],
         default="none",
     )
-    review.add_argument("--reviewer-mode", choices=["single", "multi"], default="single")
-    review.add_argument(
-        "--reviewer-loop",
-        choices=["single-shot", "agent-loop"],
-        default="single-shot",
-    )
     review.add_argument("--reviewer-model")
     review.add_argument("--reviewer-base-url")
     review.add_argument("--reviewer-api-key-env", default="REVIEW_AGENT_API_KEY")
-    _add_review_memory_arguments(review)
-    _add_model_stage_arguments(review, "risk-assessor")
-    _add_model_stage_arguments(review, "portfolio-planner")
-    _add_model_stage_arguments(review, "semantic-reconciler")
-    _add_model_stage_arguments(review, "memory-curator")
+    _add_risk_model_arguments_v6(review)
 
     resume = subparsers.add_parser(
         "resume",
-        help="Inspect and resume from a local review checkpoint",
+        help="Resume a PRWorkspace Session v6 or inspect a legacy review",
+        allow_abbrev=False,
     )
-    resume.add_argument("review_id", help="Review id under .review-agent/runs")
+    resume.add_argument("session_id", help="SESSION- locator or legacy review id")
     resume.add_argument("--repo", default=".", help="Repository path")
+    resume.add_argument("--workspace-root")
+    resume.add_argument("--pr-id")
+    resume.add_argument("--snapshot-id")
     resume.add_argument(
-        "--upgrade-to-v5",
-        action="store_true",
-        help=(
-            "Explicitly upgrade a legacy revision-drift Session to the v5 "
-            "Memory-aware execution protocol"
-        ),
+        "--format",
+        dest="output_format",
+        choices=["json", "markdown"],
+        default="json",
     )
-    _add_review_memory_arguments(resume)
-    _add_model_stage_arguments(resume, "memory-curator")
+    resume.add_argument(
+        "--reviewer-provider",
+        choices=["none", "fake", "openai-compatible"],
+        default="none",
+    )
+    resume.add_argument("--reviewer-model")
+    resume.add_argument("--reviewer-base-url")
+    resume.add_argument("--reviewer-api-key-env", default="REVIEW_AGENT_API_KEY")
+    _add_risk_model_arguments_v6(resume)
     _add_memory_parser(subparsers)
     return parser
 
@@ -840,17 +871,54 @@ def resolve_review_execution_config(
     )
 
 
+def _add_risk_model_arguments_v6(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--risk-assessor-mode",
+        choices=["local", "model"],
+        default="local",
+    )
+    parser.add_argument(
+        "--risk-assessor-provider",
+        choices=["inherit", "none", "fake", "openai-compatible"],
+        default="inherit",
+    )
+    parser.add_argument("--risk-assessor-model")
+    parser.add_argument("--risk-assessor-base-url")
+    parser.add_argument("--risk-assessor-api-key-env")
+
+
 def review_execution_profile_from_arguments(
     review_arguments: Sequence[str],
     *,
     memory_mode: str,
     memory_root: Path,
 ) -> AgentExecutionProfile:
-    parsed = _build_parser().parse_args(
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--reviewer-provider",
+        choices=["none", "fake", "openai-compatible"],
+        default="none",
+    )
+    parser.add_argument("--reviewer-model")
+    parser.add_argument("--reviewer-base-url")
+    parser.add_argument("--reviewer-api-key-env", default="REVIEW_AGENT_API_KEY")
+    parser.add_argument("--reviewer-mode", choices=["single", "multi"], default="single")
+    parser.add_argument(
+        "--reviewer-loop",
+        choices=["single-shot", "agent-loop"],
+        default="single-shot",
+    )
+    parser.add_argument("--non-interactive", action="store_true")
+    _add_review_memory_arguments(parser)
+    for stage in (
+        "risk-assessor",
+        "portfolio-planner",
+        "semantic-reconciler",
+        "memory-curator",
+    ):
+        _add_model_stage_arguments(parser, stage)
+    parsed = parser.parse_args(
         [
-            "review",
-            "--base=" + ("0" * 40),
-            "--head=" + ("1" * 40),
             *review_arguments,
             "--memory-mode=" + memory_mode,
             "--memory-root=" + str(memory_root),
@@ -4218,7 +4286,219 @@ def _load_ci_evidence_bundle(repository: Path, supplied: str) -> tuple[str, ...]
     return tuple(encoded)
 
 
+def _product_workspace_root(args: argparse.Namespace, repository: Path) -> Path:
+    supplied = getattr(args, "workspace_root", None)
+    if supplied is None:
+        supplied = os.environ.get("REVIEW_AGENT_WORKSPACE_ROOT")
+    if supplied is None:
+        return repository / ".review-agent" / "workspaces-v6"
+    if type(supplied) is not str or not supplied.strip() or "\x00" in supplied:
+        raise ProductRuntimeUsageError("workspace root is invalid")
+    return Path(supplied).expanduser().resolve()
+
+
+def _product_review_input_v6(args: argparse.Namespace) -> ProductReviewInputV6:
+    repository = Path(args.repo).resolve()
+    if args.ci_evidence and args.ci_evidence_file is not None:
+        raise ProductRuntimeUsageError(
+            "direct and file CI evidence are mutually exclusive"
+        )
+    ci_evidence = tuple(args.ci_evidence)
+    if args.ci_evidence_file is not None:
+        try:
+            ci_evidence = _load_ci_evidence_bundle(
+                repository,
+                args.ci_evidence_file,
+            )
+        except ValueError as error:
+            raise ProductRuntimeUsageError(str(error)) from error
+
+    lines = [
+        (
+            "Review the immutable code changes between the requested base and "
+            "head revisions."
+        )
+    ]
+    for label, value in (
+        ("Title", args.title),
+        ("Description", args.description),
+        ("Declared intent", args.intent),
+        ("Review focus", args.focus),
+    ):
+        if value is not None:
+            lines.append(f"{label}: {value}")
+    if args.requirement:
+        lines.append("Linked requirements:")
+        lines.extend(f"- {value}" for value in args.requirement)
+    if args.project_rule:
+        lines.append("User review rules:")
+        lines.extend(f"- {value}" for value in args.project_rule)
+    if ci_evidence:
+        lines.append("Existing CI evidence:")
+        lines.extend(f"- {value}" for value in ci_evidence)
+    request = ReviewRequestV6(
+        conversation=(
+            ConversationMessage(
+                speaker=ConversationSpeaker.USER,
+                content="\n".join(lines),
+            ),
+        )
+    )
+    return ProductReviewInputV6(
+        request=request,
+        declared_goal=args.intent,
+        title=args.title,
+        description=args.description,
+    )
+
+
+def _product_runtime_config_v6(
+    args: argparse.Namespace,
+) -> ProductRuntimeConfigV6:
+    reviewer = ModelAdapterConfig(
+        provider_name=args.reviewer_provider,
+        model=args.reviewer_model,
+        base_url=args.reviewer_base_url,
+        api_key_env=args.reviewer_api_key_env,
+        stage_label="reviewer",
+    )
+    risk = None
+    if getattr(args, "risk_assessor_mode", "local") == "model":
+        requested_provider = args.risk_assessor_provider
+        provider = (
+            reviewer.provider_name
+            if requested_provider == "inherit"
+            else requested_provider
+        )
+        risk = ModelAdapterConfig(
+            provider_name=provider,
+            model=args.risk_assessor_model or reviewer.model,
+            base_url=args.risk_assessor_base_url or reviewer.base_url,
+            api_key_env=(
+                args.risk_assessor_api_key_env or reviewer.api_key_env
+            ),
+            stage_label="risk-assessor",
+        )
+    return ProductRuntimeConfigV6(reviewer=reviewer, risk=risk)
+
+
+def _emit_product_outcome(
+    outcome: ProductReviewOutcomeV6,
+    output_format: str,
+) -> None:
+    if output_format == "json":
+        rendered = outcome.review_result_json
+    elif output_format == "markdown":
+        rendered = outcome.review_markdown
+    else:
+        raise ProductRuntimeUsageError("output format is unsupported")
+    sys.stdout.write(rendered)
+    if not rendered.endswith("\n"):
+        sys.stdout.write("\n")
+    _emit_product_locator(outcome.locator())
+
+
+def _emit_product_locator(locator: Mapping[str, str]) -> None:
+    print(
+        "Review locator: "
+        + json.dumps(
+            dict(locator),
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        file=sys.stderr,
+    )
+
+
+def _inspect_legacy_review(repository: Path, review_id: str) -> int:
+    if (
+        type(review_id) is not str
+        or re.fullmatch(r"review-[A-Za-z0-9._-]{1,128}", review_id) is None
+    ):
+        print(
+            "Resume configuration error: expected a Session v6 locator or a "
+            "canonical legacy review id",
+            file=sys.stderr,
+        )
+        return 2
+    run_dir = repository / ".review-agent" / "runs" / review_id
+    if not run_dir.is_dir():
+        print(f"Legacy review not found: {run_dir}", file=sys.stderr)
+        return 2
+    session_path = run_dir / "session.json"
+    if session_path.is_file():
+        try:
+            diagnostic = diagnose_legacy_session(run_dir)
+        except Exception as error:
+            print(
+                f"Legacy review has an invalid Session: {error}",
+                file=sys.stderr,
+            )
+            return 2
+        invalid = [
+            artifact.name
+            for artifact in diagnostic.artifacts
+            if not artifact.valid
+        ]
+        print(
+            "Legacy review is read-only and cannot be resumed by Session v6. "
+            f"schema=v{diagnostic.schema_version} status={diagnostic.status} "
+            f"phase={diagnostic.current_phase} invalid_artifacts={invalid}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "Legacy review has no Session manifest and is inspect-only under "
+            f"Session v6: {run_dir}",
+            file=sys.stderr,
+        )
+    print(
+        "Start a new v6 review with --external-review-id; no legacy Phase was run.",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _run_review_v6(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    if not isinstance(args.external_review_id, str) or not args.external_review_id.strip():
+        print("Review configuration error: --external-review-id is required", file=sys.stderr)
+        return 2
+    try:
+        review_input = _product_review_input_v6(args)
+        config = _product_runtime_config_v6(args)
+        outcome = start_product_review_v6(
+            repository=repo,
+            workspace_root=_product_workspace_root(args, repo),
+            base_revision=args.base,
+            head_revision=args.head,
+            external_review_id=args.external_review_id,
+            review_input=review_input,
+            config=config,
+        )
+    except (ProductRuntimeUsageError, ProductRuntimeIntegrityError) as error:
+        print(f"Review configuration error: {error}", file=sys.stderr)
+        return 2
+    except ProductRuntimeInfrastructureError as error:
+        print(f"Review failed: {error}", file=sys.stderr)
+        if error.locator is not None:
+            _emit_product_locator(error.locator)
+        return 1
+    except Exception as error:
+        print(
+            f"Review failed: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return 1
+    _emit_product_outcome(outcome, args.output_format)
+    return 0
+
+
 def _run_review(args: argparse.Namespace) -> int:
+    return _run_review_v6(args)
+
+
+def _run_review_legacy(args: argparse.Namespace) -> int:
     requested_repo = Path(args.repo).resolve()
     try:
         if args.ci_evidence and args.ci_evidence_file is not None:
@@ -4353,7 +4633,51 @@ def _run_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_resume_v6(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    if not args.session_id.startswith("SESSION-"):
+        return _inspect_legacy_review(repo, args.session_id)
+    if not isinstance(args.pr_id, str) or not args.pr_id:
+        print("Resume configuration error: --pr-id is required", file=sys.stderr)
+        return 2
+    if not isinstance(args.snapshot_id, str) or not args.snapshot_id:
+        print(
+            "Resume configuration error: --snapshot-id is required",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        outcome = resume_product_review_v6(
+            repository=repo,
+            workspace_root=_product_workspace_root(args, repo),
+            pr_id=args.pr_id,
+            snapshot_id=args.snapshot_id,
+            session_id=args.session_id,
+            config=_product_runtime_config_v6(args),
+        )
+    except (ProductRuntimeUsageError, ProductRuntimeIntegrityError) as error:
+        print(f"Resume configuration error: {error}", file=sys.stderr)
+        return 2
+    except ProductRuntimeInfrastructureError as error:
+        print(f"Resume failed: {error}", file=sys.stderr)
+        if error.locator is not None:
+            _emit_product_locator(error.locator)
+        return 1
+    except Exception as error:
+        print(
+            f"Resume failed: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return 1
+    _emit_product_outcome(outcome, args.output_format)
+    return 0
+
+
 def _run_resume(args: argparse.Namespace) -> int:
+    return _run_resume_v6(args)
+
+
+def _run_resume_legacy(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     store = CheckpointStore(repo, args.review_id, create=False)
     if not store.run_dir.exists():

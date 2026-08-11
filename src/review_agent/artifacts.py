@@ -107,6 +107,7 @@ MEMORY_ARTIFACT_SCHEMAS = MappingProxyType(
 
 SESSION_V6_ARTIFACT_PHASES = MappingProxyType(
     {
+        "preflight.request": "preflight",
         "preflight.diff_patch": "preflight",
         "preflight.diff_index": "preflight",
         "preflight.quality_gate": "preflight",
