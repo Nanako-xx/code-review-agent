@@ -2,7 +2,7 @@
 
 > **For agentic workers:** 按 Task 顺序实施，使用 checkbox 跟踪进度；每个 Task 在定向测试通过后形成一个独立提交。不要把协议、存储、Agent Loop 和 Eval 切换压成一次大提交。
 
-**状态：** 实施中（Task 1–4 已完成）
+**状态：** 实施中（Task 1–5 已完成）
 
 **设计来源：** `docs/superpowers/specs/2026-08-10-pr-workspace-preflight-reviewer-runtime-redesign.md`
 
@@ -446,7 +446,7 @@ refactor: collapse preflight to deterministic checks
 - Create: `tests/test_intent_v2.py`
 - Modify: `tests/test_intent_inference.py`
 
-- [ ] **Step 1：写 explicit/inferred/null RED 测试**
+- [x] **Step 1：写 explicit/inferred/null RED 测试**
 
 覆盖：
 
@@ -458,15 +458,15 @@ refactor: collapse preflight to deterministic checks
 - Intent Agent 的 envelope/raw response/tool trace 仅进入内部 IntentAnalysisRecord；
 - 新版本引用 source_snapshot_id，旧版本不可覆盖。
 
-- [ ] **Step 2：把现有 Intent 复杂模型隔离为内部分析**
+- [x] **Step 2：把现有 Intent 复杂模型隔离为内部分析**
 
 可以通过纯函数复用当前 inference 候选和证据收集，但旧 Intent wire model 与 v5 行为保持不变；`intent_runtime.py` 最终只投影新 IntentPacket。v6 不进入交互式 `AWAITING_USER`；缺失 Intent 直接形成 null source，后续 Risk floor 升为 high。
 
-- [ ] **Step 3：实现跨 Snapshot 延续**
+- [x] **Step 3：实现跨 Snapshot 延续**
 
 显式 Intent 可延续到新 Snapshot；inferred Intent 必须重新校验并产生新版本。历史文件 create-only，`current.json` 只原子更新版本指针。
 
-- [ ] **Step 4：运行测试**
+- [x] **Step 4：运行测试**
 
 Run:
 
@@ -479,7 +479,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；Reviewer/Risk 只能取得三个字段的 Packet。
 
-- [ ] **Step 5：提交**
+- [x] **Step 5：提交**
 
 ```text
 refactor: project minimal intent packet v2

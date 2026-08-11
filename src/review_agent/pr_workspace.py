@@ -428,6 +428,95 @@ class PRWorkspaceStore:
 
         self._assert_snapshot_authority(snapshot)
 
+    def verify_workspace(self, workspace: PRWorkspace) -> None:
+        self._assert_workspace_authority(workspace)
+
+    def publish_intent_history(
+        self,
+        workspace: PRWorkspace,
+        filename: str,
+        content: bytes,
+    ) -> Path:
+        self._assert_workspace_authority(workspace)
+        try:
+            canonical_relative_path(filename)
+        except SafeIOError as error:
+            raise PRWorkspaceSecurityError(str(error)) from error
+        if "/" in filename:
+            raise PRWorkspaceSecurityError("Intent history filename must be flat")
+        path = workspace.path / "Intent" / "history" / filename
+        if _path_exists(path):
+            try:
+                existing = path.read_bytes()
+            except OSError as error:
+                raise PRWorkspaceSecurityError(
+                    "Intent history file is unavailable"
+                ) from error
+            if existing != content:
+                raise PRWorkspaceSecurityError(
+                    "Intent history is create-only and already exists"
+                )
+            return path
+        self._publish_bytes_create_only(path, content)
+        return path
+
+    def replace_current_intent(
+        self,
+        workspace: PRWorkspace,
+        content: bytes,
+    ) -> Path:
+        self._assert_workspace_authority(workspace)
+        path = workspace.path / "Intent" / "current.json"
+        try:
+            atomic_replace_bytes(path, content)
+        except SafeIOError as error:
+            raise PRWorkspaceSecurityError(str(error)) from error
+        return path
+
+    def intent_current_exists(self, workspace: PRWorkspace) -> bool:
+        self._assert_workspace_authority(workspace)
+        return _path_exists(workspace.path / "Intent" / "current.json")
+
+    def read_intent_json(
+        self,
+        workspace: PRWorkspace,
+        relative_path: str,
+    ) -> dict[str, Any]:
+        self._assert_workspace_authority(workspace)
+        try:
+            relative = canonical_relative_path(relative_path)
+            path = resolve_managed_path(workspace.path / "Intent", relative)
+        except SafeIOError as error:
+            raise PRWorkspaceSecurityError(str(error)) from error
+        value = self._read_json(path, "Intent record")
+        if type(value) is not dict:
+            raise PRWorkspaceSecurityError("Intent record must be an object")
+        return value
+
+    def set_current_intent_version(
+        self,
+        workspace: PRWorkspace,
+        version: int,
+    ) -> None:
+        self._assert_workspace_authority(workspace)
+        if type(version) is not int or version < 1:
+            raise PRWorkspaceError("Intent version must be a positive integer")
+        manifest = self._validate_workspace_manifest(workspace)
+        if manifest["current_intent_version"] == version:
+            return
+        manifest["current_intent_version"] = version
+        try:
+            atomic_replace_bytes(
+                workspace.path / "manifest.json",
+                canonical_json_bytes(manifest),
+            )
+        except SafeIOError as error:
+            raise PRWorkspaceSecurityError(str(error)) from error
+
+    def current_intent_version(self, workspace: PRWorkspace) -> int | None:
+        self._assert_workspace_authority(workspace)
+        return self._validate_workspace_manifest(workspace)["current_intent_version"]
+
     def describe_artifact(
         self,
         snapshot: SnapshotWorkspace,

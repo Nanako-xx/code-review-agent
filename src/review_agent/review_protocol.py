@@ -52,6 +52,7 @@ EnumT = TypeVar("EnumT", bound=Enum)
 _PR_ID_PATTERN = re.compile(r"\APR-[0-9a-f]{64}\Z")
 _SNAPSHOT_ID_PATTERN = re.compile(r"\AS-[0-9a-f]{64}\Z")
 _FINDING_ID_PATTERN = re.compile(r"\AF-[0-9a-f]{64}\Z")
+_INTENT_ANALYSIS_ID_PATTERN = re.compile(r"\AIA-[0-9a-f]{64}\Z")
 _WINDOWS_DRIVE_PATTERN = re.compile(r"\A[A-Za-z]:")
 
 
@@ -334,6 +335,66 @@ class IntentPacket(WireModel):
 
 
 @dataclass(frozen=True)
+class IntentVersionEnvelope(WireModel):
+    version: int
+    source_snapshot_id: str
+    packet: IntentPacket
+    analysis_record_ref: str
+
+    _WIRE_FIELDS = (
+        "version",
+        "source_snapshot_id",
+        "packet",
+        "analysis_record_ref",
+    )
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version < 1:
+            raise WireProtocolError("version must be a positive integer")
+        _stable_id(
+            self.source_snapshot_id,
+            _SNAPSHOT_ID_PATTERN,
+            "source_snapshot_id",
+        )
+        if type(self.packet) is not IntentPacket:
+            raise WireProtocolError("packet must be an IntentPacket")
+        _stable_id(
+            self.analysis_record_ref,
+            _INTENT_ANALYSIS_ID_PATTERN,
+            "analysis_record_ref",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "source_snapshot_id": self.source_snapshot_id,
+            "packet": self.packet.to_dict(),
+            "analysis_record_ref": self.analysis_record_ref,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "IntentVersionEnvelope":
+        value = _exact_object(payload, cls._WIRE_FIELDS, "IntentVersionEnvelope")
+        version = value["version"]
+        if type(version) is not int or version < 1:
+            raise WireProtocolError("version must be a positive integer")
+        return cls(
+            version=version,
+            source_snapshot_id=_stable_id(
+                value["source_snapshot_id"],
+                _SNAPSHOT_ID_PATTERN,
+                "source_snapshot_id",
+            ),
+            packet=IntentPacket.from_dict(value["packet"]),
+            analysis_record_ref=_stable_id(
+                value["analysis_record_ref"],
+                _INTENT_ANALYSIS_ID_PATTERN,
+                "analysis_record_ref",
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class RiskDecision(WireModel):
     level: RiskLevel
 
@@ -569,6 +630,7 @@ __all__ = [
     "FindingSeverity",
     "IntentPacket",
     "IntentSource",
+    "IntentVersionEnvelope",
     "ReviewRequest",
     "ReviewerFinding",
     "ReviewerOutput",

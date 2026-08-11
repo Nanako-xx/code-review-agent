@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 from typing import Any, Mapping, Sequence
+import unicodedata
 
 from review_agent.memory_models import (
     MAX_SNAPSHOT_RECORDS,
@@ -304,6 +305,36 @@ def intent_inference_run_to_dict(run: IntentInferenceRun) -> dict[str, Any]:
     if not isinstance(run, IntentInferenceRun):
         raise ValueError("run must be an IntentInferenceRun")
     return run.to_dict()
+
+
+def project_inference_goal_v2(
+    run: IntentInferenceRun,
+) -> tuple[str | None, tuple[str, ...]]:
+    """Project internal Intent analysis to one downstream inferred goal."""
+
+    if not isinstance(run, IntentInferenceRun):
+        raise ValueError("run must be an IntentInferenceRun")
+    uncertainties = [
+        " ".join(unicodedata.normalize("NFKC", item).split())
+        for item in run.result.uncertainties
+        if item.strip()
+    ]
+    if run.status not in {"completed", "partial"}:
+        uncertainties.append("Intent analysis did not complete reliably.")
+        return None, tuple(dict.fromkeys(uncertainties))
+    goals: dict[str, str] = {}
+    for candidate in run.result.candidates:
+        if candidate.field != "goal":
+            continue
+        normalized = " ".join(unicodedata.normalize("NFKC", candidate.value).split())
+        goals.setdefault(normalized, candidate.value.strip())
+    if not goals:
+        uncertainties.append("Intent analysis produced no reliable goal.")
+        return None, tuple(dict.fromkeys(uncertainties))
+    if len(goals) > 1:
+        uncertainties.append("Intent analysis produced conflicting goal candidates.")
+        return None, tuple(dict.fromkeys(uncertainties))
+    return next(iter(goals.values())), tuple(dict.fromkeys(uncertainties))
 
 
 def build_intent_memory_projection(

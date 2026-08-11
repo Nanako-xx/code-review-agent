@@ -6,13 +6,18 @@ import pytest
 
 from review_agent.intent_inference import (
     INTENT_INFERENCE_SYSTEM_PROMPT,
+    IntentInferenceCandidate,
     IntentInferenceParseError,
+    IntentInferenceResult,
+    IntentInferenceRun,
+    IntentInferenceTrace,
     build_intent_memory_projection,
     intent_claims_from_memory_projection,
     intent_inference_protocol_projection,
     intent_inference_run_to_dict,
     parse_intent_inference_result,
     run_intent_inference,
+    project_inference_goal_v2,
 )
 from review_agent.intent import apply_user_decision, generate_material_questions
 from review_agent.memory_models import (
@@ -727,6 +732,40 @@ def _result_json(
             "summary": "Intent candidate extracted.",
         }
     )
+
+
+def test_v2_projection_keeps_model_generated_goal_inferred() -> None:
+    run = IntentInferenceRun(
+        result=IntentInferenceResult(
+            candidates=[
+                IntentInferenceCandidate(
+                    field="goal",
+                    value="Preserve retry safety.",
+                    origin="repository_document",
+                    confidence="high",
+                    source_refs=["README.md:1"],
+                    evidence_refs=["O-evidence"],
+                    rationale="The repository document states this goal.",
+                    conclusion_impact="material",
+                )
+            ],
+            uncertainties=[],
+            summary="One goal was found.",
+        ),
+        trace=IntentInferenceTrace(
+            trace_id="v2-projection",
+            turns=[],
+            tool_call_count=0,
+            final_status="completed",
+        ),
+        provider_name="fake",
+        model="fake",
+    )
+
+    goal, uncertainties = project_inference_goal_v2(run)
+
+    assert goal == "Preserve retry safety."
+    assert uncertainties == ()
 
 
 def _memory_record(index: int, kind: MemoryKind, statement: str) -> DurableMemoryRecord:
