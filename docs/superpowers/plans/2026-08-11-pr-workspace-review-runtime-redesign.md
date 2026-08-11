@@ -2,7 +2,7 @@
 
 > **For agentic workers:** 按 Task 顺序实施，使用 checkbox 跟踪进度；每个 Task 在定向测试通过后形成一个独立提交。不要把协议、存储、Agent Loop 和 Eval 切换压成一次大提交。
 
-**状态：** 实施中（Task 1 已完成）
+**状态：** 实施中（Task 1–2 已完成）
 
 **设计来源：** `docs/superpowers/specs/2026-08-10-pr-workspace-preflight-reviewer-runtime-redesign.md`
 
@@ -268,7 +268,7 @@ feat: add minimal review protocol v2
 - Create: `tests/test_safe_io.py`
 - Create: `tests/test_pr_workspace.py`
 
-- [ ] **Step 1：写 Workspace 安全与身份 RED 测试**
+- [x] **Step 1：写 Workspace 安全与身份 RED 测试**
 
 覆盖：
 
@@ -281,11 +281,11 @@ feat: add minimal review protocol v2
 - hash 验证、普通文件验证和 interrupted staging cleanup；
 - Windows 路径使用真实短根和短 physical ID，不创建 `\\?\` 通用包装层或 Junction。
 
-- [ ] **Step 2：提取安全写入原语**
+- [x] **Step 2：提取安全写入原语**
 
 把 `checkpoint.py`/`attempts.py` 中可复用的原子写、fsync、canonical relative path 和 regular-file 检查移入 `safe_io.py`，旧调用暂时通过兼容 import 使用同一实现。
 
-- [ ] **Step 3：实现 PRWorkspaceStore**
+- [x] **Step 3：实现 PRWorkspaceStore**
 
 提供：
 
@@ -301,7 +301,7 @@ read_verified_json(...)
 
 Workspace manifest 和 Snapshot manifest 均绑定 repository identity、pr_id、base/head SHA 和 schema version。
 
-- [ ] **Step 4：运行测试**
+- [x] **Step 4：运行测试**
 
 Run:
 
@@ -314,7 +314,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；旧 CheckpointStore 原子写回归不变，新 PRWorkspace 隔离测试通过。
 
-- [ ] **Step 5：提交**
+- [x] **Step 5：提交**
 
 ```text
 feat: add isolated PR workspace and snapshot store
