@@ -8,7 +8,11 @@ from types import MappingProxyType
 from typing import Any
 
 from review_agent.completion import COMPLETION_POLICY_VERSION
-from review_agent.context import reviewer_protocol_projection
+from review_agent.context import (
+    REVIEWER_TOOL_NAMES_V2,
+    reviewer_protocol_projection,
+    reviewer_tool_schemas_v2,
+)
 from review_agent.intent_inference import (
     INTENT_INFERENCE_MAX_TOOL_CALLS,
     INTENT_INFERENCE_MAX_TURNS,
@@ -35,10 +39,16 @@ from review_agent.tool_gateway import (
     DEFAULT_TOOL_TIMEOUT_SECONDS,
     tool_gateway_limits_projection,
 )
+from review_agent.review_context import DiffFitPolicy
+from review_agent.review_policy import (
+    DeveloperReviewPolicy,
+    build_reviewer_system_prompt,
+)
 
 
 AGENT_EXECUTION_PROFILE_SCHEMA_VERSION = "agent_execution_profile_v1"
 PRODUCT_ORCHESTRATION_MARGIN_SECONDS = 300.0
+REVIEWER_EXECUTION_PROFILE_V2_SCHEMA = "reviewer_execution_profile_v2"
 
 
 def _text_sha256(value: str) -> str:
@@ -55,6 +65,45 @@ def stage_prompt_digests() -> dict[str, str]:
             SEMANTIC_RECONCILER_SYSTEM_PROMPT
         ),
         "memory_curator": _text_sha256(MEMORY_CURATOR_SYSTEM_PROMPT),
+    }
+
+
+def reviewer_execution_profile_v2(
+    policy: DeveloperReviewPolicy,
+    *,
+    diff_fit_policy: DiffFitPolicy | None = None,
+) -> dict[str, Any]:
+    """Return the v6 Reviewer product identity without v5 character budgets."""
+
+    if not isinstance(policy, DeveloperReviewPolicy):
+        raise TypeError("policy must be DeveloperReviewPolicy")
+    fit = diff_fit_policy or DiffFitPolicy()
+    if not isinstance(fit, DiffFitPolicy):
+        raise TypeError("diff_fit_policy must be DiffFitPolicy")
+    system = build_reviewer_system_prompt(policy)
+    tools = reviewer_tool_schemas_v2(REVIEWER_TOOL_NAMES_V2)
+    return {
+        "schema_version": REVIEWER_EXECUTION_PROFILE_V2_SCHEMA,
+        "invocation_inputs": ["system", "tools", "messages", "parameters"],
+        "developer_policy_sha256": policy.digest(),
+        "reviewer_system_prompt_sha256": _text_sha256(system),
+        "tool_catalog_sha256": hashlib.sha256(
+            json.dumps(
+                list(tools),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "tool_names": list(REVIEWER_TOOL_NAMES_V2),
+        "diff_fit_policy": fit.to_dict(),
+        "global_memory": "immutable_snapshot_projection",
+        "invocation_defaults": {
+            "reasoning_effort": "medium",
+            "temperature": 0,
+            "tool_choice_policy": "auto_if_tools_else_none",
+            "response_schema": "reviewer_output_v2",
+        },
     }
 
 

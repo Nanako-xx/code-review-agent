@@ -571,11 +571,11 @@ refactor: simplify risk and fix reviewer slots
 - Modify: `tests/test_execution_profile.py`
 - Modify: `tests/test_architecture_boundaries.py`
 
-- [ ] **Step 1：写四输入边界和规则优先级 RED 测试**
+- [x] **Step 1：写四输入边界和规则优先级 RED 测试**
 
 断言每次模型调用仍严格为 system/tools/messages/parameters；DeveloperReviewPolicy 位于 System 且没有 CLI/user override；用户规则与 LLM 经验只进入 user message 的 `{{system_rule}}`；冲突时低优先级规则不能覆盖开发者规则。
 
-- [ ] **Step 2：实现静态 Pinned Context**
+- [x] **Step 2：实现静态 Pinned Context**
 
 初始 user message 固定包含：
 
@@ -594,19 +594,19 @@ Available Artifacts
 
 当前 CLI 的一条用户请求也必须先规范化为 speaker-labeled conversation；以后追加的公开澄清沿用同一结构，不能把 Orchestrator 私有推断伪装成用户消息。
 
-- [ ] **Step 3：实现 Global Memory facade 和规则投影**
+- [x] **Step 3：实现 Global Memory facade 和规则投影**
 
 复用现有 Durable Memory 的身份、完整性和 CLI 管理能力，但 Review Pipeline 不再拥有 MEMORY_SELECTION/MEMORY_PROPOSAL Phase。Facade 只选择用户规则和已批准经验，生成当前 Session 的不可变 snapshot；不得保存 PR Diff、Intent、Assignment 或临时 Tool Result，也不得把 live MemoryStore 传入 Reviewer execution modules。
 
-- [ ] **Step 4：实现 Diff fit policy**
+- [x] **Step 4：实现 Diff fit policy**
 
 先估算除 Diff 外的 Pinned Token；完整 Diff 能保持初始目标不超过 500K～600K 时内联，否则放 Index、相关 hunk 和 diff artifact_id。不得按 120/80 行截断。
 
-- [ ] **Step 5：移除旧字符预算和 Memory 10% 配额**
+- [x] **Step 5：移除旧字符预算和 Memory 10% 配额**
 
 `ContextBudget(max_message_chars=16_000)`、`compacted_section_min_chars` 和固定 `memory_subbudget_ratio` 不进入新 Reviewer protocol projection。Task 16 前旧类可以留给 v5；Global Memory 通过 immutable snapshot 投影，不把 live MemoryStore 传给 Reviewer。
 
-- [ ] **Step 6：运行测试**
+- [x] **Step 6：运行测试**
 
 Run:
 
@@ -620,7 +620,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；旧 16K/10% 预算不出现在 v2 projection，规则权威和 Pinned 区块稳定。
 
-- [ ] **Step 7：提交**
+- [x] **Step 7：提交**
 
 ```text
 refactor: rebuild reviewer context and policy boundary

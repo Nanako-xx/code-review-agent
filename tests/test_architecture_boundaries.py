@@ -242,6 +242,31 @@ def test_v6_review_protocol_does_not_depend_on_runtime_or_eval_layers() -> None:
     assert not violations
 
 
+def test_v6_reviewer_context_uses_frozen_memory_not_live_store_or_legacy_models() -> None:
+    forbidden_modules = {
+        "review_agent.memory_store",
+        "review_agent.models",
+        "review_agent.pipeline",
+        "review_agent.provider",
+        "review_agent_eval",
+    }
+
+    for filename in (
+        "global_memory.py",
+        "review_policy.py",
+        "review_context.py",
+    ):
+        tree = _tree(filename)
+        violations = [
+            (module, symbol)
+            for module, symbol in _imports(tree)
+            if _module_matches(module, forbidden_modules)
+            or symbol == "MemoryStore"
+        ]
+        assert not violations, f"{filename}: {violations}"
+        assert not _live_memory_store_bindings(tree), filename
+
+
 def test_quality_business_logic_does_not_own_subprocess_execution() -> None:
     quality = _tree("quality.py")
     pipeline = _tree("pipeline.py")

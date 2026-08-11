@@ -7,10 +7,14 @@ import pytest
 import review_agent.execution_profile as profile_module
 from review_agent.command import review_execution_profile_from_arguments
 from review_agent.context import ContextBudget
-from review_agent.execution_profile import AgentExecutionProfile
+from review_agent.execution_profile import (
+    AgentExecutionProfile,
+    reviewer_execution_profile_v2,
+)
 from review_agent.memory_models import MemoryExecutionConfig, MemoryMode
 from review_agent.models import ReviewProfile, RiskLevel
 from review_agent.session import ReviewExecutionConfig, SupplementalPolicy
+from review_agent.review_policy import DeveloperReviewPolicy
 
 
 def execution_config(
@@ -206,3 +210,22 @@ def test_profile_digest_changes_with_risk_and_protocol_inputs(
         profile_module.RISK_MODEL_SYSTEM_PROMPT + "\nidentity change",
     )
     assert AgentExecutionProfile.from_execution(config).digest() != baseline
+
+
+def test_v2_reviewer_profile_binds_developer_policy_without_legacy_budgets() -> None:
+    policy = DeveloperReviewPolicy(
+        policy_id="product-review-policy-v1",
+        content="Report concrete defects and preserve evidence-backed findings.",
+        locked_topics=("finding-suppression",),
+    )
+
+    profile = reviewer_execution_profile_v2(policy)
+    encoded = str(profile)
+
+    assert profile["developer_policy_sha256"] == policy.digest()
+    assert len(profile["reviewer_system_prompt_sha256"]) == 64
+    assert profile["diff_fit_policy"]["target_initial_tokens"] >= 500_000
+    assert "max_message_chars" not in encoded
+    assert "compacted_section_min_chars" not in encoded
+    assert "memory_subbudget_ratio" not in encoded
+    assert "max_output_tokens" not in encoded

@@ -267,6 +267,45 @@ _REVIEWER_TOOL_DEFINITIONS = (
     ),
 )
 REVIEWER_TOOL_NAMES = tuple(name for name, _, _ in _REVIEWER_TOOL_DEFINITIONS)
+_REVIEWER_TOOL_DEFINITIONS_V2 = (
+    *_REVIEWER_TOOL_DEFINITIONS,
+    (
+        "read_commit_messages",
+        "Read bounded commit subjects and bodies for the immutable Snapshot range.",
+        {
+            "type": "object",
+            "properties": {
+                "max_count": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    ),
+    (
+        "read_artifact",
+        "Read one bounded page from a Runtime-authorized immutable Artifact.",
+        {
+            "type": "object",
+            "properties": {
+                "artifact_id": {
+                    "type": "string",
+                    "pattern": r"^A-[0-9a-f]{64}$",
+                },
+                "cursor": {"type": "integer", "minimum": 0},
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50_000,
+                },
+            },
+            "required": ["artifact_id"],
+            "additionalProperties": False,
+        },
+    ),
+)
+REVIEWER_TOOL_NAMES_V2 = tuple(
+    name for name, _, _ in _REVIEWER_TOOL_DEFINITIONS_V2
+)
 _SCOPED_REVIEWER_TOOLS: ContextVar[tuple[str, ...] | None] = ContextVar(
     "reviewer_allowed_tools",
     default=None,
@@ -373,6 +412,38 @@ def reviewer_protocol_projection() -> dict[str, Any]:
             "response_schema": REVIEWER_RESPONSE_SCHEMA,
         },
     }
+
+
+def reviewer_tool_schemas_v2(
+    allowed_tools: Iterable[str],
+) -> tuple[dict[str, Any], ...]:
+    """Project only Assignment-authorized schemas into the API tools field."""
+
+    names = tuple(allowed_tools)
+    if any(type(name) is not str or not name for name in names):
+        raise ValueError("allowed_tools must contain non-empty tool names")
+    if len(names) != len(set(names)):
+        raise ValueError("allowed_tools must not contain duplicates")
+    unknown = sorted(set(names) - set(REVIEWER_TOOL_NAMES_V2))
+    if unknown:
+        raise ValueError("unknown Reviewer tool(s): " + ", ".join(unknown))
+    definitions = {
+        name: (description, parameters)
+        for name, description, parameters in _REVIEWER_TOOL_DEFINITIONS_V2
+    }
+    projected: list[dict[str, Any]] = []
+    for name in names:
+        description, parameters = definitions[name]
+        projected.append(
+            {
+                "name": name,
+                "description": description,
+                "parameters": json.loads(
+                    json.dumps(parameters, ensure_ascii=False, allow_nan=False)
+                ),
+            }
+        )
+    return tuple(projected)
 
 
 def _reviewer_tool_choice(has_tools: bool) -> str:
