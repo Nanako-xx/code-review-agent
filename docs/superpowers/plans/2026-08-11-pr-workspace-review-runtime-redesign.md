@@ -1150,23 +1150,23 @@ refactor: bind eval adapter to review result v1
 - Modify: affected legacy unit tests
 - Modify: `docs/superpowers/specs/2026-08-10-pr-workspace-preflight-reviewer-runtime-redesign.md`
 
-- [ ] **Step 1：用 rg 和 AST tests 证明新产品入口无旧 import**
+- [x] **Step 1：用 rg 和 AST tests 证明新产品入口无旧 import**
 
 检查 command/review_pipeline/resume/execution_profile/current Eval Adapter。新路径不得出现 Reconciler、Supplemental、Completion、FinalRisk、ReviewBrief 或 deep quality gate。
 
-- [ ] **Step 2：删除旧调度和配置面**
+- [x] **Step 2：删除旧调度和配置面**
 
 删除 RunPhase dispatch、Session supplemental waves/budgets、CLI stage args、artifact ownership 和 profile digests。只读 legacy hydration 如仍需要，移动到明确命名的 compatibility module。
 
-- [ ] **Step 3：删除旧测试预期，保留安全回归**
+- [x] **Step 3：删除旧测试预期，保留安全回归**
 
 删除“旧功能仍在主链”的测试，不删除 path traversal、hash、prompt injection、provider timeout、artifact integrity 和 Eval isolation 等安全测试；将其改写到新边界。
 
-- [ ] **Step 4：更新主 Spec 实施状态和迁移说明**
+- [x] **Step 4：更新主 Spec 实施状态和迁移说明**
 
 逐项勾选实现状态，记录 v6 breaking schema、legacy read-only 和外部 review ID 要求。不要把本实施计划中的临时步骤写成长期产品承诺。
 
-- [ ] **Step 5：运行架构与邻接测试**
+- [x] **Step 5：运行架构与邻接测试**
 
 Run:
 
@@ -1181,7 +1181,7 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 
 Expected: PASS；新主链对旧后处理模块零依赖。
 
-- [ ] **Step 6：提交**
+- [x] **Step 6：提交**
 
 ```text
 refactor: remove legacy post-review product pipeline

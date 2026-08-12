@@ -4,9 +4,16 @@
 
 **更新：** 2026-08-11
 
-**状态：** Draft，PR Workspace、Reviewer 上下文、Finding v2、三层上下文压缩、最终 ReviewResult、风险、预算与长链路恢复边界已确认
+**状态：** 已实施；Task 1–16 已完成，完整回归与经授权真实模型 Smoke 由 Task 17 验收
 
 **范围：** 产品侧 Code Review Agent Runtime，不包含 Eval/Judge 内部实现
+
+**实施记录（2026-08-11）：** 产品入口现只执行 Session v6 五阶段主链，并以六字段
+`ReviewResult` 作为唯一返回事实。`review` 必须提供稳定的 `--external-review-id`；`resume`
+必须使用 `session_id + pr_id + snapshot_id`。v1–v5 Session 只允许做 hash 校验后的只读诊断，
+不能从公开 CLI 恢复或执行旧 Phase。既有 Durable Memory 管理命令被隔离为显式兼容面，
+只有用户调用 `review-agent memory` 时才加载；它不再进入 review/resume 的 import、配置、
+Execution Profile 或 Reviewer 后处理路径。
 
 ## 1. 背景
 
@@ -1454,6 +1461,14 @@ ContextAssembler / ContextWindowManager
 - `review.md` 和 CLI 输出不得产生 `review-result.json` 中不存在的新事实。
 
 ## 22. 迁移影响
+
+实现采用明确的 breaking cutover：Session v6、IntentPacket v2、Finding/ReviewerOutput v2 和
+ReviewResult v1 不伪装成旧 schema。公开产品入口不再导入或调度 Semantic Reconciler、
+Supplemental Investigation、Evidence Reconciliation、Completion、Final Risk、阻塞式 Memory
+Proposal 或旧 ReviewBrief Reporting。历史实现只保留在显式 legacy/Memory 兼容模块及其安全
+回归中；它们不能被 `review`、v6 `resume` 或 Current Eval Adapter 调用。旧 Session 的兼容范围
+严格限制为只读诊断，迁移方式是以同一外部 review ID 创建新的 PRWorkspace v6 Snapshot/Session，
+而不是原地升级旧制品。
 
 后续实现至少需要处理以下现有接口：
 

@@ -70,7 +70,7 @@ from review_agent.pipeline import (
     replay_memory_outbox,
 )
 from review_agent.quality import QualityGateExecution
-from review_agent.resume import ResumeAction, ReviewSessionResumer
+from review_agent.legacy_resume import ResumeAction, ReviewSessionResumer
 from review_agent.revision import RevisionResolver
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
