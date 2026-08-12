@@ -39,9 +39,12 @@ from review_agent.session import (
     SupplementalTaskStatus,
     child_session_manifest,
     initial_session_manifest,
+    model_stage_config_to_dict,
+    review_execution_config_to_dict,
     session_phases_for_schema,
     session_manifest_from_dict,
     session_manifest_to_dict,
+    supplemental_policy_to_dict,
 )
 
 
@@ -156,6 +159,15 @@ def test_session_manifest_round_trips_with_pending_phases() -> None:
     loaded = session_manifest_from_dict(payload)
 
     assert loaded == original
+    assert payload["execution"] == review_execution_config_to_dict(
+        original.execution
+    )
+    assert model_stage_config_to_dict(original.execution.risk_assessor) == (
+        payload["execution"]["risk_assessor"]
+    )
+    assert supplemental_policy_to_dict(
+        original.execution.supplemental_policy
+    ) == payload["execution"]["supplemental_policy"]
     assert payload["schema_version"] == SESSION_SCHEMA_VERSION
     assert payload["status"] == "created"
     assert payload["current_phase"] == "created"

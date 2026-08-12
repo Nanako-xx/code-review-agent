@@ -28,6 +28,16 @@ REVIEW_EXECUTION_MODULES = (
     "tool_gateway.py",
 )
 
+V6_PROTOCOL_FORBIDDEN_MODULES = {
+    "review_agent.pipeline",
+    "review_agent.review_pipeline",
+    "review_agent.memory_store",
+    "review_agent.provider",
+    "review_agent.model_adapter",
+    "review_agent.model_adapter_factory",
+    "review_agent_eval",
+}
+
 
 def _module_path(filename: str) -> Path:
     return SOURCE_ROOT / filename
@@ -213,6 +223,183 @@ def test_reviewer_business_modules_do_not_import_legacy_model_provider() -> None
             or symbol in forbidden_symbols
         ], filename
         assert not set(_definitions(tree)).intersection(forbidden_symbols), filename
+
+
+def test_v6_review_protocol_does_not_depend_on_runtime_or_eval_layers() -> None:
+    violations = [
+        (module, symbol)
+        for module, symbol in _imports(_tree("review_protocol.py"))
+        if _module_matches(module, V6_PROTOCOL_FORBIDDEN_MODULES)
+        or symbol in {
+            "MemoryStore",
+            "ModelAdapter",
+            "ModelAdapterFactory",
+            "Pipeline",
+            "ReviewPipelineV6",
+        }
+    ]
+
+    assert not violations
+
+
+def test_v6_reviewer_context_uses_frozen_memory_not_live_store_or_legacy_models() -> None:
+    forbidden_modules = {
+        "review_agent.memory_store",
+        "review_agent.models",
+        "review_agent.pipeline",
+        "review_agent.provider",
+        "review_agent_eval",
+    }
+
+    for filename in (
+        "global_memory.py",
+        "review_policy.py",
+        "review_context.py",
+    ):
+        tree = _tree(filename)
+        violations = [
+            (module, symbol)
+            for module, symbol in _imports(tree)
+            if _module_matches(module, forbidden_modules)
+            or symbol == "MemoryStore"
+        ]
+        assert not violations, f"{filename}: {violations}"
+        assert not _live_memory_store_bindings(tree), filename
+
+
+def test_v6_tool_gateway_has_no_observation_store_or_legacy_gateway_dependency() -> None:
+    forbidden_modules = {
+        "review_agent.observations",
+        "review_agent.tool_gateway",
+        "review_agent.memory_store",
+        "review_agent.pipeline",
+    }
+    tree = _tree("review_tool_gateway.py")
+    violations = [
+        (module, symbol)
+        for module, symbol in _imports(tree)
+        if _module_matches(module, forbidden_modules)
+        or symbol in {"ObservationStore", "ToolGateway", "MemoryStore"}
+    ]
+
+    assert not violations
+    assert "ObservationStore" not in _definitions(tree)
+
+
+def test_v6_reviewer_loop_does_not_import_legacy_loop_assignment_or_observations() -> None:
+    forbidden_modules = {
+        "review_agent.agent_loop",
+        "review_agent.models",
+        "review_agent.observations",
+        "review_agent.tool_gateway",
+        "review_agent.pipeline",
+    }
+    for filename in (
+        "execution_journal.py",
+        "review_agent_loop.py",
+        "reviewer_executor.py",
+    ):
+        violations = [
+            (module, symbol)
+            for module, symbol in _imports(_tree(filename))
+            if _module_matches(module, forbidden_modules)
+            or symbol in {"Assignment", "ObservationStore", "ToolGateway"}
+        ]
+        assert not violations, f"{filename}: {violations}"
+
+
+def test_v6_product_pipeline_has_no_legacy_post_processing_or_live_store() -> None:
+    forbidden_modules = {
+        "review_agent.pipeline",
+        "review_agent.reconciler",
+        "review_agent.supplemental",
+        "review_agent.evidence",
+        "review_agent.completion",
+        "review_agent.final_risk",
+        "review_agent.brief",
+        "review_agent.memory_store",
+        "review_agent.provider",
+        "review_agent_eval",
+        "sqlite3",
+        "subprocess",
+    }
+    forbidden_symbols = {
+        "MemoryStore",
+        "SemanticReconciliation",
+        "CompletionResult",
+        "FinalRiskAssessment",
+        "ReviewBrief",
+        "Popen",
+    }
+    for filename in (
+        "review_pipeline.py",
+        "review_agent_loop.py",
+        "reviewer_executor.py",
+        "reviewer_output.py",
+        "aggregation.py",
+        "review_renderer.py",
+    ):
+        violations = [
+            (module, symbol)
+            for module, symbol in _imports(_tree(filename))
+            if _module_matches(module, forbidden_modules)
+            or symbol in forbidden_symbols
+        ]
+        assert not violations, f"{filename}: {violations}"
+        assert not _live_memory_store_bindings(_tree(filename)), filename
+
+
+def test_product_entrypoints_have_no_legacy_post_review_dependencies() -> None:
+    forbidden_modules = {
+        "review_agent.pipeline",
+        "review_agent.legacy_resume",
+        "review_agent.reconciler",
+        "review_agent.supplemental",
+        "review_agent.evidence",
+        "review_agent.completion",
+        "review_agent.final_risk",
+        "review_agent.brief",
+        "review_agent.reporting",
+    }
+    forbidden_symbols = {
+        "CompletionResult",
+        "FinalRiskAssessment",
+        "ReviewBrief",
+        "ReviewPipeline",
+        "SemanticReconciliation",
+        "SupplementalPlan",
+    }
+
+    for filename in (
+        "command.py",
+        "product_runtime.py",
+        "review_pipeline.py",
+        "resume.py",
+        "execution_profile.py",
+    ):
+        violations = [
+            (module, symbol)
+            for module, symbol in _imports(_tree(filename))
+            if _module_matches(module, forbidden_modules)
+            or symbol in forbidden_symbols
+        ]
+        assert not violations, f"{filename}: {violations}"
+
+
+def test_product_cli_source_has_no_removed_stage_or_memory_overrides() -> None:
+    source = _module_path("command.py").read_text(encoding="utf-8")
+
+    for option in (
+        "--semantic-reconciler",
+        "--portfolio-planner",
+        "--memory-curator",
+        "--memory-mode",
+        "--memory-root",
+        "--reviewer-loop",
+        "--reviewer-mode",
+        "--supplemental",
+    ):
+        assert re.search(re.escape(option) + r"(?![A-Za-z0-9-])", source) is None
 
 
 def test_quality_business_logic_does_not_own_subprocess_execution() -> None:

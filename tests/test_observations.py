@@ -2,12 +2,44 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 import review_agent.observations as observations_module
 from review_agent.observations import ObservationStore
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path regression")
+def test_observation_store_round_trips_extended_length_raw_path(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path
+    index = 0
+    while len(str(run_dir / "observations")) < 228:
+        run_dir /= "deep%04d" % index
+        index += 1
+    observations_dir = run_dir / "observations"
+    temporary_probe = observations_dir / (".tmp-" + "0" * 12 + ".tmp")
+    assert len(str(temporary_probe)) < 260
+
+    store = ObservationStore(run_dir)
+    observation = store.record(
+        source="git.repository_intelligence",
+        revision="head@abc",
+        path="src/app.py",
+        line_start=1,
+        line_end=1,
+        raw_content="value = 1\n",
+        context_view="src/app.py:1",
+    )
+    raw_path = run_dir / observation.raw_artifact_ref
+
+    assert len(str(raw_path)) > 260
+    assert ObservationStore.load(run_dir, {"head@abc"}).list_observations() == [
+        observation
+    ]
 
 
 def test_observation_store_records_stable_id_and_raw_artifact(tmp_path: Path):

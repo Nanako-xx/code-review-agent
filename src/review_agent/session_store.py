@@ -9,6 +9,7 @@ import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import stat
+import threading
 import unicodedata
 import uuid
 from typing import Iterable, Mapping
@@ -16,9 +17,19 @@ from typing import Iterable, Mapping
 from review_agent.artifacts import (
     MEMORY_ARTIFACT_PHASES,
     MEMORY_ARTIFACT_SCHEMAS,
+    session_v6_artifact_phase,
 )
 from review_agent.checkpoint import _atomic_write_text, _fsync_parent_directory
 from review_agent.run_state import RunPhase, RunStatus
+from review_agent.pr_workspace import PRWorkspaceStore, SessionWorkspace
+from review_agent.safe_io import (
+    SafeIOError,
+    atomic_replace_bytes,
+    canonical_json_bytes,
+    publish_create_only_bytes,
+    read_strict_json,
+    resolve_managed_path,
+)
 from review_agent.session import (
     RESUMABLE_SESSION_SCHEMA_VERSIONS,
     SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION,
@@ -30,6 +41,10 @@ from review_agent.session import (
     ReviewWaveCheckpoint,
     ReviewerTaskCheckpoint,
     SessionManifest,
+    SESSION_V6_PHASES,
+    SessionV6ArtifactRef,
+    SessionV6Manifest,
+    SessionV6PhaseCheckpoint,
     SupplementalBudget,
     SupplementalPolicy,
     SupplementalTaskCheckpoint,
@@ -37,6 +52,8 @@ from review_agent.session import (
     session_phases_for_schema,
     session_manifest_from_dict,
     session_manifest_to_dict,
+    new_session_v6_manifest,
+    session_v6_manifest_from_dict,
 )
 
 
@@ -2553,3 +2570,294 @@ def _reviewer_task(
     if task is None:
         raise ValueError(f"reviewer task is not initialized: {task_name}")
     return task
+
+
+_V6_STORE_LOCKS: dict[str, threading.Lock] = {}
+_V6_STORE_LOCKS_GUARD = threading.Lock()
+
+
+@dataclass(frozen=True)
+class SessionV6PhaseStart:
+    manifest: SessionV6Manifest
+    reused: bool
+    restarted: bool
+
+
+class SessionV6Store:
+    """Small, independent state store for the five-phase product pipeline."""
+
+    def __init__(
+        self,
+        workspace_store: PRWorkspaceStore,
+        session: SessionWorkspace,
+    ) -> None:
+        if not isinstance(workspace_store, PRWorkspaceStore):
+            raise ValueError("workspace_store must be PRWorkspaceStore")
+        workspace_store.verify_session(session)
+        self.workspace_store = workspace_store
+        self.session = session
+        try:
+            self.path = resolve_managed_path(session.path, "pipeline-state.json")
+        except SafeIOError as error:
+            raise ValueError("Session v6 state path is unavailable") from error
+        key = str(self.path.resolve()).casefold()
+        with _V6_STORE_LOCKS_GUARD:
+            self._lock = _V6_STORE_LOCKS.setdefault(key, threading.Lock())
+
+    def create(self) -> SessionV6Manifest:
+        manifest = new_session_v6_manifest(
+            session_id=self.session.session_id,
+            pr_id=self.session.workspace.pr_id,
+            snapshot_id=self.session.snapshot.snapshot_id,
+        )
+        try:
+            publish_create_only_bytes(
+                self.path,
+                canonical_json_bytes(manifest.to_dict()),
+            )
+        except SafeIOError as error:
+            raise FileExistsError(
+                f"Session v6 state already exists: {self.path}"
+            ) from error
+        return self.load()
+
+    def create_or_load(self) -> SessionV6Manifest:
+        try:
+            return self.load()
+        except FileNotFoundError:
+            return self.create()
+
+    def load(self) -> SessionV6Manifest:
+        self.workspace_store.verify_session(self.session)
+        try:
+            payload = read_strict_json(self.path)
+        except SafeIOError as error:
+            if not self.path.exists():
+                raise FileNotFoundError(self.path) from error
+            raise ValueError("Session v6 state is unavailable") from error
+        try:
+            manifest = session_v6_manifest_from_dict(payload)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Session v6 state is invalid") from error
+        if (
+            manifest.session_id != self.session.session_id
+            or manifest.pr_id != self.session.workspace.pr_id
+            or manifest.snapshot_id != self.session.snapshot.snapshot_id
+        ):
+            raise ValueError("Session v6 state binding changed")
+        try:
+            encoded = canonical_json_bytes(payload)
+            actual = self.path.read_bytes()
+        except (OSError, SafeIOError) as error:
+            raise ValueError("Session v6 state cannot be verified") from error
+        if encoded != actual:
+            raise ValueError("Session v6 state must be canonical JSON")
+        self._validate_artifact_ownership(manifest)
+        return manifest
+
+    def start_phase(self, phase: RunPhase) -> SessionV6PhaseStart:
+        _require_v6_phase(phase)
+        with self._lock:
+            current = self.load()
+            checkpoint = current.phases[phase.value]
+            if checkpoint.status is PhaseStatus.COMPLETED:
+                return SessionV6PhaseStart(current, reused=True, restarted=False)
+            index = SESSION_V6_PHASES.index(phase)
+            if index and current.phases[
+                SESSION_V6_PHASES[index - 1].value
+            ].status is not PhaseStatus.COMPLETED:
+                raise ValueError("Session v6 Phase predecessor is incomplete")
+            if checkpoint.status not in {
+                PhaseStatus.PENDING,
+                PhaseStatus.RUNNING,
+                PhaseStatus.FAILED,
+                PhaseStatus.INVALIDATED,
+            }:
+                raise ValueError("Session v6 Phase cannot be started")
+            restarted = checkpoint.status is PhaseStatus.RUNNING
+            phases = dict(current.phases)
+            phases[phase.value] = SessionV6PhaseCheckpoint(
+                status=PhaseStatus.RUNNING,
+                attempt=checkpoint.attempt + 1,
+            )
+            updated = SessionV6Manifest(
+                session_id=current.session_id,
+                pr_id=current.pr_id,
+                snapshot_id=current.snapshot_id,
+                status=RunStatus.RUNNING,
+                current_phase=phase,
+                phases=phases,
+                revision=current.revision + 1,
+            )
+            self._write(updated, expected_revision=current.revision)
+            return SessionV6PhaseStart(
+                self.load(),
+                reused=False,
+                restarted=restarted,
+            )
+
+    def complete_phase(
+        self,
+        phase: RunPhase,
+        artifacts: Iterable[SessionV6ArtifactRef],
+    ) -> SessionV6Manifest:
+        _require_v6_phase(phase)
+        refs = tuple(artifacts)
+        if any(type(item) is not SessionV6ArtifactRef for item in refs):
+            raise ValueError("Session v6 Phase artifacts are invalid")
+        if len({item.logical_name for item in refs}) != len(refs):
+            raise ValueError("Session v6 Phase artifact names must be unique")
+        for item in refs:
+            if session_v6_artifact_phase(item.logical_name) != phase.value:
+                raise ValueError("Session v6 artifact Phase ownership is invalid")
+            self._verify_artifact_ref(item)
+        with self._lock:
+            current = self.load()
+            checkpoint = current.phases[phase.value]
+            if (
+                current.current_phase is not phase
+                or checkpoint.status is not PhaseStatus.RUNNING
+            ):
+                raise ValueError("Session v6 Phase is not running")
+            phases = dict(current.phases)
+            phases[phase.value] = SessionV6PhaseCheckpoint(
+                status=PhaseStatus.COMPLETED,
+                attempt=checkpoint.attempt,
+                artifacts=refs,
+            )
+            index = SESSION_V6_PHASES.index(phase)
+            if index + 1 == len(SESSION_V6_PHASES):
+                status = RunStatus.COMPLETED
+                next_phase = RunPhase.COMPLETED
+            else:
+                status = RunStatus.RUNNING
+                next_phase = SESSION_V6_PHASES[index + 1]
+            updated = SessionV6Manifest(
+                session_id=current.session_id,
+                pr_id=current.pr_id,
+                snapshot_id=current.snapshot_id,
+                status=status,
+                current_phase=next_phase,
+                phases=phases,
+                revision=current.revision + 1,
+            )
+            self._write(updated, expected_revision=current.revision)
+            return self.load()
+
+    def fail_phase(self, phase: RunPhase, error_code: str) -> SessionV6Manifest:
+        _require_v6_phase(phase)
+        if type(error_code) is not str or not error_code.strip() or "\x00" in error_code:
+            raise ValueError("Session v6 error_code is invalid")
+        with self._lock:
+            current = self.load()
+            checkpoint = current.phases[phase.value]
+            if (
+                current.current_phase is not phase
+                or checkpoint.status is not PhaseStatus.RUNNING
+            ):
+                raise ValueError("Session v6 Phase is not running")
+            phases = dict(current.phases)
+            phases[phase.value] = SessionV6PhaseCheckpoint(
+                status=PhaseStatus.FAILED,
+                attempt=checkpoint.attempt,
+                artifacts=checkpoint.artifacts,
+                error_code=error_code,
+            )
+            updated = SessionV6Manifest(
+                session_id=current.session_id,
+                pr_id=current.pr_id,
+                snapshot_id=current.snapshot_id,
+                status=RunStatus.FAILED,
+                current_phase=phase,
+                phases=phases,
+                revision=current.revision + 1,
+            )
+            self._write(updated, expected_revision=current.revision)
+            return self.load()
+
+    def invalidate_from(
+        self,
+        phase: RunPhase,
+        reason: str,
+    ) -> SessionV6Manifest:
+        _require_v6_phase(phase)
+        if type(reason) is not str or not reason.strip() or "\x00" in reason:
+            raise ValueError("Session v6 invalidation reason is invalid")
+        with self._lock:
+            current = self.load()
+            start = SESSION_V6_PHASES.index(phase)
+            phases = dict(current.phases)
+            for candidate in SESSION_V6_PHASES[start:]:
+                checkpoint = phases[candidate.value]
+                phases[candidate.value] = SessionV6PhaseCheckpoint(
+                    status=PhaseStatus.INVALIDATED,
+                    attempt=checkpoint.attempt,
+                    artifacts=checkpoint.artifacts,
+                    invalidation_reason=reason,
+                )
+            updated = SessionV6Manifest(
+                session_id=current.session_id,
+                pr_id=current.pr_id,
+                snapshot_id=current.snapshot_id,
+                status=RunStatus.RUNNING,
+                current_phase=phase,
+                phases=phases,
+                revision=current.revision + 1,
+            )
+            self._write(updated, expected_revision=current.revision)
+            return self.load()
+
+    def next_incomplete_phase(self) -> RunPhase | None:
+        manifest = self.load()
+        for phase in SESSION_V6_PHASES:
+            if manifest.phases[phase.value].status is not PhaseStatus.COMPLETED:
+                return phase
+        return None
+
+    def _write(
+        self,
+        manifest: SessionV6Manifest,
+        *,
+        expected_revision: int,
+    ) -> None:
+        observed = self.load()
+        if observed.revision != expected_revision:
+            raise ValueError("Session v6 state changed concurrently")
+        try:
+            atomic_replace_bytes(
+                self.path,
+                canonical_json_bytes(manifest.to_dict()),
+            )
+        except (OSError, SafeIOError) as error:
+            raise ValueError("Session v6 state update failed") from error
+
+    def _validate_artifact_ownership(self, manifest: SessionV6Manifest) -> None:
+        seen: set[str] = set()
+        for phase in SESSION_V6_PHASES:
+            for artifact in manifest.phases[phase.value].artifacts:
+                if session_v6_artifact_phase(artifact.logical_name) != phase.value:
+                    raise ValueError("Session v6 artifact ownership changed")
+                if artifact.logical_name in seen:
+                    raise ValueError("Session v6 artifact has multiple owners")
+                self._verify_artifact_ref(artifact)
+                seen.add(artifact.logical_name)
+
+    def _verify_artifact_ref(self, artifact: SessionV6ArtifactRef) -> None:
+        descriptor = self.workspace_store.find_snapshot_artifact(
+            self.session.snapshot,
+            artifact.relative_path,
+        )
+        if (
+            descriptor.artifact_id != artifact.artifact_id
+            or descriptor.sha256 != artifact.sha256
+        ):
+            raise ValueError("Session v6 artifact binding changed")
+        self.workspace_store.read_verified_artifact(
+            self.session.snapshot,
+            descriptor.artifact_id,
+        )
+
+
+def _require_v6_phase(phase: RunPhase) -> None:
+    if not isinstance(phase, RunPhase) or phase not in SESSION_V6_PHASES:
+        raise ValueError("phase must be a Session v6 Phase")

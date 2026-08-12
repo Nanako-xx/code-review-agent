@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 import subprocess
 from typing import Any, Mapping
+
+from review_agent.revision import sanitized_git_environment
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,67 @@ def _run_git(repo: Path, args: list[str]) -> str:
         stderr=subprocess.PIPE,
     )
     return result.stdout
+
+
+def complete_diff_command(base_sha: str, head_sha: str) -> list[str]:
+    object_id = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+    if object_id.fullmatch(base_sha) is None or object_id.fullmatch(head_sha) is None:
+        raise ValueError("complete Diff revisions must be full lowercase Git object IDs")
+    return [
+        "git",
+        "--no-replace-objects",
+        "-c",
+        "core.longpaths=true",
+        "-c",
+        "core.quotePath=true",
+        "-c",
+        "color.ui=false",
+        "-c",
+        "diff.algorithm=myers",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--binary",
+        "--full-index",
+        "--find-renames",
+        "--find-copies",
+        "--find-copies-harder",
+        "--unified=3",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--ignore-submodules=none",
+        base_sha,
+        head_sha,
+        "--",
+    ]
+
+
+def collect_complete_diff_bytes(
+    repo_path: Path,
+    base_sha: str,
+    head_sha: str,
+) -> bytes:
+    """Collect the one authoritative, untruncated DiffArtifact byte stream."""
+
+    repo = Path(repo_path).resolve()
+    if not repo.exists():
+        raise FileNotFoundError(f"Repository path does not exist: {repo}")
+    try:
+        result = subprocess.run(
+            complete_diff_command(base_sha, head_sha),
+            cwd=repo,
+            env=sanitized_git_environment(),
+            text=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise RuntimeError(f"failed to execute Git in {repo}: {error}") from error
+    if result.returncode != 0:
+        reason = result.stderr.decode("utf-8", "replace").strip()
+        raise ValueError(reason or "Git failed to produce the complete Diff")
+    return bytes(result.stdout)
 
 
 def collect_change_summary(

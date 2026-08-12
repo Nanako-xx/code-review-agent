@@ -1,10 +1,12 @@
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
 
 from conftest import run_git
+import review_agent.quality as quality_module
 from review_agent.models import (
     Assignment,
     InitialContext,
@@ -23,6 +25,31 @@ from review_agent.quality_runner import (
     _run_bounded_process,
     execute_quality_gate,
 )
+
+
+def test_revision_git_watchdog_allows_large_official_repositories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["timeout"] = kwargs["timeout"]
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(quality_module.subprocess, "run", fake_run)
+
+    result = quality_module._run_git(tmp_path, ["ls-tree", "HEAD"])
+
+    assert result.returncode == 0
+    assert captured["timeout"] == 3600.0
+    assert quality_module.DEFAULT_GIT_TIMEOUT_SECONDS == 3600.0
 
 
 def test_detect_python_compile_for_python_repo(tmp_path: Path):

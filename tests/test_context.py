@@ -9,6 +9,8 @@ from review_agent.context import (
     build_reviewer_context_payload,
     build_reviewer_envelope,
     remote_visible_memory_snapshot,
+    reviewer_protocol_projection,
+    reviewer_tool_schemas_v2,
 )
 from review_agent.memory_models import (
     Applicability,
@@ -46,6 +48,47 @@ from review_agent.memory_retrieval import (
     RetrievalStage,
     SnapshotMemoryQueryService,
 )
+
+
+def test_reviewer_protocol_projection_uses_product_context_and_invocation_defaults():
+    projection = reviewer_protocol_projection()
+
+    assert projection["context_budget"] == {
+        "max_message_chars": 16_000,
+        "compacted_section_min_chars": 180,
+        "memory_subbudget_ratio": 0.10,
+        "memory_subbudget_chars": None,
+    }
+    assert projection["invocation_defaults"] == {
+        "reasoning_effort": "medium",
+        "temperature": 0,
+        "tool_choice_policy": "auto_if_tools_else_none",
+        "response_schema": "reviewer_assignment_result_v2",
+    }
+    assert projection["tool_names"] == list(dict.fromkeys(projection["tool_names"]))
+    assert all(len(projection[key]) == 64 for key in (
+        "system_prompt_sha256",
+        "result_contract_sha256",
+        "tool_result_protocol_sha256",
+        "tool_catalog_sha256",
+    ))
+
+
+def test_v2_tool_schemas_are_api_fields_without_legacy_context_budget() -> None:
+    tools = reviewer_tool_schemas_v2(
+        ("search_code", "read_range", "read_commit_messages", "read_artifact")
+    )
+
+    assert [tool["name"] for tool in tools] == [
+        "search_code",
+        "read_range",
+        "read_commit_messages",
+        "read_artifact",
+    ]
+    assert all("parameters" in tool for tool in tools)
+    encoded = str(tools)
+    assert "max_message_chars" not in encoded
+    assert "memory_subbudget_ratio" not in encoded
 
 
 def _context_assignment() -> Assignment:

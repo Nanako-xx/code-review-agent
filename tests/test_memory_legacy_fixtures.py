@@ -15,8 +15,8 @@ import pytest
 
 import review_agent.memory_curator as memory_curator_module
 import review_agent.memory_store as memory_store_module
-import review_agent.resume as resume_module
-from review_agent.resume import ResumeAction, ReviewSessionResumer
+import review_agent.legacy_resume as resume_module
+from review_agent.legacy_resume import ResumeAction, ReviewSessionResumer
 from review_agent.run_state import RunPhase
 from review_agent.session import ModelStageConfig, session_manifest_to_dict
 from review_agent.session_store import SessionStore

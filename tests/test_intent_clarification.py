@@ -26,6 +26,17 @@ def test_non_interactive_never_reads_input_and_skips():
     assert decision.continuation_basis == "non_interactive_policy"
 
 
+def test_eval_no_user_token_continues_without_promoting_inferred_intent():
+    decision = ConsoleIntentClarifier(
+        input_fn=lambda _prompt: "continue-with-uncertainty:benchmark-no-user",
+        output_fn=lambda _message: None,
+    ).decide(question())
+
+    assert decision is not None
+    assert decision.action is IntentDecisionAction.SKIPPED_NON_INTERACTIVE
+    assert decision.continuation_basis == "benchmark_no_user"
+
+
 def test_console_confirm_uses_proposed_value():
     decision = ConsoleIntentClarifier(
         input_fn=lambda _prompt: "confirm",
@@ -34,6 +45,18 @@ def test_console_confirm_uses_proposed_value():
 
     assert decision is not None
     assert decision.action is IntentDecisionAction.CONFIRMED
+    assert decision.continuation_basis is None
+
+
+def test_console_benchmark_auto_accept_uses_non_human_basis():
+    decision = ConsoleIntentClarifier(
+        input_fn=lambda _prompt: "confirm:benchmark-auto-accept",
+        output_fn=lambda _message: None,
+    ).decide(question())
+
+    assert decision is not None
+    assert decision.action is IntentDecisionAction.CONFIRMED
+    assert decision.continuation_basis == "benchmark_auto_accept"
 
 
 def test_console_correction_parses_semicolon_values():

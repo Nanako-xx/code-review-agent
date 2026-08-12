@@ -9,9 +9,10 @@ import sqlite3
 import pytest
 
 from conftest import run_git
-import review_agent.command as command_module
+import review_agent.legacy_memory_command as command_module
 import review_agent.pipeline as pipeline_module
-from review_agent.command import _build_parser, main
+from review_agent.command import main
+from review_agent.legacy_memory_command import _build_parser
 from review_agent.evidence import (
     CanonicalFinding,
     EvidenceReconciliation,
@@ -42,7 +43,6 @@ from review_agent.memory_models import (
     HumanDeclarationAuthority,
     HumanDeclarationOrigin,
     HumanDeclarationSourceRef,
-    MAX_SNAPSHOT_RECORDS,
     MemoryCandidate,
     MemoryConfidence,
     MemoryExecutionConfig,
@@ -744,83 +744,6 @@ def test_parser_core_only() -> None:
         parser.parse_args(["memory", "feedback"])
     with pytest.raises(SystemExit):
         parser.parse_args(["memory", "replay-outbox"])
-
-
-def _review_args(*arguments: str):
-    return _build_parser().parse_args(
-        ["review", "--base", "HEAD~1", "--head", "HEAD", *arguments]
-    )
-
-
-def test_review_memory_config_defaults_and_root_priority_are_fixed_without_creation(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    environment_root = (tmp_path / "environment-memory").resolve()
-    cli_root = (tmp_path / "cli-memory").resolve()
-    monkeypatch.setenv("REVIEW_AGENT_MEMORY_ROOT", str(environment_root))
-
-    environment_config = command_module._resolve_memory_execution_config(
-        _review_args()
-    )
-    cli_config = command_module._resolve_memory_execution_config(
-        _review_args("--memory-root", str(cli_root))
-    )
-
-    assert environment_config.mode is MemoryMode.READ_WRITE
-    assert environment_config.root_path == environment_root.as_posix()
-    assert cli_config.root_path == cli_root.as_posix()
-    assert not environment_root.exists()
-    assert not cli_root.exists()
-
-
-def test_review_memory_config_validates_required_mode_and_snapshot_budgets(
-    tmp_path: Path,
-) -> None:
-    root = (tmp_path / "memory").resolve()
-
-    with pytest.raises(ValueError, match="required=true cannot be combined"):
-        command_module._resolve_memory_execution_config(
-            _review_args(
-                "--memory-root",
-                str(root),
-                "--memory-mode",
-                "off",
-                "--memory-required",
-            )
-        )
-
-    with pytest.raises(ValueError, match="max_snapshot_records"):
-        command_module._resolve_memory_execution_config(
-            _review_args(
-                "--memory-root",
-                str(root),
-                "--memory-max-snapshot-records",
-                str(MAX_SNAPSHOT_RECORDS + 1),
-            )
-        )
-
-    config = command_module._resolve_memory_execution_config(
-        _review_args(
-            "--memory-root",
-            str(root),
-            "--memory-mode",
-            "read",
-            "--memory-max-snapshot-records",
-            "20",
-            "--memory-max-snapshot-bytes",
-            "4096",
-            "--memory-max-context-records",
-            "4",
-            "--memory-max-query-results",
-            "3",
-        )
-    )
-    assert config.mode is MemoryMode.READ
-    assert config.max_snapshot_records == 20
-    assert config.max_snapshot_bytes == 4096
-    assert config.max_context_records == 4
-    assert config.max_query_results == 3
 
 
 @pytest.mark.parametrize(

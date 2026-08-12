@@ -25,11 +25,14 @@ from review_agent.models import (
     VerificationTemplateHint,
 )
 from review_agent.portfolio import (
+    ASSIGNMENT_PLANNER_SYSTEM_PROMPT_V2,
     CORE_REVIEW_CONTRACT,
+    AssignmentPlannerProposalParseError,
     PortfolioProposalParseError,
     build_portfolio_packet,
     build_planner_memory_projection,
     deterministic_fallback_proposal,
+    parse_assignment_planner_proposal_v2,
     parse_portfolio_proposal,
     portfolio_packet_to_model_input,
     portfolio_size_bounds,
@@ -635,3 +638,71 @@ def test_planner_projection_revalidates_registry_and_blocks_its_own_overflow() -
         and item.blocking
         for item in projection.diagnostics
     )
+
+
+def test_v2_assignment_planner_parser_accepts_only_slot_task_content() -> None:
+    proposal = parse_assignment_planner_proposal_v2(
+        json.dumps(
+            {
+                "assignments": [
+                    {
+                        "slot_id": "core-1",
+                        "perspective": None,
+                        "mission": "Review the changed request behavior.",
+                        "targets": {
+                            "files": ["src/app.py"],
+                            "symbols": ["src/app.py::run"],
+                            "hunks": ["src/app.py#hunk-0"],
+                        },
+                        "checks": ["Verify caller compatibility."],
+                    }
+                ]
+            }
+        )
+    )
+
+    assert len(proposal.assignments) == 1
+    assert proposal.assignments[0].slot_id == "core-1"
+    assert proposal.assignments[0].targets.files == ("src/app.py",)
+
+
+@pytest.mark.parametrize(
+    "forbidden_field",
+    [
+        "role_kind",
+        "role",
+        "permissions",
+        "provider",
+        "model",
+        "max_tool_calls",
+        "max_output_tokens",
+        "contract",
+        "risk_reasons",
+    ],
+)
+def test_v2_assignment_planner_cannot_propose_runtime_authority(
+    forbidden_field: str,
+) -> None:
+    draft = {
+        "slot_id": "core-1",
+        "perspective": None,
+        "mission": "Review the changed request behavior.",
+        "targets": {"files": [], "symbols": [], "hunks": []},
+        "checks": [],
+        forbidden_field: "untrusted",
+    }
+
+    with pytest.raises(AssignmentPlannerProposalParseError, match="unknown field"):
+        parse_assignment_planner_proposal_v2(
+            json.dumps({"assignments": [draft]})
+        )
+
+
+def test_v2_assignment_planner_prompt_keeps_slot_authority_in_runtime() -> None:
+    normalized = ASSIGNMENT_PLANNER_SYSTEM_PROMPT_V2.casefold()
+
+    assert "runtime" in normalized
+    assert "cannot" in normalized or "must not" in normalized
+    assert "slot" in normalized
+    assert "provider" in normalized
+    assert "budget" in normalized

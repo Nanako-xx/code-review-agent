@@ -15,6 +15,9 @@ from review_agent.models import (
 )
 
 
+REVIEW_CONTRACT_VALIDATION_VERSION = "review-contract-validation-v1"
+
+
 @dataclass(frozen=True)
 class ReviewerCompletionValidation:
     accepted: bool

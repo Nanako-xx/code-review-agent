@@ -19,6 +19,7 @@ class RunPhase(str, Enum):
     QUALITY_GATES = "quality_gates"
     REPOSITORY_INTELLIGENCE = "repository_intelligence"
     MEMORY_SELECTION = "memory_selection"
+    INTENT = "intent"
     INTENT_DISCOVERY = "intent_discovery"
     INTENT_RESOLUTION = "intent_resolution"
     PLANNING = "planning"
@@ -30,6 +31,7 @@ class RunPhase(str, Enum):
     FINAL_RISK = "final_risk"
     MEMORY_PROPOSAL = "memory_proposal"
     REPORTING = "reporting"
+    AGGREGATION = "aggregation"
     COMPLETED = "completed"
     FAILED = "failed"
 

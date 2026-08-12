@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 import review_agent.model_adapter as model_adapter_module
+from review_agent.context_window import canonical_context_eviction_marker
 from review_agent.model_adapter import (
     MAX_ALLOWED_RESPONSE_BYTES,
     MAX_HTTP_DEADLINE_WORKERS,
@@ -17,6 +18,7 @@ from review_agent.model_adapter import (
     _urllib_transport,
     model_response_to_assistant_message,
     model_tool_result_to_message,
+    review_tool_projection_to_message,
 )
 from review_agent.model_protocol import (
     ModelResponse,
@@ -28,6 +30,81 @@ from review_agent.model_protocol import (
     ModelTurnResponse,
 )
 from review_agent.tool_result_protocol import serialize_tool_result_envelope
+from review_agent.tool_result_protocol import (
+    ReviewToolResult,
+    ToolResultProjectionV2,
+)
+
+
+def test_openai_payload_accepts_context_eviction_marker_with_tool_pair() -> None:
+    marker = canonical_context_eviction_marker(
+        tool_call_id="call-evicted",
+        tool_name="read_range",
+        canonical_arguments_hash="a" * 64,
+    )
+    request = ModelTurnRequest(
+        system="system",
+        tools=[ModelToolSpec("read_range", "Read", {"type": "object"})],
+        messages=[
+            {
+                "role": "assistant",
+                "content": "Read it.",
+                "tool_calls": [
+                    {
+                        "id": "call-evicted",
+                        "type": "function",
+                        "function": {
+                            "name": "read_range",
+                            "arguments": '{"path":"src/a.py"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-evicted",
+                "content": marker,
+            },
+        ],
+        tool_results=[],
+        parameters={"temperature": 0},
+    )
+
+    payload = model_adapter_module._build_openai_tool_payload("model", request)
+
+    assert payload["messages"][-1]["content"] == marker
+
+
+def test_openai_adapter_exposes_configured_exact_token_estimators() -> None:
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="model",
+        ),
+        transport=lambda *_args: {},
+        request_token_estimator=lambda _request: 123,
+        text_token_estimator=lambda text: len(text),
+    )
+    request = ModelTurnRequest("system", [], [], [], {})
+
+    assert adapter.estimate_request_tokens(request) == 123
+    assert adapter.estimate_text_tokens("four") == 4
+
+
+def test_openai_payload_omits_empty_tools_for_plain_compaction_request() -> None:
+    request = ModelTurnRequest(
+        "compact",
+        [],
+        [{"role": "user", "content": "Summarize."}],
+        [],
+        {"tool_choice": "none", "max_output_tokens": 50_000},
+    )
+
+    payload = model_adapter_module._build_openai_tool_payload("model", request)
+
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
 
 
 class _BoundedHttpResponse:
@@ -1914,3 +1991,133 @@ def test_openai_compatible_adapter_caps_transport_timeout_to_runtime_budget():
     adapter.complete_turn(request)
 
     assert captured["timeout_seconds"] == 2.5
+
+
+def test_v2_tool_projection_serializes_directly_to_tool_message() -> None:
+    raw = ReviewToolResult.success(
+        tool_call_id="call-v2",
+        session_id="session-v2",
+        snapshot_id="S-" + "a" * 64,
+        tool_name="read_range",
+        arguments={"path": "src/api.py"},
+        content="line 1",
+        reacquirable=True,
+    )
+
+    message = review_tool_projection_to_message(
+        ToolResultProjectionV2.inline(raw)
+    )
+    payload = json.loads(message["content"])
+
+    assert message["role"] == "tool"
+    assert message["tool_call_id"] == "call-v2"
+    assert payload["schema_version"] == "review_tool_result_v2"
+    assert payload["content"] == "line 1"
+    assert "observation_ids" not in payload
+
+
+def test_openai_adapter_accepts_canonical_v2_tool_transcript_without_legacy_metadata() -> None:
+    captured = {}
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured.update(payload)
+        return {"choices": [{"message": {"content": '{"findings":[]}'}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    raw = ReviewToolResult.success(
+        tool_call_id="call-v2-transcript",
+        session_id="session-v2",
+        snapshot_id="S-" + "b" * 64,
+        tool_name="read_range",
+        arguments={"path": "src/api.py"},
+        content="line 1",
+        reacquirable=True,
+    )
+    tool_message = review_tool_projection_to_message(
+        ToolResultProjectionV2.inline(raw)
+    )
+    request = ModelTurnRequest(
+        system="system",
+        tools=[],
+        messages=[
+            {"role": "user", "content": "Review"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-v2-transcript",
+                        "type": "function",
+                        "function": {
+                            "name": "read_range",
+                            "arguments": '{"path":"src/api.py"}',
+                        },
+                    }
+                ],
+            },
+            tool_message,
+        ],
+        tool_results=[],
+        parameters={"tool_choice": "none"},
+    )
+
+    response = adapter.complete_turn(request)
+
+    assert response.kind is ModelResponseKind.FINAL
+    assert captured["messages"][-1] == tool_message
+
+
+def test_openai_adapter_omits_reviewer_output_limit_when_runtime_does_not_set_one() -> None:
+    captured = {}
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured.update(payload)
+        return {"choices": [{"message": {"content": "{}"}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+
+    adapter.complete_turn(make_request())
+
+    assert "max_tokens" not in captured
+
+
+def test_adapter_uses_model_capability_only_when_provider_requires_output_limit() -> None:
+    captured = {}
+
+    def transport(url, headers, payload, timeout_seconds):
+        captured.update(payload)
+        return {"choices": [{"message": {"content": "{}"}}]}
+
+    adapter = OpenAICompatibleToolAdapter(
+        OpenAICompatibleConfig(
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="review-model",
+        ),
+        transport=transport,
+    )
+    request = make_request()
+    request.parameters.update(
+        {
+            "requires_max_output_tokens": True,
+            "model_max_output_tokens": 131_072,
+        }
+    )
+
+    adapter.complete_turn(request)
+
+    assert captured["max_tokens"] == 131_072

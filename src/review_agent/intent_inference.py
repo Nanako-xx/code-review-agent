@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import hashlib
 import json
 from typing import Any, Mapping, Sequence
+import unicodedata
 
 from review_agent.memory_models import (
     MAX_SNAPSHOT_RECORDS,
@@ -72,6 +74,16 @@ _MODEL_INFERRED_ORIGINS = frozenset(
 _DOCUMENT_SUFFIXES = frozenset(
     {".md", ".markdown", ".rst", ".adoc", ".txt", ".yaml", ".yml"}
 )
+
+
+INTENT_INFERENCE_PROTOCOL_VERSION = "intent-inference-protocol-v1"
+INTENT_INFERENCE_MAX_TURNS = 4
+INTENT_INFERENCE_MAX_TOOL_CALLS = 8
+INTENT_INFERENCE_MAX_OUTPUT_TOKENS = 4_096
+INTENT_INFERENCE_REASONING_EFFORT = "low"
+INTENT_INFERENCE_TEMPERATURE = 0
+INTENT_INFERENCE_TOOL_CHOICE = "auto"
+INTENT_INFERENCE_RESPONSE_SCHEMA = "intent_inference_result_v1"
 
 
 INTENT_INFERENCE_SYSTEM_PROMPT = f"""\
@@ -295,6 +307,36 @@ def intent_inference_run_to_dict(run: IntentInferenceRun) -> dict[str, Any]:
     return run.to_dict()
 
 
+def project_inference_goal_v2(
+    run: IntentInferenceRun,
+) -> tuple[str | None, tuple[str, ...]]:
+    """Project internal Intent analysis to one downstream inferred goal."""
+
+    if not isinstance(run, IntentInferenceRun):
+        raise ValueError("run must be an IntentInferenceRun")
+    uncertainties = [
+        " ".join(unicodedata.normalize("NFKC", item).split())
+        for item in run.result.uncertainties
+        if item.strip()
+    ]
+    if run.status not in {"completed", "partial"}:
+        uncertainties.append("Intent analysis did not complete reliably.")
+        return None, tuple(dict.fromkeys(uncertainties))
+    goals: dict[str, str] = {}
+    for candidate in run.result.candidates:
+        if candidate.field != "goal":
+            continue
+        normalized = " ".join(unicodedata.normalize("NFKC", candidate.value).split())
+        goals.setdefault(normalized, candidate.value.strip())
+    if not goals:
+        uncertainties.append("Intent analysis produced no reliable goal.")
+        return None, tuple(dict.fromkeys(uncertainties))
+    if len(goals) > 1:
+        uncertainties.append("Intent analysis produced conflicting goal candidates.")
+        return None, tuple(dict.fromkeys(uncertainties))
+    return next(iter(goals.values())), tuple(dict.fromkeys(uncertainties))
+
+
 def build_intent_memory_projection(
     records: Sequence[DurableMemoryRecord],
     *,
@@ -373,10 +415,10 @@ def run_intent_inference(
     resolved_base_revision: str | None = None,
     resolved_head_revision: str | None = None,
     model: str = "configured-intent-model",
-    max_turns: int = 4,
-    max_tool_calls: int = 8,
-    max_output_tokens: int = 4096,
-    reasoning_effort: str = "low",
+    max_turns: int = INTENT_INFERENCE_MAX_TURNS,
+    max_tool_calls: int = INTENT_INFERENCE_MAX_TOOL_CALLS,
+    max_output_tokens: int = INTENT_INFERENCE_MAX_OUTPUT_TOKENS,
+    reasoning_effort: str = INTENT_INFERENCE_REASONING_EFFORT,
     memory_projection: IntentMemoryProjection | None = None,
 ) -> IntentInferenceRun:
     """Run a bounded, read-only intent analysis conversation.
@@ -447,10 +489,10 @@ def run_intent_inference(
         "model": model,
         "max_output_tokens": max_output_tokens,
         "reasoning_effort": reasoning_effort,
-        "temperature": 0,
-        "tool_choice": "auto",
+        "temperature": INTENT_INFERENCE_TEMPERATURE,
+        "tool_choice": INTENT_INFERENCE_TOOL_CHOICE,
         "trace_id": trace_id,
-        "response_schema": "intent_inference_result_v1",
+        "response_schema": INTENT_INFERENCE_RESPONSE_SCHEMA,
     }
     tools = _intent_tool_specs()
     turns: list[IntentInferenceTurn] = []
@@ -1026,6 +1068,38 @@ def _intent_tool_specs() -> list[ModelToolSpec]:
             },
         ),
     ]
+
+
+def intent_inference_protocol_projection() -> dict[str, Any]:
+    tools = _intent_tool_specs()
+    canonical_tools = [asdict(item) for item in tools]
+    tool_catalog_sha256 = hashlib.sha256(
+        json.dumps(
+            canonical_tools,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "version": INTENT_INFERENCE_PROTOCOL_VERSION,
+        "system_prompt_sha256": hashlib.sha256(
+            INTENT_INFERENCE_SYSTEM_PROMPT.encode("utf-8")
+        ).hexdigest(),
+        "tool_catalog_sha256": tool_catalog_sha256,
+        "tool_names": [item.name for item in tools],
+        "runtime_limits": {
+            "max_turns": INTENT_INFERENCE_MAX_TURNS,
+            "max_tool_calls": INTENT_INFERENCE_MAX_TOOL_CALLS,
+            "max_output_tokens": INTENT_INFERENCE_MAX_OUTPUT_TOKENS,
+        },
+        "invocation_defaults": {
+            "reasoning_effort": INTENT_INFERENCE_REASONING_EFFORT,
+            "temperature": INTENT_INFERENCE_TEMPERATURE,
+            "tool_choice": INTENT_INFERENCE_TOOL_CHOICE,
+            "response_schema": INTENT_INFERENCE_RESPONSE_SCHEMA,
+        },
+    }
 
 
 def _execute_tool_call(gateway: ToolGateway, call: ModelToolCall) -> ModelToolResult:

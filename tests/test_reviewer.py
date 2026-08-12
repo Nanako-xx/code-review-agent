@@ -1,4 +1,5 @@
 from dataclasses import replace
+import inspect
 import json
 import time
 
@@ -16,6 +17,7 @@ from review_agent.models import (
     ReviewerTerminationReason,
 )
 from review_agent.reviewer import ReviewerResultParseError, parse_reviewer_result, run_single_reviewer
+from review_agent.review_agent_loop import ReviewAgentLoopV2
 
 
 def test_parse_reviewer_result_accepts_valid_json():
@@ -476,3 +478,10 @@ def test_single_reviewer_stops_on_elapsed_time_budget():
     assert run.result.status is ReviewerResultStatus.PARTIAL
     assert run.runtime.elapsed_seconds >= assignment.max_elapsed_seconds
     assert run.runtime.termination_reason is ReviewerTerminationReason.TIME_BUDGET_EXHAUSTED
+
+
+def test_v2_reviewer_loop_does_not_use_legacy_contract_completion() -> None:
+    source = inspect.getsource(ReviewAgentLoopV2)
+
+    assert "validate_reviewer_completion" not in source
+    assert "ContractAssessment" not in source

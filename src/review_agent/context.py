@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import hashlib
+import json
 import math
 from typing import Any
 
@@ -34,6 +36,13 @@ from review_agent.models import (
     ModelInvocationEnvelope,
 )
 from review_agent.tool_result_protocol import TOOL_RESULT_PROTOCOL_INSTRUCTIONS
+
+
+REVIEWER_PROTOCOL_VERSION = "reviewer-protocol-v1"
+REVIEWER_REASONING_EFFORT = "medium"
+REVIEWER_TEMPERATURE = 0
+REVIEWER_TOOL_CHOICE_POLICY = "auto_if_tools_else_none"
+REVIEWER_RESPONSE_SCHEMA = "reviewer_assignment_result_v2"
 
 
 REVIEWER_RESULT_JSON_EXAMPLE = """{
@@ -258,6 +267,45 @@ _REVIEWER_TOOL_DEFINITIONS = (
     ),
 )
 REVIEWER_TOOL_NAMES = tuple(name for name, _, _ in _REVIEWER_TOOL_DEFINITIONS)
+_REVIEWER_TOOL_DEFINITIONS_V2 = (
+    *_REVIEWER_TOOL_DEFINITIONS,
+    (
+        "read_commit_messages",
+        "Read bounded commit subjects and bodies for the immutable Snapshot range.",
+        {
+            "type": "object",
+            "properties": {
+                "max_count": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    ),
+    (
+        "read_artifact",
+        "Read one bounded page from a Runtime-authorized immutable Artifact.",
+        {
+            "type": "object",
+            "properties": {
+                "artifact_id": {
+                    "type": "string",
+                    "pattern": r"^A-[0-9a-f]{64}$",
+                },
+                "cursor": {"type": "integer", "minimum": 0},
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50_000,
+                },
+            },
+            "required": ["artifact_id"],
+            "additionalProperties": False,
+        },
+    ),
+)
+REVIEWER_TOOL_NAMES_V2 = tuple(
+    name for name, _, _ in _REVIEWER_TOOL_DEFINITIONS_V2
+)
 _SCOPED_REVIEWER_TOOLS: ContextVar[tuple[str, ...] | None] = ContextVar(
     "reviewer_allowed_tools",
     default=None,
@@ -316,6 +364,92 @@ class ContextBudget:
             int(self.max_message_chars * MAX_MEMORY_CONTEXT_RATIO),
             int(self.max_message_chars * self.memory_subbudget_ratio),
         )
+
+
+def _reviewer_tool_catalog_payload() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": name,
+            "description": description,
+            "parameters": parameters_schema,
+        }
+        for name, description, parameters_schema in _REVIEWER_TOOL_DEFINITIONS
+    ]
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def reviewer_protocol_projection() -> dict[str, Any]:
+    return {
+        "version": REVIEWER_PROTOCOL_VERSION,
+        "system_prompt_sha256": hashlib.sha256(
+            REVIEWER_SYSTEM_PROMPT.encode("utf-8")
+        ).hexdigest(),
+        "result_contract_sha256": hashlib.sha256(
+            REVIEWER_RESULT_OUTPUT_INSTRUCTIONS.encode("utf-8")
+        ).hexdigest(),
+        "tool_result_protocol_sha256": hashlib.sha256(
+            TOOL_RESULT_PROTOCOL_INSTRUCTIONS.encode("utf-8")
+        ).hexdigest(),
+        "tool_catalog_sha256": _canonical_json_sha256(
+            _reviewer_tool_catalog_payload()
+        ),
+        "tool_names": list(REVIEWER_TOOL_NAMES),
+        "context_budget": asdict(ContextBudget()),
+        "invocation_defaults": {
+            "reasoning_effort": REVIEWER_REASONING_EFFORT,
+            "temperature": REVIEWER_TEMPERATURE,
+            "tool_choice_policy": REVIEWER_TOOL_CHOICE_POLICY,
+            "response_schema": REVIEWER_RESPONSE_SCHEMA,
+        },
+    }
+
+
+def reviewer_tool_schemas_v2(
+    allowed_tools: Iterable[str],
+) -> tuple[dict[str, Any], ...]:
+    """Project only Assignment-authorized schemas into the API tools field."""
+
+    names = tuple(allowed_tools)
+    if any(type(name) is not str or not name for name in names):
+        raise ValueError("allowed_tools must contain non-empty tool names")
+    if len(names) != len(set(names)):
+        raise ValueError("allowed_tools must not contain duplicates")
+    unknown = sorted(set(names) - set(REVIEWER_TOOL_NAMES_V2))
+    if unknown:
+        raise ValueError("unknown Reviewer tool(s): " + ", ".join(unknown))
+    definitions = {
+        name: (description, parameters)
+        for name, description, parameters in _REVIEWER_TOOL_DEFINITIONS_V2
+    }
+    projected: list[dict[str, Any]] = []
+    for name in names:
+        description, parameters = definitions[name]
+        projected.append(
+            {
+                "name": name,
+                "description": description,
+                "parameters": json.loads(
+                    json.dumps(parameters, ensure_ascii=False, allow_nan=False)
+                ),
+            }
+        )
+    return tuple(projected)
+
+
+def _reviewer_tool_choice(has_tools: bool) -> str:
+    if REVIEWER_TOOL_CHOICE_POLICY != "auto_if_tools_else_none":
+        raise RuntimeError("reviewer tool choice policy is unsupported")
+    return "auto" if has_tools else "none"
 
 
 @dataclass(frozen=True)
@@ -462,7 +596,7 @@ def build_reviewer_envelope(
     model: str = "configured-reviewer-model",
     max_output_tokens: int | None = None,
     max_elapsed_seconds: float | None = None,
-    reasoning_effort: str = "medium",
+    reasoning_effort: str = REVIEWER_REASONING_EFFORT,
     allowed_tools: Iterable[str] | None = None,
     memory_snapshot: MemorySnapshot | None = None,
     memory_context: ReviewerMemoryContext | None = None,
@@ -542,9 +676,9 @@ def build_reviewer_envelope(
                 else max_elapsed_seconds
             ),
             "reasoning_effort": reasoning_effort,
-            "temperature": 0,
-            "tool_choice": "auto" if tools else "none",
-            "response_schema": "reviewer_assignment_result_v2",
+            "temperature": REVIEWER_TEMPERATURE,
+            "tool_choice": _reviewer_tool_choice(bool(tools)),
+            "response_schema": REVIEWER_RESPONSE_SCHEMA,
             "trace_id": trace_id,
             "context": context_payload.metadata,
         },

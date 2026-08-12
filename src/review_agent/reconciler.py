@@ -37,6 +37,7 @@ SEMANTIC_RECONCILIATION_SCHEMA_VERSION = "semantic_reconciliation_v1"
 SEMANTIC_RECONCILER_ENVELOPE_SCHEMA_VERSION = "semantic_reconciler_envelope_v1"
 SEMANTIC_RECONCILER_RAW_SCHEMA_VERSION = "semantic_reconciler_raw_response_v1"
 SEMANTIC_RECONCILER_DECISION_SCHEMA_VERSION = "semantic_reconciler_decision_v1"
+RECONCILIATION_POLICY_VERSION = "evidence-reconciliation-v1"
 
 SEMANTIC_RECONCILER_SYSTEM_PROMPT = """You are a read-only Semantic Evidence Reconciler.
 

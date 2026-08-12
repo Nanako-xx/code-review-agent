@@ -11,6 +11,7 @@ from review_agent.intent import (
     merge_inference_claims,
 )
 from review_agent.models import (
+    BENCHMARK_AUTO_ACCEPT_BASIS,
     ClarificationQuestion,
     ClarificationStatus,
     ConclusionImpact,
@@ -137,6 +138,12 @@ def test_claim_question_and_decision_ids_are_stable_and_models_validate_input():
             question_id=question_a.question_id,
             action=IntentDecisionAction.CORRECTED,
             corrected_values=["Use the corrected goal"],
+        )
+    with pytest.raises(ValueError, match="benchmark_auto_accept"):
+        IntentDecision(
+            question_id=question_a.question_id,
+            action=IntentDecisionAction.CONFIRMED,
+            continuation_basis="pretend_human_confirmation",
         )
 
 
@@ -323,6 +330,27 @@ def test_confirm_rejects_multiple_conflicting_goal_candidates():
                 action=IntentDecisionAction.CONFIRMED,
             ),
         )
+
+
+def test_benchmark_auto_accept_promotes_with_truthful_origin():
+    inferred = _claim(IntentField.GOAL, "Bound job retries")
+    questions = generate_material_questions([inferred])
+    updated_claims, updated_questions = apply_user_decision(
+        [inferred],
+        questions,
+        IntentDecision(
+            question_id=questions[0].question_id,
+            action=IntentDecisionAction.CONFIRMED,
+            continuation_basis=BENCHMARK_AUTO_ACCEPT_BASIS,
+        ),
+    )
+
+    accepted = updated_claims[0]
+    updated_question = updated_questions[0]
+    assert accepted.source is IntentSource.EXPLICIT
+    assert accepted.origin is IntentOrigin.BENCHMARK_AUTO_ACCEPT
+    assert updated_question.continuation_basis == "benchmark_auto_accept"
+    assert updated_question.status is ClarificationStatus.CONFIRMED
 
 
 def test_correct_replaces_candidates_with_explicit_user_values():

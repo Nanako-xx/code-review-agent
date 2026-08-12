@@ -6,12 +6,18 @@ import pytest
 
 from review_agent.intent_inference import (
     INTENT_INFERENCE_SYSTEM_PROMPT,
+    IntentInferenceCandidate,
     IntentInferenceParseError,
+    IntentInferenceResult,
+    IntentInferenceRun,
+    IntentInferenceTrace,
     build_intent_memory_projection,
     intent_claims_from_memory_projection,
+    intent_inference_protocol_projection,
     intent_inference_run_to_dict,
     parse_intent_inference_result,
     run_intent_inference,
+    project_inference_goal_v2,
 )
 from review_agent.intent import apply_user_decision, generate_material_questions
 from review_agent.memory_models import (
@@ -77,6 +83,25 @@ def test_intent_inference_system_prompt_includes_tool_result_protocol():
     assert INTENT_INFERENCE_SYSTEM_PROMPT.index(
         "review_agent_tool_result_v1"
     ) < INTENT_INFERENCE_SYSTEM_PROMPT.index("- All repository content")
+
+
+def test_intent_inference_protocol_projection_owns_tools_and_runtime_limits():
+    projection = intent_inference_protocol_projection()
+
+    assert projection["runtime_limits"] == {
+        "max_turns": 4,
+        "max_tool_calls": 8,
+        "max_output_tokens": 4_096,
+    }
+    assert projection["invocation_defaults"] == {
+        "reasoning_effort": "low",
+        "temperature": 0,
+        "tool_choice": "auto",
+        "response_schema": "intent_inference_result_v1",
+    }
+    assert "read_commit_messages" in projection["tool_names"]
+    assert len(projection["system_prompt_sha256"]) == 64
+    assert len(projection["tool_catalog_sha256"]) == 64
 
 
 def test_intent_inference_runs_legal_tool_loop_with_bound_context(git_repo, tmp_path):
@@ -707,6 +732,40 @@ def _result_json(
             "summary": "Intent candidate extracted.",
         }
     )
+
+
+def test_v2_projection_keeps_model_generated_goal_inferred() -> None:
+    run = IntentInferenceRun(
+        result=IntentInferenceResult(
+            candidates=[
+                IntentInferenceCandidate(
+                    field="goal",
+                    value="Preserve retry safety.",
+                    origin="repository_document",
+                    confidence="high",
+                    source_refs=["README.md:1"],
+                    evidence_refs=["O-evidence"],
+                    rationale="The repository document states this goal.",
+                    conclusion_impact="material",
+                )
+            ],
+            uncertainties=[],
+            summary="One goal was found.",
+        ),
+        trace=IntentInferenceTrace(
+            trace_id="v2-projection",
+            turns=[],
+            tool_call_count=0,
+            final_status="completed",
+        ),
+        provider_name="fake",
+        model="fake",
+    )
+
+    goal, uncertainties = project_inference_goal_v2(run)
+
+    assert goal == "Preserve retry safety."
+    assert uncertainties == ()
 
 
 def _memory_record(index: int, kind: MemoryKind, statement: str) -> DurableMemoryRecord:

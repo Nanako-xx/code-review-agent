@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, NoReturn, Protocol, Union, cast
 
+from review_agent.context_window import validate_context_eviction_marker
 from review_agent.model_protocol import (
     ModelResponseKind,
     ModelToolCall,
@@ -19,8 +20,11 @@ from review_agent.model_protocol import (
     ModelTurnResponse,
 )
 from review_agent.tool_result_protocol import (
+    ToolResultProjectionV2,
     parse_tool_result_envelope,
+    serialize_tool_result_projection_v2,
     serialize_tool_result_envelope,
+    validate_serialized_tool_result_projection_v2,
 )
 
 
@@ -37,6 +41,17 @@ _TOOL_RESULT_METADATA_MISMATCH_DIAGNOSTIC = (
 )
 _HTTP_DEADLINE_SLOTS = threading.BoundedSemaphore(MAX_HTTP_DEADLINE_WORKERS)
 _HTTP_CLOSE_SLOTS = threading.BoundedSemaphore(MAX_HTTP_CLOSE_WORKERS)
+
+
+def provider_transport_projection() -> dict[str, Any]:
+    return {
+        "openai_compatible": {
+            "request_timeout_seconds": (
+                DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS
+            ),
+            "max_response_bytes": DEFAULT_MAX_RESPONSE_BYTES,
+        },
+    }
 
 
 def _tool_result_metadata_mismatch() -> NoReturn:
@@ -172,6 +187,8 @@ class OpenAICompatibleConfig:
 
 
 Transport = Callable[[str, dict[str, str], dict[str, Any], float], dict[str, Any]]
+RequestTokenEstimator = Callable[[ModelTurnRequest], int]
+TextTokenEstimator = Callable[[str], int]
 
 
 class _ProviderResponseTooLargeError(OSError):
@@ -343,6 +360,8 @@ class OpenAICompatibleToolAdapter:
         transport: Transport | None = None,
         *,
         capabilities: ModelAdapterCapabilities | None = None,
+        request_token_estimator: RequestTokenEstimator | None = None,
+        text_token_estimator: TextTokenEstimator | None = None,
     ) -> None:
         if not isinstance(config, OpenAICompatibleConfig):
             raise TypeError("config must be an OpenAICompatibleConfig")
@@ -353,6 +372,12 @@ class OpenAICompatibleToolAdapter:
             raise TypeError(
                 "capabilities must be a ModelAdapterCapabilities or None"
             )
+        if request_token_estimator is not None and not callable(
+            request_token_estimator
+        ):
+            raise TypeError("request_token_estimator must be callable or None")
+        if text_token_estimator is not None and not callable(text_token_estimator):
+            raise TypeError("text_token_estimator must be callable or None")
         if transport is None:
             if capabilities is not None:
                 raise ValueError(
@@ -381,10 +406,22 @@ class OpenAICompatibleToolAdapter:
         self._config = config
         self._transport = transport
         self._capabilities = resolved_capabilities
+        self._request_token_estimator = request_token_estimator
+        self._text_token_estimator = text_token_estimator
 
     @property
     def capabilities(self) -> ModelAdapterCapabilities:
         return self._capabilities
+
+    def estimate_request_tokens(self, request: ModelTurnRequest) -> int:
+        if self._request_token_estimator is None:
+            raise NotImplementedError("No exact request Token estimator is configured")
+        return self._request_token_estimator(request)
+
+    def estimate_text_tokens(self, text: str) -> int:
+        if self._text_token_estimator is None:
+            raise NotImplementedError("No exact text Token estimator is configured")
+        return self._text_token_estimator(text)
 
     def complete_turn(self, request: ModelTurnRequest) -> ModelTurnResponse:
         payload = _build_openai_tool_payload(self._config.model, request)
@@ -457,9 +494,18 @@ def _build_openai_tool_payload(
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": request.parameters.get("max_output_tokens", 4096),
         "temperature": request.parameters.get("temperature", 0),
     }
+    configured_output = request.parameters.get("max_output_tokens")
+    if configured_output is not None:
+        payload["max_tokens"] = configured_output
+    elif request.parameters.get("requires_max_output_tokens") is True:
+        provider_maximum = request.parameters.get("model_max_output_tokens")
+        if type(provider_maximum) is not int or provider_maximum <= 0:
+            raise ValueError(
+                "provider requires a positive model_max_output_tokens capability"
+            )
+        payload["max_tokens"] = provider_maximum
     response_format = request.parameters.get("response_format")
     if response_format is not None:
         if response_format != "json_object":
@@ -467,6 +513,9 @@ def _build_openai_tool_payload(
         if request.tools:
             raise ValueError("json_object response_format requires a no-tool request")
         payload["response_format"] = {"type": "json_object"}
+        return payload
+
+    if not request.tools:
         return payload
 
     payload["tools"] = [_tool_spec_to_openai(tool) for tool in request.tools]
@@ -490,6 +539,20 @@ def model_tool_result_to_message(result: ModelToolResult) -> dict[str, Any]:
         "role": "tool",
         "tool_call_id": result.call_id,
         "content": serialize_tool_result_envelope(result),
+    }
+
+
+def review_tool_projection_to_message(
+    projection: ToolResultProjectionV2,
+) -> dict[str, Any]:
+    """Serialize a v6 Tool Result without the legacy Observation envelope."""
+
+    if not isinstance(projection, ToolResultProjectionV2):
+        raise ValueError("projection must be ToolResultProjectionV2")
+    return {
+        "role": "tool",
+        "tool_call_id": projection.tool_call_id,
+        "content": serialize_tool_result_projection_v2(projection),
     }
 
 
@@ -552,10 +615,10 @@ def _validate_complete_tool_transcript(
     messages: list[dict[str, Any]],
     assistant_batches: list[tuple[int, list[str]]],
     assistant_call_ids: set[str],
-) -> dict[str, ModelToolResult]:
+) -> dict[str, ModelToolResult | None]:
     tool_message_ids: set[str] = set()
     tool_message_indices: dict[int, str] = {}
-    tool_message_results: dict[str, ModelToolResult] = {}
+    tool_message_results: dict[str, ModelToolResult | None] = {}
     for message_index, message in enumerate(messages):
         if message.get("role") != "tool":
             continue
@@ -570,10 +633,25 @@ def _validate_complete_tool_transcript(
             )
         tool_message_ids.add(call_id)
         tool_message_indices[message_index] = call_id
-        tool_message_results[call_id] = parse_tool_result_envelope(
-            call_id,
-            message.get("content"),
-        )
+        try:
+            tool_message_results[call_id] = parse_tool_result_envelope(
+                call_id,
+                message.get("content"),
+            )
+        except ValueError as legacy_error:
+            try:
+                validate_serialized_tool_result_projection_v2(
+                    message.get("content")
+                )
+            except ValueError:
+                try:
+                    validate_context_eviction_marker(
+                        message.get("content"),
+                        expected_call_id=call_id,
+                    )
+                except ValueError:
+                    raise legacy_error
+            tool_message_results[call_id] = None
 
     for call_id in assistant_call_ids:
         if call_id not in tool_message_ids:
@@ -606,7 +684,7 @@ def _validate_complete_tool_transcript(
 
 
 def _validate_tool_result_metadata(
-    message_tool_results: dict[str, ModelToolResult],
+    message_tool_results: dict[str, ModelToolResult | None],
     tool_results: list[ModelToolResult],
 ) -> None:
     metadata_by_call_id: dict[str, ModelToolResult] = {}
@@ -624,10 +702,13 @@ def _validate_tool_result_metadata(
         _tool_result_metadata_mismatch()
 
     for call_id, result in metadata_by_call_id.items():
+        transcript_result = message_tool_results[call_id]
+        if not isinstance(transcript_result, ModelToolResult):
+            _tool_result_metadata_mismatch()
         try:
             metadata_canonical = serialize_tool_result_envelope(result)
             transcript_canonical = serialize_tool_result_envelope(
-                message_tool_results[call_id]
+                transcript_result
             )
         except Exception:
             _tool_result_metadata_mismatch()
