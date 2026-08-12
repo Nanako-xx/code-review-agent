@@ -6,6 +6,8 @@ import re
 import subprocess
 
 from review_agent.cli import main
+from review_agent.model_adapter import FakeToolCallingAdapter
+from review_agent.model_protocol import ModelResponseKind, ModelTurnResponse
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -98,6 +100,67 @@ def test_cli_v6_fake_review_returns_only_authoritative_json(
     assert not (git_repo / ".review-agent" / "runs").exists()
     assert list(workspace_root.glob("pr/p-*/Snapshots/s-*/Results/review-result.json"))
     assert list(workspace_root.glob("pr/p-*/Sessions/u-*/pipeline-state.json"))
+
+
+def test_cli_v6_injects_only_assignment_rules_and_runs_no_quality_command(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    base, head = _revisions(git_repo)
+    adapter = FakeToolCallingAdapter(
+        [
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(
+                    {
+                        "findings": [],
+                        "uncertainties": ["Recording-only reviewer."],
+                    }
+                ),
+            )
+        ]
+    )
+
+    class RecordingFactory:
+        def create(self):
+            return adapter
+
+    def recording_factory(_config, *, stage_label):
+        assert stage_label == "reviewer"
+        return RecordingFactory()
+
+    def quality_process_must_not_run(*_args, **_kwargs):
+        raise AssertionError("empty LocalQualityPlan must not execute a process")
+
+    monkeypatch.setattr(
+        "review_agent.product_runtime.build_model_adapter_factory_from_config",
+        recording_factory,
+    )
+    monkeypatch.setattr(
+        "review_agent.local_quality.SubprocessQualityExecutor.run",
+        quality_process_must_not_run,
+    )
+
+    exit_code = main(
+        _review_args(
+            git_repo,
+            tmp_path / "workspace-rules",
+            base,
+            head,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0, captured.err
+    assert len(adapter.requests) == 1
+    request = adapter.requests[0]
+    assert '<BuiltInReviewRule name="python.md">' in request.system
+    assert "Mutable Default Arguments" in request.system
+    assert "Go Review Principles" not in request.system
+    assert "github_workflows.md" not in request.system
+    assert "no_configured_checks" in request.messages[0]["content"]
 
 
 def test_cli_v6_markdown_is_a_pure_review_result_render(

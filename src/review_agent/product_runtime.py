@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from review_agent.aggregation import ReviewAggregationInput
 from review_agent.diff_artifact import DiffArtifact, DiffArtifactStore
+from review_agent.developer_rules import DeveloperRuleResolver
 from review_agent.execution_journal import ExecutionJournal
 from review_agent.global_memory import GlobalMemoryFacade
 from review_agent.intent_runtime import IntentRuntime
@@ -57,7 +58,6 @@ from review_agent.review_planning import (
     ReviewPlanningRuntime,
     fixed_reviewer_slots,
 )
-from review_agent.review_policy import DEFAULT_DEVELOPER_REVIEW_POLICY
 from review_agent.review_protocol import (
     IntentVersionEnvelope,
     ReviewPlan,
@@ -363,6 +363,7 @@ class _BoundProductRuntimeV6:
             workspace_store,
             self.snapshot,
         )
+        self.developer_rules = DeveloperRuleResolver()
         self.session_store = SessionV6Store(workspace_store, session)
         self.context = PipelineContextV6(
             workspace_store=workspace_store,
@@ -630,7 +631,9 @@ class _BoundProductRuntimeV6:
                 base_sha=self.snapshot.base_sha,
                 head_sha=self.snapshot.head_sha,
                 request=review_input.request,
-                developer_policy=DEFAULT_DEVELOPER_REVIEW_POLICY,
+                developer_policy=self.developer_rules.policy_for_assignment(
+                    assignment
+                ),
                 global_memory=GlobalMemoryFacade().freeze(()),
                 intent=intent,
                 assignment=assignment,

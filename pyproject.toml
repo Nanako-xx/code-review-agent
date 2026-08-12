@@ -20,6 +20,9 @@ review-agent-eval = "review_agent_eval.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"review_agent.developer_rules" = ["system_rules.json", "rule_docs/*.md"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]

@@ -5,6 +5,7 @@ import json
 import pytest
 
 from review_agent.command import review_execution_profile_from_arguments
+from review_agent.developer_rules import load_builtin_developer_rule_catalog
 from review_agent.execution_profile import (
     AGENT_EXECUTION_PROFILE_SCHEMA_VERSION,
     AgentExecutionProfile,
@@ -105,6 +106,27 @@ def test_profile_v2_binds_fixed_slots_and_runtime_limits() -> None:
         "preview_chars": 2_000,
         "max_artifact_page_chars": 50_000,
     }
+
+
+def test_profile_v2_binds_the_immutable_builtin_rule_catalog() -> None:
+    payload = AgentExecutionProfile.from_product_configuration(
+        reviewer=_config(),
+        risk=None,
+    ).to_dict()
+    expected = load_builtin_developer_rule_catalog()
+
+    assert (
+        payload["reviewer_execution"]["developer_rule_catalog_sha256"]
+        == expected.digest
+    )
+    assert (
+        payload["reviewer_execution"]["developer_rule_resolver_version"]
+        == expected.resolver_version
+    )
+    assert (
+        payload["product_protocol"]["developer_rule_catalog_sha256"]
+        == expected.digest
+    )
 
 
 def test_profile_v2_binds_one_million_context_compaction_policy() -> None:

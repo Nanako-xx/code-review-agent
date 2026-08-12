@@ -14,6 +14,7 @@ from review_agent.context_window import (
     COMPACTION_USER_PROMPT,
     ContextWindowPolicy,
 )
+from review_agent.developer_rules import load_builtin_developer_rule_catalog
 from review_agent.model_adapter import (
     DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
     provider_transport_projection,
@@ -72,10 +73,13 @@ def reviewer_execution_profile_v2(
     system = build_reviewer_system_prompt(policy)
     tools = reviewer_tool_schemas_v2(REVIEWER_TOOL_NAMES_V2)
     runtime = ReviewerRuntimeLimitsV2()
+    rules = load_builtin_developer_rule_catalog()
     return {
         "schema_version": REVIEWER_EXECUTION_PROFILE_V2_SCHEMA,
         "invocation_inputs": ["system", "tools", "messages", "parameters"],
         "developer_policy_sha256": policy.digest(),
+        "developer_rule_catalog_sha256": rules.digest,
+        "developer_rule_resolver_version": rules.resolver_version,
         "reviewer_system_prompt_sha256": _text_sha256(system),
         "tool_catalog_sha256": _canonical_sha256(list(tools)),
         "tool_names": list(REVIEWER_TOOL_NAMES_V2),
@@ -124,6 +128,7 @@ def _slot_projection() -> dict[str, list[dict[str, str]]]:
 def _product_protocol_projection(
     policy: DeveloperReviewPolicy,
 ) -> dict[str, Any]:
+    rules = load_builtin_developer_rule_catalog()
     return {
         "session": {
             "schema_version": SESSION_V6_SCHEMA_VERSION,
@@ -181,6 +186,8 @@ def _product_protocol_projection(
             "model_calls": 0,
         },
         "developer_policy_sha256": policy.digest(),
+        "developer_rule_catalog_sha256": rules.digest,
+        "developer_rule_resolver_version": rules.resolver_version,
     }
 
 
