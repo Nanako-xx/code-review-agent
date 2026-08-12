@@ -295,6 +295,7 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--agent-name", default="Current code review agent")
     prepare.add_argument("--agent-version", default="working-tree")
     prepare.add_argument("--agent-commit", default="unknown")
+    prepare.add_argument("--memory-mode", choices=("off", "read", "read-write"), default="off")
     prepare.add_argument("--task-id", action="append", default=[])
     prepare.add_argument(
         "--unanswered-clarification",
@@ -562,13 +563,7 @@ _PROFILE_CONTROLLED_REVIEW_ARGUMENTS = frozenset(
         "--reviewer-model",
         "--reviewer-base-url",
         "--reviewer-api-key-env",
-        "--risk-assessor-mode",
-        "--risk-assessor-provider",
-        "--risk-assessor-model",
-        "--risk-assessor-base-url",
-        "--risk-assessor-api-key-env",
         "--reviewer-loop",
-        "--reviewer-mode",
         "--memory-mode",
         "--memory-root",
     }
@@ -678,8 +673,11 @@ def _default_agent_snapshot(args: argparse.Namespace):
             review_arguments.append("--reviewer-model=" + args.agent_model)
         if args.agent_base_url:
             review_arguments.append("--reviewer-base-url=" + args.agent_base_url)
-        review_arguments.append(
-            "--reviewer-api-key-env=" + args.agent_api_key_env
+        review_arguments.extend(
+            [
+                "--reviewer-loop=agent-loop",
+                "--reviewer-api-key-env=" + args.agent_api_key_env,
+            ]
         )
         adapter = {
             "kind": CURRENT_AGENT_ADAPTER_KIND,
@@ -688,6 +686,7 @@ def _default_agent_snapshot(args: argparse.Namespace):
             "environment_allowlist": [args.agent_api_key_env]
             if args.agent_provider == "openai-compatible"
             else [],
+            "memory_mode": args.memory_mode,
         }
     else:
         adapter = {
@@ -716,6 +715,10 @@ def _default_agent_snapshot(args: argparse.Namespace):
 
         profile = review_execution_profile_from_arguments(
             tuple(adapter["review_arguments"]),
+            memory_mode=args.memory_mode,
+            memory_root=(
+                Path.cwd() / ".review-agent" / "eval-profile-memory"
+            ).resolve(),
         )
         parameters["agent_execution_profile"] = {
             "profile": profile.to_dict(),

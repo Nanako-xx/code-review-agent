@@ -2,9 +2,9 @@
 
 **日期：** 2026-08-10
 
-**更新：** 2026-08-11
+**更新：** 2026-08-12
 
-**状态：** 已实施；Task 1–16 已完成，完整回归与经授权真实模型 Smoke 由 Task 17 验收
+**状态：** 产品范围已实施并通过 Task 17 验收；Eval/Judge 与 benchmark 兼容另行重构
 
 **范围：** 产品侧 Code Review Agent Runtime，不包含 Eval/Judge 内部实现
 
@@ -14,6 +14,11 @@
 不能从公开 CLI 恢复或执行旧 Phase。既有 Durable Memory 管理命令被隔离为显式兼容面，
 只有用户调用 `review-agent memory` 时才加载；它不再进入 review/resume 的 import、配置、
 Execution Profile 或 Reviewer 后处理路径。
+
+**最终范围记录（2026-08-12）：** 本次交付只包含 Code Review Agent 产品运行时、CLI、
+持久化协议与产品测试。实施期间试做的旧 Eval Adapter 兼容已从最终分支撤回；
+`src/review_agent_eval`、`eval`、`tests/eval` 和 benchmark Ground Truth/Judge 均不在本次
+重构范围内。AACR/SWE/Core 与真实模型 Smoke 随后续 Eval 重构重新设计和验收。
 
 ## 1. 背景
 
@@ -1504,7 +1509,7 @@ Proposal 或旧 ReviewBrief Reporting。历史实现只保留在显式 legacy/Me
     `max_total_tokens` 作为停止条件；统一 1,800 秒累计活跃执行时间、三次 Provider 尝试和 300 秒工具超时。
 19. Agent Loop 增加追加式 execution journal、Tool Call 幂等账本和 `turn_committed` Resume；旧 Session
     hydration 需要明确兼容策略。
-20. Runtime/Eval 生成路径迁移到短真实根目录，GitRunner 统一显式启用 `core.longpaths=true`。
+20. 产品 Runtime 生成路径迁移到短真实根目录，GitRunner 统一显式启用 `core.longpaths=true`。
 21. `ContextBudget(max_message_chars=16_000)` 被 Token-aware `ContextWindowPolicy` 和固定三层
     Compaction Pipeline 取代。
 22. Session state 增加累计 `active_elapsed_seconds`；Context Manifest 增加 `last_api_request_at`、Compaction
@@ -1517,8 +1522,9 @@ Proposal 或旧 ReviewBrief Reporting。历史实现只保留在显式 legacy/Me
 27. 新 Deterministic Aggregator 生成 `aggregation.json` 和六字段 `review-result.json`，并实现稳定 fingerprint、
     Finding ID、状态、uncertainty 合并和排序。
 28. Reporting 改为 ReviewResult 的纯 JSON/Markdown Renderer；长期经验提取移到返回后的非阻塞流程。
-29. Reviewer protocol projection、配置 digest、Eval product-equivalence binding 和相关测试必须随产品
-    协议版本更新，不能让旧 Intent/Risk/ReviewerOutput/ReviewBrief Schema、角色和预算继续伪装成当前产品配置。
+29. Reviewer protocol projection、配置 digest 和相关产品测试必须随产品协议版本更新，不能让旧
+    Intent/Risk/ReviewerOutput/ReviewBrief Schema、角色和预算继续伪装成当前产品配置；Eval
+    product-equivalence binding 留给独立 Eval 重构处理。
 
 ## 23. 验收标准
 

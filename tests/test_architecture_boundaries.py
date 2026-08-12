@@ -8,7 +8,6 @@ from typing import Iterable
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = REPOSITORY_ROOT / "src" / "review_agent"
-EVAL_SOURCE_ROOT = REPOSITORY_ROOT / "src" / "review_agent_eval"
 
 MEMORY_FOUNDATION_MODULES = (
     "memory_models.py",
@@ -46,11 +45,6 @@ def _module_path(filename: str) -> Path:
 
 def _tree(filename: str) -> ast.Module:
     module = _module_path(filename)
-    return ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
-
-
-def _eval_tree(filename: str) -> ast.Module:
-    module = EVAL_SOURCE_ROOT / filename
     return ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
 
 
@@ -390,36 +384,6 @@ def test_product_entrypoints_have_no_legacy_post_review_dependencies() -> None:
             or symbol in forbidden_symbols
         ]
         assert not violations, f"{filename}: {violations}"
-
-
-def test_current_eval_adapter_contains_only_the_v6_product_projection() -> None:
-    tree = _eval_tree("adapters/current_agent.py")
-    forbidden_modules = {
-        "review_agent.pipeline",
-        "review_agent.reconciler",
-        "review_agent.supplemental",
-        "review_agent.evidence",
-        "review_agent.completion",
-        "review_agent.final_risk",
-        "review_agent.brief",
-        "review_agent.reporting",
-        "review_agent.observations",
-    }
-    violations = [
-        (module, symbol)
-        for module, symbol in _imports(tree)
-        if _module_matches(module, forbidden_modules)
-        or symbol in {
-            "CompletionResult",
-            "ObservationStore",
-            "ReviewBrief",
-            "SemanticReconciliation",
-        }
-    ]
-
-    assert not violations
-    assert "_run_legacy" not in _definitions(tree)
-    assert "_completed_submission" not in _definitions(tree)
 
 
 def test_product_cli_source_has_no_removed_stage_or_memory_overrides() -> None:

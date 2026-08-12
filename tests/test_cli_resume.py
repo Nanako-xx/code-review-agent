@@ -212,7 +212,6 @@ def test_cli_resume_rejects_wrong_repository_identity(
 def test_cli_legacy_review_is_inspect_only_and_never_resumed(
     git_repo: Path,
     capsys,
-    monkeypatch,
 ) -> None:
     review_id = "review-legacy"
     run_dir = git_repo / ".review-agent" / "runs" / review_id
@@ -220,13 +219,6 @@ def test_cli_legacy_review_is_inspect_only_and_never_resumed(
     state = {"review_id": review_id, "status": "running"}
     (run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
 
-    def legacy_must_not_run(*_args, **_kwargs):
-        raise AssertionError("legacy pipeline must not run")
-
-    monkeypatch.setattr(
-        "review_agent.command.ReviewSessionResumer",
-        legacy_must_not_run,
-    )
     assert main(["resume", review_id, "--repo", str(git_repo)]) == 2
 
     captured = capsys.readouterr()

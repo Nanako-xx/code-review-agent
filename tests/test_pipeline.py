@@ -23,7 +23,7 @@ from review_agent.models import QualityGateResult, ReviewRequest
 from review_agent.observations import ObservationStore
 from review_agent.pipeline import PHASE_MESSAGES, PipelineStageError, ReviewPipeline
 from review_agent.quality import QualityGateExecution
-from review_agent.resume import ResumeAction, ReviewSessionResumer
+from review_agent.legacy_resume import ResumeAction, ReviewSessionResumer
 from review_agent.revision import RevisionResolver
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
