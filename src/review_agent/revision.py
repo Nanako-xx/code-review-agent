@@ -26,6 +26,35 @@ class RepositoryIdentity:
 
 
 @dataclass(frozen=True)
+class CanonicalRepositoryIdentity:
+    """Stable clone-local identity shared by linked Git worktrees."""
+
+    repository_key: str
+    git_common_dir: str
+    origin_url: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.repository_key, str) or re.fullmatch(
+            r"[0-9a-f]{64}", self.repository_key
+        ) is None:
+            raise ValueError("canonical repository key is invalid")
+        common_dir = normalize_repository_identity_path(self.git_common_dir)
+        origin_url = normalize_repository_origin(self.origin_url)
+        if common_dir != self.git_common_dir or origin_url != self.origin_url:
+            raise ValueError("canonical repository identity is not normalized")
+        material = f"{common_dir}\0{origin_url or ''}".encode("utf-8")
+        if hashlib.sha256(material).hexdigest() != self.repository_key:
+            raise ValueError("canonical repository identity hash does not match")
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "repository_key": self.repository_key,
+            "git_common_dir": self.git_common_dir,
+            "origin_url": self.origin_url,
+        }
+
+
+@dataclass(frozen=True)
 class RepositoryLayout:
     """Canonical worktree and Git-directory locations for one common dir."""
 
@@ -412,6 +441,21 @@ def normalize_repository_identity_path(path: str | Path) -> str:
         raise ValueError("unable to canonicalize repository identity path") from error
     normalized = os.path.normcase(os.path.normpath(str(resolved)))
     return normalized.replace("\\", "/")
+
+
+def canonical_repository_identity(
+    identity: RepositoryIdentity,
+) -> CanonicalRepositoryIdentity:
+    if not isinstance(identity, RepositoryIdentity):
+        raise ValueError("repository identity is invalid")
+    common_dir = normalize_repository_identity_path(identity.git_common_dir)
+    origin_url = normalize_repository_origin(identity.origin_url)
+    material = f"{common_dir}\0{origin_url or ''}".encode("utf-8")
+    return CanonicalRepositoryIdentity(
+        repository_key=hashlib.sha256(material).hexdigest(),
+        git_common_dir=common_dir,
+        origin_url=origin_url,
+    )
 
 
 def _parse_worktree_paths(output: bytes) -> tuple[str, ...]:

@@ -22,7 +22,7 @@ from review_agent.models import (
     ReviewRequest,
 )
 from review_agent.pipeline import ReviewPipeline
-from review_agent.resume import ResumeAction, ReviewSessionResumer
+from review_agent.legacy_resume import ResumeAction, ReviewSessionResumer
 from review_agent.revision import RevisionResolver
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import ReviewExecutionConfig, initial_session_manifest

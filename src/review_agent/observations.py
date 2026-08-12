@@ -18,6 +18,27 @@ DEFAULT_MAX_RAW_ARTIFACT_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_TOTAL_RAW_ARTIFACT_BYTES = 64 * 1024 * 1024
 
 
+def _storage_path(path: Path) -> Path:
+    """Use the extended-length namespace for Windows filesystem syscalls."""
+
+    raw = os.fspath(path)
+    if os.name != "nt" or raw.startswith("\\\\?\\"):
+        return Path(raw)
+    absolute = os.path.abspath(raw)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
+def _path_is_symlink(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        pass
+    return os.path.islink(_storage_path(path))
+
+
 @dataclass(frozen=True)
 class Observation:
     observation_id: str
@@ -250,7 +271,7 @@ class ObservationStore:
             artifact_ref,
             observation_id,
         )
-        if raw_path.exists():
+        if os.path.exists(_storage_path(raw_path)):
             existing_content = _read_regular_file_bytes(raw_path, artifact_ref)
             if existing_content != raw_bytes:
                 raise ValueError(
@@ -474,10 +495,12 @@ def _validate_observations_directory(run_dir: Path) -> Path:
     root = Path(run_dir).resolve(strict=True)
     observations_dir = Path(run_dir) / "observations"
     try:
-        directory_metadata = observations_dir.lstat()
+        directory_metadata = os.lstat(_storage_path(observations_dir))
     except OSError as error:
         raise ValueError("observations directory is missing") from error
-    if not stat.S_ISDIR(directory_metadata.st_mode) or observations_dir.is_symlink():
+    if not stat.S_ISDIR(directory_metadata.st_mode) or _path_is_symlink(
+        observations_dir
+    ):
         raise ValueError("observations directory must be a regular directory")
     resolved_observations_dir = observations_dir.resolve(strict=True)
     try:
@@ -501,8 +524,9 @@ def _read_regular_file_bytes(
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
+    storage_path = _storage_path(path)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(storage_path, flags)
     except OSError as error:
         raise ValueError(
             f"raw observation artifact is missing or not regular: {artifact_ref}"
@@ -510,7 +534,7 @@ def _read_regular_file_bytes(
     try:
         try:
             opened_metadata = os.fstat(descriptor)
-            path_metadata = path.lstat()
+            path_metadata = os.lstat(storage_path)
         except OSError as error:
             raise ValueError(
                 f"unable to inspect raw observation artifact: {artifact_ref}"
@@ -519,7 +543,7 @@ def _read_regular_file_bytes(
             not stat.S_ISREG(opened_metadata.st_mode)
             or not stat.S_ISREG(path_metadata.st_mode)
             or stat.S_ISLNK(path_metadata.st_mode)
-            or path.is_symlink()
+            or _path_is_symlink(path)
             or not os.path.samestat(path_metadata, opened_metadata)
         ):
             raise ValueError(
@@ -553,7 +577,7 @@ def _read_regular_file_bytes(
 
         try:
             final_opened = os.fstat(descriptor)
-            final_path = path.lstat()
+            final_path = os.lstat(storage_path)
         except OSError as error:
             raise ValueError(
                 f"unable to inspect raw observation artifact: {artifact_ref}"
@@ -562,7 +586,7 @@ def _read_regular_file_bytes(
             not _same_file_snapshot(opened_metadata, final_opened)
             or not stat.S_ISREG(final_path.st_mode)
             or stat.S_ISLNK(final_path.st_mode)
-            or path.is_symlink()
+            or _path_is_symlink(path)
             or not os.path.samestat(final_opened, final_path)
         ):
             raise ValueError(
@@ -575,7 +599,7 @@ def _read_regular_file_bytes(
 
 def _regular_file_size(path: Path, artifact_ref: str) -> int:
     try:
-        metadata = path.lstat()
+        metadata = os.lstat(_storage_path(path))
     except OSError as error:
         raise ValueError(
             f"raw observation artifact is missing or not regular: {artifact_ref}"
@@ -583,7 +607,7 @@ def _regular_file_size(path: Path, artifact_ref: str) -> int:
     if (
         not stat.S_ISREG(metadata.st_mode)
         or stat.S_ISLNK(metadata.st_mode)
-        or path.is_symlink()
+        or _path_is_symlink(path)
     ):
         raise ValueError(
             f"raw observation artifact is missing or not regular: {artifact_ref}"
@@ -643,16 +667,18 @@ def _validate_raw_artifact_hash(
 
 def _atomic_write_bytes(path: Path, content: bytes) -> None:
     temporary = path.with_name(f".tmp-{uuid.uuid4().hex[:12]}.tmp")
+    storage_temporary = _storage_path(temporary)
+    storage_path = _storage_path(path)
     try:
-        with temporary.open("wb") as handle:
+        with storage_temporary.open("wb") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        _fsync_parent_directory(path.parent)
+        os.replace(storage_temporary, storage_path)
+        _fsync_parent_directory(_storage_path(path.parent))
     finally:
         try:
-            temporary.unlink(missing_ok=True)
+            storage_temporary.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -661,15 +687,16 @@ def _append_jsonl_record(path: Path, payload: dict[str, Any]) -> None:
     content = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o666)
+    storage_path = _storage_path(path)
+    descriptor = os.open(storage_path, flags, 0o666)
     try:
         opened_metadata = os.fstat(descriptor)
         if not stat.S_ISREG(opened_metadata.st_mode):
             raise ValueError("observations.jsonl must be a regular file")
-        current_metadata = path.lstat()
+        current_metadata = os.lstat(storage_path)
         if (
             not stat.S_ISREG(current_metadata.st_mode)
-            or path.is_symlink()
+            or _path_is_symlink(path)
             or not os.path.samestat(current_metadata, opened_metadata)
         ):
             raise ValueError("observations.jsonl changed while opening")
@@ -680,17 +707,17 @@ def _append_jsonl_record(path: Path, payload: dict[str, Any]) -> None:
                 raise OSError("unable to append observations.jsonl")
             written += count
         os.fsync(descriptor)
-        final_metadata = path.lstat()
+        final_metadata = os.lstat(storage_path)
         if not os.path.samestat(final_metadata, opened_metadata):
             raise ValueError("observations.jsonl changed while appending")
     finally:
         os.close(descriptor)
-    _fsync_parent_directory(path.parent)
+    _fsync_parent_directory(_storage_path(path.parent))
 
 
 def _is_regular_file(path: Path) -> bool:
     try:
-        metadata = path.lstat()
+        metadata = os.lstat(_storage_path(path))
     except OSError:
         return False
-    return stat.S_ISREG(metadata.st_mode) and not path.is_symlink()
+    return stat.S_ISREG(metadata.st_mode) and not _path_is_symlink(path)

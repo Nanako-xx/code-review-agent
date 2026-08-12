@@ -20,6 +20,12 @@ from review_agent.model_risk import (
     risk_model_run_to_dict,
     run_model_risk_assessment,
 )
+from review_agent.model_risk import (
+    RISK_MODEL_SYSTEM_PROMPT_V2,
+    RiskDecisionParseError,
+    parse_risk_decision_v2,
+)
+from review_agent.review_protocol import RiskLevel as RiskLevelV2
 from review_agent.models import (
     CompiledRiskFloor,
     IntentStatus,
@@ -479,3 +485,36 @@ def test_informational_memory_is_not_a_model_authority_channel() -> None:
     assert memory_id not in encoded
     assert statement not in encoded
     assert "local_only" not in encoded
+
+
+def test_v2_risk_parser_accepts_only_the_single_level_field() -> None:
+    decision = parse_risk_decision_v2('{"level":"medium"}')
+
+    assert decision.level is RiskLevelV2.MEDIUM
+    assert decision.to_dict() == {"level": "medium"}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"level":"low","reasons":[]}',
+        '{"level":"low","level":"high"}',
+        '{"dimensions":{},"level":"low"}',
+        '```json\n{"level":"low"}\n```',
+        '{"level":"unknown"}',
+    ],
+)
+def test_v2_risk_parser_rejects_legacy_or_noncanonical_output(content: str) -> None:
+    with pytest.raises(RiskDecisionParseError):
+        parse_risk_decision_v2(content)
+
+
+def test_v2_risk_prompt_defaults_ordinary_reversible_changes_to_low() -> None:
+    normalized = RISK_MODEL_SYSTEM_PROMPT_V2.casefold()
+
+    assert "exactly" in normalized
+    assert '{"level":"low"}' in normalized
+    assert "default" in normalized and "low" in normalized
+    assert "50" in normalized or "eighty" in normalized
+    assert "dimensions" not in normalized
+    assert "suggested_focus" not in normalized

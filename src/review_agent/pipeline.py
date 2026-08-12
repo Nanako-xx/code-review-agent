@@ -5025,13 +5025,15 @@ class ReviewPipeline:
     def _review_diff_excerpt(self, full_summary: ChangeSummary) -> list[str]:
         priority = self.context.incremental_priority
         if priority is None:
-            return list(full_summary.diff_excerpt)
-        return [
-            "Incremental priority diff (new changes since parent Head):",
-            *priority.diff_excerpt,
-            "Full review diff (child Base..Head):",
-            *full_summary.diff_excerpt,
-        ]
+            lines = full_summary.diff_excerpt
+        else:
+            lines = [
+                "Incremental priority diff (new changes since parent Head):",
+                *priority.diff_excerpt,
+                "Full review diff (child Base..Head):",
+                *full_summary.diff_excerpt,
+            ]
+        return [line for line in lines if line.strip()]
 
     def _write_compatibility_state(self, message: str) -> bool:
         manifest = self.context.manifest

@@ -5,6 +5,7 @@ from dataclasses import replace
 
 from review_agent.git_repo import ChangeSummary
 from review_agent.models import (
+    BENCHMARK_AUTO_ACCEPT_BASIS,
     ClarificationQuestion,
     ClarificationStatus,
     ConclusionImpact,
@@ -289,11 +290,16 @@ def apply_user_decision(
         if not confirmable:
             raise ValueError("confirmed decision requires an active inferred candidate")
         resolved_values = [claim.value for claim in confirmable]
+        confirmation_origin = (
+            IntentOrigin.BENCHMARK_AUTO_ACCEPT
+            if decision.continuation_basis == BENCHMARK_AUTO_ACCEPT_BASIS
+            else IntentOrigin.USER_CONFIRMATION
+        )
         updated_claims = [
             replace(
                 claim,
                 source=IntentSource.EXPLICIT,
-                origin=IntentOrigin.USER_CONFIRMATION,
+                origin=confirmation_origin,
                 confidence=IntentConfidence.HIGH,
             )
             if claim in confirmable

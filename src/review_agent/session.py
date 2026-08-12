@@ -19,6 +19,7 @@ PREVIOUS_SESSION_SCHEMA_VERSION = 2
 MODEL_STAGE_SESSION_SCHEMA_VERSION = 3
 SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION = 4
 SESSION_SCHEMA_VERSION = 5
+SESSION_V6_SCHEMA_VERSION = 6
 SUPPORTED_SESSION_SCHEMA_VERSIONS = (
     LEGACY_SESSION_SCHEMA_VERSION,
     PREVIOUS_SESSION_SCHEMA_VERSION,
@@ -36,6 +37,19 @@ DEFAULT_MODEL_STAGE_API_KEY_ENV = "REVIEW_AGENT_API_KEY"
 DEFAULT_MODEL_STAGE_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_MODEL_STAGE_MAX_PROVIDER_ATTEMPTS = 2
 DEFAULT_MODEL_STAGE_MAX_ELAPSED_SECONDS = 60.0
+
+
+def reviewer_runtime_limits_v2_to_dict() -> dict[str, object]:
+    """Project the three v6 Reviewer safety limits into Session configuration."""
+
+    from review_agent.reviewer_runtime import ReviewerRuntimeLimitsV2
+
+    limits = ReviewerRuntimeLimitsV2()
+    return {
+        "max_elapsed_seconds": limits.max_elapsed_seconds,
+        "max_provider_attempts": limits.max_provider_attempts,
+        "tool_timeout_seconds": limits.tool_timeout_seconds,
+    }
 LEGACY_SESSION_PHASES = (
     RunPhase.PREFLIGHT,
     RunPhase.REPOSITORY_INTELLIGENCE,
@@ -89,6 +103,13 @@ SESSION_PHASES = (
     RunPhase.FINAL_RISK,
     RunPhase.MEMORY_PROPOSAL,
     RunPhase.REPORTING,
+)
+SESSION_V6_PHASES = (
+    RunPhase.PREFLIGHT,
+    RunPhase.INTENT,
+    RunPhase.PLANNING,
+    RunPhase.REVIEWERS,
+    RunPhase.AGGREGATION,
 )
 
 _ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -395,6 +416,71 @@ class ReviewExecutionConfig:
             raise ValueError("memory must be a MemoryExecutionConfig or null")
         if not isinstance(self.memory_curator, ModelStageConfig):
             raise ValueError("memory_curator must be a ModelStageConfig")
+
+
+def model_stage_config_to_dict(config: ModelStageConfig) -> dict[str, Any]:
+    if not isinstance(config, ModelStageConfig):
+        raise TypeError("config must be ModelStageConfig")
+    return {
+        "mode": config.mode,
+        "provider": config.provider,
+        "model": config.model,
+        "base_url": config.base_url,
+        "api_key_env": config.api_key_env,
+        "max_output_tokens": config.max_output_tokens,
+        "max_provider_attempts": config.max_provider_attempts,
+        "max_elapsed_seconds": config.max_elapsed_seconds,
+    }
+
+
+def supplemental_policy_to_dict(config: SupplementalPolicy) -> dict[str, Any]:
+    if not isinstance(config, SupplementalPolicy):
+        raise TypeError("config must be SupplementalPolicy")
+    return {
+        "version": config.version,
+        "risk_level": config.risk_level,
+        "max_waves": config.max_waves,
+        "max_tasks": config.max_tasks,
+        "max_tasks_per_wave": config.max_tasks_per_wave,
+        "max_concurrency": config.max_concurrency,
+        "max_turns_per_task": config.max_turns_per_task,
+        "max_tool_calls_per_task": config.max_tool_calls_per_task,
+        "max_tokens_per_task": config.max_tokens_per_task,
+        "max_total_tokens": config.max_total_tokens,
+        "max_elapsed_seconds": config.max_elapsed_seconds,
+    }
+
+
+def review_execution_config_to_dict(
+    execution: ReviewExecutionConfig,
+) -> dict[str, Any]:
+    if not isinstance(execution, ReviewExecutionConfig):
+        raise TypeError("execution must be ReviewExecutionConfig")
+    return {
+        "reviewer_provider": execution.reviewer_provider,
+        "reviewer_model": execution.reviewer_model,
+        "reviewer_base_url": execution.reviewer_base_url,
+        "reviewer_api_key_env": execution.reviewer_api_key_env,
+        "reviewer_mode": execution.reviewer_mode,
+        "reviewer_loop": execution.reviewer_loop,
+        "non_interactive": execution.non_interactive,
+        "risk_assessor": model_stage_config_to_dict(execution.risk_assessor),
+        "portfolio_planner": model_stage_config_to_dict(
+            execution.portfolio_planner
+        ),
+        "semantic_reconciler": model_stage_config_to_dict(
+            execution.semantic_reconciler
+        ),
+        "supplemental_policy": supplemental_policy_to_dict(
+            execution.supplemental_policy
+        ),
+        "memory": (
+            None if execution.memory is None else execution.memory.to_dict()
+        ),
+        "memory_curator": model_stage_config_to_dict(
+            execution.memory_curator
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -1353,33 +1439,6 @@ def child_session_manifest(
 
 
 def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
-    def model_stage_payload(config: ModelStageConfig) -> dict[str, Any]:
-        return {
-            "mode": config.mode,
-            "provider": config.provider,
-            "model": config.model,
-            "base_url": config.base_url,
-            "api_key_env": config.api_key_env,
-            "max_output_tokens": config.max_output_tokens,
-            "max_provider_attempts": config.max_provider_attempts,
-            "max_elapsed_seconds": config.max_elapsed_seconds,
-        }
-
-    def supplemental_policy_payload(config: SupplementalPolicy) -> dict[str, Any]:
-        return {
-            "version": config.version,
-            "risk_level": config.risk_level,
-            "max_waves": config.max_waves,
-            "max_tasks": config.max_tasks,
-            "max_tasks_per_wave": config.max_tasks_per_wave,
-            "max_concurrency": config.max_concurrency,
-            "max_turns_per_task": config.max_turns_per_task,
-            "max_tool_calls_per_task": config.max_tool_calls_per_task,
-            "max_tokens_per_task": config.max_tokens_per_task,
-            "max_total_tokens": config.max_total_tokens,
-            "max_elapsed_seconds": config.max_elapsed_seconds,
-        }
-
     def budget_payload(budget: SupplementalBudget) -> dict[str, Any]:
         return {
             "tasks": budget.tasks,
@@ -1411,7 +1470,7 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
             "wave_id": checkpoint.wave_id,
             "wave_index": checkpoint.wave_index,
             "trigger_digest": checkpoint.trigger_digest,
-            "effective_policy": supplemental_policy_payload(
+            "effective_policy": supplemental_policy_to_dict(
                 checkpoint.effective_policy
             ),
             "status": checkpoint.status.value,
@@ -1451,38 +1510,39 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
             payload["user_decisions"] = dict(checkpoint.user_decisions)
         return payload
 
+    complete_execution_payload = review_execution_config_to_dict(
+        manifest.execution
+    )
     execution_payload = {
-        "reviewer_provider": manifest.execution.reviewer_provider,
-        "reviewer_model": manifest.execution.reviewer_model,
-        "reviewer_base_url": manifest.execution.reviewer_base_url,
-        "reviewer_api_key_env": manifest.execution.reviewer_api_key_env,
-        "reviewer_mode": manifest.execution.reviewer_mode,
-        "reviewer_loop": manifest.execution.reviewer_loop,
-        "non_interactive": manifest.execution.non_interactive,
+        key: complete_execution_payload[key]
+        for key in (
+            "reviewer_provider",
+            "reviewer_model",
+            "reviewer_base_url",
+            "reviewer_api_key_env",
+            "reviewer_mode",
+            "reviewer_loop",
+            "non_interactive",
+        )
     }
     if manifest.schema_version >= MODEL_STAGE_SESSION_SCHEMA_VERSION:
         execution_payload.update(
             {
-                "risk_assessor": model_stage_payload(
-                    manifest.execution.risk_assessor
-                ),
-                "portfolio_planner": model_stage_payload(
-                    manifest.execution.portfolio_planner
-                ),
+                "risk_assessor": complete_execution_payload["risk_assessor"],
+                "portfolio_planner": complete_execution_payload[
+                    "portfolio_planner"
+                ],
             }
         )
-    if (
-        manifest.schema_version
-        >= SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION
-    ):
+    if manifest.schema_version >= SEMANTIC_RECONCILIATION_SESSION_SCHEMA_VERSION:
         execution_payload.update(
             {
-                "semantic_reconciler": model_stage_payload(
-                    manifest.execution.semantic_reconciler
-                ),
-                "supplemental_policy": supplemental_policy_payload(
-                    manifest.execution.supplemental_policy
-                ),
+                "semantic_reconciler": complete_execution_payload[
+                    "semantic_reconciler"
+                ],
+                "supplemental_policy": complete_execution_payload[
+                    "supplemental_policy"
+                ],
             }
         )
     if manifest.schema_version >= SESSION_SCHEMA_VERSION:
@@ -1492,10 +1552,8 @@ def session_manifest_to_dict(manifest: SessionManifest) -> dict[str, Any]:
             )
         execution_payload.update(
             {
-                "memory": manifest.execution.memory.to_dict(),
-                "memory_curator": model_stage_payload(
-                    manifest.execution.memory_curator
-                ),
+                "memory": complete_execution_payload["memory"],
+                "memory_curator": complete_execution_payload["memory_curator"],
             }
         )
 
@@ -2236,3 +2294,301 @@ def _enum_value(
         return enum_type(value)
     except ValueError as error:
         raise ValueError(f"{context} has unsupported value: {value}") from error
+
+
+_V6_SESSION_ID = re.compile(r"^SESSION-[0-9a-f]{64}$")
+_V6_PR_ID = re.compile(r"^PR-[0-9a-f]{64}$")
+_V6_SNAPSHOT_ID = re.compile(r"^S-[0-9a-f]{64}$")
+_V6_ARTIFACT_ID = re.compile(r"^A-[0-9a-f]{64}$")
+_V6_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class SessionV6ArtifactRef:
+    logical_name: str
+    artifact_id: str
+    relative_path: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.logical_name) is not str or not self.logical_name.strip():
+            raise ValueError("Session v6 logical artifact name is invalid")
+        if _V6_ARTIFACT_ID.fullmatch(self.artifact_id) is None:
+            raise ValueError("Session v6 artifact_id is invalid")
+        if type(self.relative_path) is not str or not self.relative_path:
+            raise ValueError("Session v6 artifact path is invalid")
+        posix = PurePosixPath(self.relative_path)
+        windows = PureWindowsPath(self.relative_path)
+        if (
+            posix.is_absolute()
+            or windows.is_absolute()
+            or "\\" in self.relative_path
+            or any(part in {"", ".", ".."} for part in posix.parts)
+        ):
+            raise ValueError("Session v6 artifact path must be repository-relative")
+        if _V6_SHA256.fullmatch(self.sha256) is None:
+            raise ValueError("Session v6 artifact hash is invalid")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "logical_name": self.logical_name,
+            "artifact_id": self.artifact_id,
+            "relative_path": self.relative_path,
+            "sha256": self.sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "SessionV6ArtifactRef":
+        if type(payload) is not dict or set(payload) != {
+            "logical_name",
+            "artifact_id",
+            "relative_path",
+            "sha256",
+        }:
+            raise ValueError("Session v6 artifact reference schema is invalid")
+        return cls(**dict(payload))
+
+
+@dataclass(frozen=True)
+class SessionV6PhaseCheckpoint:
+    status: PhaseStatus = PhaseStatus.PENDING
+    attempt: int = 0
+    artifacts: tuple[SessionV6ArtifactRef, ...] = ()
+    error_code: str | None = None
+    invalidation_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, PhaseStatus):
+            raise ValueError("Session v6 Phase status is invalid")
+        if self.status is PhaseStatus.AWAITING_USER:
+            raise ValueError("Session v6 has no awaiting-user Phase state")
+        if type(self.attempt) is not int or self.attempt < 0:
+            raise ValueError("Session v6 Phase attempt is invalid")
+        if type(self.artifacts) is not tuple or any(
+            type(item) is not SessionV6ArtifactRef for item in self.artifacts
+        ):
+            raise ValueError("Session v6 Phase artifacts are invalid")
+        names = [item.logical_name for item in self.artifacts]
+        if len(names) != len(set(names)):
+            raise ValueError("Session v6 Phase artifact names must be unique")
+        if self.status is PhaseStatus.PENDING:
+            if self.attempt != 0 or self.artifacts or self.error_code is not None:
+                raise ValueError("Pending Session v6 Phase contains progress")
+            if self.invalidation_reason is not None:
+                raise ValueError("Pending Session v6 Phase is invalidated")
+        elif self.status is PhaseStatus.RUNNING:
+            if self.attempt < 1 or self.error_code is not None:
+                raise ValueError("Running Session v6 Phase state is invalid")
+            if self.invalidation_reason is not None:
+                raise ValueError("Running Session v6 Phase is invalidated")
+        elif self.status is PhaseStatus.COMPLETED:
+            if self.attempt < 1 or self.error_code is not None:
+                raise ValueError("Completed Session v6 Phase state is invalid")
+            if self.invalidation_reason is not None:
+                raise ValueError("Completed Session v6 Phase is invalidated")
+        elif self.status is PhaseStatus.FAILED:
+            if self.attempt < 1 or not _v6_text_or_none(self.error_code):
+                raise ValueError("Failed Session v6 Phase requires an error code")
+            if self.invalidation_reason is not None:
+                raise ValueError("Failed Session v6 Phase is invalidated")
+        elif self.status is PhaseStatus.INVALIDATED:
+            if not _v6_text_or_none(self.invalidation_reason):
+                raise ValueError(
+                    "Invalidated Session v6 Phase requires a reason"
+                )
+            if self.error_code is not None:
+                raise ValueError("Invalidated Session v6 Phase has an error")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status.value,
+            "attempt": self.attempt,
+            "artifacts": [item.to_dict() for item in self.artifacts],
+            "error_code": self.error_code,
+            "invalidation_reason": self.invalidation_reason,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "SessionV6PhaseCheckpoint":
+        if type(payload) is not dict or set(payload) != {
+            "status",
+            "attempt",
+            "artifacts",
+            "error_code",
+            "invalidation_reason",
+        }:
+            raise ValueError("Session v6 Phase checkpoint schema is invalid")
+        artifacts = payload["artifacts"]
+        if type(artifacts) is not list:
+            raise ValueError("Session v6 Phase artifacts must be an array")
+        return cls(
+            status=PhaseStatus(payload["status"]),
+            attempt=payload["attempt"],
+            artifacts=tuple(SessionV6ArtifactRef.from_dict(item) for item in artifacts),
+            error_code=payload["error_code"],
+            invalidation_reason=payload["invalidation_reason"],
+        )
+
+
+@dataclass(frozen=True)
+class SessionV6Manifest:
+    session_id: str
+    pr_id: str
+    snapshot_id: str
+    status: RunStatus
+    current_phase: RunPhase
+    phases: Mapping[str, SessionV6PhaseCheckpoint]
+    revision: int = 0
+    schema_version: int = SESSION_V6_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SESSION_V6_SCHEMA_VERSION:
+            raise ValueError("Session v6 schema_version is invalid")
+        if _V6_SESSION_ID.fullmatch(self.session_id) is None:
+            raise ValueError("Session v6 session_id is invalid")
+        if _V6_PR_ID.fullmatch(self.pr_id) is None:
+            raise ValueError("Session v6 pr_id is invalid")
+        if _V6_SNAPSHOT_ID.fullmatch(self.snapshot_id) is None:
+            raise ValueError("Session v6 snapshot_id is invalid")
+        if not isinstance(self.status, RunStatus) or self.status is RunStatus.AWAITING_USER:
+            raise ValueError("Session v6 Run status is invalid")
+        if not isinstance(self.current_phase, RunPhase):
+            raise ValueError("Session v6 current_phase is invalid")
+        if type(self.revision) is not int or self.revision < 0:
+            raise ValueError("Session v6 revision is invalid")
+        if not isinstance(self.phases, Mapping) or set(self.phases) != {
+            phase.value for phase in SESSION_V6_PHASES
+        }:
+            raise ValueError("Session v6 Phase layout is invalid")
+        normalized = {
+            phase.value: self.phases[phase.value]
+            for phase in SESSION_V6_PHASES
+        }
+        if any(
+            type(checkpoint) is not SessionV6PhaseCheckpoint
+            for checkpoint in normalized.values()
+        ):
+            raise ValueError("Session v6 Phase checkpoint is invalid")
+        object.__setattr__(self, "phases", MappingProxyType(normalized))
+        self._validate_state()
+
+    def _validate_state(self) -> None:
+        checkpoints = [self.phases[phase.value] for phase in SESSION_V6_PHASES]
+        seen_incomplete = False
+        for checkpoint in checkpoints:
+            if checkpoint.status is PhaseStatus.COMPLETED:
+                if seen_incomplete:
+                    raise ValueError("Session v6 completed Phases are not a prefix")
+            else:
+                seen_incomplete = True
+        all_completed = all(
+            checkpoint.status is PhaseStatus.COMPLETED
+            for checkpoint in checkpoints
+        )
+        if self.status is RunStatus.COMPLETED:
+            if self.current_phase is not RunPhase.COMPLETED or not all_completed:
+                raise ValueError("Completed Session v6 state is inconsistent")
+            return
+        if self.current_phase not in SESSION_V6_PHASES:
+            raise ValueError("Active Session v6 current Phase is invalid")
+        current = self.phases[self.current_phase.value]
+        if self.status is RunStatus.CREATED:
+            if (
+                self.current_phase is not RunPhase.PREFLIGHT
+                or any(item.status is not PhaseStatus.PENDING for item in checkpoints)
+            ):
+                raise ValueError("Created Session v6 state is inconsistent")
+        elif self.status is RunStatus.FAILED:
+            if current.status is not PhaseStatus.FAILED:
+                raise ValueError("Failed Session v6 current Phase is inconsistent")
+        elif self.status is RunStatus.RUNNING:
+            if current.status not in {
+                PhaseStatus.PENDING,
+                PhaseStatus.RUNNING,
+                PhaseStatus.FAILED,
+                PhaseStatus.INVALIDATED,
+            }:
+                raise ValueError("Running Session v6 current Phase is inconsistent")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "revision": self.revision,
+            "session_id": self.session_id,
+            "pr_id": self.pr_id,
+            "snapshot_id": self.snapshot_id,
+            "status": self.status.value,
+            "current_phase": self.current_phase.value,
+            "phases": {
+                phase.value: self.phases[phase.value].to_dict()
+                for phase in SESSION_V6_PHASES
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "SessionV6Manifest":
+        if type(payload) is not dict or set(payload) != {
+            "schema_version",
+            "revision",
+            "session_id",
+            "pr_id",
+            "snapshot_id",
+            "status",
+            "current_phase",
+            "phases",
+        }:
+            raise ValueError("Session v6 manifest schema is invalid")
+        phases = payload["phases"]
+        if type(phases) is not dict:
+            raise ValueError("Session v6 phases must be an object")
+        return cls(
+            schema_version=payload["schema_version"],
+            revision=payload["revision"],
+            session_id=payload["session_id"],
+            pr_id=payload["pr_id"],
+            snapshot_id=payload["snapshot_id"],
+            status=RunStatus(payload["status"]),
+            current_phase=RunPhase(payload["current_phase"]),
+            phases={
+                name: SessionV6PhaseCheckpoint.from_dict(value)
+                for name, value in phases.items()
+            },
+        )
+
+
+def new_session_v6_manifest(
+    *,
+    session_id: str,
+    pr_id: str,
+    snapshot_id: str,
+) -> SessionV6Manifest:
+    return SessionV6Manifest(
+        session_id=session_id,
+        pr_id=pr_id,
+        snapshot_id=snapshot_id,
+        status=RunStatus.CREATED,
+        current_phase=RunPhase.PREFLIGHT,
+        phases={
+            phase.value: SessionV6PhaseCheckpoint()
+            for phase in SESSION_V6_PHASES
+        },
+    )
+
+
+def session_v6_manifest_to_dict(manifest: SessionV6Manifest) -> dict[str, Any]:
+    if type(manifest) is not SessionV6Manifest:
+        raise ValueError("manifest must be SessionV6Manifest")
+    return manifest.to_dict()
+
+
+def session_v6_manifest_from_dict(
+    payload: Mapping[str, Any],
+) -> SessionV6Manifest:
+    return SessionV6Manifest.from_dict(payload)
+
+
+def _v6_text_or_none(value: object) -> bool:
+    return type(value) is str and bool(value.strip()) and "\x00" not in value

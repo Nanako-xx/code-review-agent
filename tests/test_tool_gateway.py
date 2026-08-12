@@ -11,8 +11,26 @@ from review_agent.memory_retrieval import (
     SnapshotMemoryQueryService,
 )
 from review_agent.observations import ObservationStore
-from review_agent.tool_gateway import ToolGateway, ToolGatewayError
+from review_agent.tool_gateway import (
+    ToolGateway,
+    ToolGatewayError,
+    tool_gateway_limits_projection,
+)
+from review_agent.review_tool_gateway import (
+    ReviewToolFailure,
+    ReviewToolGateway,
+    ToolBackendResult,
+)
 from tests.test_context import _combined_memory_snapshot, _memory_snapshot
+
+
+def test_tool_gateway_default_limits_have_one_product_projection():
+    assert tool_gateway_limits_projection() == {
+        "max_context_chars": 4_000,
+        "timeout_seconds": 10,
+        "max_commit_messages": 50,
+        "max_commit_body_chars": 4_000,
+    }
 
 
 def test_tool_gateway_read_range_records_observation(git_repo: Path, tmp_path: Path):
@@ -537,3 +555,112 @@ def test_memory_gateway_rejects_snapshot_that_does_not_match_resolved_head(
             observation_store=ObservationStore(tmp_path / "memory-wrong-head"),
             memory_query_service=service,
         )
+
+
+class _SequencedBackend:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.timeouts = []
+
+    def execute(self, tool_name, arguments, timeout_seconds):
+        self.timeouts.append(timeout_seconds)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def test_v2_gateway_uses_call_level_reacquirable_metadata_without_observations() -> None:
+    backend = _SequencedBackend(
+        (
+            ToolBackendResult(content="first", reacquirable=True),
+            ToolBackendResult(content="second", reacquirable=False),
+        )
+    )
+    gateway = ReviewToolGateway(
+        snapshot_id="S-" + "a" * 64,
+        session_id="session-1",
+        allowed_tools=("read_range",),
+        backend=backend,
+    )
+
+    first = gateway.execute("call-1", "read_range", {"path": "src/api.py"})
+    second = gateway.execute("call-2", "read_range", {"path": "src/api.py"})
+
+    assert first.reacquirable is True
+    assert second.reacquirable is False
+    assert not hasattr(first, "observation_ids")
+    assert not hasattr(second, "observation_ids")
+    assert backend.timeouts == [300.0, 300.0]
+
+
+@pytest.mark.parametrize(
+    ("failure", "code", "retryable"),
+    [
+        (TimeoutError("slow"), "tool_timeout", True),
+        (OSError("temporary lock"), "transient_io", True),
+        (ValueError("bad args"), "invalid_arguments", False),
+        (
+            ReviewToolFailure(
+                code="unauthorized_path",
+                retryable=False,
+                message="Path is outside the Snapshot",
+            ),
+            "unauthorized_path",
+            False,
+        ),
+    ],
+)
+def test_v2_gateway_has_one_explicit_error_retry_classification(
+    failure: Exception,
+    code: str,
+    retryable: bool,
+) -> None:
+    gateway = ReviewToolGateway(
+        snapshot_id="S-" + "b" * 64,
+        session_id="session-2",
+        allowed_tools=("read_range",),
+        backend=_SequencedBackend((failure,)),
+    )
+
+    result = gateway.execute("call-error", "read_range", {"path": "src/api.py"})
+
+    assert result.is_error is True
+    assert result.error is not None
+    assert result.error.code == code
+    assert result.error.retryable is retryable
+    assert result.content == ""
+
+
+@pytest.mark.parametrize(
+    ("path", "code"),
+    [
+        pytest.param(
+            "C:/trusted/local/secret.txt",
+            "unauthorized_path",
+            id="absolute",
+        ),
+        pytest.param("../outside.py", "unauthorized_path", id="traversal"),
+        pytest.param("x" * 40_000, "path_too_long", id="too-long"),
+    ],
+)
+def test_v2_gateway_rejects_unsafe_paths_without_calling_backend(
+    path: str,
+    code: str,
+) -> None:
+    backend = _SequencedBackend(
+        (ToolBackendResult(content="must not run", reacquirable=True),)
+    )
+    gateway = ReviewToolGateway(
+        snapshot_id="S-" + "c" * 64,
+        session_id="session-path",
+        allowed_tools=("read_range",),
+        backend=backend,
+    )
+
+    result = gateway.execute("call-path", "read_range", {"path": path})
+
+    assert result.error is not None
+    assert result.error.code == code
+    assert result.error.retryable is False
+    assert backend.outcomes

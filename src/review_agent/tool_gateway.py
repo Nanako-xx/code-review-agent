@@ -57,6 +57,19 @@ SUPPORTED_TOOL_NAMES = (
     "read_commit_messages",
     "query_project_memory",
 )
+DEFAULT_TOOL_CONTEXT_CHARS = 4_000
+DEFAULT_TOOL_TIMEOUT_SECONDS = 10
+DEFAULT_MAX_COMMIT_MESSAGES = 50
+DEFAULT_MAX_COMMIT_BODY_CHARS = 4_000
+
+
+def tool_gateway_limits_projection() -> dict[str, int]:
+    return {
+        "max_context_chars": DEFAULT_TOOL_CONTEXT_CHARS,
+        "timeout_seconds": DEFAULT_TOOL_TIMEOUT_SECONDS,
+        "max_commit_messages": DEFAULT_MAX_COMMIT_MESSAGES,
+        "max_commit_body_chars": DEFAULT_MAX_COMMIT_BODY_CHARS,
+    }
 
 
 class ToolGateway:
@@ -66,10 +79,10 @@ class ToolGateway:
         base_revision: str,
         head_revision: str,
         observation_store: ObservationStore,
-        max_context_chars: int = 4000,
-        timeout_seconds: int = 10,
-        max_commit_messages: int = 50,
-        max_commit_body_chars: int = 4000,
+        max_context_chars: int = DEFAULT_TOOL_CONTEXT_CHARS,
+        timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS,
+        max_commit_messages: int = DEFAULT_MAX_COMMIT_MESSAGES,
+        max_commit_body_chars: int = DEFAULT_MAX_COMMIT_BODY_CHARS,
         allowed_tools: Iterable[str] | None = None,
         memory_query_service: SnapshotMemoryQueryService | None = None,
         snapshot_query_service: SnapshotMemoryQueryService | None = None,

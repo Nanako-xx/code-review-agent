@@ -61,6 +61,25 @@ ARTIFACT_SCHEMAS = {
     "review_brief": "review_brief_v1",
     "report": "review_report_markdown_v1",
     "observations": "observation_log_jsonl_v1",
+    # Session v6 / PRWorkspace artifacts use distinct logical names so the
+    # v1-v5 readers above retain their original schema bindings.
+    "pr_workspace_manifest": "pr_workspace_manifest_v1",
+    "snapshot_manifest": "snapshot_manifest_v1",
+    "diff_artifact_index": "diff_artifact_index_v1",
+    "preflight_result": "preflight_result_v1",
+    "quality_gate_v2": "quality_gate_result_v2",
+    "changed_symbols_v2": "changed_symbols_v2",
+    "intent_packet": "intent_packet_v2_minimal",
+    "intent_version": "intent_version_envelope_v1",
+    "intent_analysis_record": "intent_analysis_record_v1",
+    "risk_decision": "risk_decision_v2",
+    "review_plan": "review_plan_v2",
+    "reviewer_assignment": "reviewer_assignment_v2",
+    "reviewer_output": "reviewer_output_v2",
+    "aggregation_record": "aggregation_record_v1",
+    "review_result": "review_result_v1",
+    "context_manifest": "context_manifest_v1",
+    "execution_journal_event": "execution_journal_event_v1",
 }
 
 # This contract intentionally contains only stable wire strings so SessionStore
@@ -85,6 +104,43 @@ MEMORY_ARTIFACT_SCHEMAS = MappingProxyType(
         for name in MEMORY_ARTIFACT_PHASES
     }
 )
+
+SESSION_V6_ARTIFACT_PHASES = MappingProxyType(
+    {
+        "preflight.request": "preflight",
+        "preflight.diff_patch": "preflight",
+        "preflight.diff_index": "preflight",
+        "preflight.quality_gate": "preflight",
+        "preflight.changed_symbols": "preflight",
+        "intent.packet": "intent",
+        "planning.risk": "planning",
+        "planning.review_plan": "planning",
+        "aggregation.record": "aggregation",
+        "aggregation.review_result": "aggregation",
+        "aggregation.review_markdown": "aggregation",
+    }
+)
+
+_SESSION_V6_DYNAMIC_ARTIFACTS = (
+    (re.compile(r"\Aplanning\.assignment:ASG-[0-9a-f]{64}\Z"), "planning"),
+    (re.compile(r"\Areviewer\.result:ASG-[0-9a-f]{64}\Z"), "reviewers"),
+)
+
+
+def session_v6_artifact_phase(logical_name: str) -> str:
+    """Return the sole v6 phase allowed to own a logical artifact."""
+
+    if type(logical_name) is not str:
+        raise ValueError("Session v6 artifact name must be text")
+    owner = SESSION_V6_ARTIFACT_PHASES.get(logical_name)
+    if owner is not None:
+        return owner
+    for pattern, dynamic_owner in _SESSION_V6_DYNAMIC_ARTIFACTS:
+        if pattern.fullmatch(logical_name) is not None:
+            return dynamic_owner
+    raise ValueError(
+        f"No Session v6 artifact owner is defined for: {logical_name}"
+    )
 
 PER_REVIEWER_SCHEMAS = {
     "_envelope": "model_request_envelope_v1",

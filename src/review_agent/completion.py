@@ -17,6 +17,9 @@ from review_agent.orchestrator import ReviewerExecution
 from review_agent.quality import QualityGatePlan
 
 
+COMPLETION_POLICY_VERSION = "completion-policy-v1"
+
+
 @dataclass(frozen=True)
 class CompletionResult:
     status: str

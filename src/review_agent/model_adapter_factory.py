@@ -165,12 +165,36 @@ def _fake_response_for_request(request: ModelTurnRequest) -> ModelTurnResponse:
         return _fake_intent_inference_response()
     if response_schema == "risk_proposal_v1":
         return _fake_risk_proposal_response()
+    if response_schema == "risk_decision_v2":
+        return ModelTurnResponse(
+            kind=ModelResponseKind.FINAL,
+            final_text='{"level":"low"}',
+            provider_name="fake",
+            model="fake-risk-assessor-v2",
+            raw={"fake": True, "response_schema": "risk_decision_v2"},
+        )
     if response_schema == "portfolio_proposal_v1":
         return _fake_portfolio_proposal_response()
     if response_schema == "semantic_reconciliation_proposal_v1":
         return _fake_semantic_reconciliation_response(request)
     if response_schema == "memory_curator_proposal_v1":
         return _fake_memory_curator_response(request)
+    if response_schema == "reviewer_output_v2":
+        return ModelTurnResponse(
+            kind=ModelResponseKind.FINAL,
+            final_text=json.dumps(
+                {
+                    "findings": [],
+                    "uncertainties": [
+                        "Fake provider does not perform semantic review."
+                    ],
+                },
+                separators=(",", ":"),
+            ),
+            provider_name="fake",
+            model="fake-reviewer-v2",
+            raw={"fake": True, "response_schema": "reviewer_output_v2"},
+        )
     if not request.tools or request.parameters.get("tool_choice") == "none":
         return _fake_single_shot_response()
 

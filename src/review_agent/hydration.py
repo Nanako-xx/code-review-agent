@@ -77,10 +77,40 @@ from review_agent.reconciler import (
     semantic_reconciliation_from_dict as _semantic_reconciliation_from_dict,
 )
 from review_agent.reviewer_runtime import reviewer_runtime_to_dict
+from review_agent.reviewer_executor import (
+    ReviewerExecutionResultV2,
+    reviewer_execution_result_v2_from_dict as _reviewer_execution_result_v2_from_dict,
+)
 from review_agent.repository_intelligence import (
     ChangedSymbol,
     RepositoryIntelligenceSnapshot,
 )
+from review_agent.review_protocol import ReviewerOutput as ReviewerOutputV2
+from review_agent.reviewer_output import RejectedReviewerFinding
+
+
+def reviewer_output_v2_from_dict(
+    payload: Mapping[str, Any],
+) -> ReviewerOutputV2:
+    """Hydrate a persisted, already validated ReviewerOutput v2."""
+
+    return ReviewerOutputV2.from_dict(payload)
+
+
+def rejected_reviewer_finding_v2_from_dict(
+    payload: Mapping[str, Any],
+) -> RejectedReviewerFinding:
+    """Hydrate one stable candidate-level rejection record."""
+
+    return RejectedReviewerFinding.from_dict(payload)
+
+
+def reviewer_execution_result_v2_from_dict(
+    payload: Mapping[str, Any],
+) -> ReviewerExecutionResultV2:
+    """Hydrate one persisted terminal v6 Reviewer execution result."""
+
+    return _reviewer_execution_result_v2_from_dict(payload)
 
 
 def semantic_reconciliation_from_dict(

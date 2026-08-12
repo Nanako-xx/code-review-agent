@@ -9,6 +9,10 @@ from review_agent.tool_result_protocol import (
     parse_tool_result_envelope,
     serialize_tool_result_envelope,
     tool_result_envelope_to_dict,
+    ReviewToolResult,
+    ToolErrorEnvelope,
+    ToolResultProjectionV2,
+    serialize_tool_result_projection_v2,
 )
 
 
@@ -473,3 +477,45 @@ def test_parser_rejects_escaped_unpaired_surrogate_without_echoing_content():
     diagnostic = str(error.value)
     assert diagnostic == INVALID_ENVELOPE_DIAGNOSTIC
     assert secret_prefix not in diagnostic
+
+
+def test_v2_tool_error_envelope_has_only_common_retry_fields() -> None:
+    error = ToolErrorEnvelope(
+        code="path_too_long",
+        retryable=False,
+        message="The requested path exceeds the supported path length",
+    )
+    projection = ToolResultProjectionV2.from_error(
+        tool_call_id="call-error",
+        tool_name="read_range",
+        error=error,
+    )
+
+    assert error.to_dict() == {
+        "is_error": True,
+        "code": "path_too_long",
+        "retryable": False,
+        "message": "The requested path exceeds the supported path length",
+    }
+    assert json.loads(serialize_tool_result_projection_v2(projection)) == error.to_dict()
+
+
+def test_v2_success_projection_has_no_observation_or_control_fields() -> None:
+    raw = ReviewToolResult.success(
+        tool_call_id="call-success",
+        session_id="session-1",
+        snapshot_id="S-" + "a" * 64,
+        tool_name="search_code",
+        arguments={"query": "token"},
+        content="src/api.py:10: token",
+        reacquirable=True,
+    )
+    projection = ToolResultProjectionV2.inline(raw)
+    payload = json.loads(serialize_tool_result_projection_v2(projection))
+
+    assert payload["is_error"] is False
+    assert payload["status"] == "inline"
+    assert payload["content"] == "src/api.py:10: token"
+    assert "observation_ids" not in payload
+    assert "evidence_refs" not in payload
+    assert "instruction" not in payload

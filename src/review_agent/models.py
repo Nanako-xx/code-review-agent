@@ -8,6 +8,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
+BENCHMARK_AUTO_ACCEPT_BASIS = "benchmark_auto_accept"
+
+
 class IntentSource(str, Enum):
     EXPLICIT = "explicit"
     INFERRED = "inferred"
@@ -35,6 +38,7 @@ class IntentOrigin(str, Enum):
     COMMIT_MESSAGE = "commit_message"
     LLM_INFERENCE = "llm_inference"
     USER_CONFIRMATION = "user_confirmation"
+    BENCHMARK_AUTO_ACCEPT = "benchmark_auto_accept"
     USER_CORRECTION = "user_correction"
     CHANGED_FILES = "changed_files"
     PROJECT_MEMORY = "project_memory"
@@ -319,6 +323,15 @@ class IntentDecision:
             IntentDecisionAction.SKIPPED_NON_INTERACTIVE,
         } and self.continuation_basis is None:
             raise ValueError("skipped decision must contain continuation_basis")
+        if (
+            self.action is IntentDecisionAction.CONFIRMED
+            and self.continuation_basis
+            not in {None, BENCHMARK_AUTO_ACCEPT_BASIS}
+        ):
+            raise ValueError(
+                "confirmed decision continuation_basis must be "
+                "benchmark_auto_accept"
+            )
 
         expected_id = _stable_intent_id(
             "decision",

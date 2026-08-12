@@ -10,6 +10,7 @@ import pytest
 from conftest import run_git
 
 from review_agent.checkpoint import CheckpointStore
+from review_agent.git_repo import ChangeSummary
 from review_agent.memory_models import MemoryExecutionConfig, MemoryMode
 from review_agent.model_adapter import FakeToolCallingAdapter
 from review_agent.model_adapter_factory import FakeModelAdapterFactory
@@ -22,7 +23,7 @@ from review_agent.models import QualityGateResult, ReviewRequest
 from review_agent.observations import ObservationStore
 from review_agent.pipeline import PHASE_MESSAGES, PipelineStageError, ReviewPipeline
 from review_agent.quality import QualityGateExecution
-from review_agent.resume import ResumeAction, ReviewSessionResumer
+from review_agent.legacy_resume import ResumeAction, ReviewSessionResumer
 from review_agent.revision import RevisionResolver
 from review_agent.run_state import RunPhase, RunStatus
 from review_agent.session import (
@@ -111,6 +112,23 @@ def _pipeline(
         session_store,
         checkpoint_store,
     )
+
+
+def test_reviewer_diff_excerpt_omits_blank_git_diff_lines(git_repo: Path) -> None:
+    pipeline, _session_store, _checkpoint_store = _pipeline(git_repo)
+    summary = ChangeSummary(
+        repository_path=str(git_repo),
+        base_revision="a" * 40,
+        head_revision="b" * 40,
+        changed_files=["app.py"],
+        diff_stat="1 file changed",
+        diff_excerpt=["diff --git a/app.py b/app.py", "", "   ", "+return value"],
+    )
+
+    assert pipeline._review_diff_excerpt(summary) == [
+        "diff --git a/app.py b/app.py",
+        "+return value",
+    ]
 
 
 def test_ci_evidence_reaches_each_reviewer_without_cross_reviewer_leakage(
