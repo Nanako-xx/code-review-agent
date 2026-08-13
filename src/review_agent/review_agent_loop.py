@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 import time
 from typing import Any, Callable
 
@@ -32,9 +33,11 @@ from review_agent.review_context import ReviewerInvocationV2
 from review_agent.review_protocol import ReviewerAssignment
 from review_agent.review_protocol import ReviewerOutput
 from review_agent.reviewer_output import (
+    REVIEWER_OUTPUT_JSON_SCHEMA_V2,
     RejectedReviewerFinding,
     ReviewerOutputEnvelopeError,
     ReviewerOutputParser,
+    ReviewerOutputParseResult,
 )
 from review_agent.review_tool_gateway import ReviewToolGateway
 from review_agent.reviewer_runtime import (
@@ -60,8 +63,37 @@ class ReviewAgentRunV2:
     rejected_findings: tuple[RejectedReviewerFinding, ...] = ()
 
 
+@dataclass(frozen=True)
+class _JsonFinalizationOutcomeV2:
+    parsed: ReviewerOutputParseResult | None
+    messages: tuple[dict[str, Any], ...]
+    status: str | None = None
+    error_code: str | None = None
+
+
 class ReviewAgentLoopError(ValueError):
     pass
+
+
+def _json_finalization_message(error_code: str) -> dict[str, str]:
+    schema = json.dumps(
+        REVIEWER_OUTPUT_JSON_SCHEMA_V2,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "role": "user",
+        "content": (
+            "Runtime rejected the prior final response as "
+            f"{error_code}. The investigation is complete. Do not call tools, "
+            "add new analysis, or repeat prose. Convert the completed analysis "
+            "into exactly one JSON object matching this schema. Preserve only "
+            "confirmed findings and explicit uncertainties. Do not add fields.\n\n"
+            + schema
+        ),
+    }
 
 
 class ReviewAgentLoopV2:
@@ -390,14 +422,27 @@ class ReviewAgentLoopV2:
                     )
                 try:
                     parsed = self.output_parser.parse(response.final_text)
-                except ReviewerOutputEnvelopeError:
-                    return self._result(
-                        "invalid_output",
-                        None,
-                        "invalid_reviewer_output",
-                        messages,
-                        runtime,
+                except ReviewerOutputEnvelopeError as error:
+                    finalization = self._finalize_reviewer_json(
+                        original_response=response,
+                        parse_error=error,
+                        messages=messages,
+                        runtime=runtime,
+                        turn_index=request_turn_index,
+                        next_attempt=provider_attempt + 1,
                     )
+                    messages = [
+                        dict(message) for message in finalization.messages
+                    ]
+                    if finalization.parsed is None:
+                        return self._result(
+                            finalization.status or "invalid_output",
+                            None,
+                            finalization.error_code or "invalid_reviewer_output",
+                            messages,
+                            runtime,
+                        )
+                    parsed = finalization.parsed
                 canonical_output = parsed.output.to_json()
                 self.journal.record_final_result(
                     final_text=canonical_output,
@@ -490,6 +535,183 @@ class ReviewAgentLoopV2:
                     messages,
                     runtime,
                 )
+
+    def _finalize_reviewer_json(
+        self,
+        *,
+        original_response: ModelTurnResponse,
+        parse_error: ReviewerOutputEnvelopeError,
+        messages: list[dict[str, Any]],
+        runtime: ReviewerRuntimeStateV2,
+        turn_index: int,
+        next_attempt: int,
+    ) -> _JsonFinalizationOutcomeV2:
+        finalization_messages = [
+            *(dict(message) for message in messages),
+            model_response_to_assistant_message(original_response),
+            _json_finalization_message(parse_error.code),
+        ]
+        if next_attempt > self.limits.max_provider_attempts:
+            return _JsonFinalizationOutcomeV2(
+                parsed=None,
+                messages=tuple(finalization_messages),
+                status="invalid_output",
+                error_code="invalid_reviewer_output",
+            )
+
+        last_transport_error = False
+        for attempt in range(next_attempt, self.limits.max_provider_attempts + 1):
+            if runtime.remaining_seconds(self.limits) <= 0:
+                return _JsonFinalizationOutcomeV2(
+                    parsed=None,
+                    messages=tuple(finalization_messages),
+                    status="timeout",
+                    error_code="active_time_exhausted",
+                )
+            try:
+                parameters = request_parameters_v2(
+                    self.invocation.parameters,
+                    runtime,
+                    self.limits,
+                )
+            except TimeoutError:
+                return _JsonFinalizationOutcomeV2(
+                    parsed=None,
+                    messages=tuple(finalization_messages),
+                    status="timeout",
+                    error_code="active_time_exhausted",
+                )
+            parameters.update(
+                {
+                    "tool_choice": "none",
+                    "response_format": "json_object",
+                }
+            )
+            request = ModelTurnRequest(
+                system=self.invocation.system,
+                tools=[],
+                messages=[dict(message) for message in finalization_messages],
+                tool_results=[],
+                parameters=parameters,
+            )
+            estimate = self.context_window.estimate_request(request)
+            if (
+                estimate.input_tokens > estimate.hard_input_limit_tokens
+                or estimate.total_tokens
+                > self.context_window.policy.context_window_tokens
+            ):
+                return _JsonFinalizationOutcomeV2(
+                    parsed=None,
+                    messages=tuple(finalization_messages),
+                    status="failed",
+                    error_code="json_finalization_context_overflow",
+                )
+            try:
+                self.context_window.mark_api_request()
+            except ContextWindowIntegrityError:
+                return _JsonFinalizationOutcomeV2(
+                    parsed=None,
+                    messages=tuple(finalization_messages),
+                    status="failed",
+                    error_code="context_window_integrity_error",
+                )
+
+            started = self.clock()
+            try:
+                candidate = self.adapter.complete_turn(request)
+            except Exception:
+                runtime.consume_active(max(0.0, self.clock() - started))
+                usage = runtime.record_provider_attempt(None)
+                self.journal.record_provider_attempt(
+                    turn_index=turn_index,
+                    attempt=attempt,
+                    status="failed",
+                    response_kind=None,
+                    error_code="json_finalization_transport_error",
+                    usage={
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "total_tokens": usage.total_tokens,
+                        "available": usage.available,
+                    },
+                    active_elapsed_seconds=runtime.active_elapsed_seconds,
+                )
+                last_transport_error = True
+                continue
+
+            runtime.consume_active(max(0.0, self.clock() - started))
+            usage = runtime.record_provider_attempt(
+                candidate.raw if isinstance(candidate, ModelTurnResponse) else None
+            )
+            self.journal.record_provider_attempt(
+                turn_index=turn_index,
+                attempt=attempt,
+                status="succeeded",
+                response_kind=(
+                    candidate.kind.value
+                    if isinstance(candidate, ModelTurnResponse)
+                    else None
+                ),
+                error_code=(
+                    None
+                    if isinstance(candidate, ModelTurnResponse)
+                    else "invalid_provider_response"
+                ),
+                usage={
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "available": usage.available,
+                },
+                active_elapsed_seconds=runtime.active_elapsed_seconds,
+            )
+            if not isinstance(candidate, ModelTurnResponse):
+                return _JsonFinalizationOutcomeV2(
+                    parsed=None,
+                    messages=tuple(finalization_messages),
+                    status="invalid_output",
+                    error_code="invalid_provider_response",
+                )
+            runtime.model_turns += 1
+            last_transport_error = False
+            finalization_messages.append(
+                model_response_to_assistant_message(candidate)
+            )
+            if (
+                candidate.kind is not ModelResponseKind.FINAL
+                or not isinstance(candidate.final_text, str)
+                or not candidate.final_text.strip()
+            ):
+                return _JsonFinalizationOutcomeV2(
+                    parsed=None,
+                    messages=tuple(finalization_messages),
+                    status="invalid_output",
+                    error_code="invalid_reviewer_output",
+                )
+            try:
+                parsed = self.output_parser.parse(candidate.final_text)
+            except ReviewerOutputEnvelopeError:
+                return _JsonFinalizationOutcomeV2(
+                    parsed=None,
+                    messages=tuple(finalization_messages),
+                    status="invalid_output",
+                    error_code="invalid_reviewer_output",
+                )
+            return _JsonFinalizationOutcomeV2(
+                parsed=parsed,
+                messages=tuple(finalization_messages),
+            )
+
+        return _JsonFinalizationOutcomeV2(
+            parsed=None,
+            messages=tuple(finalization_messages),
+            status="failed",
+            error_code=(
+                "json_finalization_transport_failed"
+                if last_transport_error
+                else "invalid_reviewer_output"
+            ),
+        )
 
     def _summarize_compaction(
         self,

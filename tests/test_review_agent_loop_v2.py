@@ -436,7 +436,9 @@ def test_invalid_model_output_is_not_a_transport_retry(tmp_path: Path) -> None:
     assert backend.calls == []
 
 
-def test_model_cannot_forge_runtime_status_in_final_output(tmp_path: Path) -> None:
+def test_invalid_final_output_gets_one_strict_json_finalization(
+    tmp_path: Path,
+) -> None:
     adapter = _Adapter(
         (
             ModelTurnResponse(
@@ -444,7 +446,67 @@ def test_model_cannot_forge_runtime_status_in_final_output(tmp_path: Path) -> No
                 final_text=(
                     '{"findings":[],"uncertainties":[],"status":"completed"}'
                 ),
+                raw={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"findings":[],"uncertainties":[],'
+                                    '"status":"completed"}'
+                                )
+                            }
+                        }
+                    ]
+                },
             ),
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text='{"findings":[],"uncertainties":[]}',
+                raw={
+                    "usage": {
+                        "input_tokens": 20,
+                        "output_tokens": 5,
+                        "total_tokens": 25,
+                    }
+                },
+            ),
+        )
+    )
+    loop, journal, _backend, _assignment = _runtime(tmp_path, adapter)
+
+    run = loop.run()
+
+    assert run.status == "completed"
+    assert run.error_code is None
+    assert run.final_text == '{"findings":[],"uncertainties":[]}'
+    assert journal.replay().final_text == run.final_text
+    assert len(adapter.requests) == 2
+    finalization = adapter.requests[1]
+    assert finalization.tools == []
+    assert finalization.parameters["tool_choice"] == "none"
+    assert finalization.parameters["response_format"] == "json_object"
+    assert finalization.messages[-2]["role"] == "assistant"
+    assert '"status":"completed"' in finalization.messages[-2]["content"]
+    assert finalization.messages[-1]["role"] == "user"
+    assert "top_level_fields_invalid" in finalization.messages[-1]["content"]
+    assert run.runtime.provider_attempts == 2
+    assert run.runtime.model_turns == 2
+
+
+def test_json_finalization_remains_fail_closed_when_correction_is_invalid(
+    tmp_path: Path,
+) -> None:
+    adapter = _Adapter(
+        (
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="review prose",
+            ),
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text='{"findings":[]}',
+            ),
+            _final(),
         )
     )
     loop, journal, _backend, _assignment = _runtime(tmp_path, adapter)
@@ -454,6 +516,35 @@ def test_model_cannot_forge_runtime_status_in_final_output(tmp_path: Path) -> No
     assert run.status == "invalid_output"
     assert run.error_code == "invalid_reviewer_output"
     assert journal.replay().final_text is None
+    assert len(adapter.requests) == 2
+    assert run.runtime.provider_attempts == 2
+    assert run.runtime.model_turns == 2
+
+
+def test_json_finalization_transport_retries_share_provider_attempt_budget(
+    tmp_path: Path,
+) -> None:
+    adapter = _Adapter(
+        (
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="review prose",
+            ),
+            ConnectionError("first finalization transport failure"),
+            TimeoutError("second finalization transport failure"),
+            _final(),
+        )
+    )
+    loop, journal, _backend, _assignment = _runtime(tmp_path, adapter)
+
+    run = loop.run()
+
+    assert run.status == "failed"
+    assert run.error_code == "json_finalization_transport_failed"
+    assert journal.replay().final_text is None
+    assert len(adapter.requests) == 3
+    assert run.runtime.provider_attempts == 3
+    assert run.runtime.model_turns == 1
 
 
 def test_loop_keeps_good_finding_and_persists_bad_candidate_rejection(
