@@ -98,6 +98,7 @@ Security and authority:
 - Use `repository_document`, `repository_test`, or `commit_message` only when the claim cites source_refs and evidence_refs for matching observations returned by the read-only tools. Runtime independently validates every claim.
 - Do not claim user_input, request_metadata, project_rule, user_confirmation, or user_correction for facts you inferred yourself.
 - Only return candidates for fields listed in the request `missing_fields`; omit every other field even when evidence is available.
+- When `missing_fields` contains only `goal`, return exactly one goal candidate. Combine compatible primary and supporting sub-goals into one concise compound goal; never return one candidate per changed subsystem.
 
 Return one JSON object and no markdown. It must contain exactly `candidates`, `uncertainties`, and `summary`.
 Each candidate must contain exactly: `field`, `value`, `origin`, `confidence`, `source_refs`, `evidence_refs`, `rationale`, and `conclusion_impact`.
@@ -723,6 +724,33 @@ def run_intent_inference(
                     else None
                 ),
             )
+            if goal_only and not validation_deficiencies:
+                goal_candidates = [
+                    candidate
+                    for candidate in validated.candidates
+                    if candidate.field == "goal"
+                ]
+                if len(goal_candidates) != 1:
+                    error_message = (
+                        "goal-only intent must contain exactly one goal candidate; "
+                        f"received {len(goal_candidates)}"
+                    )
+                    turns.append(
+                        IntentInferenceTurn(
+                            turn_index=turn_index,
+                            response_kind=response.kind.value,
+                            error=error_message,
+                        )
+                    )
+                    recoverable_diagnostics.append(error_message)
+                    messages.extend(
+                        [
+                            model_response_to_assistant_message(response),
+                            _goal_only_rejection_message(error_message),
+                        ]
+                    )
+                    turn_index += 1
+                    continue
             all_deficiencies = _dedupe([*deficiencies, *validation_deficiencies])
             if all_deficiencies:
                 validated = IntentInferenceResult(
@@ -1324,6 +1352,18 @@ def _runtime_rejection_message(reason: str) -> dict[str, str]:
         "content": (
             f"Runtime rejected the prior final response: {reason}. Return corrected JSON "
             "that exactly matches intent_inference_result_v1."
+        ),
+    }
+
+
+def _goal_only_rejection_message(reason: str) -> dict[str, str]:
+    return {
+        "role": "user",
+        "content": (
+            f"Runtime rejected the prior goal-only response: {reason}. Return corrected "
+            "JSON with exactly one goal candidate. Merge compatible primary and supporting "
+            "sub-goals into one concise compound goal; do not return separate goals per "
+            "changed subsystem. Preserve uncertainties separately."
         ),
     }
 

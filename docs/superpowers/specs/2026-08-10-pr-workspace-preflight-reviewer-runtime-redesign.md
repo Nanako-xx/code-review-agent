@@ -321,6 +321,10 @@ Intent Agent 使用 1,800 秒累计活跃时间边界，每次 Provider 请求�
 它们被忽略。一次格式错误若在后续 Turn 得到合法修正，只保留在原 Turn 审计中，不把最终运行降级为 partial。
 涉及 goal 本身、Tool/Provider/时间边界或冲突 goal 的失败仍属于阻断性 deficiency。
 
+`goal_only` 响应必须恰好包含一个 goal。一个 PR 同时具有主目标和配套子目标时，Intent Agent 必须把兼容的
+目标合并成一条复合 goal；不得按文件或子系统返回多条。若第一次 final 返回零条或多条 goal，Runtime 不自行
+拼接文本，而是在同一会话中拒绝该 final 并要求模型重写；失败的 final 保留在 Turn 审计中。
+
 信任策略写入不可变 Product Review Request，Resume 只能沿用首次请求的策略。评测提升属于当前
 Snapshot 的运行策略，不等于人工确认，不能作为跨 Snapshot 的普通 explicit Intent 直接延续。
 

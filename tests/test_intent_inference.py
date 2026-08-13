@@ -585,6 +585,84 @@ def test_intent_inference_ignores_non_requested_candidates_without_tainting_goal
     assert uncertainties == ()
 
 
+def test_goal_only_intent_retries_multiple_subgoals_until_one_compound_goal(
+    git_repo,
+    tmp_path,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    gateway = ToolGateway(
+        git_repo,
+        head,
+        head,
+        ObservationStore(tmp_path / "intent-compound-goal"),
+    )
+    first = json.loads(
+        _result_json(
+            origin="llm_inference",
+            source_refs=[],
+            evidence_refs=[],
+        )
+    )
+    first["candidates"][0]["field"] = "goal"
+    first["candidates"].append(
+        {
+            **first["candidates"][0],
+            "value": "Simplify the SQL mock infrastructure.",
+        }
+    )
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(first),
+            ),
+            lambda request: ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(
+                    {
+                        **first,
+                        "candidates": [
+                            {
+                                **first["candidates"][0],
+                                "value": (
+                                    "Harden MongoDB connection logging and simplify the "
+                                    "supporting SQL mock infrastructure."
+                                ),
+                            }
+                        ],
+                    }
+                ),
+                raw={"retry_message": request.messages[-1]},
+            ),
+        ]
+    )
+
+    run = _run(
+        adapter,
+        gateway,
+        base=head,
+        head=head,
+        missing_fields=("goal",),
+        goal_only=True,
+    )
+
+    assert run.status == "completed"
+    assert run.trace.deficiencies == []
+    assert len(run.trace.turns) == 2
+    assert run.trace.turns[0].error == (
+        "goal-only intent must contain exactly one goal candidate; received 2"
+    )
+    retry_message = adapter.requests[1].messages[-1]
+    assert retry_message["role"] == "user"
+    assert "Merge compatible primary and supporting sub-goals" in retry_message["content"]
+    goal, uncertainties = project_inference_goal_v2(run)
+    assert goal == (
+        "Harden MongoDB connection logging and simplify the supporting SQL mock "
+        "infrastructure."
+    )
+    assert uncertainties == ()
+
+
 def test_intent_inference_does_not_cap_cumulative_tool_calls(git_repo, tmp_path):
     head = run_git(git_repo, "rev-parse", "HEAD")
     gateway = ToolGateway(
