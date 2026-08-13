@@ -89,8 +89,9 @@ def test_intent_inference_protocol_projection_owns_tools_and_runtime_limits():
     projection = intent_inference_protocol_projection()
 
     assert projection["runtime_limits"] == {
-        "max_turns": 4,
+        "max_turns": None,
         "max_tool_calls": None,
+        "max_elapsed_seconds": 1_800.0,
         "max_output_tokens": 4_096,
     }
     assert projection["invocation_defaults"] == {
@@ -443,7 +444,7 @@ def test_intent_inference_parse_error_returns_auditable_failed_run(git_repo, tmp
         ]
     )
 
-    run = _run(adapter, gateway, base=head, head=head, max_turns=1)
+    run = _run(adapter, gateway, base=head, head=head)
     payload = intent_inference_run_to_dict(run)
 
     assert run.status == "failed"
@@ -563,13 +564,54 @@ def test_intent_inference_does_not_cap_cumulative_tool_calls(git_repo, tmp_path)
     assert [len(turn.tool_results) for turn in run.trace.turns[:2]] == [7, 4]
 
 
-def test_intent_inference_turn_budget_exhaustion_returns_partial(git_repo, tmp_path):
+def test_intent_inference_does_not_cap_model_turns(git_repo, tmp_path):
     head = run_git(git_repo, "rev-parse", "HEAD")
     gateway = ToolGateway(
         git_repo,
         head,
         head,
-        ObservationStore(tmp_path / "intent-turn-budget"),
+        ObservationStore(tmp_path / "intent-unlimited-turns"),
+    )
+    adapter = FakeToolCallingAdapter(
+        script=[
+            *[
+                ModelTurnResponse(
+                    kind=ModelResponseKind.TOOL_CALLS,
+                    tool_calls=[
+                        ModelToolCall(
+                            f"read-{index}",
+                            "read_commit_messages",
+                            {"max_commits": index},
+                        )
+                    ],
+                )
+                for index in range(1, 6)
+            ],
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=_result_json(
+                    origin="llm_inference",
+                    source_refs=[],
+                    evidence_refs=[],
+                ),
+            ),
+        ],
+    )
+
+    run = _run(adapter, gateway, base=head, head=head)
+
+    assert run.status == "completed"
+    assert run.trace.tool_call_count == 5
+    assert len(run.trace.turns) == 6
+
+
+def test_intent_inference_stops_at_elapsed_time_limit(git_repo, tmp_path):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    gateway = ToolGateway(
+        git_repo,
+        head,
+        head,
+        ObservationStore(tmp_path / "intent-elapsed-limit"),
     )
     adapter = FakeToolCallingAdapter(
         script=[
@@ -579,12 +621,22 @@ def test_intent_inference_turn_budget_exhaustion_returns_partial(git_repo, tmp_p
             )
         ]
     )
+    times = iter([0.0, 0.0, 1_800.0])
 
-    run = _run(adapter, gateway, base=head, head=head, max_turns=1)
+    run = _run(
+        adapter,
+        gateway,
+        base=head,
+        head=head,
+        max_elapsed_seconds=1_800.0,
+        clock=lambda: next(times),
+    )
 
     assert run.status == "partial"
-    assert run.trace.tool_call_count == 1
-    assert "turn budget exhausted" in run.result.uncertainties
+    assert run.trace.tool_call_count == 0
+    assert run.trace.turns[0].tool_calls[0].call_id == "read"
+    assert "intent inference elapsed-time limit exhausted" in run.result.uncertainties
+    assert adapter.requests[0].parameters["timeout_seconds"] == 1_800.0
 
 
 def test_intent_inference_provider_invalid_returns_failed(git_repo, tmp_path):
@@ -711,9 +763,13 @@ def _run(
     base,
     head,
     initial_observation_summaries=None,
-    max_turns=4,
+    max_elapsed_seconds=1_800.0,
     memory_projection=None,
+    clock=None,
 ):
+    kwargs = {}
+    if clock is not None:
+        kwargs["clock"] = clock
     return run_intent_inference(
         adapter=adapter,
         gateway=gateway,
@@ -725,8 +781,9 @@ def _run(
         missing_fields=["acceptance_criteria", "scope"],
         initial_observation_summaries=initial_observation_summaries or {},
         trace_id="intent-test-trace",
-        max_turns=max_turns,
+        max_elapsed_seconds=max_elapsed_seconds,
         memory_projection=memory_projection,
+        **kwargs,
     )
 
 

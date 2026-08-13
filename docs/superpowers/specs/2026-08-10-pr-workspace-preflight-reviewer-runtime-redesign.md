@@ -312,8 +312,9 @@ Diff、代码、Commit 或其他证据推断；无法形成可靠目标时使用
 4. 模型失败、partial、无目标或冲突目标不得提升，必须保留 `inferred` 或形成
    `goal=null/source=null` 并进入 high risk floor。
 
-Intent Agent 的只读工具调用不设置累计次数预算；单轮并行调用数也不受产品层人为上限限制。工具自身超时、
-Provider 超时和无进展循环保护继续作为运行安全机制，不能用任意大的整数伪装“无限制”。
+Intent Agent 的模型轮数和只读工具调用都不设置累计次数预算；单轮并行调用数也不受产品层人为上限限制。
+Intent Agent 使用 1,800 秒累计活跃时间边界，每次 Provider 请求只获得剩余时间；工具自身超时、Provider
+超时和无进展循环保护继续作为运行安全机制，不能用任意大的整数伪装“无限制”。
 
 信任策略写入不可变 Product Review Request，Resume 只能沿用首次请求的策略。评测提升属于当前
 Snapshot 的运行策略，不等于人工确认，不能作为跨 Snapshot 的普通 explicit Intent 直接延续。

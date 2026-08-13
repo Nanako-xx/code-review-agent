@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
-from typing import Any, Mapping, Protocol, Sequence
+import math
+import time
+from typing import Any, Callable, Mapping, Protocol, Sequence
 import unicodedata
 
 from review_agent.memory_models import (
@@ -75,7 +77,7 @@ _DOCUMENT_SUFFIXES = frozenset(
 
 
 INTENT_INFERENCE_PROTOCOL_VERSION = "intent-inference-protocol-v1"
-INTENT_INFERENCE_MAX_TURNS = 4
+INTENT_INFERENCE_MAX_ELAPSED_SECONDS = 1_800.0
 INTENT_INFERENCE_MAX_OUTPUT_TOKENS = 4_096
 INTENT_INFERENCE_REASONING_EFFORT = "low"
 INTENT_INFERENCE_TEMPERATURE = 0
@@ -456,26 +458,34 @@ def run_intent_inference(
     resolved_base_revision: str | None = None,
     resolved_head_revision: str | None = None,
     model: str = "configured-intent-model",
-    max_turns: int = INTENT_INFERENCE_MAX_TURNS,
+    max_elapsed_seconds: float = INTENT_INFERENCE_MAX_ELAPSED_SECONDS,
     max_output_tokens: int = INTENT_INFERENCE_MAX_OUTPUT_TOKENS,
     reasoning_effort: str = INTENT_INFERENCE_REASONING_EFFORT,
     memory_projection: IntentMemoryProjection | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> IntentInferenceRun:
-    """Run a bounded, read-only intent analysis conversation.
+    """Run an elapsed-time-bounded, read-only intent analysis conversation.
 
-    Provider, parsing, validation, tool, and budget failures are represented in the
-    returned run. Invalid caller-owned configuration still raises ValueError.
+    Provider, parsing, validation, tool, and elapsed-time failures are represented
+    in the returned run. Invalid caller-owned configuration still raises ValueError.
     """
 
     _require_non_empty_string(trace_id, "trace_id")
     _require_non_empty_string(model, "model")
     _require_string(deterministic_request_summary, "deterministic_request_summary")
     _require_string(change_summary, "change_summary")
-    if type(max_turns) is not int or max_turns < 0:
-        raise ValueError("max_turns must be a non-negative integer")
+    if (
+        isinstance(max_elapsed_seconds, bool)
+        or not isinstance(max_elapsed_seconds, (int, float))
+        or not math.isfinite(max_elapsed_seconds)
+        or max_elapsed_seconds <= 0
+    ):
+        raise ValueError("max_elapsed_seconds must be a positive finite number")
     if type(max_output_tokens) is not int or max_output_tokens < 1:
         raise ValueError("max_output_tokens must be a positive integer")
     _require_non_empty_string(reasoning_effort, "reasoning_effort")
+    if not callable(clock):
+        raise ValueError("clock must be callable")
     if memory_projection is not None and not isinstance(
         memory_projection,
         IntentMemoryProjection,
@@ -545,15 +555,36 @@ def run_intent_inference(
             for item in memory_projection.diagnostics
         )
     last_response: ModelTurnResponse | None = None
+    started_at = _clock_value(clock, "clock start")
+    turn_index = 0
 
-    for turn_index in range(max_turns):
+    while True:
+        elapsed_before = _elapsed(clock, started_at, f"clock before turn {turn_index}")
+        if elapsed_before >= max_elapsed_seconds:
+            error_message = "intent inference elapsed-time limit exhausted"
+            all_deficiencies = _dedupe([*deficiencies, error_message])
+            return _finish_run(
+                trace_id,
+                turns,
+                tool_call_count,
+                "partial",
+                all_deficiencies,
+                _partial_result(all_deficiencies),
+                last_response,
+            )
+        turn_parameters = dict(parameters)
+        turn_parameters["timeout_seconds"] = max(
+            0.001,
+            max_elapsed_seconds - elapsed_before,
+        )
         request = ModelTurnRequest(
             system=INTENT_INFERENCE_SYSTEM_PROMPT,
             tools=tools,
             messages=list(messages),
             tool_results=list(tool_results),
-            parameters=dict(parameters),
+            parameters=turn_parameters,
         )
+        prior_response = last_response
         try:
             response = adapter.complete_turn(request)
         except Exception as error:  # Provider isolation boundary.
@@ -572,9 +603,30 @@ def run_intent_inference(
                 "failed",
                 [*deficiencies, error_message],
                 _failure_result([*deficiencies, error_message]),
-                None,
+                last_response,
             )
         last_response = response
+        elapsed_after = _elapsed(clock, started_at, f"clock after turn {turn_index}")
+        if elapsed_after >= max_elapsed_seconds:
+            error_message = "intent inference elapsed-time limit exhausted"
+            turns.append(
+                IntentInferenceTurn(
+                    turn_index=turn_index,
+                    response_kind=response.kind.value,
+                    tool_calls=list(response.tool_calls),
+                    error=error_message,
+                )
+            )
+            all_deficiencies = _dedupe([*deficiencies, error_message])
+            return _finish_run(
+                trace_id,
+                turns,
+                tool_call_count,
+                "partial",
+                all_deficiencies,
+                _partial_result(all_deficiencies),
+                response,
+            )
 
         if response.kind is ModelResponseKind.TOOL_CALLS:
             calls = list(response.tool_calls)
@@ -619,6 +671,7 @@ def run_intent_inference(
                     error="; ".join(tool_errors) if tool_errors else None,
                 )
             )
+            turn_index += 1
             continue
 
         if response.kind is ModelResponseKind.FINAL:
@@ -634,24 +687,14 @@ def run_intent_inference(
                     )
                 )
                 deficiencies.append(error_message)
-                if turn_index + 1 < max_turns:
-                    messages.extend(
-                        [
-                            model_response_to_assistant_message(response),
-                            _runtime_rejection_message(error_message),
-                        ]
-                    )
-                    continue
-                all_deficiencies = _dedupe(deficiencies)
-                return _finish_run(
-                    trace_id,
-                    turns,
-                    tool_call_count,
-                    "failed",
-                    all_deficiencies,
-                    _failure_result(all_deficiencies),
-                    response,
+                messages.extend(
+                    [
+                        model_response_to_assistant_message(response),
+                        _runtime_rejection_message(error_message),
+                    ]
                 )
+                turn_index += 1
+                continue
 
             validated, validation_deficiencies = _validate_runtime_candidates(
                 parsed,
@@ -710,19 +753,15 @@ def run_intent_inference(
             "failed",
             all_deficiencies,
             _failure_result(all_deficiencies),
-            response,
+            (
+                prior_response
+                if (
+                    response.kind is ModelResponseKind.INVALID
+                    and prior_response is not None
+                )
+                else response
+            ),
         )
-
-    all_deficiencies = _dedupe([*deficiencies, "turn budget exhausted"])
-    return _finish_run(
-        trace_id,
-        turns,
-        tool_call_count,
-        "partial",
-        all_deficiencies,
-        _partial_result(all_deficiencies),
-        last_response,
-    )
 
 
 def _result_from_payload(payload: Any) -> IntentInferenceResult:
@@ -1108,8 +1147,9 @@ def intent_inference_protocol_projection() -> dict[str, Any]:
         "tool_catalog_sha256": tool_catalog_sha256,
         "tool_names": [item.name for item in tools],
         "runtime_limits": {
-            "max_turns": INTENT_INFERENCE_MAX_TURNS,
+            "max_turns": None,
             "max_tool_calls": None,
+            "max_elapsed_seconds": INTENT_INFERENCE_MAX_ELAPSED_SECONDS,
             "max_output_tokens": INTENT_INFERENCE_MAX_OUTPUT_TOKENS,
         },
         "invocation_defaults": {
@@ -1341,6 +1381,24 @@ def _require_json_serializable(value: Any, context: str) -> None:
         json.dumps(value)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{context} must be JSON serializable") from error
+
+
+def _clock_value(clock: Callable[[], float], context: str) -> float:
+    try:
+        value = clock()
+    except Exception as error:
+        raise ValueError(f"{context} failed") from error
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ValueError(f"{context} must be a finite number")
+    return float(value)
+
+
+def _elapsed(clock: Callable[[], float], started_at: float, context: str) -> float:
+    return max(0.0, _clock_value(clock, context) - started_at)
 
 
 def _dedupe(items: Sequence[str]) -> list[str]:
