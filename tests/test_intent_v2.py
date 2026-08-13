@@ -9,7 +9,10 @@ from review_agent.intent_inference import (
     IntentInferenceResult,
     IntentInferenceRun,
     IntentInferenceTrace,
+    run_intent_inference,
 )
+from review_agent.model_adapter import FakeToolCallingAdapter
+from review_agent.model_protocol import ModelResponseKind, ModelTurnResponse
 from review_agent.intent_runtime import IntentRuntime
 from review_agent.artifacts import artifact_schema
 from review_agent.pr_workspace import PRMetadata, PRWorkspaceStore
@@ -180,6 +183,99 @@ def test_evaluation_policy_promotes_only_completed_unique_model_goal(
     assert version.packet.source is IntentSource.EXPLICIT
     analysis = runtime.load_analysis_record(workspace, version.analysis_record_ref)
     assert analysis["trust_policy"] == "evaluation_trust_model"
+    assert analysis["model_inference_promoted"] is True
+    assert analysis["selection_reason"] == "evaluation_model_inference_promoted"
+
+
+def test_evaluation_promotes_recovered_goal_and_ignores_legacy_candidates(
+    tmp_path: Path,
+) -> None:
+    class GoalOnlyGateway:
+        base_revision = BASE_SHA
+        head_revision = HEAD_SHA
+
+        @staticmethod
+        def intent_evidence():
+            return ()
+
+        @staticmethod
+        def execute(_tool_name, _arguments):
+            raise AssertionError("This inference script does not call tools")
+
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text="not json",
+            ),
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "field": "goal",
+                                "value": "Avoid exposing credentials in MongoDB logs.",
+                                "origin": "llm_inference",
+                                "confidence": "high",
+                                "source_refs": [],
+                                "evidence_refs": [],
+                                "rationale": "The logging changes imply this objective.",
+                                "conclusion_impact": "blocking",
+                            },
+                            {
+                                "field": "acceptance_criteria",
+                                "value": "Legacy output that IntentPacket v2 did not request.",
+                                "origin": "repository_test",
+                                "confidence": "high",
+                                "source_refs": ["missing_test.go"],
+                                "evidence_refs": ["O-not-authorized"],
+                                "rationale": "This candidate has deliberately invalid provenance.",
+                                "conclusion_impact": "material",
+                            },
+                        ],
+                        "uncertainties": [],
+                        "summary": "One reliable goal was inferred.",
+                    }
+                ),
+            ),
+        ]
+    )
+    run = run_intent_inference(
+        adapter,
+        GoalOnlyGateway(),
+        deterministic_request_summary="Review the immutable changes.",
+        change_summary="MongoDB logging changed.",
+        explicit_intent={},
+        missing_fields=("goal",),
+        initial_observation_summaries={},
+        trace_id="recovered-evaluation-intent",
+        resolved_base_revision=BASE_SHA,
+        resolved_head_revision=HEAD_SHA,
+        goal_only=True,
+    )
+    store, workspace, snapshot, _second = _workspace(tmp_path)
+
+    version = IntentRuntime(store).resolve(
+        workspace,
+        snapshot,
+        _request(),
+        inference_run=run,
+        trust_policy="evaluation_trust_model",
+    )
+
+    assert run.status == "completed"
+    assert run.trace.deficiencies == []
+    assert run.trace.turns[0].error.startswith("final response parse failed")
+    assert run.trace.turns[1].error.startswith(
+        "Runtime ignored non-requested candidates"
+    )
+    assert version.packet.goal == "Avoid exposing credentials in MongoDB logs."
+    assert version.packet.source is IntentSource.EXPLICIT
+    analysis = IntentRuntime(store).load_analysis_record(
+        workspace,
+        version.analysis_record_ref,
+    )
     assert analysis["model_inference_promoted"] is True
     assert analysis["selection_reason"] == "evaluation_model_inference_promoted"
 

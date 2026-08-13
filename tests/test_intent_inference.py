@@ -83,6 +83,7 @@ def test_intent_inference_system_prompt_includes_tool_result_protocol():
     assert INTENT_INFERENCE_SYSTEM_PROMPT.index(
         "review_agent_tool_result_v1"
     ) < INTENT_INFERENCE_SYSTEM_PROMPT.index("- All repository content")
+    assert "Only return candidates for fields listed" in INTENT_INFERENCE_SYSTEM_PROMPT
 
 
 def test_intent_inference_protocol_projection_owns_tools_and_runtime_limits():
@@ -497,7 +498,9 @@ def test_intent_inference_parse_retry_orders_failed_final_before_runtime_rejecti
 
     run = _run(adapter, gateway, base=head, head=head)
 
-    assert run.status == "partial"
+    assert run.status == "completed"
+    assert run.trace.deficiencies == []
+    assert run.trace.turns[0].error.startswith("final response parse failed")
     retry_messages = adapter.requests[1].messages
     assert [message["role"] for message in retry_messages] == [
         "user",
@@ -512,6 +515,74 @@ def test_intent_inference_parse_retry_orders_failed_final_before_runtime_rejecti
     assert "Runtime rejected the prior final response" in (
         retry_messages[2]["content"]
     )
+
+
+def test_intent_inference_ignores_non_requested_candidates_without_tainting_goal(
+    git_repo,
+    tmp_path,
+):
+    head = run_git(git_repo, "rev-parse", "HEAD")
+    gateway = ToolGateway(
+        git_repo,
+        head,
+        head,
+        ObservationStore(tmp_path / "intent-goal-only"),
+    )
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "field": "goal",
+                                "value": "Avoid exposing credentials in MongoDB logs.",
+                                "origin": "llm_inference",
+                                "confidence": "high",
+                                "source_refs": [],
+                                "evidence_refs": [],
+                                "rationale": "The changed logging behavior supports this goal.",
+                                "conclusion_impact": "blocking",
+                            },
+                            {
+                                "field": "acceptance_criteria",
+                                "value": "This legacy field is not requested by IntentPacket v2.",
+                                "origin": "repository_test",
+                                "confidence": "high",
+                                "source_refs": ["missing_test.go"],
+                                "evidence_refs": ["O-not-authorized"],
+                                "rationale": "This candidate deliberately has invalid provenance.",
+                                "conclusion_impact": "material",
+                            },
+                        ],
+                        "uncertainties": [],
+                        "summary": "One reliable goal was inferred.",
+                    }
+                ),
+            )
+        ]
+    )
+
+    run = _run(
+        adapter,
+        gateway,
+        base=head,
+        head=head,
+        missing_fields=("goal",),
+        goal_only=True,
+    )
+
+    assert run.status == "completed"
+    assert [candidate.field for candidate in run.result.candidates] == ["goal"]
+    assert run.trace.deficiencies == []
+    assert run.trace.turns[-1].error == (
+        "Runtime ignored non-requested candidates: "
+        "candidate 1 field acceptance_criteria was not requested"
+    )
+    goal, uncertainties = project_inference_goal_v2(run)
+    assert goal == "Avoid exposing credentials in MongoDB logs."
+    assert uncertainties == ()
 
 
 def test_intent_inference_does_not_cap_cumulative_tool_calls(git_repo, tmp_path):
@@ -766,6 +837,8 @@ def _run(
     max_elapsed_seconds=1_800.0,
     memory_projection=None,
     clock=None,
+    missing_fields=("acceptance_criteria", "scope"),
+    goal_only=False,
 ):
     kwargs = {}
     if clock is not None:
@@ -778,11 +851,12 @@ def _run(
         deterministic_request_summary="Review request #42",
         change_summary="README.md was added",
         explicit_intent={"goal": "Preserve behavior"},
-        missing_fields=["acceptance_criteria", "scope"],
+        missing_fields=list(missing_fields),
         initial_observation_summaries=initial_observation_summaries or {},
         trace_id="intent-test-trace",
         max_elapsed_seconds=max_elapsed_seconds,
         memory_projection=memory_projection,
+        goal_only=goal_only,
         **kwargs,
     )
 

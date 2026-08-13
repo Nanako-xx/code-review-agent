@@ -76,7 +76,7 @@ _DOCUMENT_SUFFIXES = frozenset(
 )
 
 
-INTENT_INFERENCE_PROTOCOL_VERSION = "intent-inference-protocol-v1"
+INTENT_INFERENCE_PROTOCOL_VERSION = "intent-inference-protocol-v2"
 INTENT_INFERENCE_MAX_ELAPSED_SECONDS = 1_800.0
 INTENT_INFERENCE_MAX_OUTPUT_TOKENS = 4_096
 INTENT_INFERENCE_REASONING_EFFORT = "low"
@@ -97,6 +97,7 @@ Security and authority:
 - Approved project memory is still not current-user intent. Use origin `project_memory` only for an exact supplied claim and keep it inferred with its `memory:MEM-...` source ref.
 - Use `repository_document`, `repository_test`, or `commit_message` only when the claim cites source_refs and evidence_refs for matching observations returned by the read-only tools. Runtime independently validates every claim.
 - Do not claim user_input, request_metadata, project_rule, user_confirmation, or user_correction for facts you inferred yourself.
+- Only return candidates for fields listed in the request `missing_fields`; omit every other field even when evidence is available.
 
 Return one JSON object and no markdown. It must contain exactly `candidates`, `uncertainties`, and `summary`.
 Each candidate must contain exactly: `field`, `value`, `origin`, `confidence`, `source_refs`, `evidence_refs`, `rationale`, and `conclusion_impact`.
@@ -463,6 +464,7 @@ def run_intent_inference(
     reasoning_effort: str = INTENT_INFERENCE_REASONING_EFFORT,
     memory_projection: IntentMemoryProjection | None = None,
     clock: Callable[[], float] = time.monotonic,
+    goal_only: bool = False,
 ) -> IntentInferenceRun:
     """Run an elapsed-time-bounded, read-only intent analysis conversation.
 
@@ -486,6 +488,8 @@ def run_intent_inference(
     _require_non_empty_string(reasoning_effort, "reasoning_effort")
     if not callable(clock):
         raise ValueError("clock must be callable")
+    if type(goal_only) is not bool:
+        raise ValueError("goal_only must be a boolean")
     if memory_projection is not None and not isinstance(
         memory_projection,
         IntentMemoryProjection,
@@ -549,6 +553,7 @@ def run_intent_inference(
     tool_results: list[ModelToolResult] = []
     tool_call_count = 0
     deficiencies = list(initial_deficiencies)
+    recoverable_diagnostics: list[str] = []
     if memory_projection is not None:
         deficiencies.extend(
             f"memory {item.code.value}: {item.message}"
@@ -562,7 +567,9 @@ def run_intent_inference(
         elapsed_before = _elapsed(clock, started_at, f"clock before turn {turn_index}")
         if elapsed_before >= max_elapsed_seconds:
             error_message = "intent inference elapsed-time limit exhausted"
-            all_deficiencies = _dedupe([*deficiencies, error_message])
+            all_deficiencies = _dedupe(
+                [*deficiencies, *recoverable_diagnostics, error_message]
+            )
             return _finish_run(
                 trace_id,
                 turns,
@@ -601,8 +608,10 @@ def run_intent_inference(
                 turns,
                 tool_call_count,
                 "failed",
-                [*deficiencies, error_message],
-                _failure_result([*deficiencies, error_message]),
+                [*deficiencies, *recoverable_diagnostics, error_message],
+                _failure_result(
+                    [*deficiencies, *recoverable_diagnostics, error_message]
+                ),
                 last_response,
             )
         last_response = response
@@ -617,7 +626,9 @@ def run_intent_inference(
                     error=error_message,
                 )
             )
-            all_deficiencies = _dedupe([*deficiencies, error_message])
+            all_deficiencies = _dedupe(
+                [*deficiencies, *recoverable_diagnostics, error_message]
+            )
             return _finish_run(
                 trace_id,
                 turns,
@@ -644,8 +655,10 @@ def run_intent_inference(
                     turns,
                     tool_call_count,
                     "failed",
-                    [*deficiencies, error_message],
-                    _failure_result([*deficiencies, error_message]),
+                    [*deficiencies, *recoverable_diagnostics, error_message],
+                    _failure_result(
+                        [*deficiencies, *recoverable_diagnostics, error_message]
+                    ),
                     response,
                 )
             current_results = _execute_tool_calls(gateway, calls)
@@ -686,7 +699,7 @@ def run_intent_inference(
                         error=error_message,
                     )
                 )
-                deficiencies.append(error_message)
+                recoverable_diagnostics.append(error_message)
                 messages.extend(
                     [
                         model_response_to_assistant_message(response),
@@ -696,10 +709,19 @@ def run_intent_inference(
                 turn_index += 1
                 continue
 
-            validated, validation_deficiencies = _validate_runtime_candidates(
+            (
+                validated,
+                validation_deficiencies,
+                ignored_candidate_diagnostics,
+            ) = _validate_runtime_candidates(
                 parsed,
                 gateway,
                 memory_projection,
+                requested_fields=(
+                    frozenset({"goal"})
+                    if goal_only
+                    else None
+                ),
             )
             all_deficiencies = _dedupe([*deficiencies, *validation_deficiencies])
             if all_deficiencies:
@@ -721,7 +743,12 @@ def run_intent_inference(
                     error=(
                         "Runtime validation deficiencies: " + "; ".join(all_deficiencies)
                         if all_deficiencies
-                        else None
+                        else (
+                            "Runtime ignored non-requested candidates: "
+                            + "; ".join(ignored_candidate_diagnostics)
+                            if ignored_candidate_diagnostics
+                            else None
+                        )
                     ),
                 )
             )
@@ -745,7 +772,9 @@ def run_intent_inference(
                 error=error_message,
             )
         )
-        all_deficiencies = _dedupe([*deficiencies, error_message])
+        all_deficiencies = _dedupe(
+            [*deficiencies, *recoverable_diagnostics, error_message]
+        )
         return _finish_run(
             trace_id,
             turns,
@@ -822,15 +851,23 @@ def _validate_runtime_candidates(
     result: IntentInferenceResult,
     gateway: IntentInferenceGateway,
     memory_projection: IntentMemoryProjection | None = None,
-) -> tuple[IntentInferenceResult, list[str]]:
+    *,
+    requested_fields: frozenset[str] | None = None,
+) -> tuple[IntentInferenceResult, list[str], list[str]]:
     observations = {
         observation.observation_id: observation
         for observation in _gateway_evidence(gateway)
     }
     candidates: list[IntentInferenceCandidate] = []
     deficiencies: list[str] = []
+    ignored_candidate_diagnostics: list[str] = []
 
     for index, candidate in enumerate(result.candidates):
+        if requested_fields is not None and candidate.field not in requested_fields:
+            ignored_candidate_diagnostics.append(
+                f"candidate {index} field {candidate.field} was not requested"
+            )
+            continue
         unauthorized = [
             evidence_ref
             for evidence_ref in candidate.evidence_refs
@@ -892,6 +929,7 @@ def _validate_runtime_candidates(
             summary=result.summary,
         ),
         _dedupe(deficiencies),
+        _dedupe(ignored_candidate_diagnostics),
     )
 
 

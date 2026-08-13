@@ -316,6 +316,11 @@ Intent Agent 的模型轮数和只读工具调用都不设置累计次数预算�
 Intent Agent 使用 1,800 秒累计活跃时间边界，每次 Provider 请求只获得剩余时间；工具自身超时、Provider
 超时和无进展循环保护继续作为运行安全机制，不能用任意大的整数伪装“无限制”。
 
+新版产品 Intent 请求只允许模型返回 `goal` 候选。模型额外返回的旧 `acceptance_criteria/scope/constraints`
+候选不得进入最终结果，也不得因为这些非请求字段的来源问题污染合法 goal；Runtime 应在最终 Turn 审计中记录
+它们被忽略。一次格式错误若在后续 Turn 得到合法修正，只保留在原 Turn 审计中，不把最终运行降级为 partial。
+涉及 goal 本身、Tool/Provider/时间边界或冲突 goal 的失败仍属于阻断性 deficiency。
+
 信任策略写入不可变 Product Review Request，Resume 只能沿用首次请求的策略。评测提升属于当前
 Snapshot 的运行策略，不等于人工确认，不能作为跨 Snapshot 的普通 explicit Intent 直接延续。
 

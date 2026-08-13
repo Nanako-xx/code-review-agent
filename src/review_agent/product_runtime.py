@@ -604,6 +604,7 @@ class _BoundProductRuntimeV6:
             resolved_base_revision=self.snapshot.base_sha,
             resolved_head_revision=self.snapshot.head_sha,
             model=self.config.reviewer.model or "fake-intent-analyst",
+            goal_only=True,
         )
 
     def _intent_trace_id(self) -> str:
