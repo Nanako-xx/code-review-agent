@@ -249,7 +249,7 @@ def test_cli_fake_reviewer_handles_empty_diff(
     assert (_snapshot(root) / "DiffArtifact" / "diff.patch").read_bytes() == b""
 
 
-def test_null_intent_raises_risk_and_runs_all_fixed_slots(
+def test_missing_explicit_intent_runs_agent_and_uses_inferred_risk_slots(
     git_repo: Path,
     tmp_path: Path,
     capsys,
@@ -263,8 +263,12 @@ def test_null_intent_raises_risk_and_runs_all_fixed_slots(
     reviewer_records = list(
         (_snapshot(root) / "Results" / "reviewers").glob("r-*.json")
     )
-    assert result["risk_level"] == "high"
-    assert len(reviewer_records) == 3
+    intent_paths = list(root.glob("pr/p-*/Intent/current.json"))
+    assert len(intent_paths) == 1
+    intent_packet = json.loads(intent_paths[0].read_text("utf-8"))["packet"]
+    assert intent_packet["source"] == "inferred"
+    assert result["risk_level"] == "medium"
+    assert len(reviewer_records) == 2
 
 
 @pytest.mark.parametrize(

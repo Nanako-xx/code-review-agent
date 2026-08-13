@@ -5,9 +5,15 @@ from pathlib import Path
 import re
 import subprocess
 
+import pytest
+
 from review_agent.cli import main
 from review_agent.model_adapter import FakeToolCallingAdapter
-from review_agent.model_protocol import ModelResponseKind, ModelTurnResponse
+from review_agent.model_protocol import (
+    ModelResponseKind,
+    ModelToolCall,
+    ModelTurnResponse,
+)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -69,6 +75,28 @@ def _review_args(
         "--format",
         output_format,
     ]
+
+
+def _without_declared_intent(arguments: list[str]) -> list[str]:
+    values = list(arguments)
+    index = values.index("--intent")
+    del values[index : index + 2]
+    return values
+
+
+def _intent_records(workspace_root: Path) -> tuple[dict, dict, dict]:
+    current_paths = list(workspace_root.glob("pr/p-*/Intent/current.json"))
+    analysis_paths = list(
+        workspace_root.glob("pr/p-*/Intent/history/analysis-*.json")
+    )
+    request_paths = list(
+        workspace_root.glob("pr/p-*/Snapshots/s-*/Requests/request-*.json")
+    )
+    assert len(current_paths) == len(analysis_paths) == len(request_paths) == 1
+    return tuple(
+        json.loads(path.read_text("utf-8"))
+        for path in (current_paths[0], analysis_paths[0], request_paths[0])
+    )
 
 
 def test_cli_v6_fake_review_returns_only_authoritative_json(
@@ -161,6 +189,255 @@ def test_cli_v6_injects_only_assignment_rules_and_runs_no_quality_command(
     assert "Go Review Principles" not in request.system
     assert "github_workflows.md" not in request.system
     assert "no_configured_checks" in request.messages[0]["content"]
+
+
+def test_cli_v6_missing_explicit_intent_must_run_intent_agent_and_stay_inferred(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    base, head = _revisions(git_repo)
+    workspace_root = tmp_path / "workspace-inferred-intent"
+    arguments = _without_declared_intent(
+        _review_args(git_repo, workspace_root, base, head)
+    )
+    arguments.append("--non-interactive")
+
+    assert main(arguments) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    current, analysis, request = _intent_records(workspace_root)
+    assert output["risk_level"] == "medium"
+    assert current["packet"]["source"] == "inferred"
+    assert analysis["inference_run"]["status"] == "completed"
+    assert analysis["trust_policy"] == "normal"
+    assert analysis["model_inference_promoted"] is False
+    assert request["intent_trust_policy"] == "normal"
+
+
+def test_cli_v6_intent_agent_tools_use_v6_tool_results_without_observation_store(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    base, head = _revisions(git_repo)
+    workspace_root = tmp_path / "workspace-intent-tools"
+
+    def finish_intent(request):
+        evidence_id = request.tool_results[-1].observation_ids[0]
+        return ModelTurnResponse(
+            kind=ModelResponseKind.FINAL,
+            final_text=json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "field": "goal",
+                            "value": "Make the add implementation explicit.",
+                            "origin": "commit_message",
+                            "confidence": "high",
+                            "source_refs": ["change add"],
+                            "evidence_refs": [evidence_id],
+                            "rationale": "The commit subject states the change.",
+                            "conclusion_impact": "material",
+                        }
+                    ],
+                    "uncertainties": [],
+                    "summary": "The commit message supplied one review goal.",
+                }
+            ),
+            provider_name="fake",
+            model="fake-intent-analyst",
+        )
+
+    intent_adapter = FakeToolCallingAdapter(
+        [
+            ModelTurnResponse(
+                kind=ModelResponseKind.TOOL_CALLS,
+                tool_calls=[
+                    ModelToolCall(
+                        "intent-commit-1",
+                        "read_commit_messages",
+                        {"max_commits": 1},
+                    )
+                ],
+                provider_name="fake",
+                model="fake-intent-analyst",
+            ),
+            finish_intent,
+        ]
+    )
+
+    def reviewer_response(_request):
+        return ModelTurnResponse(
+            kind=ModelResponseKind.FINAL,
+            final_text='{"findings":[],"uncertainties":[]}',
+            provider_name="fake",
+            model="fake-reviewer-v2",
+        )
+
+    class RecordingFactory:
+        def __init__(self):
+            self.created = 0
+
+        def create(self):
+            self.created += 1
+            if self.created == 1:
+                return intent_adapter
+            return FakeToolCallingAdapter([reviewer_response])
+
+    factory = RecordingFactory()
+    monkeypatch.setattr(
+        "review_agent.product_runtime.build_model_adapter_factory_from_config",
+        lambda _config, *, stage_label: factory,
+    )
+
+    arguments = _without_declared_intent(
+        _review_args(git_repo, workspace_root, base, head)
+    )
+    assert main(arguments) == 0
+
+    capsys.readouterr()
+    current, analysis, _request = _intent_records(workspace_root)
+    tool_indices = list(
+        workspace_root.glob("pr/p-*/Snapshots/s-*/ToolResults/index.jsonl")
+    )
+    assert current["packet"]["source"] == "inferred"
+    assert analysis["inference_run"]["trace"]["tool_call_count"] == 1
+    assert len(tool_indices) == 1
+    records = [
+        json.loads(line)
+        for line in tool_indices[0].read_text("utf-8").splitlines()
+    ]
+    assert records[0]["tool_name"] == "read_commit_messages"
+    assert records[0]["status"] == "completed"
+    assert not list(workspace_root.glob("**/observations.jsonl"))
+    assert not list(workspace_root.glob("**/observations"))
+
+
+def test_cli_v6_evaluation_policy_promotes_reliable_model_intent_to_explicit(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    base, head = _revisions(git_repo)
+    workspace_root = tmp_path / "workspace-evaluation-intent"
+    arguments = _without_declared_intent(
+        _review_args(git_repo, workspace_root, base, head)
+    )
+    arguments.append("--evaluation-trust-model-intent")
+
+    assert main(arguments) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    current, analysis, request = _intent_records(workspace_root)
+    assert output["risk_level"] == "low"
+    assert current["packet"]["source"] == "explicit"
+    assert analysis["inference_run"]["status"] == "completed"
+    assert analysis["trust_policy"] == "evaluation_trust_model"
+    assert analysis["model_inference_promoted"] is True
+    assert request["intent_trust_policy"] == "evaluation_trust_model"
+
+
+def test_cli_v6_explicit_input_skips_intent_agent_even_in_evaluation_mode(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    base, head = _revisions(git_repo)
+    workspace_root = tmp_path / "workspace-explicit-intent"
+
+    def inference_must_not_run(*_args, **_kwargs):
+        raise AssertionError("explicit Intent must bypass Intent Agent")
+
+    monkeypatch.setattr(
+        "review_agent.product_runtime.run_intent_inference",
+        inference_must_not_run,
+    )
+    arguments = _review_args(git_repo, workspace_root, base, head)
+    arguments.append("--evaluation-trust-model-intent")
+
+    assert main(arguments) == 0
+
+    capsys.readouterr()
+    current, analysis, request = _intent_records(workspace_root)
+    assert current["packet"]["source"] == "explicit"
+    assert analysis["inference_run"] is None
+    assert analysis["model_inference_promoted"] is False
+    assert request["intent_trust_policy"] == "evaluation_trust_model"
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--title", "Make add() implementation explicit"),
+        ("--description", "Preserve add behavior while naming the intermediate value."),
+    ],
+)
+def test_cli_v6_pr_metadata_is_explicit_and_skips_intent_agent(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    option: str,
+    value: str,
+) -> None:
+    base, head = _revisions(git_repo)
+    workspace_root = tmp_path / ("workspace-metadata-" + option[2:])
+
+    def inference_must_not_run(*_args, **_kwargs):
+        raise AssertionError("PR metadata must bypass Intent Agent")
+
+    monkeypatch.setattr(
+        "review_agent.product_runtime.run_intent_inference",
+        inference_must_not_run,
+    )
+    arguments = _without_declared_intent(
+        _review_args(git_repo, workspace_root, base, head)
+    )
+    arguments.extend([option, value])
+
+    assert main(arguments) == 0
+
+    capsys.readouterr()
+    current, analysis, _request = _intent_records(workspace_root)
+    assert current["packet"] == {
+        "goal": value,
+        "source": "explicit",
+        "uncertainties": [],
+    }
+    assert analysis["inference_run"] is None
+
+
+def test_cli_v6_evaluation_policy_never_promotes_failed_intent_agent(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    base, head = _revisions(git_repo)
+    workspace_root = tmp_path / "workspace-failed-intent"
+    arguments = _without_declared_intent(
+        _review_args(
+            git_repo,
+            workspace_root,
+            base,
+            head,
+            provider="none",
+        )
+    )
+    arguments.append("--evaluation-trust-model-intent")
+
+    assert main(arguments) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    current, analysis, request = _intent_records(workspace_root)
+    assert output["risk_level"] == "high"
+    assert current["packet"]["goal"] is None
+    assert current["packet"]["source"] is None
+    assert analysis["inference_run"]["status"] == "failed"
+    assert analysis["model_inference_promoted"] is False
+    assert request["intent_trust_policy"] == "evaluation_trust_model"
 
 
 def test_cli_v6_markdown_is_a_pure_review_result_render(

@@ -451,7 +451,8 @@ refactor: collapse preflight to deterministic checks
 覆盖：
 
 - 明确用户目标 -> `source=explicit`；
-- 根据 PR metadata/Diff 推断 -> `source=inferred`；
+- PR 标题或 PR 描述 -> `source=explicit` 且不调用 Intent Agent；
+- 无 explicit 输入时必须由 Intent Agent 根据 Diff/代码/Commit 推断，普通运行 -> `source=inferred`；
 - 无法形成可信目标 -> `goal=null, source=null`；
 - goal/source nullability 不变量；
 - 下游 Packet 不包含 rules、acceptance criteria、scope、constraints、status、provenance 或 clarifications；
@@ -460,11 +461,11 @@ refactor: collapse preflight to deterministic checks
 
 - [x] **Step 2：把现有 Intent 复杂模型隔离为内部分析**
 
-可以通过纯函数复用当前 inference 候选和证据收集，但旧 Intent wire model 与 v5 行为保持不变；`intent_runtime.py` 最终只投影新 IntentPacket。v6 不进入交互式 `AWAITING_USER`；缺失 Intent 直接形成 null source，后续 Risk floor 升为 high。
+可以通过纯函数复用当前 inference 候选和证据收集，但旧 Intent wire model 与 v5 行为保持不变；`intent_runtime.py` 最终只投影新 IntentPacket。v6 不进入交互式 `AWAITING_USER`。缺失 `--intent`、PR 标题和 PR 描述时必须调用 Intent Agent；普通运行的唯一可靠模型目标为 inferred。无人交互评测只有显式持久化 `evaluation_trust_model` 策略时，才可把完整成功且唯一可靠的模型目标提升为 explicit；`--non-interactive` 不等同于信任模型。失败、partial、无目标或冲突目标保持不确定性并按 inferred/null 风险下限处理。
 
 - [x] **Step 3：实现跨 Snapshot 延续**
 
-显式 Intent 可延续到新 Snapshot；inferred Intent 必须重新校验并产生新版本。历史文件 create-only，`current.json` 只原子更新版本指针。
+人工或 PR metadata 的显式 Intent 可延续到新 Snapshot；inferred Intent 和仅因评测策略提升的模型 Intent 必须重新校验并产生新版本。历史文件 create-only，`current.json` 只原子更新版本指针。
 
 - [x] **Step 4：运行测试**
 

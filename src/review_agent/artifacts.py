@@ -71,7 +71,7 @@ ARTIFACT_SCHEMAS = {
     "changed_symbols_v2": "changed_symbols_v2",
     "intent_packet": "intent_packet_v2_minimal",
     "intent_version": "intent_version_envelope_v1",
-    "intent_analysis_record": "intent_analysis_record_v1",
+    "intent_analysis_record": "intent_analysis_record_v2",
     "risk_decision": "risk_decision_v2",
     "review_plan": "review_plan_v2",
     "reviewer_assignment": "reviewer_assignment_v2",

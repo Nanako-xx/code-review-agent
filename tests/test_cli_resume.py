@@ -186,6 +186,45 @@ def test_cli_resume_restarts_failed_preflight_without_new_session(
     assert len(list(root.glob("pr/p-*/Sessions/u-*"))) == 1
 
 
+def test_cli_resume_uses_persisted_evaluation_intent_policy(
+    git_repo: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    base, head = _commit(git_repo)
+    root = tmp_path / "workspace-evaluation-resume"
+    arguments = _review_args(git_repo, root, base, head)
+    intent_index = arguments.index("--intent")
+    del arguments[intent_index : intent_index + 2]
+    arguments.append("--evaluation-trust-model-intent")
+
+    def fail_intent_once(*_args, **_kwargs):
+        raise RuntimeError("transient Intent Agent failure")
+
+    monkeypatch.setattr(
+        "review_agent.product_runtime.run_intent_inference",
+        fail_intent_once,
+    )
+    assert main(arguments) == 1
+    locator = _locator(capsys.readouterr().err)
+    monkeypatch.undo()
+
+    assert main(_resume_args(git_repo, root, locator, provider="fake")) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    current_paths = list(root.glob("pr/p-*/Intent/current.json"))
+    request_paths = list(
+        root.glob("pr/p-*/Snapshots/s-*/Requests/request-*.json")
+    )
+    assert len(current_paths) == len(request_paths) == 1
+    intent = json.loads(current_paths[0].read_text("utf-8"))
+    request = json.loads(request_paths[0].read_text("utf-8"))
+    assert result["risk_level"] == "low"
+    assert intent["packet"]["source"] == "explicit"
+    assert request["intent_trust_policy"] == "evaluation_trust_model"
+
+
 def test_cli_resume_rejects_wrong_repository_identity(
     git_repo: Path,
     tmp_path: Path,

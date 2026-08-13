@@ -119,7 +119,7 @@ def test_declared_goal_projects_to_an_explicit_three_field_packet(
     ]
     assert runtime.load_current_packet(workspace) == version.packet
     assert artifact_schema("intent_version") == "intent_version_envelope_v1"
-    assert artifact_schema("intent_analysis_record") == "intent_analysis_record_v1"
+    assert artifact_schema("intent_analysis_record") == "intent_analysis_record_v2"
 
 
 def test_model_analysis_projects_only_an_inferred_packet_and_keeps_trace_internal(
@@ -158,6 +158,137 @@ def test_model_analysis_projects_only_an_inferred_packet_and_keeps_trace_interna
     assert "private_provider_payload" in analysis_text
     assert "intent-trace-1" in analysis_text
     assert analysis["source_snapshot_id"] == snapshot.snapshot_id
+    assert analysis["trust_policy"] == "normal"
+    assert analysis["model_inference_promoted"] is False
+
+
+def test_evaluation_policy_promotes_only_completed_unique_model_goal(
+    tmp_path: Path,
+) -> None:
+    store, workspace, snapshot, _second = _workspace(tmp_path)
+    runtime = IntentRuntime(store)
+
+    version = runtime.resolve(
+        workspace,
+        snapshot,
+        _request(),
+        inference_run=_inference_run("Keep retries idempotent."),
+        trust_policy="evaluation_trust_model",
+    )
+
+    assert version.packet.goal == "Keep retries idempotent."
+    assert version.packet.source is IntentSource.EXPLICIT
+    analysis = runtime.load_analysis_record(workspace, version.analysis_record_ref)
+    assert analysis["trust_policy"] == "evaluation_trust_model"
+    assert analysis["model_inference_promoted"] is True
+    assert analysis["selection_reason"] == "evaluation_model_inference_promoted"
+
+
+def test_evaluation_policy_does_not_promote_partial_or_conflicting_analysis(
+    tmp_path: Path,
+) -> None:
+    store, workspace, snapshot, _second = _workspace(tmp_path)
+    runtime = IntentRuntime(store)
+    base_run = _inference_run("Keep retries idempotent.")
+    partial_run = IntentInferenceRun(
+        result=base_run.result,
+        trace=IntentInferenceTrace(
+            trace_id="partial-evaluation-intent",
+            turns=[],
+            tool_call_count=0,
+            final_status="partial",
+            deficiencies=["provider response was incomplete"],
+        ),
+        provider_name="fake-provider",
+        model="fake-intent-model",
+    )
+
+    partial = runtime.resolve(
+        workspace,
+        snapshot,
+        _request(),
+        inference_run=partial_run,
+        trust_policy="evaluation_trust_model",
+    )
+
+    assert partial.packet.source is IntentSource.INFERRED
+    assert runtime.load_analysis_record(
+        workspace, partial.analysis_record_ref
+    )["model_inference_promoted"] is False
+
+    store2, workspace2, snapshot2, _second2 = _workspace(tmp_path / "conflict")
+    conflicting = IntentInferenceRun(
+        result=IntentInferenceResult(
+            candidates=[
+                *_inference_run("Keep retries idempotent.").result.candidates,
+                IntentInferenceCandidate(
+                    field="goal",
+                    value="Remove retries entirely.",
+                    origin="llm_inference",
+                    confidence="medium",
+                    source_refs=[],
+                    evidence_refs=[],
+                    rationale="A conflicting interpretation was produced.",
+                    conclusion_impact="material",
+                ),
+            ],
+            uncertainties=[],
+            summary="Conflicting goals were produced.",
+        ),
+        trace=IntentInferenceTrace(
+            trace_id="conflicting-evaluation-intent",
+            turns=[],
+            tool_call_count=0,
+            final_status="completed",
+        ),
+        provider_name="fake-provider",
+        model="fake-intent-model",
+    )
+
+    unresolved = IntentRuntime(store2).resolve(
+        workspace2,
+        snapshot2,
+        _request(),
+        inference_run=conflicting,
+        trust_policy="evaluation_trust_model",
+    )
+
+    assert unresolved.packet.goal is None
+    assert unresolved.packet.source is None
+    assert any("conflicting" in item for item in unresolved.packet.uncertainties)
+
+
+def test_evaluation_policy_does_not_invent_explicit_when_model_has_no_goal(
+    tmp_path: Path,
+) -> None:
+    store, workspace, snapshot, _second = _workspace(tmp_path)
+    run = IntentInferenceRun(
+        result=IntentInferenceResult(
+            candidates=[],
+            uncertainties=["The changed behavior has no reliable objective."],
+            summary="No reliable goal was found.",
+        ),
+        trace=IntentInferenceTrace(
+            trace_id="no-goal-evaluation-intent",
+            turns=[],
+            tool_call_count=0,
+            final_status="completed",
+        ),
+        provider_name="fake-provider",
+        model="fake-intent-model",
+    )
+
+    version = IntentRuntime(store).resolve(
+        workspace,
+        snapshot,
+        _request(),
+        inference_run=run,
+        trust_policy="evaluation_trust_model",
+    )
+
+    assert version.packet.goal is None
+    assert version.packet.source is None
+    assert any("no reliable goal" in item.casefold() for item in version.packet.uncertainties)
 
 
 def test_missing_reliable_goal_uses_null_source_with_an_explicit_uncertainty(
@@ -251,3 +382,35 @@ def test_revalidated_inference_creates_a_new_snapshot_bound_version(
     assert revalidated.version == 2
     assert revalidated.source_snapshot_id == second.snapshot_id
     assert revalidated.packet.source is IntentSource.INFERRED
+
+
+def test_evaluation_promoted_model_goal_requires_new_snapshot_revalidation(
+    tmp_path: Path,
+) -> None:
+    store, workspace, first, second = _workspace(tmp_path)
+    runtime = IntentRuntime(store)
+    promoted = runtime.resolve(
+        workspace,
+        first,
+        _request(),
+        inference_run=_inference_run("Preserve retry idempotency."),
+        trust_policy="evaluation_trust_model",
+    )
+
+    unvalidated = runtime.resolve(
+        workspace,
+        second,
+        _request(),
+        trust_policy="evaluation_trust_model",
+    )
+
+    assert promoted.packet.source is IntentSource.EXPLICIT
+    assert unvalidated.packet.goal is None
+    assert unvalidated.packet.source is None
+    analysis = runtime.load_analysis_record(
+        workspace,
+        unvalidated.analysis_record_ref,
+    )
+    assert analysis["selection_reason"] == (
+        "evaluation_model_inference_revalidation_missing"
+    )

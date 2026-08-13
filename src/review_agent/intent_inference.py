@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 import unicodedata
 
 from review_agent.memory_models import (
@@ -28,7 +28,6 @@ from review_agent.model_protocol import (
     ModelTurnRequest,
     ModelTurnResponse,
 )
-from review_agent.observations import Observation
 from review_agent.models import (
     ConclusionImpact,
     IntentClaim,
@@ -41,7 +40,6 @@ from review_agent.models import (
     MemoryDiagnostic,
     MemoryReference,
 )
-from review_agent.tool_gateway import ToolGateway, ToolGatewayError
 from review_agent.tool_result_protocol import TOOL_RESULT_PROTOCOL_INSTRUCTIONS
 
 
@@ -111,6 +109,50 @@ Every value, rationale, uncertainty, and summary must be a non-empty string. sou
 
 class IntentInferenceParseError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class IntentInferenceEvidence:
+    """Minimal source metadata used to validate Intent Agent citations.
+
+    The v6 product Runtime deliberately does not depend on the legacy
+    ObservationStore.  Legacy gateways may still expose Observation values;
+    their public attributes are structurally compatible with this record.
+    """
+
+    observation_id: str
+    source: str
+    revision: str
+    path: str | None
+    line_start: int | None
+    line_end: int | None
+    context_view: str
+
+    def __post_init__(self) -> None:
+        for name in ("observation_id", "source", "revision"):
+            _require_non_empty_string(getattr(self, name), f"Evidence.{name}")
+        if self.path is not None:
+            _require_non_empty_string(self.path, "Evidence.path")
+        if (self.line_start is None) != (self.line_end is None):
+            raise ValueError("Evidence line range must be complete or absent")
+        if self.line_start is not None and (
+            type(self.line_start) is not int
+            or type(self.line_end) is not int
+            or self.line_start < 1
+            or self.line_end < self.line_start
+        ):
+            raise ValueError("Evidence line range is invalid")
+        _require_string(self.context_view, "Evidence.context_view")
+
+
+class IntentInferenceGateway(Protocol):
+    """Read-only structural boundary consumed by Intent inference."""
+
+    base_revision: str
+    head_revision: str
+
+    def execute(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+        ...
 
 
 @dataclass(frozen=True)
@@ -404,7 +446,7 @@ project_memory_intent_claims = intent_claims_from_memory_projection
 
 def run_intent_inference(
     adapter: ModelAdapter,
-    gateway: ToolGateway,
+    gateway: IntentInferenceGateway,
     *,
     deterministic_request_summary: str,
     change_summary: str,
@@ -451,7 +493,9 @@ def run_intent_inference(
     _require_non_empty_string(base_revision, "resolved_base_revision")
     _require_non_empty_string(head_revision, "resolved_head_revision")
     if base_revision != gateway.base_revision or head_revision != gateway.head_revision:
-        raise ValueError("resolved revisions must match the ToolGateway revision binding")
+        raise ValueError(
+            "resolved revisions must match the Intent inference Tool binding"
+        )
 
     normalized_explicit = _normalize_explicit_intent(explicit_intent)
     normalized_missing = _normalize_missing_fields(missing_fields)
@@ -577,7 +621,7 @@ def run_intent_inference(
                     response,
                 )
 
-            current_results = [_execute_tool_call(gateway, call) for call in calls]
+            current_results = _execute_tool_calls(gateway, calls)
             tool_call_count += len(calls)
             tool_results.extend(current_results)
             messages.append(model_response_to_assistant_message(response))
@@ -762,12 +806,12 @@ def _candidate_from_payload(payload: Any, index: int) -> IntentInferenceCandidat
 
 def _validate_runtime_candidates(
     result: IntentInferenceResult,
-    gateway: ToolGateway,
+    gateway: IntentInferenceGateway,
     memory_projection: IntentMemoryProjection | None = None,
 ) -> tuple[IntentInferenceResult, list[str]]:
     observations = {
         observation.observation_id: observation
-        for observation in gateway.observation_store.list_observations()
+        for observation in _gateway_evidence(gateway)
     }
     candidates: list[IntentInferenceCandidate] = []
     deficiencies: list[str] = []
@@ -857,8 +901,8 @@ def _memory_claim_is_supported(
 def _source_claim_is_supported(
     origin: str,
     source_refs: list[str],
-    observations: list[Observation],
-    gateway: ToolGateway,
+    observations: list[IntentInferenceEvidence],
+    gateway: IntentInferenceGateway,
 ) -> bool:
     if not source_refs or not observations:
         return False
@@ -926,12 +970,12 @@ def _source_refs_match_path(source_refs: list[str], path: str) -> bool:
 
 
 def _authorized_initial_summaries(
-    gateway: ToolGateway,
+    gateway: IntentInferenceGateway,
     summaries: Mapping[str, str],
 ) -> tuple[dict[str, str], list[str]]:
     if not isinstance(summaries, Mapping):
         raise ValueError("initial_observation_summaries must be an object")
-    authorized = gateway.observation_store.summaries_by_id()
+    authorized = _gateway_evidence_summaries(gateway)
     normalized: dict[str, str] = {}
     deficiencies: list[str] = []
     for observation_id, summary in summaries.items():
@@ -1102,10 +1146,110 @@ def intent_inference_protocol_projection() -> dict[str, Any]:
     }
 
 
-def _execute_tool_call(gateway: ToolGateway, call: ModelToolCall) -> ModelToolResult:
+def _gateway_evidence(
+    gateway: IntentInferenceGateway,
+) -> tuple[IntentInferenceEvidence, ...]:
+    provider = getattr(gateway, "intent_evidence", None)
+    if callable(provider):
+        values = tuple(provider())
+    else:
+        store = getattr(gateway, "observation_store", None)
+        if store is None or not callable(getattr(store, "list_observations", None)):
+            raise ValueError("Intent inference gateway does not expose Evidence")
+        values = tuple(store.list_observations())
+    normalized: list[IntentInferenceEvidence] = []
+    for value in values:
+        if isinstance(value, IntentInferenceEvidence):
+            normalized.append(value)
+            continue
+        try:
+            normalized.append(
+                IntentInferenceEvidence(
+                    observation_id=value.observation_id,
+                    source=value.source,
+                    revision=value.revision,
+                    path=value.path,
+                    line_start=value.line_start,
+                    line_end=value.line_end,
+                    context_view=value.context_view,
+                )
+            )
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError(
+                "Intent inference gateway exposed invalid Evidence"
+            ) from error
+    return tuple(normalized)
+
+
+def _gateway_evidence_summaries(
+    gateway: IntentInferenceGateway,
+) -> dict[str, str]:
+    provider = getattr(gateway, "intent_evidence_summaries", None)
+    if callable(provider):
+        supplied = provider()
+        if not isinstance(supplied, Mapping):
+            raise ValueError("Intent inference Evidence summaries are invalid")
+        result = dict(supplied)
+    else:
+        store = getattr(gateway, "observation_store", None)
+        if store is None or not callable(getattr(store, "summaries_by_id", None)):
+            return {
+                item.observation_id: item.context_view
+                for item in _gateway_evidence(gateway)
+            }
+        result = dict(store.summaries_by_id())
+    for observation_id, summary in result.items():
+        _require_non_empty_string(observation_id, "Evidence summary ID")
+        _require_string(summary, f"Evidence summary {observation_id}")
+    return result
+
+
+def _execute_tool_calls(
+    gateway: IntentInferenceGateway,
+    calls: list[ModelToolCall],
+) -> list[ModelToolResult]:
+    batch_executor = getattr(gateway, "execute_intent_calls", None)
+    if callable(batch_executor):
+        try:
+            results = list(batch_executor(tuple(calls)))
+            if (
+                len(results) != len(calls)
+                or any(
+                    not isinstance(result, ModelToolResult)
+                    for result in results
+                )
+                or any(
+                    result.call_id != call.call_id
+                    or result.tool_name != call.tool_name
+                    for call, result in zip(calls, results)
+                )
+            ):
+                raise ValueError(
+                    "Intent inference Tool batch returned invalid results"
+                )
+            return results
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            return [
+                ModelToolResult(
+                    call_id=call.call_id,
+                    tool_name=call.tool_name,
+                    content=message,
+                    observation_ids=[],
+                    is_error=True,
+                )
+                for call in calls
+            ]
+    return [_execute_tool_call(gateway, call) for call in calls]
+
+
+def _execute_tool_call(
+    gateway: IntentInferenceGateway,
+    call: ModelToolCall,
+) -> ModelToolResult:
     try:
         result = gateway.execute(call.tool_name, call.arguments)
-    except (ToolGatewayError, KeyError, ValueError, TypeError) as error:
+    except Exception as error:
         return ModelToolResult(
             call_id=call.call_id,
             tool_name=call.tool_name,

@@ -303,6 +303,18 @@ goal == null  -> source 必须是 null，且 uncertainties 必须非空
 `explicit` 表示目标由当前用户输入、PR 标题或 PR 描述明确声明；`inferred` 表示 Intent Agent 根据
 Diff、代码、Commit 或其他证据推断；无法形成可靠目标时使用 `null`。
 
+解析顺序固定如下：
+
+1. `--intent`、PR 标题或 PR 描述中任一项存在时，直接形成 `explicit`，不调用 Intent Agent；
+2. 三项均缺失时必须调用 Intent Agent，普通运行中唯一可靠目标标记为 `inferred`；
+3. 无人交互评测必须显式启用 `evaluation_trust_model` 策略，才可把完整成功且唯一可靠的模型目标提升为
+   `explicit`；`--non-interactive` 本身不具有此语义；
+4. 模型失败、partial、无目标或冲突目标不得提升，必须保留 `inferred` 或形成
+   `goal=null/source=null` 并进入 high risk floor。
+
+信任策略写入不可变 Product Review Request，Resume 只能沿用首次请求的策略。评测提升属于当前
+Snapshot 的运行策略，不等于人工确认，不能作为跨 Snapshot 的普通 explicit Intent 直接延续。
+
 以下旧字段从 Packet、Intent Inference Schema 和 Reviewer 投影中删除：
 
 ```text
@@ -331,7 +343,8 @@ packet
 analysis_record_ref
 ```
 
-内部 `IntentAnalysisRecord` 可以保存候选、Evidence Ref、工具 Trace、推断摘要和澄清历史，但不会发送给
+内部 `IntentAnalysisRecord` 可以保存候选、Evidence Ref、工具 Trace、推断摘要、信任策略、是否发生
+评测提升和澄清历史，但不会发送给
 Risk Agent 或 Reviewer。Intent 可以跨 Snapshot 延续；每次更新形成新版本并记录依据的 Snapshot，
 不得覆盖旧历史。
 

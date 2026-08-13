@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from enum import Enum
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -13,6 +15,13 @@ from review_agent.developer_rules import DeveloperRuleResolver
 from review_agent.execution_journal import ExecutionJournal
 from review_agent.global_memory import GlobalMemoryFacade
 from review_agent.intent_runtime import IntentRuntime
+from review_agent.intent_inference import (
+    IntentInferenceEvidence,
+    IntentInferenceResult,
+    IntentInferenceRun,
+    IntentInferenceTrace,
+    run_intent_inference,
+)
 from review_agent.local_quality import LocalQualityPlan, LocalQualityRunner
 from review_agent.model_adapter_factory import (
     ModelAdapterConfig,
@@ -20,6 +29,8 @@ from review_agent.model_adapter_factory import (
 )
 from review_agent.model_protocol import (
     ModelResponseKind,
+    ModelToolCall,
+    ModelToolResult,
     ModelTurnRequest,
 )
 from review_agent.model_risk import (
@@ -90,9 +101,11 @@ from review_agent.tool_artifacts import (
     ToolResultArtifactStore,
     ToolResultProjector,
 )
+from review_agent.tool_result_protocol import serialize_tool_result_projection_v2
 
 
-PRODUCT_REVIEW_REQUEST_SCHEMA = "product_review_request_v6"
+PRODUCT_REVIEW_REQUEST_SCHEMA = "product_review_request_v7"
+_LEGACY_PRODUCT_REVIEW_REQUEST_SCHEMA = "product_review_request_v6"
 _REQUEST_PREFIX = "Requests/request-"
 _INTENT_PREFIX = "Intent/intent-"
 
@@ -120,12 +133,18 @@ class ProductRuntimeInfrastructureError(ProductRuntimeError):
         self.locator = None if locator is None else dict(locator)
 
 
+class IntentTrustPolicyV6(str, Enum):
+    NORMAL = "normal"
+    EVALUATION_TRUST_MODEL = "evaluation_trust_model"
+
+
 @dataclass(frozen=True)
 class ProductReviewInputV6:
     request: ReviewRequest
     declared_goal: str | None = None
     title: str | None = None
     description: str | None = None
+    intent_trust_policy: IntentTrustPolicyV6 = IntentTrustPolicyV6.NORMAL
 
     def __post_init__(self) -> None:
         if type(self.request) is not ReviewRequest:
@@ -140,6 +159,8 @@ class ProductReviewInputV6:
                 raise ProductRuntimeUsageError(
                     f"{name} must be non-empty text or null"
                 )
+        if type(self.intent_trust_policy) is not IntentTrustPolicyV6:
+            raise ProductRuntimeUsageError("Intent trust policy is invalid")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -148,22 +169,40 @@ class ProductReviewInputV6:
             "declared_goal": self.declared_goal,
             "title": self.title,
             "description": self.description,
+            "intent_trust_policy": self.intent_trust_policy.value,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ProductReviewInputV6":
-        expected = {
+        legacy_expected = {
             "schema_version",
             "request",
             "declared_goal",
             "title",
             "description",
         }
-        if type(payload) is not dict or set(payload) != expected:
+        expected = {
+            *legacy_expected,
+            "intent_trust_policy",
+        }
+        if type(payload) is not dict:
             raise ProductRuntimeIntegrityError(
                 "persisted product request schema is invalid"
             )
-        if payload["schema_version"] != PRODUCT_REVIEW_REQUEST_SCHEMA:
+        schema = payload.get("schema_version")
+        if schema == PRODUCT_REVIEW_REQUEST_SCHEMA:
+            if set(payload) != expected:
+                raise ProductRuntimeIntegrityError(
+                    "persisted product request schema is invalid"
+                )
+            trust_policy = payload["intent_trust_policy"]
+        elif schema == _LEGACY_PRODUCT_REVIEW_REQUEST_SCHEMA:
+            if set(payload) != legacy_expected:
+                raise ProductRuntimeIntegrityError(
+                    "persisted product request schema is invalid"
+                )
+            trust_policy = IntentTrustPolicyV6.NORMAL.value
+        else:
             raise ProductRuntimeIntegrityError(
                 "persisted product request version is unsupported"
             )
@@ -173,6 +212,7 @@ class ProductReviewInputV6:
                 declared_goal=payload["declared_goal"],
                 title=payload["title"],
                 description=payload["description"],
+                intent_trust_policy=IntentTrustPolicyV6(trust_policy),
             )
         except (TypeError, ValueError) as error:
             raise ProductRuntimeIntegrityError(
@@ -496,6 +536,14 @@ class _BoundProductRuntimeV6:
             self._load_intent_envelope()
             return (_artifact_ref("intent.packet", existing),)
         review_input = self._load_review_input()
+        explicit = (
+            review_input.declared_goal
+            or review_input.title
+            or review_input.description
+        )
+        inference_run = None
+        if explicit is None:
+            inference_run = self._run_intent_agent(review_input)
         envelope = self.intent_runtime.resolve(
             self.session.workspace,
             self.snapshot,
@@ -503,6 +551,8 @@ class _BoundProductRuntimeV6:
             declared_goal=review_input.declared_goal,
             pr_title=review_input.title,
             pr_description=review_input.description,
+            inference_run=inference_run,
+            trust_policy=review_input.intent_trust_policy.value,
         )
         descriptor = self.workspace_store.publish_create_only(
             self.snapshot,
@@ -510,6 +560,60 @@ class _BoundProductRuntimeV6:
             envelope.to_json_bytes(),
         )
         return (_artifact_ref("intent.packet", descriptor),)
+
+    def _run_intent_agent(
+        self,
+        review_input: ProductReviewInputV6,
+    ) -> IntentInferenceRun:
+        factory = self._reviewer_factory
+        if factory is None:
+            return _failed_intent_inference_run(
+                trace_id=self._intent_trace_id(),
+                model=self.config.reviewer.model or "unavailable",
+                reason="Intent Agent model provider is not configured.",
+            )
+        diff = self.diff_store.load(self.snapshot)
+        gateway = _V6IntentInferenceGateway(
+            snapshot_id=self.snapshot.snapshot_id,
+            session_id=self.session.session_id,
+            base_revision=self.snapshot.base_sha,
+            head_revision=self.snapshot.head_sha,
+            backend=_GitReviewToolBackend(
+                self.repository,
+                self.snapshot.base_sha,
+                self.snapshot.head_sha,
+            ),
+            timeout_seconds=self.config.reviewer_limits.tool_timeout_seconds,
+            artifact_store=self.tool_artifacts,
+        )
+        return run_intent_inference(
+            adapter=factory.create(),
+            gateway=gateway,
+            deterministic_request_summary=json.dumps(
+                review_input.request.to_dict(),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            change_summary=_intent_change_summary(diff),
+            explicit_intent={},
+            missing_fields=("goal",),
+            initial_observation_summaries={},
+            trace_id=self._intent_trace_id(),
+            resolved_base_revision=self.snapshot.base_sha,
+            resolved_head_revision=self.snapshot.head_sha,
+            model=self.config.reviewer.model or "fake-intent-analyst",
+        )
+
+    def _intent_trace_id(self) -> str:
+        return "intent-" + hashlib.sha256(
+            (
+                self.session.session_id
+                + "\0"
+                + self.snapshot.snapshot_id
+            ).encode("utf-8", "strict")
+        ).hexdigest()
 
     def _planning(
         self,
@@ -927,7 +1031,11 @@ class _GitReviewToolBackend:
                 {"matches": [asdict(match) for match in matches]}
             )
         if tool_name == "read_commit_messages":
-            count = _bounded_int(args.get("max_count", 20), 1, 50)
+            requested_count = args.get(
+                "max_commits",
+                args.get("max_count", 20),
+            )
+            count = _bounded_int(requested_count, 1, 50)
             output = self._git(
                 [
                     "log",
@@ -1020,6 +1128,169 @@ class _GitReviewToolBackend:
         return completed.stdout
 
 
+_INTENT_TOOL_NAMES = (
+    "read_range",
+    "compare_base_head",
+    "search_code",
+    "list_symbols",
+    "inspect_symbol",
+    "find_references",
+    "read_commit_messages",
+)
+
+
+@dataclass(frozen=True)
+class _IntentToolExecution:
+    context_view: str
+    observation_ids: list[str]
+
+
+class _V6IntentInferenceGateway:
+    """Adapt the v6 Tool gateway to the Intent Agent's narrow protocol."""
+
+    def __init__(
+        self,
+        *,
+        snapshot_id: str,
+        session_id: str,
+        base_revision: str,
+        head_revision: str,
+        backend: _GitReviewToolBackend,
+        timeout_seconds: float,
+        artifact_store: ToolResultArtifactStore,
+    ) -> None:
+        self.base_revision = base_revision
+        self.head_revision = head_revision
+        self._gateway = ReviewToolGateway(
+            snapshot_id=snapshot_id,
+            session_id=session_id,
+            allowed_tools=_INTENT_TOOL_NAMES,
+            backend=backend,
+            timeout_seconds=timeout_seconds,
+            artifact_store=artifact_store,
+        )
+        self._projector = ToolResultProjector(artifact_store)
+        self._evidence: dict[str, IntentInferenceEvidence] = {}
+
+    def execute_intent_calls(
+        self,
+        calls: tuple[ModelToolCall, ...],
+    ) -> tuple[ModelToolResult, ...]:
+        raw_results = tuple(
+            self._gateway.execute(
+                call.call_id,
+                call.tool_name,
+                call.arguments,
+            )
+            for call in calls
+        )
+        batch = self._projector.project_turn(raw_results)
+        projected: list[ModelToolResult] = []
+        for call, raw_result, projection in zip(
+            calls,
+            raw_results,
+            batch.projections,
+        ):
+            content = serialize_tool_result_projection_v2(projection)
+            observation_ids: list[str] = []
+            if not projection.is_error:
+                evidence = _intent_tool_evidence(
+                    raw_result,
+                    content,
+                    base_revision=self.base_revision,
+                    head_revision=self.head_revision,
+                )
+                self._evidence[evidence.observation_id] = evidence
+                observation_ids.append(evidence.observation_id)
+            projected.append(
+                ModelToolResult(
+                    call_id=call.call_id,
+                    tool_name=call.tool_name,
+                    content=content,
+                    observation_ids=observation_ids,
+                    is_error=projection.is_error,
+                )
+            )
+        return tuple(projected)
+
+    def execute(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> _IntentToolExecution:
+        call_id = "intent-call-" + hashlib.sha256(
+            canonical_json_bytes(
+                {"tool_name": tool_name, "arguments": arguments}
+            )
+        ).hexdigest()
+        result = self.execute_intent_calls(
+            (ModelToolCall(call_id, tool_name, arguments),)
+        )[0]
+        if result.is_error:
+            raise ValueError(result.content)
+        return _IntentToolExecution(result.content, result.observation_ids)
+
+    def intent_evidence(self) -> tuple[IntentInferenceEvidence, ...]:
+        return tuple(self._evidence[key] for key in sorted(self._evidence))
+
+    def intent_evidence_summaries(self) -> dict[str, str]:
+        return {
+            key: self._evidence[key].context_view
+            for key in sorted(self._evidence)
+        }
+
+
+def _intent_tool_evidence(
+    result,
+    context_view: str,
+    *,
+    base_revision: str,
+    head_revision: str,
+) -> IntentInferenceEvidence:
+    arguments = result.arguments
+    path = arguments.get("path")
+    if type(path) is not str:
+        path = None
+    if result.tool_name == "read_commit_messages":
+        source = "git.read_commit_messages"
+        revision = f"{base_revision}..{head_revision}"
+    else:
+        source = {
+            "read_range": "git.read_range",
+            "compare_base_head": "git.compare_base_head",
+            "search_code": "git.search_code",
+            "list_symbols": "repo_intelligence.list_symbols",
+            "inspect_symbol": "repo_intelligence.inspect_symbol",
+            "find_references": "repo_intelligence.find_references",
+        }.get(result.tool_name, "review_tool")
+        revision = str(arguments.get("revision", "head"))
+    line_start = arguments.get("line_start")
+    line_end = arguments.get("line_end")
+    if type(line_start) is not int:
+        line_start = None
+    if type(line_end) is not int:
+        line_end = None
+    identity = {
+        "snapshot_id": result.snapshot_id,
+        "tool_name": result.tool_name,
+        "arguments": result.arguments,
+        "content_hash": hashlib.sha256(
+            context_view.encode("utf-8", "strict")
+        ).hexdigest(),
+    }
+    return IntentInferenceEvidence(
+        observation_id="O-" + hashlib.sha256(
+            canonical_json_bytes(identity)
+        ).hexdigest(),
+        source=source,
+        revision=revision,
+        path=path,
+        line_start=line_start,
+        line_end=line_end,
+        context_view=context_view,
+    )
+
+
 def _load_outcome(
     workspace_store: PRWorkspaceStore,
     session: SessionWorkspace,
@@ -1077,6 +1348,57 @@ def _load_outcome(
         review_markdown=markdown,
         manifest=manifest,
         reused=reused,
+    )
+
+
+def _intent_change_summary(diff: DiffArtifact) -> str:
+    payload = {
+        "base_sha": diff.index.base_sha,
+        "head_sha": diff.index.head_sha,
+        "changed_file_count": len(diff.index.files),
+        "files": [
+            {
+                "path": item.path,
+                "previous_path": item.previous_path,
+                "status": item.status,
+                "additions": item.additions,
+                "deletions": item.deletions,
+                "binary": item.binary,
+            }
+            for item in diff.index.files
+        ],
+    }
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _failed_intent_inference_run(
+    *,
+    trace_id: str,
+    model: str,
+    reason: str,
+) -> IntentInferenceRun:
+    return IntentInferenceRun(
+        result=IntentInferenceResult(
+            candidates=[],
+            uncertainties=[reason],
+            summary="Intent inference failed: " + reason,
+        ),
+        trace=IntentInferenceTrace(
+            trace_id=trace_id,
+            turns=[],
+            tool_call_count=0,
+            final_status="failed",
+            deficiencies=[reason],
+        ),
+        provider_name="review-agent",
+        model=model,
+        response_error=reason,
     )
 
 
@@ -1152,6 +1474,7 @@ def _bounded_int(value: Any, minimum: int, maximum: int) -> int:
 
 
 __all__ = [
+    "IntentTrustPolicyV6",
     "PRODUCT_REVIEW_REQUEST_SCHEMA",
     "ProductReviewInputV6",
     "ProductReviewOutcomeV6",

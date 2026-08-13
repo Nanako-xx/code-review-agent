@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 from review_agent.execution_profile import AgentExecutionProfile
 from review_agent.model_adapter_factory import ModelAdapterConfig
 from review_agent.product_runtime import (
+    IntentTrustPolicyV6,
     ProductReviewInputV6,
     ProductReviewOutcomeV6,
     ProductRuntimeConfigV6,
@@ -82,6 +83,14 @@ def _build_parser() -> argparse.ArgumentParser:
     ci_evidence.add_argument("--ci-evidence", action="append", default=[])
     ci_evidence.add_argument("--ci-evidence-file")
     review.add_argument("--non-interactive", action="store_true")
+    review.add_argument(
+        "--evaluation-trust-model-intent",
+        action="store_true",
+        help=(
+            "Evaluation-only policy: promote one reliable Intent Agent goal "
+            "to explicit when no human can confirm it"
+        ),
+    )
     review.add_argument(
         "--reviewer-provider",
         choices=["none", "fake", "openai-compatible"],
@@ -435,6 +444,11 @@ def _product_review_input_v6(args: argparse.Namespace) -> ProductReviewInputV6:
         declared_goal=args.intent,
         title=args.title,
         description=args.description,
+        intent_trust_policy=(
+            IntentTrustPolicyV6.EVALUATION_TRUST_MODEL
+            if args.evaluation_trust_model_intent
+            else IntentTrustPolicyV6.NORMAL
+        ),
     )
 
 def _product_runtime_config_v6(

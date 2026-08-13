@@ -35,8 +35,10 @@ class IntentIntegrityError(IntentRuntimeError):
     pass
 
 
-INTENT_ANALYSIS_SCHEMA = "intent_analysis_record_v1"
+INTENT_ANALYSIS_SCHEMA = "intent_analysis_record_v2"
+_LEGACY_INTENT_ANALYSIS_SCHEMA = "intent_analysis_record_v1"
 _ANALYSIS_REF = re.compile(r"\AIA-[0-9a-f]{64}\Z")
+INTENT_TRUST_POLICIES = frozenset({"normal", "evaluation_trust_model"})
 
 
 def _optional_text(value: Any, field_name: str) -> str | None:
@@ -67,6 +69,8 @@ class IntentAnalysisRecord:
     pr_description: str | None
     inferred_goal: str | None
     inference_run: IntentInferenceRun | None
+    trust_policy: str
+    model_inference_promoted: bool
     selection_reason: str
     continued_from_version: int | None
 
@@ -88,6 +92,8 @@ class IntentAnalysisRecord:
                 if self.inference_run is not None
                 else None
             ),
+            "trust_policy": self.trust_policy,
+            "model_inference_promoted": self.model_inference_promoted,
             "selection_reason": self.selection_reason,
             "continued_from_version": self.continued_from_version,
         }
@@ -110,6 +116,7 @@ class IntentRuntime:
         pr_description: str | None = None,
         inferred_goal: str | None = None,
         inference_run: IntentInferenceRun | None = None,
+        trust_policy: str = "normal",
     ) -> IntentVersionEnvelope:
         self._store.verify_workspace(workspace)
         self._store.verify_snapshot(snapshot)
@@ -125,8 +132,19 @@ class IntentRuntime:
             inference_run, IntentInferenceRun
         ):
             raise IntentRuntimeError("inference_run must be an IntentInferenceRun")
+        if trust_policy not in INTENT_TRUST_POLICIES:
+            raise IntentRuntimeError("Intent trust policy is unsupported")
 
         current = self.load_current(workspace)
+        current_model_inference_promoted = False
+        if current is not None:
+            current_analysis = self.load_analysis_record(
+                workspace,
+                current.analysis_record_ref,
+            )
+            current_model_inference_promoted = (
+                current_analysis.get("model_inference_promoted") is True
+            )
         has_new_analysis = any(
             value is not None
             for value in (
@@ -146,6 +164,7 @@ class IntentRuntime:
 
         explicit = declared or title or description
         selection_reason: str
+        model_inference_promoted = False
         projected_inferred_goal: str | None = direct_inference
         inference_uncertainties: tuple[str, ...] = ()
         if inference_run is not None:
@@ -173,19 +192,36 @@ class IntentRuntime:
         elif (
             current is not None
             and current.packet.source is IntentSource.EXPLICIT
+            and not current_model_inference_promoted
         ):
             packet = current.packet
             selection_reason = "explicit_continuation"
         elif projected_inferred_goal is not None:
+            model_inference_promoted = (
+                trust_policy == "evaluation_trust_model"
+                and inference_run is not None
+                and inference_run.status == "completed"
+            )
             packet = IntentPacket(
                 goal=projected_inferred_goal,
-                source=IntentSource.INFERRED,
+                source=(
+                    IntentSource.EXPLICIT
+                    if model_inference_promoted
+                    else IntentSource.INFERRED
+                ),
                 uncertainties=_normalize_uncertainties(inference_uncertainties),
             )
-            selection_reason = "inference_revalidated"
+            selection_reason = (
+                "evaluation_model_inference_promoted"
+                if model_inference_promoted
+                else "inference_revalidated"
+            )
         elif (
             current is not None
-            and current.packet.source is IntentSource.INFERRED
+            and (
+                current.packet.source is IntentSource.INFERRED
+                or current_model_inference_promoted
+            )
             and current.source_snapshot_id != snapshot.snapshot_id
         ):
             packet = IntentPacket(
@@ -195,7 +231,11 @@ class IntentRuntime:
                     "The previous inferred Intent requires revalidation for this Snapshot.",
                 ),
             )
-            selection_reason = "inference_revalidation_missing"
+            selection_reason = (
+                "evaluation_model_inference_revalidation_missing"
+                if current_model_inference_promoted
+                else "inference_revalidation_missing"
+            )
         else:
             uncertainties = _normalize_uncertainties(inference_uncertainties)
             if not uncertainties:
@@ -217,6 +257,8 @@ class IntentRuntime:
             pr_description=description,
             inferred_goal=direct_inference,
             inference_run=inference_run,
+            trust_policy=trust_policy,
+            model_inference_promoted=model_inference_promoted,
             selection_reason=selection_reason,
             continued_from_version=current.version if current is not None else None,
         )
@@ -270,7 +312,7 @@ class IntentRuntime:
             payload = self._store.read_intent_json(workspace, relative)
         except PRWorkspaceError as error:
             raise IntentIntegrityError("Intent analysis record is unavailable") from error
-        expected_fields = {
+        legacy_fields = {
             "schema_version",
             "source_snapshot_id",
             "public_conversation",
@@ -280,8 +322,18 @@ class IntentRuntime:
             "selection_reason",
             "continued_from_version",
         }
-        if set(payload) != expected_fields or payload["schema_version"] != (
-            INTENT_ANALYSIS_SCHEMA
+        expected_fields = {
+            *legacy_fields,
+            "trust_policy",
+            "model_inference_promoted",
+        }
+        schema = payload.get("schema_version")
+        if not (
+            schema == INTENT_ANALYSIS_SCHEMA
+            and set(payload) == expected_fields
+        ) and not (
+            schema == _LEGACY_INTENT_ANALYSIS_SCHEMA
+            and set(payload) == legacy_fields
         ):
             raise IntentIntegrityError("Intent analysis record schema is invalid")
         digest = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()

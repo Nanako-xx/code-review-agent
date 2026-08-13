@@ -286,6 +286,21 @@ def test_v6_tool_gateway_has_no_observation_store_or_legacy_gateway_dependency()
     assert "ObservationStore" not in _definitions(tree)
 
 
+def test_v6_intent_inference_uses_a_structural_gateway_not_legacy_storage() -> None:
+    tree = _tree("intent_inference.py")
+    violations = [
+        (module, symbol)
+        for module, symbol in _imports(tree)
+        if _module_matches(
+            module,
+            {"review_agent.observations", "review_agent.tool_gateway"},
+        )
+        or symbol in {"ObservationStore", "ToolGateway"}
+    ]
+
+    assert not violations
+
+
 def test_v6_reviewer_loop_does_not_import_legacy_loop_assignment_or_observations() -> None:
     forbidden_modules = {
         "review_agent.agent_loop",
