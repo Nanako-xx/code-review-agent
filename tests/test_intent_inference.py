@@ -90,7 +90,7 @@ def test_intent_inference_protocol_projection_owns_tools_and_runtime_limits():
 
     assert projection["runtime_limits"] == {
         "max_turns": 4,
-        "max_tool_calls": 8,
+        "max_tool_calls": None,
         "max_output_tokens": 4_096,
     }
     assert projection["invocation_defaults"] == {
@@ -513,30 +513,54 @@ def test_intent_inference_parse_retry_orders_failed_final_before_runtime_rejecti
     )
 
 
-def test_intent_inference_tool_budget_exhaustion_returns_partial(git_repo, tmp_path):
+def test_intent_inference_does_not_cap_cumulative_tool_calls(git_repo, tmp_path):
     head = run_git(git_repo, "rev-parse", "HEAD")
     gateway = ToolGateway(
         git_repo,
         head,
         head,
-        ObservationStore(tmp_path / "intent-tool-budget"),
+        ObservationStore(tmp_path / "intent-unlimited-tools"),
     )
     adapter = FakeToolCallingAdapter(
         script=[
             ModelTurnResponse(
                 kind=ModelResponseKind.TOOL_CALLS,
                 tool_calls=[
-                    ModelToolCall("read", "read_commit_messages", {})
+                    ModelToolCall(
+                        f"first-{index}",
+                        "read_commit_messages",
+                        {"max_commits": index},
+                    )
+                    for index in range(1, 8)
                 ],
-            )
-        ]
+            ),
+            ModelTurnResponse(
+                kind=ModelResponseKind.TOOL_CALLS,
+                tool_calls=[
+                    ModelToolCall(
+                        f"second-{index}",
+                        "read_commit_messages",
+                        {"max_commits": index},
+                    )
+                    for index in range(8, 12)
+                ],
+            ),
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=_result_json(
+                    origin="llm_inference",
+                    source_refs=[],
+                    evidence_refs=[],
+                ),
+            ),
+        ],
     )
 
-    run = _run(adapter, gateway, base=head, head=head, max_tool_calls=0)
+    run = _run(adapter, gateway, base=head, head=head)
 
-    assert run.status == "partial"
-    assert run.trace.tool_call_count == 0
-    assert "tool budget exhausted" in run.result.uncertainties
+    assert run.status == "completed"
+    assert run.trace.tool_call_count == 11
+    assert [len(turn.tool_results) for turn in run.trace.turns[:2]] == [7, 4]
 
 
 def test_intent_inference_turn_budget_exhaustion_returns_partial(git_repo, tmp_path):
@@ -688,7 +712,6 @@ def _run(
     head,
     initial_observation_summaries=None,
     max_turns=4,
-    max_tool_calls=8,
     memory_projection=None,
 ):
     return run_intent_inference(
@@ -703,7 +726,6 @@ def _run(
         initial_observation_summaries=initial_observation_summaries or {},
         trace_id="intent-test-trace",
         max_turns=max_turns,
-        max_tool_calls=max_tool_calls,
         memory_projection=memory_projection,
     )
 

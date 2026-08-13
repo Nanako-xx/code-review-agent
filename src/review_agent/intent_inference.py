@@ -76,7 +76,6 @@ _DOCUMENT_SUFFIXES = frozenset(
 
 INTENT_INFERENCE_PROTOCOL_VERSION = "intent-inference-protocol-v1"
 INTENT_INFERENCE_MAX_TURNS = 4
-INTENT_INFERENCE_MAX_TOOL_CALLS = 8
 INTENT_INFERENCE_MAX_OUTPUT_TOKENS = 4_096
 INTENT_INFERENCE_REASONING_EFFORT = "low"
 INTENT_INFERENCE_TEMPERATURE = 0
@@ -458,7 +457,6 @@ def run_intent_inference(
     resolved_head_revision: str | None = None,
     model: str = "configured-intent-model",
     max_turns: int = INTENT_INFERENCE_MAX_TURNS,
-    max_tool_calls: int = INTENT_INFERENCE_MAX_TOOL_CALLS,
     max_output_tokens: int = INTENT_INFERENCE_MAX_OUTPUT_TOKENS,
     reasoning_effort: str = INTENT_INFERENCE_REASONING_EFFORT,
     memory_projection: IntentMemoryProjection | None = None,
@@ -475,8 +473,6 @@ def run_intent_inference(
     _require_string(change_summary, "change_summary")
     if type(max_turns) is not int or max_turns < 0:
         raise ValueError("max_turns must be a non-negative integer")
-    if type(max_tool_calls) is not int or max_tool_calls < 0:
-        raise ValueError("max_tool_calls must be a non-negative integer")
     if type(max_output_tokens) is not int or max_output_tokens < 1:
         raise ValueError("max_output_tokens must be a positive integer")
     _require_non_empty_string(reasoning_effort, "reasoning_effort")
@@ -600,27 +596,6 @@ def run_intent_inference(
                     _failure_result([*deficiencies, error_message]),
                     response,
                 )
-            if tool_call_count + len(calls) > max_tool_calls:
-                error_message = "tool budget exhausted"
-                turns.append(
-                    IntentInferenceTurn(
-                        turn_index=turn_index,
-                        response_kind=response.kind.value,
-                        tool_calls=calls,
-                        error=error_message,
-                    )
-                )
-                all_deficiencies = _dedupe([*deficiencies, error_message])
-                return _finish_run(
-                    trace_id,
-                    turns,
-                    tool_call_count,
-                    "partial",
-                    all_deficiencies,
-                    _partial_result(all_deficiencies),
-                    response,
-                )
-
             current_results = _execute_tool_calls(gateway, calls)
             tool_call_count += len(calls)
             tool_results.extend(current_results)
@@ -1134,7 +1109,7 @@ def intent_inference_protocol_projection() -> dict[str, Any]:
         "tool_names": [item.name for item in tools],
         "runtime_limits": {
             "max_turns": INTENT_INFERENCE_MAX_TURNS,
-            "max_tool_calls": INTENT_INFERENCE_MAX_TOOL_CALLS,
+            "max_tool_calls": None,
             "max_output_tokens": INTENT_INFERENCE_MAX_OUTPUT_TOKENS,
         },
         "invocation_defaults": {
