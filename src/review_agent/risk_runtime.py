@@ -66,7 +66,7 @@ def deterministic_risk_floor(
         raise RiskRuntimeError("intent must be an IntentPacket")
 
     floors = [RiskLevel.LOW]
-    if changed_file_count > 50:
+    if changed_file_count > 100:
         floors.append(RiskLevel.MEDIUM)
     if intent.source is IntentSource.INFERRED:
         floors.append(RiskLevel.MEDIUM)

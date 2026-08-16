@@ -42,7 +42,7 @@ WORKSPACE_SCHEMA = "pr_workspace_manifest_v1"
 PR_METADATA_SCHEMA = "pr_metadata_v1"
 SNAPSHOT_SCHEMA = "snapshot_manifest_v1"
 SESSION_BINDING_SCHEMA = "session_binding_v1"
-CONTEXT_MANIFEST_SCHEMA = "context_manifest_v1"
+CONTEXT_MANIFEST_SCHEMA = "context_manifest_v2"
 ARTIFACT_RECEIPT_SCHEMA = "snapshot_artifact_receipt_v1"
 
 _PR_ID = re.compile(r"\APR-[0-9a-f]{64}\Z")
@@ -370,6 +370,7 @@ class PRWorkspaceStore:
             raise PRWorkspaceError("Session already exists")
         try:
             ensure_secure_directory(path)
+            ensure_secure_directory(resolve_managed_path(path, "Reviewers"))
         except SafeIOError as error:
             raise PRWorkspaceSecurityError(str(error)) from error
 
@@ -380,20 +381,7 @@ class PRWorkspaceStore:
             "snapshot_id": snapshot.snapshot_id,
             "status": "created",
         }
-        context = {
-            "schema_version": CONTEXT_MANIFEST_SCHEMA,
-            "session_id": session_id,
-            "pr_id": workspace.pr_id,
-            "snapshot_id": snapshot.snapshot_id,
-            "last_api_request_at": None,
-            "compaction_generation": 0,
-            "compacted_through_turn": 0,
-            "compaction_trigger": None,
-            "compaction_summary_hash": None,
-        }
         self._publish_json_create_only(path / "state.json", state)
-        self._publish_bytes_create_only(path / "execution-log.jsonl", b"")
-        self._publish_json_create_only(path / "context-manifest.json", context)
         return SessionWorkspace(
             workspace=workspace,
             snapshot=snapshot,

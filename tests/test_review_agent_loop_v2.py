@@ -284,7 +284,7 @@ def test_loop_compacts_full_dynamic_history_before_next_reviewer_call(
     assert run.runtime.provider_attempts == 3
     assert run.runtime.total_tokens == 45
     manifest = json.loads(
-        (journal.session.path / "context-manifest.json").read_text("utf-8")
+        (journal.runtime_path / "context-manifest.json").read_text("utf-8")
     )
     assert manifest["last_api_request_at"] is not None
 

@@ -212,13 +212,24 @@ PRWorkspace
 └─ Sessions
    └─ <session-id>
       ├─ state.json
-      ├─ execution-log.jsonl
-      └─ context-manifest.json
+      ├─ pipeline-state.json
+      └─ Reviewers
+         └─ <reviewer-id>
+            ├─ reviewer.json
+            ├─ execution-log.jsonl
+            ├─ context-manifest.json
+            └─ context-compaction-<generation>.txt
 ```
 
-`context-manifest.json` 引用当前 Snapshot、已选择 Artifact 和当前上下文投影，并至少记录：
+Session 根目录只保存跨 Reviewer 的编排进度，不保存任何可变的 Reviewer 对话或压缩状态。每个
+`Reviewers/<reviewer-id>` 目录通过 `reviewer.json` 唯一绑定一个 Assignment；同一 Session 中并行 Reviewer
+不得共用 execution journal、上下文投影、上次 API 调用时间、压缩代次或压缩 Summary。
+
+每个 Reviewer 私有的 `context-manifest.json` 引用当前 Snapshot、Assignment、已选择 Artifact 和当前上下文
+投影，并至少记录：
 
 ```text
+assignment_id
 last_api_request_at
 compaction_generation
 compacted_through_turn
@@ -227,7 +238,8 @@ compaction_summary_hash
 ```
 
 原始 `execution-log.jsonl` 保持追加式；Context Compaction 只替换下一次 API 请求使用的投影，不删除原始
-Session 事件或权威 Artifact。
+Reviewer 事件或权威 Artifact。完整 Diff、QualityGate、ChangedSymbols、Intent 和 ReviewPlan 等不可变
+Snapshot 事实可以共享存储；Reviewer 的消息历史、Tool Result 投影、淘汰标记和压缩状态不能共享。
 
 ## 7. DiffArtifact
 
@@ -307,10 +319,14 @@ Diff、代码、Commit 或其他证据推断；无法形成可靠目标时使用
 
 1. `--intent`、PR 标题或 PR 描述中任一项存在时，直接形成 `explicit`，不调用 Intent Agent；
 2. 三项均缺失时必须调用 Intent Agent，普通运行中唯一可靠目标标记为 `inferred`；
-3. 无人交互评测必须显式启用 `evaluation_trust_model` 策略，才可把完整成功且唯一可靠的模型目标提升为
-   `explicit`；`--non-interactive` 本身不具有此语义；
-4. 模型失败、partial、无目标或冲突目标不得提升，必须保留 `inferred` 或形成
-   `goal=null/source=null` 并进入 high risk floor。
+3. 无人交互评测必须显式启用 `evaluation_trust_model` 策略；只要 Intent Agent 的 `completed` 或 `partial`
+   结果投影出唯一可用目标，就提升为 `explicit`；`--non-interactive` 本身不具有此语义；
+4. 模型失败、无目标或冲突目标不得提升，必须保留 `inferred` 或形成 `goal=null/source=null` 并进入
+   high risk floor。`partial` 中保留下来的唯一可用目标在评测策略下仍视为可信模型结论。
+
+`evaluation_trust_model` 下不执行候选 `origin/source_refs/evidence_refs` 的权威性匹配：Runtime 仍移除未授权
+Evidence、把无法证明的显式来源清洗为 `llm_inference`，并在内部保留原始模型响应，但这些来源问题不产生
+deficiency、不降低 Intent Agent status，也不进入下游 `uncertainties`。普通模式继续执行完整来源校验。
 
 Intent Agent 的模型轮数和只读工具调用都不设置累计次数预算；单轮并行调用数也不受产品层人为上限限制。
 Intent Agent 使用 1,800 秒累计活跃时间边界，每次 Provider 请求只获得剩余时间；工具自身超时、Provider
@@ -474,7 +490,7 @@ Runtime 使用以下初始规则：
 ```python
 risk_floor = RiskLevel.LOW
 
-if len(diff_artifact.index.files) > 50:
+if len(diff_artifact.index.files) > 100:
     risk_floor = max(risk_floor, RiskLevel.MEDIUM)
 
 if intent.source == "inferred":
@@ -484,7 +500,7 @@ if intent.source is None:
     risk_floor = max(risk_floor, RiskLevel.HIGH)
 ```
 
-文件数按 Diff Index 中逻辑文件记录计数；一次 rename/copy 算一个文件修改。正好 50 个文件不触发升级。
+文件数按 Diff Index 中逻辑文件记录计数；一次 rename/copy 算一个文件修改。正好 100 个文件不触发升级。
 Intent 来源映射为：
 
 ```text
@@ -834,14 +850,15 @@ tool_result_preview_chars = 2_000
 - Tool Gateway 必须按具体调用标记结果是否 `reacquirable`，不能仅按工具名称推断；
 - 不可重新获取的单个结果 `> 50,000` 字符时，在工具返回后立即完整写入 `ToolResults/artifacts`；
 - 对于上述大结果，模型只接收不透明 `artifact_id`、工具名、原始大小、状态和最多约 2,000 字符预览；
-- 不可重新获取但 `<= 50,000` 字符的结果不创建独立 Artifact，完整保留在当前上下文和 Session transcript；
+- 不可重新获取但 `<= 50,000` 字符的结果不创建独立 Artifact，完整保留在当前上下文和 Reviewer transcript；
 - 可重新获取的结果默认不创建独立 Artifact，在当前轮预算允许时完整保留；超过当前轮预算时用最多 2,000
   字符预览和原 Tool Call 的重取信息代替，模型应改用更窄查询或分页读取；
 - 模型不得接收受信任本地绝对路径作为读取授权；
 - 外置失败时必须形成显式工具错误或采用明确的安全回退，不得悄悄丢失内容。
 
 这里的“不落盘”是指不创建独立 Tool Result Artifact。为了支持断线恢复，已经进入模型消息链的小结果仍随
-`execution-log.jsonl`/Session transcript 持久化；否则无法从 `turn_committed` 重建同一会话。
+当前 Reviewer 私有的 `execution-log.jsonl`/transcript 持久化；否则无法从 `turn_committed` 重建同一
+Reviewer 会话。
 
 第一版默认分类：
 
@@ -890,7 +907,7 @@ artifact_id when externalized
 context_evicted_at when evicted
 ```
 
-小结果可以随 Session transcript 持久化；大结果必须能通过 Artifact Store 在恢复后读取。相同 Artifact 内容
+小结果可以随 Reviewer transcript 持久化；大结果必须能通过 Artifact Store 在恢复后读取。相同 Artifact 内容
 可以内容寻址去重，但是否允许语义复用仍必须验证 Snapshot、工具参数和环境有效性。
 
 ### 14.5 Artifact 读取
@@ -1158,8 +1175,8 @@ Summary 使用一个简洁文本块，不建立新的复杂领域模型，但必
 仍未完成的任务与下一步
 ```
 
-Compaction 只在 Summary 生成成功、不超过 50,000 Token、通过非空和大小校验、写入 Session 并更新
-`context-manifest.json` 后提交。压缩后的完整候选请求必须低于 700,000 Token；否则本次 Summary 无效，
+Compaction 只在 Summary 生成成功、不超过 50,000 Token、通过非空和大小校验、写入当前 Reviewer 私有
+目录并更新其 `context-manifest.json` 后提交。压缩后的完整候选请求必须低于 700,000 Token；否则本次 Summary 无效，
 不得提交。
 至少记录 generation、压缩到的最后 Turn、触发原因、源消息范围和 Summary hash。原始 execution journal 和
 Artifact 不删除；它们用于审计和恢复，但默认不重新注入模型上下文。
@@ -1198,7 +1215,9 @@ Prompt Cache 空闲清理       3,600 seconds / keep latest 5
 
 ### 17.1 追加式执行日志
 
-每个 Reviewer 使用 `Sessions/<session-id>/execution-log.jsonl` 保存逐轮执行事件。最小事件集合为：
+每个 Reviewer 使用
+`Sessions/<session-id>/Reviewers/<reviewer-id>/execution-log.jsonl` 保存自己的逐轮执行事件。不同 Reviewer
+之间不得读取、追加或恢复彼此的 journal。最小事件集合为：
 
 ```text
 model_response
@@ -1581,7 +1600,7 @@ Proposal 或旧 ReviewBrief Reporting。历史实现只保留在显式 legacy/Me
 - `goal/source` 的 nullability 不变量被严格验证；
 - Intent/Risk 内部对话不会进入 Reviewer Context；
 - `explicit/inferred/null` 分别产生 low/medium/high Intent risk floor；
-- 50 个文件不升级，51 个文件产生 medium floor；
+- 100 个文件不升级，101 个文件产生 medium floor；
 - Risk Model 只能返回 `{"level":"..."}`，未知字段被拒绝；
 - 最终 Risk 等于全部确定性 floor 与模型 level 的最大值。
 

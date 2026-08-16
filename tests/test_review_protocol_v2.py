@@ -446,7 +446,7 @@ def test_v6_artifact_schema_names_are_registered_without_rebinding_v5() -> None:
         "reviewer_output": "reviewer_output_v2",
         "aggregation_record": "aggregation_record_v1",
         "review_result": "review_result_v1",
-        "context_manifest": "context_manifest_v1",
+        "context_manifest": "context_manifest_v2",
         "execution_journal_event": "execution_journal_event_v1",
     }
 

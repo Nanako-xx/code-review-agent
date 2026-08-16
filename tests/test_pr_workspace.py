@@ -177,10 +177,9 @@ def test_create_session_binds_pr_and_snapshot_and_creates_runtime_files(
     assert session.path.name == "u-" + "d" * 32
     assert session.session_id == session_id
     assert (session.path / "state.json").is_file()
-    assert (session.path / "execution-log.jsonl").read_bytes() == b""
-    context = json.loads((session.path / "context-manifest.json").read_text("utf-8"))
-    assert context["snapshot_id"] == snapshot.snapshot_id
-    assert context["compaction_generation"] == 0
+    assert (session.path / "Reviewers").is_dir()
+    assert not (session.path / "execution-log.jsonl").exists()
+    assert not (session.path / "context-manifest.json").exists()
 
     with pytest.raises(PRWorkspaceError, match="already exists"):
         store.create_session(workspace, snapshot, session_id=session_id)

@@ -200,7 +200,7 @@ class IntentRuntime:
             model_inference_promoted = (
                 trust_policy == "evaluation_trust_model"
                 and inference_run is not None
-                and inference_run.status == "completed"
+                and inference_run.status in {"completed", "partial"}
             )
             packet = IntentPacket(
                 goal=projected_inferred_goal,

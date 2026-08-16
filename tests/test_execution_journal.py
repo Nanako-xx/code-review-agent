@@ -64,6 +64,56 @@ def _journal(tmp_path: Path):
     )
 
 
+def test_private_reviewer_runtime_preserves_windows_staging_path_budget(
+    tmp_path: Path,
+) -> None:
+    relative_runtime = (
+        Path("pr")
+        / ("p-" + "0" * 32)
+        / "Sessions"
+        / ("u-" + "0" * 32)
+        / "Reviewers"
+        / ("r-" + "0" * 8)
+    )
+    staging_name = ".stage-" + "0" * 32 + ".tmp"
+    desired_staging_length = 254
+    fixed_length = len(str(tmp_path / relative_runtime / staging_name))
+    padding = desired_staging_length - fixed_length - 1
+    if padding < 1:
+        pytest.skip("pytest temporary root leaves no legacy MAX_PATH budget")
+
+    repository = tmp_path / "repo-long-root"
+    git_common = repository / ".git"
+    git_common.mkdir(parents=True)
+    identity = RepositoryIdentity(
+        canonical_path=str(repository.resolve()),
+        git_common_dir=str(git_common.resolve()),
+        origin_url=None,
+    )
+    store = PRWorkspaceStore(tmp_path / ("w" * padding))
+    workspace = store.create_or_load_workspace(
+        store.resolve_pr(identity, "local", "long-reviewer-runtime"),
+        PRMetadata(title="Long Reviewer Runtime"),
+    )
+    snapshot = store.create_or_load_snapshot(workspace, BASE_SHA, HEAD_SHA)
+    session = store.create_session(workspace, snapshot)
+    assignment = compile_review_plan(
+        snapshot_id=snapshot.snapshot_id,
+        risk_level=RiskLevel.LOW,
+        allowed_files=("src/api.py",),
+        allowed_symbols=(),
+        allowed_hunks=(),
+    ).assignments[0]
+
+    journal = ExecutionJournal(store, session, assignment)
+    hypothetical_staging = journal.runtime_path / staging_name
+
+    assert journal.runtime_path.name == "r-" + assignment.assignment_id[4:12]
+    assert len(str(hypothetical_staging)) <= 259
+    assert journal.path.is_file()
+    assert (journal.runtime_path / "reviewer.json").is_file()
+
+
 def _call() -> ModelToolCall:
     return ModelToolCall(
         call_id="call-1",
@@ -224,6 +274,26 @@ def test_completed_tool_call_is_idempotent_and_not_appended_twice(tmp_path: Path
 
     assert reused == projection
     assert len(journal.read_events()) == event_count
+
+
+def test_non_empty_private_journal_reopens_for_resume(tmp_path: Path) -> None:
+    journal, assignment, _snapshot = _journal(tmp_path)
+    journal.record_model_response(
+        turn_index=0,
+        assistant_message=_assistant_message(),
+        tool_calls=(_call(),),
+        active_elapsed_seconds=1.0,
+    )
+
+    resumed = ExecutionJournal(
+        journal.workspace_store,
+        journal.session,
+        assignment,
+    )
+
+    assert resumed.runtime_path == journal.runtime_path
+    assert resumed.path == journal.path
+    assert resumed.read_events() == journal.read_events()
 
 
 def test_journal_hash_chain_detects_tampering(tmp_path: Path) -> None:

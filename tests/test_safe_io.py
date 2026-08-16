@@ -157,6 +157,24 @@ def test_create_only_publication_cannot_overwrite_existing_content(
     assert destination.read_bytes() == b"first"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows long-path regression")
+def test_create_only_publication_supports_a_long_windows_staging_path(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path
+    staged_name = ".stage-" + "a" * 32 + ".tmp"
+    index = 0
+    while len(str(parent / staged_name)) <= 260:
+        parent /= f"segment-{index:02d}"
+        index += 1
+    destination = parent / "core-1.json"
+
+    assert len(str(parent / staged_name)) > 260
+    publish_create_only_bytes(destination, b"assignment")
+
+    assert destination.read_bytes() == b"assignment"
+
+
 def test_regular_file_and_hash_verification_fail_closed(tmp_path: Path) -> None:
     artifact = tmp_path / "artifact.bin"
     content = b"authoritative artifact"

@@ -28,7 +28,6 @@ _SNAPSHOT_ID = re.compile(r"\AS-[0-9a-f]{64}\Z")
 _ARTIFACT_ID = re.compile(r"\AA-[0-9a-f]{64}\Z")
 _ASSIGNMENT_ID = re.compile(r"\AASG-[0-9a-f]{64}\Z")
 _GIT_SHA = re.compile(r"\A[0-9a-f]{40,64}\Z")
-_HUNK_REF = re.compile(r"\A(?P<path>.+)#hunk-(?P<index>[0-9]+)\Z")
 
 
 class ReviewerContextError(ValueError):
@@ -82,12 +81,12 @@ class AvailableArtifact:
 @dataclass(frozen=True)
 class DiffFitPolicy:
     target_initial_tokens: int = 550_000
-    estimated_chars_per_token: float = 4.0
+    estimated_utf8_bytes_per_token: float = 1.0
 
     def __post_init__(self) -> None:
         if type(self.target_initial_tokens) is not int or self.target_initial_tokens <= 0:
             raise ReviewerContextError("target_initial_tokens must be positive")
-        value = self.estimated_chars_per_token
+        value = self.estimated_utf8_bytes_per_token
         if (
             isinstance(value, bool)
             or not isinstance(value, (int, float))
@@ -95,18 +94,27 @@ class DiffFitPolicy:
             or value <= 0
         ):
             raise ReviewerContextError(
-                "estimated_chars_per_token must be a positive finite number"
+                "estimated_utf8_bytes_per_token must be a positive finite number"
             )
 
-    def estimate_tokens(self, character_count: int) -> int:
-        if type(character_count) is not int or character_count < 0:
-            raise ReviewerContextError("character_count must be non-negative")
-        return int(math.ceil(character_count / self.estimated_chars_per_token))
+    def estimate_tokens(self, content: str | bytes) -> int:
+        if type(content) is str:
+            try:
+                byte_count = len(content.encode("utf-8", "strict"))
+            except UnicodeError as error:
+                raise ReviewerContextError("content must be valid UTF-8") from error
+        elif type(content) is bytes:
+            byte_count = len(content)
+        else:
+            raise ReviewerContextError("content must be text or bytes")
+        return int(math.ceil(byte_count / self.estimated_utf8_bytes_per_token))
 
     def to_dict(self) -> dict[str, object]:
         return {
             "target_initial_tokens": self.target_initial_tokens,
-            "estimated_chars_per_token": float(self.estimated_chars_per_token),
+            "estimated_utf8_bytes_per_token": float(
+                self.estimated_utf8_bytes_per_token
+            ),
         }
 
 
@@ -318,56 +326,60 @@ def _visible_artifacts(value: ReviewerContextInput) -> list[dict[str, str]]:
     ]
 
 
-def _relevant_diff(value: ReviewerContextInput) -> str:
-    pieces: list[tuple[str, bytes]] = []
-    files = {entry.path: entry for entry in value.diff_index.files}
-    for reference in value.assignment.targets.hunks:
-        match = _HUNK_REF.fullmatch(reference)
-        if match is None:
-            continue
-        file_entry = files.get(match.group("path"))
-        if file_entry is None:
-            continue
-        hunk_index = int(match.group("index"))
-        hunk = next(
-            (item for item in file_entry.hunks if item.hunk_index == hunk_index),
-            None,
-        )
-        if hunk is not None:
-            pieces.append(
-                (
-                    reference,
-                    value.diff_bytes[hunk.byte_start : hunk.byte_end],
-                )
-            )
-    if not pieces:
-        for path in value.assignment.targets.files:
-            file_entry = files.get(path)
-            if file_entry is not None:
-                pieces.append(
-                    (
-                        f"file:{path}",
-                        value.diff_bytes[
-                            file_entry.byte_start : file_entry.byte_end
-                        ],
-                    )
-                )
-    rendered: list[str] = []
-    for reference, content in pieces:
-        rendered.extend(
-            (
-                f"<DiffFragment ref={json.dumps(reference)}>",
-                content.decode("utf-8", "strict"),
-                "</DiffFragment>",
-            )
-        )
-    return "\n".join(rendered) if rendered else "(No inline fragment selected.)"
+def _assignment_context_projection(value: ReviewerContextInput) -> dict[str, Any]:
+    assignment = value.assignment
+    targets = assignment.targets
+    return {
+        "assignment_id": assignment.assignment_id,
+        "snapshot_id": assignment.snapshot_id,
+        "role": assignment.role,
+        "role_kind": assignment.role_kind.value,
+        "perspective": assignment.perspective,
+        "mission": assignment.mission,
+        "target_counts": {
+            "files": len(targets.files),
+            "symbols": len(targets.symbols),
+            "hunks": len(targets.hunks),
+        },
+        "checks": list(assignment.checks),
+        "permissions": list(assignment.permissions),
+    }
+
+
+def _diff_context_index(value: ReviewerContextInput) -> dict[str, Any]:
+    index = value.diff_index
+    return {
+        "schema_version": "diff_artifact_context_index_v1",
+        "snapshot_id": index.snapshot_id,
+        "base_sha": index.base_sha,
+        "head_sha": index.head_sha,
+        "patch_artifact_id": index.patch_artifact_id,
+        "diff_sha256": index.diff_sha256,
+        "diff_size_bytes": index.diff_size_bytes,
+        "file_count": len(index.files),
+        "files": [
+            {
+                "file_index": entry.file_index,
+                "path": entry.path,
+                "previous_path": entry.previous_path,
+                "status": entry.status,
+                "additions": entry.additions,
+                "deletions": entry.deletions,
+                "binary": entry.binary,
+                "submodule": entry.submodule,
+                "byte_start": entry.byte_start,
+                "byte_end": entry.byte_end,
+                "hunk_count": len(entry.hunks),
+            }
+            for entry in index.files
+        ],
+    }
 
 
 def _code_changes(
     value: ReviewerContextInput,
     *,
-    fixed_character_count: int,
+    fixed_content: str,
 ) -> tuple[str, str, int]:
     full_diff = value.diff_bytes.decode("utf-8", "strict")
     full_block = (
@@ -376,21 +388,24 @@ def _code_changes(
         + "\n</CodeChanges>"
     )
     policy = value.diff_fit_policy
-    full_tokens = policy.estimate_tokens(fixed_character_count + len(full_block))
+    full_tokens = policy.estimate_tokens(fixed_content + full_block)
     if full_tokens <= policy.target_initial_tokens:
         return "full", full_block, full_tokens
 
     indexed_block = (
         f'<CodeChanges mode="indexed" artifact_id="{value.diff_artifact_id}">\n'
         "<DiffIndex>\n"
-        + _json(value.diff_index.to_dict())
-        + "\n</DiffIndex>\n<RelevantDiff>\n"
-        + _relevant_diff(value)
-        + "\n</RelevantDiff>\n</CodeChanges>"
+        + _json(_diff_context_index(value))
+        + "\n</DiffIndex>\n"
+        "The complete immutable Diff is available through read_artifact using "
+        "the artifact_id above, and file-specific changes are available through "
+        "compare_base_head.\n</CodeChanges>"
     )
-    indexed_tokens = policy.estimate_tokens(
-        fixed_character_count + len(indexed_block)
-    )
+    indexed_tokens = policy.estimate_tokens(fixed_content + indexed_block)
+    if indexed_tokens > policy.target_initial_tokens:
+        raise ReviewerContextError(
+            "Pinned Reviewer context exceeds the initial Token target"
+        )
     return "indexed", indexed_block, indexed_tokens
 
 
@@ -427,7 +442,7 @@ def build_reviewer_invocation_v2(
         + "\n</{{system_rule}}>\n\n<IntentPacket>\n"
         + _json(value.intent.to_dict())
         + "\n</IntentPacket>\n\n<Assignment>\n"
-        + _json(value.assignment.to_dict())
+        + _json(_assignment_context_projection(value))
         + "\n</Assignment>\n\n<PreflightResults>\n"
         + _json(
             {
@@ -458,9 +473,8 @@ def build_reviewer_invocation_v2(
             ).encode("utf-8")
         ).hexdigest(),
     }
-    fixed_character_count = sum(
-        len(part)
-        for part in (
+    fixed_content = "".join(
+        (
             system,
             _json(list(tools)),
             _json(base_parameters),
@@ -470,7 +484,7 @@ def build_reviewer_invocation_v2(
     )
     diff_mode, code_changes, estimated_tokens = _code_changes(
         value,
-        fixed_character_count=fixed_character_count,
+        fixed_content=fixed_content,
     )
     message = non_code_sections + code_changes + artifacts_section
     parameters = {

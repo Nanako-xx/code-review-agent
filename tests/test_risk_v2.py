@@ -44,11 +44,11 @@ def _intent(source: IntentSource | None) -> IntentPacket:
 @pytest.mark.parametrize(
     ("changed_file_count", "source", "expected"),
     [
-        (50, IntentSource.EXPLICIT, RiskLevel.LOW),
-        (51, IntentSource.EXPLICIT, RiskLevel.MEDIUM),
+        (100, IntentSource.EXPLICIT, RiskLevel.LOW),
+        (101, IntentSource.EXPLICIT, RiskLevel.MEDIUM),
         (1, IntentSource.INFERRED, RiskLevel.MEDIUM),
         (1, None, RiskLevel.HIGH),
-        (51, None, RiskLevel.HIGH),
+        (101, None, RiskLevel.HIGH),
     ],
 )
 def test_deterministic_risk_floor_has_exact_file_and_intent_boundaries(
@@ -168,7 +168,7 @@ def test_risk_runtime_persists_one_snapshot_bound_minimal_record(
 
     record = runtime.finalize(
         snapshot,
-        _diff_index(snapshot.snapshot_id, 51),
+        _diff_index(snapshot.snapshot_id, 101),
         _intent(IntentSource.EXPLICIT),
         model_decision=RiskDecision(RiskLevel.LOW),
     )

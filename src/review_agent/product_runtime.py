@@ -605,6 +605,10 @@ class _BoundProductRuntimeV6:
             resolved_head_revision=self.snapshot.head_sha,
             model=self.config.reviewer.model or "fake-intent-analyst",
             goal_only=True,
+            enforce_candidate_provenance=(
+                review_input.intent_trust_policy
+                is not IntentTrustPolicyV6.EVALUATION_TRUST_MODEL
+            ),
         )
 
     def _intent_trace_id(self) -> str:
@@ -752,7 +756,7 @@ class _BoundProductRuntimeV6:
                 ),
                 diff_index=diff.index,
                 diff_artifact_id=diff.patch.artifact_id,
-                available_artifacts=self._available_artifacts(diff),
+                available_artifacts=self._available_artifacts(diff, assignment),
                 model=self.config.reviewer.model or "fake-reviewer-v2",
             )
         )
@@ -915,7 +919,43 @@ class _BoundProductRuntimeV6:
     def _available_artifacts(
         self,
         diff: DiffArtifact,
+        assignment: ReviewerAssignment,
     ) -> tuple[AvailableArtifact, ...]:
+        plan = self._load_plan(self.context)
+        assignment_descriptor: ArtifactDescriptor | None = None
+        for slot, candidate in zip(
+            fixed_reviewer_slots(plan.risk_level),
+            plan.assignments,
+        ):
+            if candidate.assignment_id != assignment.assignment_id:
+                continue
+            if candidate != assignment:
+                raise ProductRuntimeIntegrityError(
+                    "Reviewer Assignment binding changed"
+                )
+            assignment_descriptor = self.workspace_store.find_snapshot_artifact(
+                self.snapshot,
+                f"ReviewPlan/Assignments/{slot.slot_id}.json",
+            )
+            persisted = self.workspace_store.read_verified_artifact(
+                self.snapshot,
+                assignment_descriptor.artifact_id,
+            )
+            try:
+                loaded = ReviewerAssignment.from_json(persisted)
+            except ValueError as error:
+                raise ProductRuntimeIntegrityError(
+                    "Reviewer Assignment artifact is invalid"
+                ) from error
+            if loaded != assignment:
+                raise ProductRuntimeIntegrityError(
+                    "Reviewer Assignment artifact binding changed"
+                )
+            break
+        if assignment_descriptor is None:
+            raise ProductRuntimeIntegrityError(
+                "Reviewer Assignment is not present in the immutable ReviewPlan"
+            )
         quality = self.workspace_store.find_snapshot_artifact(
             self.snapshot,
             "QualityGate/quality-gate.json",
@@ -939,6 +979,15 @@ class _BoundProductRuntimeV6:
                 artifact_id=symbols.artifact_id,
                 kind="changed_symbols",
                 description="Changed-symbol analysis for the immutable Snapshot.",
+            ),
+            AvailableArtifact(
+                artifact_id=assignment_descriptor.artifact_id,
+                kind="reviewer_assignment",
+                description=(
+                    "Complete immutable Assignment for this Reviewer, including "
+                    "its authorized files, symbols, and hunks."
+                ),
+                assignment_ids=(assignment.assignment_id,),
             ),
         )
 

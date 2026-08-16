@@ -111,6 +111,63 @@ def _runtime(tmp_path: Path):
     return store, session, journal, invocation
 
 
+def test_parallel_reviewers_have_private_journal_and_compaction_state(
+    tmp_path: Path,
+) -> None:
+    store, session, first, invocation = _runtime(tmp_path)
+    assignments = compile_review_plan(
+        snapshot_id=session.snapshot.snapshot_id,
+        risk_level=RiskLevel.MEDIUM,
+        allowed_files=("src/api.py",),
+        allowed_symbols=(),
+        allowed_hunks=(),
+    ).assignments
+    first = ExecutionJournal(store, session, assignments[0])
+    second = ExecutionJournal(store, session, assignments[1])
+    first_manager = ContextWindowManager(
+        journal=first,
+        invocation=invocation,
+        adapter=object(),
+        estimator=_ThresholdEstimator(),
+        policy=_policy(),
+        utc_now=_Clock(datetime(2026, 8, 11, tzinfo=timezone.utc)),
+    )
+    second_manager = ContextWindowManager(
+        journal=second,
+        invocation=invocation,
+        adapter=object(),
+        estimator=_ThresholdEstimator(),
+        policy=_policy(),
+        utc_now=_Clock(datetime(2026, 8, 11, tzinfo=timezone.utc)),
+    )
+
+    _commit_turn(first, 0)
+    first_manager.prepare_request(
+        parameters=dict(invocation.parameters),
+        summarizer=lambda _work: CompactionSummaryResult(
+            summary="First Reviewer private progress.",
+            active_elapsed_seconds=5.0,
+        ),
+        active_elapsed_seconds=4.0,
+    )
+
+    assert first.runtime_path != second.runtime_path
+    assert first.path != second.path
+    assert first.replay().context_compaction is not None
+    assert second.replay().context_compaction is None
+    assert second_manager.active_messages() == invocation.messages
+    first_manifest = json.loads(
+        (first.runtime_path / "context-manifest.json").read_text("utf-8")
+    )
+    second_manifest = json.loads(
+        (second.runtime_path / "context-manifest.json").read_text("utf-8")
+    )
+    assert first_manifest["assignment_id"] == assignments[0].assignment_id
+    assert second_manifest["assignment_id"] == assignments[1].assignment_id
+    assert first_manifest["compaction_generation"] == 1
+    assert second_manifest["compaction_generation"] == 0
+
+
 def _commit_turn(
     journal: ExecutionJournal,
     turn_index: int,
@@ -370,9 +427,11 @@ def test_full_compaction_commits_summary_and_resume_uses_only_summary(
     assert replay.context_compaction is not None
     assert replay.context_compaction.generation == 1
     assert replay.context_compaction.through_turn == 1
-    summary_path = session.path / replay.context_compaction.summary_path
+    summary_path = journal.runtime_path / replay.context_compaction.summary_path
     assert summary_path.read_text("utf-8").startswith("Completed investigations")
-    manifest = json.loads((session.path / "context-manifest.json").read_text("utf-8"))
+    manifest = json.loads(
+        (journal.runtime_path / "context-manifest.json").read_text("utf-8")
+    )
     assert manifest["compaction_generation"] == 1
     assert manifest["compacted_through_turn"] == 1
     assert manifest["compaction_summary_hash"] == replay.context_compaction.summary_hash
@@ -417,10 +476,10 @@ def test_orphan_compaction_started_is_ignored_and_retry_uses_new_generation(
     ].count("context_compaction_started") == 1
 
     orphan_summary = b"orphan summary that must never become active"
-    (journal.session.path / "context-compaction-00000001.txt").write_bytes(
+    (journal.runtime_path / "context-compaction-00000001.txt").write_bytes(
         orphan_summary
     )
-    manifest_path = journal.session.path / "context-manifest.json"
+    manifest_path = journal.runtime_path / "context-manifest.json"
     manifest = json.loads(manifest_path.read_text("utf-8"))
     manifest.update(
         {
@@ -488,7 +547,7 @@ def test_compaction_that_remains_at_700k_rolls_back_without_publication(
 
     assert manager.active_messages() == before
     assert journal.replay().context_compaction is None
-    assert not list(session.path.glob("context-compaction-*.txt"))
+    assert not list(journal.runtime_path.glob("context-compaction-*.txt"))
 
 
 def test_committed_compaction_summary_is_hash_verified_on_resume(
@@ -514,7 +573,9 @@ def test_committed_compaction_summary_is_hash_verified_on_resume(
     )
     record = journal.replay().context_compaction
     assert record is not None
-    (session.path / record.summary_path).write_text("tampered", encoding="utf-8")
+    (journal.runtime_path / record.summary_path).write_text(
+        "tampered", encoding="utf-8"
+    )
 
     with pytest.raises(
         ContextWindowIntegrityError,

@@ -36,6 +36,18 @@ _WINDOWS_FORBIDDEN_CHARACTERS = frozenset('<>:"|?*')
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
+def _storage_path(path: Path) -> Path:
+    """Use Windows' extended namespace only after managed-path validation."""
+
+    raw = os.fspath(path)
+    if os.name != "nt" or raw.startswith("\\\\?\\"):
+        return Path(raw)
+    absolute = os.path.abspath(raw)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
 def _json_ready(value: Any, context: str = "value") -> Any:
     if value is None or type(value) in {str, int, bool}:
         return value
@@ -153,7 +165,7 @@ def metadata_is_reparse_point(metadata: Any) -> bool:
 
 def _lstat(path: Path) -> os.stat_result | None:
     try:
-        return os.lstat(path)
+        return os.lstat(_storage_path(path))
     except FileNotFoundError:
         return None
     except OSError as error:
@@ -179,7 +191,7 @@ def _assert_exact_child_name(
         raise SafeIOError(f"managed path parent is not a directory: {parent}")
     wanted = unicodedata.normalize("NFKC", name).casefold()
     try:
-        with os.scandir(parent) as entries:
+        with os.scandir(_storage_path(parent)) as entries:
             for entry in entries:
                 observed = unicodedata.normalize("NFKC", entry.name).casefold()
                 if observed == wanted and entry.name != name:
@@ -224,7 +236,7 @@ def ensure_secure_directory(path: Path) -> Path:
         metadata = _lstat(child)
         if metadata is None:
             try:
-                child.mkdir()
+                _storage_path(child).mkdir()
             except FileExistsError:
                 metadata = _lstat(child)
             except OSError as error:
@@ -273,7 +285,7 @@ def fsync_parent_directory(directory: Path, *, os_module: Any = os) -> None:
         getattr(errno, "EOPNOTSUPP", errno.EINVAL),
     }
     try:
-        descriptor = os_module.open(directory, flags)
+        descriptor = os_module.open(_storage_path(directory), flags)
     except OSError as error:
         if error.errno in unsupported_errors:
             return
@@ -314,16 +326,18 @@ def atomic_replace_bytes(
                     "atomic replacement destination must be a regular file"
                 )
     staging = _staging_path(destination)
+    storage_staging = _storage_path(staging)
+    storage_destination = _storage_path(destination)
     try:
-        with staging.open("xb") as handle:
+        with storage_staging.open("xb") as handle:
             handle.write(content)
             handle.flush()
             os_module.fsync(handle.fileno())
-        os_module.replace(staging, destination)
+        os_module.replace(storage_staging, storage_destination)
         fsync_parent_directory(destination.parent, os_module=os_module)
     finally:
         try:
-            staging.unlink()
+            storage_staging.unlink()
         except FileNotFoundError:
             pass
         except OSError:
@@ -363,24 +377,26 @@ def publish_create_only_bytes(
         raise SafeIOError(f"create-only destination already exists: {destination.name}")
 
     staging = _staging_path(destination)
+    storage_staging = _storage_path(staging)
+    storage_destination = _storage_path(destination)
     published = False
     try:
-        with staging.open("xb") as handle:
+        with storage_staging.open("xb") as handle:
             handle.write(content)
             handle.flush()
             os_module.fsync(handle.fileno())
         try:
-            os_module.link(staging, destination)
+            os_module.link(storage_staging, storage_destination)
         except FileExistsError as error:
             raise SafeIOError(
                 f"create-only destination already exists: {destination.name}"
             ) from error
         published = True
-        staging.unlink()
+        storage_staging.unlink()
         fsync_parent_directory(destination.parent, os_module=os_module)
     finally:
         try:
-            staging.unlink()
+            storage_staging.unlink()
         except FileNotFoundError:
             pass
         except OSError:
@@ -414,10 +430,11 @@ def read_verified_bytes(
     if type(expected_sha256) is not str or _SHA256.fullmatch(expected_sha256) is None:
         raise SafeIOError("expected hash must be a full lowercase SHA-256 digest")
     candidate = assert_regular_file(path)
+    storage_candidate = _storage_path(candidate)
     try:
-        if max_bytes is not None and candidate.stat().st_size > max_bytes:
+        if max_bytes is not None and storage_candidate.stat().st_size > max_bytes:
             raise SafeIOError("regular file exceeds its configured size bound")
-        content = candidate.read_bytes()
+        content = storage_candidate.read_bytes()
     except SafeIOError:
         raise
     except OSError as error:
@@ -432,10 +449,11 @@ def read_verified_bytes(
 
 def read_strict_json(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> Any:
     candidate = assert_regular_file(path)
+    storage_candidate = _storage_path(candidate)
     try:
-        if candidate.stat().st_size > max_bytes:
+        if storage_candidate.stat().st_size > max_bytes:
             raise SafeIOError("JSON file exceeds its configured size bound")
-        content = candidate.read_bytes()
+        content = storage_candidate.read_bytes()
     except SafeIOError:
         raise
     except OSError as error:
@@ -449,7 +467,8 @@ def cleanup_staging_files(directory: Path) -> tuple[Path, ...]:
     root = ensure_secure_directory(directory)
     removed: list[Path] = []
     try:
-        entries = tuple(root.iterdir())
+        with os.scandir(_storage_path(root)) as iterator:
+            entries = tuple(root / entry.name for entry in iterator)
     except OSError as error:
         raise SafeIOError("unable to enumerate staging directory") from error
     for entry in entries:
@@ -465,7 +484,7 @@ def cleanup_staging_files(directory: Path) -> tuple[Path, ...]:
         ):
             raise SafeIOError("staging cleanup target must be a regular file")
         try:
-            entry.unlink()
+            _storage_path(entry).unlink()
         except OSError as error:
             raise SafeIOError("unable to remove interrupted staging file") from error
         removed.append(entry)

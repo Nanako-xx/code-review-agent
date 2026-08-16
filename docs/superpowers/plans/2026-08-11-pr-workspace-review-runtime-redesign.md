@@ -232,7 +232,7 @@ reviewer_assignment_v2
 reviewer_output_v2
 aggregation_record_v1
 review_result_v1
-context_manifest_v1
+context_manifest_v2
 execution_journal_event_v1
 ```
 
@@ -461,7 +461,7 @@ refactor: collapse preflight to deterministic checks
 
 - [x] **Step 2：把现有 Intent 复杂模型隔离为内部分析**
 
-可以通过纯函数复用当前 inference 候选和证据收集，但旧 Intent wire model 与 v5 行为保持不变；`intent_runtime.py` 最终只投影新 IntentPacket。v6 不进入交互式 `AWAITING_USER`。缺失 `--intent`、PR 标题和 PR 描述时必须调用 Intent Agent；普通运行的唯一可靠模型目标为 inferred。无人交互评测只有显式持久化 `evaluation_trust_model` 策略时，才可把完整成功且唯一可靠的模型目标提升为 explicit；`--non-interactive` 不等同于信任模型。失败、partial、无目标或冲突目标保持不确定性并按 inferred/null 风险下限处理。
+可以通过纯函数复用当前 inference 候选和证据收集，但旧 Intent wire model 与 v5 行为保持不变；`intent_runtime.py` 最终只投影新 IntentPacket。v6 不进入交互式 `AWAITING_USER`。缺失 `--intent`、PR 标题和 PR 描述时必须调用 Intent Agent；普通运行的唯一可靠模型目标为 inferred。无人交互评测只有显式持久化 `evaluation_trust_model` 策略时，才可把 `completed` 或 `partial` 中唯一可用的模型目标提升为 explicit；`--non-interactive` 不等同于信任模型。失败、无目标或冲突目标保持不确定性并按 inferred/null 风险下限处理。
 
 - [x] **Step 3：实现跨 Snapshot 延续**
 
@@ -507,8 +507,8 @@ refactor: project minimal intent packet v2
 固定：
 
 ```text
-50 files         no file-count floor
-51 files         medium floor
+100 files        no file-count floor
+101 files        medium floor
 source=explicit  low intent floor
 source=inferred  medium intent floor
 source=null      high intent floor

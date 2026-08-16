@@ -298,3 +298,27 @@ def test_submodule_patch_is_marked_without_a_second_git_query() -> None:
     assert len(index.files) == 1
     assert index.files[0].submodule is True
     assert index.files[0].additions == index.files[0].deletions == 1
+
+
+def test_unquoted_git_header_with_spaces_is_parsed_without_splitting_path() -> None:
+    path = "src/Gui/Stylesheets/FreeCAD Dark.qss"
+    patch = (
+        f"diff --git a/{path} b/{path}\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    ).encode("utf-8")
+
+    index = parse_diff_patch(
+        patch,
+        snapshot_id="S-" + "a" * 64,
+        base_sha="b" * 40,
+        head_sha="c" * 40,
+        patch_artifact_id="A-" + "d" * 64,
+    )
+
+    assert len(index.files) == 1
+    assert index.files[0].path == path
+    assert index.files[0].previous_path is None

@@ -339,6 +339,48 @@ def test_intent_inference_downgrades_false_explicit_document_claim(git_repo, tmp
     assert any("did not match its Observation source/path" in item for item in run.trace.deficiencies)
 
 
+def test_evaluation_trust_mode_sanitizes_provenance_without_a_deficiency(
+    git_repo,
+    tmp_path,
+):
+    base = run_git(git_repo, "rev-parse", "HEAD")
+    store = ObservationStore(tmp_path / "intent-trusted-model-provenance")
+    gateway = ToolGateway(git_repo, base, base, store)
+    implementation = gateway.execute(
+        "read_range",
+        {"path": "app.py", "revision": "head", "line_start": 1, "line_end": 2},
+    )
+    adapter = FakeToolCallingAdapter(
+        script=[
+            ModelTurnResponse(
+                kind=ModelResponseKind.FINAL,
+                final_text=_result_json(
+                    origin="repository_document",
+                    source_refs=["app.py:1"],
+                    evidence_refs=[implementation.observation_ids[0]],
+                ),
+            )
+        ]
+    )
+
+    run = _run(
+        adapter,
+        gateway,
+        base=base,
+        head=base,
+        initial_observation_summaries=store.summaries_by_id(),
+        enforce_candidate_provenance=False,
+    )
+
+    assert run.status == "completed"
+    assert run.result.candidates[0].origin == "llm_inference"
+    assert run.trace.deficiencies == []
+    assert not any(
+        "Runtime validation deficiency" in item
+        for item in run.result.uncertainties
+    )
+
+
 def test_intent_inference_strips_unauthorized_evidence_and_records_deficiency(
     git_repo,
     tmp_path,
@@ -917,6 +959,7 @@ def _run(
     clock=None,
     missing_fields=("acceptance_criteria", "scope"),
     goal_only=False,
+    enforce_candidate_provenance=True,
 ):
     kwargs = {}
     if clock is not None:
@@ -935,6 +978,7 @@ def _run(
         max_elapsed_seconds=max_elapsed_seconds,
         memory_projection=memory_projection,
         goal_only=goal_only,
+        enforce_candidate_provenance=enforce_candidate_provenance,
         **kwargs,
     )
 

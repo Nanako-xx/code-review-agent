@@ -165,7 +165,7 @@ def test_model_analysis_projects_only_an_inferred_packet_and_keeps_trace_interna
     assert analysis["model_inference_promoted"] is False
 
 
-def test_evaluation_policy_promotes_only_completed_unique_model_goal(
+def test_evaluation_policy_promotes_completed_unique_model_goal(
     tmp_path: Path,
 ) -> None:
     store, workspace, snapshot, _second = _workspace(tmp_path)
@@ -280,7 +280,7 @@ def test_evaluation_promotes_recovered_goal_and_ignores_legacy_candidates(
     assert analysis["selection_reason"] == "evaluation_model_inference_promoted"
 
 
-def test_evaluation_policy_does_not_promote_partial_or_conflicting_analysis(
+def test_evaluation_policy_promotes_partial_goal_but_not_conflicting_analysis(
     tmp_path: Path,
 ) -> None:
     store, workspace, snapshot, _second = _workspace(tmp_path)
@@ -307,10 +307,10 @@ def test_evaluation_policy_does_not_promote_partial_or_conflicting_analysis(
         trust_policy="evaluation_trust_model",
     )
 
-    assert partial.packet.source is IntentSource.INFERRED
+    assert partial.packet.source is IntentSource.EXPLICIT
     assert runtime.load_analysis_record(
         workspace, partial.analysis_record_ref
-    )["model_inference_promoted"] is False
+    )["model_inference_promoted"] is True
 
     store2, workspace2, snapshot2, _second2 = _workspace(tmp_path / "conflict")
     conflicting = IntentInferenceRun(

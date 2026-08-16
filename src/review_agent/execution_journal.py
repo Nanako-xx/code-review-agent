@@ -22,6 +22,8 @@ from review_agent.safe_io import (
     SafeIOError,
     assert_regular_file,
     canonical_json_bytes,
+    ensure_secure_directory,
+    publish_create_only_bytes,
     resolve_managed_path,
     strict_json_loads,
 )
@@ -34,6 +36,8 @@ from review_agent.tool_result_protocol import (
 
 
 EXECUTION_JOURNAL_SCHEMA = "execution_journal_event_v1"
+REVIEWER_RUNTIME_BINDING_SCHEMA = "reviewer_runtime_binding_v1"
+_REVIEWER_RUNTIME_PHYSICAL_DIGEST_CHARS = 8
 _EVENT_TYPES = frozenset(
     {
         "model_response",
@@ -62,6 +66,70 @@ class JournalError(ValueError):
 
 class JournalIntegrityError(JournalError):
     pass
+
+
+def _publish_binding_or_verify(path: Path, content: bytes, context: str) -> None:
+    try:
+        publish_create_only_bytes(path, content)
+    except SafeIOError:
+        try:
+            existing = assert_regular_file(path).read_bytes()
+        except (OSError, SafeIOError) as error:
+            raise JournalIntegrityError(f"{context} is unavailable") from error
+        if existing != content:
+            raise JournalIntegrityError(f"{context} binding changed")
+
+
+def _create_or_open_journal(path: Path) -> None:
+    """Create an empty journal once, or reopen its existing append-only bytes."""
+
+    try:
+        publish_create_only_bytes(path, b"")
+    except SafeIOError:
+        try:
+            assert_regular_file(path)
+        except (OSError, SafeIOError) as error:
+            raise JournalIntegrityError("Execution journal is unavailable") from error
+
+
+def _reviewer_runtime_path(
+    session: SessionWorkspace,
+    assignment: ReviewerAssignment,
+) -> Path:
+    # Keep the complete Assignment ID in reviewer.json while using a short
+    # physical namespace to preserve room for create-only staging names on
+    # legacy Windows MAX_PATH. Any prefix collision fails closed on the full
+    # immutable binding below.
+    physical_id = (
+        "r-"
+        + assignment.assignment_id[
+            4 : 4 + _REVIEWER_RUNTIME_PHYSICAL_DIGEST_CHARS
+        ]
+    )
+    try:
+        reviewers = resolve_managed_path(session.path, "Reviewers")
+        ensure_secure_directory(reviewers)
+        runtime = resolve_managed_path(reviewers, physical_id)
+        ensure_secure_directory(runtime)
+        binding = canonical_json_bytes(
+            {
+                "schema_version": REVIEWER_RUNTIME_BINDING_SCHEMA,
+                "session_id": session.session_id,
+                "pr_id": session.workspace.pr_id,
+                "snapshot_id": session.snapshot.snapshot_id,
+                "assignment_id": assignment.assignment_id,
+            }
+        )
+        _publish_binding_or_verify(
+            resolve_managed_path(runtime, "reviewer.json"),
+            binding,
+            "Reviewer Runtime binding",
+        )
+        return runtime
+    except JournalIntegrityError:
+        raise
+    except (OSError, SafeIOError) as error:
+        raise JournalIntegrityError("Reviewer Runtime path is unavailable") from error
 
 
 def _utc_now() -> str:
@@ -426,14 +494,20 @@ class ExecutionJournal:
             raise JournalIntegrityError("Session workspace binding is invalid")
         if assignment.snapshot_id != session.snapshot.snapshot_id:
             raise JournalIntegrityError("Assignment Snapshot binding is invalid")
-        try:
-            path = resolve_managed_path(session.path, "execution-log.jsonl")
-            assert_regular_file(path)
-        except SafeIOError as error:
-            raise JournalIntegrityError("Execution journal path is unavailable") from error
         self.workspace_store = workspace_store
         self.session = session
         self.assignment = assignment
+        self.runtime_path = _reviewer_runtime_path(session, assignment)
+        try:
+            path = resolve_managed_path(self.runtime_path, "execution-log.jsonl")
+            _create_or_open_journal(path)
+            assert_regular_file(path)
+        except JournalIntegrityError:
+            raise
+        except SafeIOError as error:
+            raise JournalIntegrityError(
+                "Execution journal path is unavailable"
+            ) from error
         self.path = path
         self._utc_now = utc_now or _utc_now
         self._os = os_module
@@ -484,6 +558,10 @@ class ExecutionJournal:
                 payload["assignment_id"]
             ) is None:
                 raise JournalIntegrityError("Execution journal Assignment ID is invalid")
+            if payload["assignment_id"] != self.assignment.assignment_id:
+                raise JournalIntegrityError(
+                    "Execution journal Assignment binding is invalid"
+                )
             elapsed = payload["active_elapsed_seconds"]
             if (
                 isinstance(elapsed, bool)
@@ -1371,5 +1449,6 @@ __all__ = [
     "JournalIntegrityError",
     "JournalReplay",
     "PendingTurn",
+    "REVIEWER_RUNTIME_BINDING_SCHEMA",
     "ToolCallIdentity",
 ]

@@ -224,6 +224,12 @@ def _context_input(
                 assignment_ids=(assignment.assignment_id,),
             ),
             AvailableArtifact(
+                artifact_id="A-" + "6" * 64,
+                kind="reviewer_assignment",
+                description="Complete immutable Assignment for this Reviewer.",
+                assignment_ids=(assignment.assignment_id,),
+            ),
+            AvailableArtifact(
                 artifact_id="A-" + "4" * 64,
                 kind="tool_result",
                 description="UNRELATED_ARTIFACT_SENTINEL",
@@ -293,6 +299,8 @@ def test_initial_message_contains_only_current_pinned_review_inputs() -> None:
         "+return new_value",
         "<AvailableArtifacts>",
         "Relevant prior immutable result.",
+        "reviewer_assignment",
+        "Complete immutable Assignment for this Reviewer.",
     ):
         assert expected in message
     assert "src/unrelated.py" not in message
@@ -326,15 +334,15 @@ def test_reviewer_prompt_and_parameters_bind_minimal_output_v2() -> None:
         assert forbidden not in invocation.messages[0]["content"]
 
 
-def test_large_diff_uses_complete_index_and_relevant_hunk_without_line_truncation() -> None:
+def test_large_diff_uses_compact_complete_index_and_artifact_access() -> None:
     patch, _index = _diff()
-    large_patch = patch + (b"# filler\n" * 500)
+    large_patch = patch + (b"# filler\n" * 10_000)
     invocation = build_reviewer_invocation_v2(
         _context_input(
             diff_bytes=large_patch,
             diff_policy=DiffFitPolicy(
-                target_initial_tokens=700,
-                estimated_chars_per_token=1,
+                target_initial_tokens=50_000,
+                estimated_utf8_bytes_per_token=1,
             ),
         )
     )
@@ -342,8 +350,10 @@ def test_large_diff_uses_complete_index_and_relevant_hunk_without_line_truncatio
 
     assert '<CodeChanges mode="indexed"' in message
     assert '"files"' in message
-    assert "@@ -1 +1 @@" in message
-    assert "+return new_value" in message
+    assert '"hunk_count"' in message
+    assert "read_artifact" in message
+    assert "compare_base_head" in message
+    assert "@@ -1 +1 @@" not in message
     assert "# filler" not in message
     assert "truncated" not in message.casefold()
     assert "first 120 lines" not in message
@@ -355,5 +365,16 @@ def test_v2_context_has_large_token_target_not_a_character_budget() -> None:
     policy = DiffFitPolicy()
 
     assert 500_000 <= policy.target_initial_tokens <= 600_000
+    assert policy.estimated_utf8_bytes_per_token == 1.0
     assert not hasattr(policy, "max_message_chars")
     assert not hasattr(policy, "memory_subbudget_ratio")
+
+
+def test_diff_fit_uses_utf8_bytes_not_python_character_count() -> None:
+    policy = DiffFitPolicy(
+        target_initial_tokens=10,
+        estimated_utf8_bytes_per_token=1,
+    )
+
+    assert policy.estimate_tokens("a") == 1
+    assert policy.estimate_tokens("汉") == 3

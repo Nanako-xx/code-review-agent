@@ -401,9 +401,17 @@ def _decode_git_path(token: bytes, *, prefix: bytes | None = None) -> str:
 
 def _header_paths(header: bytes) -> tuple[str, str]:
     line = header[:-1] if header.endswith(b"\n") else header
-    tokens = _split_git_tokens(line[len(b"diff --git ") :])
+    payload = line[len(b"diff --git ") :]
+    tokens = _split_git_tokens(payload)
     if len(tokens) != 2:
-        raise DiffArtifactIntegrityError("Git Diff file header is invalid")
+        # Git quotes tabs, newlines, quotes, backslashes and non-ASCII bytes, but
+        # it intentionally leaves ordinary spaces unquoted.  In that case the
+        # unquoted header is still unambiguous because the second path starts at
+        # the last `` b/`` delimiter.
+        delimiter = payload.rfind(b" b/")
+        if delimiter <= 0:
+            raise DiffArtifactIntegrityError("Git Diff file header is invalid")
+        tokens = (payload[:delimiter], payload[delimiter + 1 :])
     return (
         _decode_git_path(tokens[0], prefix=b"a/"),
         _decode_git_path(tokens[1], prefix=b"b/"),

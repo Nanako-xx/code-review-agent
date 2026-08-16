@@ -186,6 +186,7 @@ class ContextManifest:
     session_id: str
     pr_id: str
     snapshot_id: str
+    assignment_id: str
     last_api_request_at: str | None
     compaction_generation: int
     compacted_through_turn: int
@@ -198,6 +199,7 @@ class ContextManifest:
             "session_id": self.session_id,
             "pr_id": self.pr_id,
             "snapshot_id": self.snapshot_id,
+            "assignment_id": self.assignment_id,
             "last_api_request_at": self.last_api_request_at,
             "compaction_generation": self.compaction_generation,
             "compacted_through_turn": self.compacted_through_turn,
@@ -384,8 +386,25 @@ class _ContextManifestStore:
         self.journal = journal
         try:
             self.path = resolve_managed_path(
-                journal.session.path, "context-manifest.json"
+                journal.runtime_path, "context-manifest.json"
             )
+            if not self.path.exists():
+                publish_create_only_bytes(
+                    self.path,
+                    canonical_json_bytes(
+                        ContextManifest(
+                            session_id=journal.session.session_id,
+                            pr_id=journal.session.workspace.pr_id,
+                            snapshot_id=journal.session.snapshot.snapshot_id,
+                            assignment_id=journal.assignment.assignment_id,
+                            last_api_request_at=None,
+                            compaction_generation=0,
+                            compacted_through_turn=0,
+                            compaction_trigger=None,
+                            compaction_summary_hash=None,
+                        ).to_dict()
+                    ),
+                )
             assert_regular_file(self.path)
         except SafeIOError as error:
             raise ContextWindowIntegrityError(
@@ -405,6 +424,7 @@ class _ContextManifestStore:
             "session_id",
             "pr_id",
             "snapshot_id",
+            "assignment_id",
             "last_api_request_at",
             "compaction_generation",
             "compacted_through_turn",
@@ -421,6 +441,7 @@ class _ContextManifestStore:
             or value["session_id"] != session.session_id
             or value["pr_id"] != session.workspace.pr_id
             or value["snapshot_id"] != session.snapshot.snapshot_id
+            or value["assignment_id"] != self.journal.assignment.assignment_id
         ):
             raise ContextWindowIntegrityError(
                 "Context manifest binding is invalid"
@@ -458,6 +479,7 @@ class _ContextManifestStore:
             session_id=value["session_id"],
             pr_id=value["pr_id"],
             snapshot_id=value["snapshot_id"],
+            assignment_id=value["assignment_id"],
             last_api_request_at=last_api,
             compaction_generation=generation,
             compacted_through_turn=through,
@@ -501,6 +523,7 @@ class _ContextManifestStore:
             session_id=current.session_id,
             pr_id=current.pr_id,
             snapshot_id=current.snapshot_id,
+            assignment_id=current.assignment_id,
             last_api_request_at=current.last_api_request_at,
             compaction_generation=generation,
             compacted_through_turn=through_turn,
@@ -838,7 +861,7 @@ class ContextWindowManager:
         summary_hash = hashlib.sha256(summary_bytes).hexdigest()
         summary_path = f"context-compaction-{generation:08d}.txt"
         try:
-            path = resolve_managed_path(self.journal.session.path, summary_path)
+            path = resolve_managed_path(self.journal.runtime_path, summary_path)
             publish_create_only_bytes(path, summary_bytes)
             self._manifest.commit_compaction(
                 generation=generation,
@@ -869,7 +892,7 @@ class ContextWindowManager:
     def _read_compaction_summary(self, compaction: Any) -> str:
         try:
             path = resolve_managed_path(
-                self.journal.session.path, compaction.summary_path
+                self.journal.runtime_path, compaction.summary_path
             )
             content = read_verified_bytes(path, compaction.summary_hash)
             summary = content.decode("utf-8", "strict")

@@ -466,6 +466,7 @@ def run_intent_inference(
     memory_projection: IntentMemoryProjection | None = None,
     clock: Callable[[], float] = time.monotonic,
     goal_only: bool = False,
+    enforce_candidate_provenance: bool = True,
 ) -> IntentInferenceRun:
     """Run an elapsed-time-bounded, read-only intent analysis conversation.
 
@@ -491,6 +492,8 @@ def run_intent_inference(
         raise ValueError("clock must be callable")
     if type(goal_only) is not bool:
         raise ValueError("goal_only must be a boolean")
+    if type(enforce_candidate_provenance) is not bool:
+        raise ValueError("enforce_candidate_provenance must be a boolean")
     if memory_projection is not None and not isinstance(
         memory_projection,
         IntentMemoryProjection,
@@ -723,6 +726,7 @@ def run_intent_inference(
                     if goal_only
                     else None
                 ),
+                enforce_provenance=enforce_candidate_provenance,
             )
             if goal_only and not validation_deficiencies:
                 goal_candidates = [
@@ -881,6 +885,7 @@ def _validate_runtime_candidates(
     memory_projection: IntentMemoryProjection | None = None,
     *,
     requested_fields: frozenset[str] | None = None,
+    enforce_provenance: bool = True,
 ) -> tuple[IntentInferenceResult, list[str], list[str]]:
     observations = {
         observation.observation_id: observation
@@ -906,7 +911,7 @@ def _validate_runtime_candidates(
             for evidence_ref in candidate.evidence_refs
             if evidence_ref in observations
         ]
-        if unauthorized:
+        if unauthorized and enforce_provenance:
             deficiencies.append(
                 f"candidate {index} cited unauthorized evidence_refs: "
                 + ", ".join(unauthorized)
@@ -914,27 +919,35 @@ def _validate_runtime_candidates(
 
         origin = candidate.origin
         if origin == IntentOrigin.PROJECT_MEMORY.value:
-            if not _memory_claim_is_supported(candidate, memory_projection):
+            if not enforce_provenance:
+                origin = IntentOrigin.LLM_INFERENCE.value
+            elif not _memory_claim_is_supported(candidate, memory_projection):
                 deficiencies.append(
                     f"candidate {index} project_memory claim did not match its typed projection"
                 )
                 origin = IntentOrigin.LLM_INFERENCE.value
         elif origin in _MODEL_EXPLICIT_ORIGINS:
-            supporting_observations = [observations[item] for item in authorized_refs]
-            if not _source_claim_is_supported(
-                origin,
-                candidate.source_refs,
-                supporting_observations,
-                gateway,
-            ):
-                deficiencies.append(
-                    f"candidate {index} origin {origin} did not match its Observation source/path"
-                )
-                origin = "llm_inference"
+            if not enforce_provenance:
+                origin = IntentOrigin.LLM_INFERENCE.value
+            else:
+                supporting_observations = [
+                    observations[item] for item in authorized_refs
+                ]
+                if not _source_claim_is_supported(
+                    origin,
+                    candidate.source_refs,
+                    supporting_observations,
+                    gateway,
+                ):
+                    deficiencies.append(
+                        f"candidate {index} origin {origin} did not match its Observation source/path"
+                    )
+                    origin = "llm_inference"
         elif origin not in _MODEL_INFERRED_ORIGINS:
-            deficiencies.append(
-                f"candidate {index} made unsupported explicit origin claim: {origin}"
-            )
+            if enforce_provenance:
+                deficiencies.append(
+                    f"candidate {index} made unsupported explicit origin claim: {origin}"
+                )
             origin = "llm_inference"
 
         candidates.append(
